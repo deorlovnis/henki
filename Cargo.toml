@@ -1,0 +1,31 @@
+[package]
+name = "henki"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.92"
+description = "A small terminal agent (early development)"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/deorlovnis/henki"
+readme = "README.md"
+keywords = ["agent", "llm", "terminal", "cli"]
+categories = ["command-line-utilities"]
+publish = false
+
+[dependencies]
+anyhow = "1.0.104"
+lexopt = "0.3.2"
+
+[lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+
+[lints.clippy]
+# Every unsafe block carries a // SAFETY: note.
+undocumented_unsafe_blocks = "deny"
+
+# Small and static: check.sh holds the release binary to 1,000,000 bytes.
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true
