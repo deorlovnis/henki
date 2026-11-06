@@ -281,3 +281,147 @@ fn kill_call_session_members() {
     assert_eq!(tool(&rx, 2, Duration::from_secs(5)).end, End::Signal(libc::SIGKILL));
     until("the second call's setsid child to die", || !alive(b_child));
 }
+
+#[test]
+fn spill_symlink_not_followed() {
+    let t = Tmp::new();
+    fs::write(t.0.join("target"), "kept").unwrap();
+    std::os::unix::fs::symlink(t.0.join("target"), t.0.join("s-9.log")).unwrap();
+    std::os::unix::fs::symlink(t.0.join("absent"), t.0.join("s-10.log")).unwrap();
+    for name in ["s-9.log", "s-10.log"] {
+        let mut c = Cap::new(4, t.spill(name));
+        c.push(b"abcdef");
+        assert!(matches!(c.sink, Sink::Lost("name in use")), "{name}");
+    }
+    assert_eq!(fs::read_to_string(t.0.join("target")).unwrap(), "kept");
+    assert!(!t.0.join("absent").exists());
+}
+
+#[test]
+fn spill_mode_0600() {
+    use std::os::unix::fs::PermissionsExt;
+    let t = Tmp::new();
+    let mut c = Cap::new(4, t.spill("s-11.log"));
+    c.push(b"abcdef");
+    let m = fs::symlink_metadata(t.0.join("s-11.log")).unwrap();
+    assert!(m.is_file());
+    assert_eq!(m.permissions().mode() & 0o7777, 0o600);
+    assert_eq!(fs::read(t.0.join("s-11.log")).unwrap(), b"abcdef");
+}
+
+#[test]
+fn spill_create_error_marker() {
+    let t = Tmp::new();
+    let mut c = Cap::new(10, Spill { path: t.0.join("missing/s-12.log"), shown: "~/missing/s-12.log".into() });
+    c.push(b"abcdefghijk");
+    assert_eq!(c.text(), "abcde\n[... 1 of 11 bytes cut; full output not kept (could not write) ...]\nghijk");
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn spill_write_error_not_kept() {
+    let t = Tmp::new();
+    let path = t.0.join("s-13.log");
+    let mut c = Cap::new(4, t.spill("s-13.log"));
+    c.push(b"abcdef");
+    assert_eq!(fs::read(&path).unwrap(), b"abcdef");
+    // From here every write fails, as on a full disk.
+    c.sink = Sink::Open(fs::OpenOptions::new().write(true).open("/dev/full").unwrap(), 6);
+    c.push(b"gh");
+    assert!(matches!(c.sink, Sink::Lost("could not write")));
+    assert!(!path.exists(), "a partial spill file stayed");
+    c.push(b"ij");
+    assert!(!path.exists());
+    assert_eq!(c.text(), "ab\n[... 6 of 10 bytes cut; full output not kept (could not write) ...]\nij");
+}
+
+#[test]
+fn capture_invalid_utf8_lossy() {
+    let t = Tmp::new();
+    // Within the cap the whole output is decoded at once: each invalid sequence becomes one U+FFFD.
+    let out = run(&t, "printf 'a\\377b\\303(\\342\\202'", 1024, t.spill("s-14.log"));
+    assert_eq!((out.text.as_str(), out.bytes), ("a\u{FFFD}b\u{FFFD}(\u{FFFD}", 7));
+    // Past the cap, invalid bytes inside head and tail are replaced; a stray lead byte at the head's end and a stray
+    // continuation byte at the tail's start are cut and counted.
+    let mut c = Cap::new(8, t.spill("s-15.log"));
+    c.push(b"\xffabc12xyz\xfe");
+    assert_eq!(c.text(), "\u{FFFD}abc\n[... 2 of 10 bytes cut; full output: ~/spill/s-15.log ...]\nxyz\u{FFFD}");
+    let mut c = Cap::new(8, t.spill("s-16.log"));
+    c.push(b"abc\xff12\x80xyz");
+    assert_eq!(c.text(), "abc\n[... 4 of 10 bytes cut; full output: ~/spill/s-16.log ...]\nxyz");
+}
+
+#[test]
+fn cap_boundary_exact() {
+    let t = Tmp::new();
+    let mut c = Cap::new(10, t.spill("s-17.log"));
+    c.push(b"abcde");
+    c.push(b"fghij");
+    assert_eq!((c.text(), c.total), ("abcdefghij".to_string(), 10));
+    assert!(!t.0.join("s-17.log").exists());
+    let mut c = Cap::new(10, t.spill("s-18.log"));
+    c.push(b"abcdefghij");
+    assert!(!t.0.join("s-18.log").exists());
+    c.push(b"k");
+    assert_eq!(fs::read(t.0.join("s-18.log")).unwrap(), b"abcdefghijk");
+    assert_eq!(c.text(), "abcde\n[... 1 of 11 bytes cut; full output: ~/spill/s-18.log ...]\nghijk");
+}
+
+#[test]
+fn spawn_failure_leaves_nothing() {
+    let t = Tmp::new();
+    let (tx, rx) = mpsc::channel();
+    let fail = |bash: &str, cmd: &str, cwd: &Path| spawn(Path::new(bash), cmd, cwd, &path_env(), 1024, t.spill("s-19.log"), 9, &tx).unwrap_err().kind();
+    assert_eq!(fail("/nonexistent/bash", "echo x", &t.0), io::ErrorKind::NotFound);
+    assert_eq!(fail(BASH, "echo x", &t.0.join("gone")), io::ErrorKind::NotFound);
+    assert_eq!(fail(BASH, "echo \0x", &t.0), io::ErrorKind::InvalidInput);
+    drop(tx);
+    // Each failed spawn's waiter held a sender: the channel closes only when all of them ended without a report.
+    match rx.recv_timeout(Duration::from_secs(10)) {
+        Err(mpsc::RecvTimeoutError::Disconnected) => {}
+        got => panic!("a failed spawn left a waiter behind: {got:?}"),
+    }
+    assert!(!t.0.join("s-19.log").exists());
+}
+
+#[test]
+fn capture_stdin_null() {
+    let t = Tmp::new();
+    let out = run(&t, "cat; read x; echo rc=$?; { : </dev/tty; } 2>/dev/null || echo no tty", 1024, t.spill("s-20.log"));
+    assert_eq!((out.text.as_str(), out.end), ("rc=1\nno tty\n", End::Exit(0)));
+    assert!(out.ms < 5_000, "{}", out.ms);
+}
+
+/// In the test process: runs the test `name` again in a new process of this test binary, alone, and returns false. In
+/// that process (marked by `HENKI_TEST_ALONE`) it returns true and the test runs its body there. Code that changes the
+/// whole process (the subreaper flag, the ledger, the sweep) is tested only this way, so it never meets another test's
+/// children.
+fn alone(name: &str) -> bool {
+    if std::env::var_os("HENKI_TEST_ALONE").is_some() {
+        return true;
+    }
+    let args = ["--exact", &format!("supervise::tests::{name}"), "--test-threads=1", "--nocapture"];
+    let out = std::process::Command::new(std::env::current_exe().unwrap()).args(args).env("HENKI_TEST_ALONE", "1").output().unwrap();
+    let text = format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+    assert!(out.status.success() && text.contains(" 1 passed;"), "{text}");
+    false
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn signal_groups_ended_background_gone() {
+    if !alone("signal_groups_ended_background_gone") {
+        return;
+    }
+    // As in henki: a subreaper, so a background process that ends after its shell is left as henki's zombie.
+    sys::harden().unwrap();
+    let t = Tmp::new();
+    let (tx, rx) = mpsc::channel();
+    let pgid = start(&t.0, "sleep 0.2 >/dev/null 2>&1 & echo started", &path_env(), 1024, t.spill("s-21.log"), 1, &tx);
+    assert_eq!(tool(&rx, 1, Duration::from_secs(5)).text, "started\n");
+    let me = std::process::id() as i32;
+    until("the background sleep to end", || sys::procs().iter().any(|p| p.sid == pgid && p.ppid == me && p.zombie));
+    assert_eq!(signal_groups(0), 0, "a group with nothing live still counts");
+    assert!(!sys::procs().iter().any(|p| p.sid == pgid), "its zombie was not reaped");
+    assert_eq!(reap(), 0);
+}

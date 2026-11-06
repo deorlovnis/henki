@@ -5,7 +5,8 @@ use crate::{config::Env, sys, term};
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError, mpsc::Sender};
+use std::sync::mpsc::{self, Sender};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 use std::{collections::VecDeque, ffi::OsString, fs::File, os::unix::process::ExitStatusExt, thread};
 
@@ -45,9 +46,11 @@ pub fn spawn(bash: &Path, cmd: &str, cwd: &Path, env: &[(OsString, OsString)], c
     let t0 = Instant::now();
     let (r, w) = io::pipe()?;
     let shared = Arc::new((Mutex::new(Cap::new(cap, spill)), Condvar::new()));
-    let (reader, tx) = (Arc::clone(&shared), tx.clone());
-    // Started first, so a failure leaves nothing running; if the spawn below fails, the write ends close and it ends.
+    let (reader, tx, (give, take)) = (Arc::clone(&shared), tx.clone(), mpsc::channel());
+    // Both threads start before the fork, so nothing can fail once bash runs. If the spawn below fails, the write ends
+    // close (the capture ends) and `give` drops (the waiter ends).
     thread::Builder::new().spawn(move || capture(r, &reader))?;
+    thread::Builder::new().spawn(move || take.recv().map(|child| waiter(child, &shared, t0, tag, &tx)))?;
     let mut c = Command::new(bash);
     c.args(["--noprofile", "--norc", "-c", cmd]).current_dir(cwd).env_clear().envs(env.iter().map(|(k, v)| (k, v)));
     c.stdin(Stdio::null()).stdout(w.try_clone()?).stderr(w);
@@ -57,14 +60,14 @@ pub fn spawn(bash: &Path, cmd: &str, cwd: &Path, env: &[(OsString, OsString)], c
     drop(c); // the parent's write ends close here, or EOF never comes
     let pgid = child.id() as i32;
     lock(&LEDGER).push(pgid);
-    thread::spawn(move || waiter(child, &shared, t0, tag, &tx));
+    let _ = give.send(child); // the waiter is in `recv` until it gets it
     Ok(pgid)
 }
 
 /// Sends `sig` (0 probes) to every group in the ledger, drops the groups that are gone (ESRCH), returns how many remain.
 pub fn signal_groups(sig: i32) -> usize {
     let mut g = lock(&LEDGER);
-    g.retain(|&pg| sys::kill(-pg, sig));
+    pass(&mut g, sig);
     g.len()
 }
 
@@ -80,8 +83,7 @@ pub fn kill_call(pgid: i32) {
 /// background descendants (macOS: live ledger groups of earlier calls).
 pub fn reap() -> usize {
     let mut g = lock(&LEDGER);
-    let live = scan(&g);
-    g.retain(|&pg| sys::kill(-pg, 0));
+    let live = pass(&mut g, 0);
     if cfg!(target_os = "linux") { live.len() } else { g.len() }
 }
 
@@ -103,16 +105,17 @@ fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
 }
 
 fn sweep(groups: &mut Vec<i32>) -> usize {
-    let live = scan(groups);
-    groups.retain(|&pg| sys::kill(-pg, libc::SIGKILL));
+    let live = pass(groups, libc::SIGKILL);
     if cfg!(target_os = "linux") { live.into_iter().filter(|&p| sys::kill(p, libc::SIGKILL)).count() } else { groups.len() }
 }
 
-/// Reaps henki's zombie children by pid, except group leaders (their waiters own them); returns the live descendants
-/// (Linux; none elsewhere).
-fn scan(groups: &[i32]) -> Vec<i32> {
+/// Reaps henki's zombie children by pid, except group leaders (their waiters own them), then sends `sig` to every group
+/// and drops the gone ones (ESRCH); returns the live descendants (Linux; none elsewhere). The reap comes first because a
+/// zombie still answers for its group: a group whose members have all ended would never give ESRCH.
+fn pass(groups: &mut Vec<i32>, sig: i32) -> Vec<i32> {
     let (ps, me) = (sys::procs(), std::process::id() as i32);
     ps.iter().filter(|p| p.zombie && p.ppid == me && !groups.contains(&p.pid)).for_each(|p| _ = sys::reap(p.pid));
+    groups.retain(|&pg| sys::kill(-pg, sig));
     sys::tree(&ps, |p| p.ppid == me)
 }
 
@@ -152,15 +155,20 @@ struct Cap {
 enum Sink {
     Later,
     Open(File, u64),
-    Lost(String),
+    Lost(&'static str),
 }
 
 impl Sink {
-    /// Appends what fits; a failed write keeps nothing more.
-    fn put(&mut self, b: &[u8]) {
+    /// Appends what fits. A failed write removes the partial file at `path` and keeps nothing more.
+    fn put(&mut self, b: &[u8], path: &Path) {
         if let Sink::Open(f, n) = self {
             let k = b.len().min((SPILL_MAX - ROOM - *n) as usize);
-            if let Err(e) = f.write_all(&b[..k]) { *self = Sink::Lost(e.to_string()) } else { *n += k as u64 }
+            if f.write_all(&b[..k]).is_ok() {
+                *n += k as u64;
+            } else {
+                let _ = std::fs::remove_file(path);
+                *self = Sink::Lost("could not write");
+            }
         }
     }
 }
@@ -178,12 +186,12 @@ impl Cap {
         if matches!(self.sink, Sink::Later) && self.total + b.len() as u64 > self.cap as u64 {
             self.sink = match sys::create_excl(&self.spill.path, 0o600, false) {
                 Ok(f) => Sink::Open(f, 0),
-                Err(e) => Sink::Lost(if e.kind() == io::ErrorKind::AlreadyExists { "name in use".into() } else { e.to_string() }),
+                Err(e) => Sink::Lost(if e.kind() == io::ErrorKind::AlreadyExists { "name in use" } else { "could not write" }),
             };
             let (a, c) = self.tail.as_slices();
-            [&self.head[..], a, c].into_iter().for_each(|part| self.sink.put(part));
+            [&self.head[..], a, c].into_iter().for_each(|part| self.sink.put(part, &self.spill.path));
         }
-        self.sink.put(b);
+        self.sink.put(b, &self.spill.path);
         self.total += b.len() as u64;
         let (head, rest) = b.split_at(b.len().min(self.cap / 2 - self.head.len()));
         self.head.extend_from_slice(head);
