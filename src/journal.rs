@@ -3,11 +3,23 @@
 use crate::config::{Config, Env};
 use crate::supervise::Spill;
 use crate::types::Outcome;
+use crate::{sys, term, tools};
 use serde_json::Value;
+use std::collections::HashSet;
+use std::fmt::Display;
+use std::fs::{self, File};
+use std::io::{Read, Write};
+use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
+use std::time::{Duration, SystemTime};
 
 pub struct Journal {
-    // private: file, path, bytes, id, spill dir, next spill n
+    file: File,
+    path: PathBuf,
+    bytes: u64,
+    id: String,
+    spill: PathBuf,
+    n: u32,
 }
 
 pub struct Resumed {
@@ -17,116 +29,324 @@ pub struct Resumed {
     pub notices: Vec<String>,
 }
 
+const ELIDED: &str = "[output elided: ";
+
 /// `$XDG_STATE_HOME/henki` (default `~/.local/state/henki`), with `sessions/` and `spill/`: `sys::private_dir` for each;
 /// spill files older than 24 h are deleted.
 pub fn state_dir(env: &Env, home: &Path) -> Result<PathBuf, String> {
-    todo!()
+    let xdg = env.get("XDG_STATE_HOME").map(Path::new).filter(|p| p.is_absolute());
+    let dir = xdg.map_or_else(|| home.join(".local/state"), Path::to_path_buf).join("henki");
+    for d in [dir.clone(), dir.join("sessions"), dir.join("spill")] {
+        sys::private_dir(&d).map_err(|e| format!("state dir {}: {e}; fix: make it a directory you own, or set XDG_STATE_HOME", d.display()))?;
+    }
+    let old = |e: &fs::DirEntry| e.metadata().ok().and_then(|m| m.modified().ok()?.elapsed().ok()).is_some_and(|age| age > Duration::from_secs(86_400));
+    for e in fs::read_dir(dir.join("spill")).into_iter().flatten().flatten().filter(old) {
+        let _ = fs::remove_file(e.path());
+    }
+    Ok(dir)
+}
+
+fn jerr(path: &Path, e: impl Display) -> Outcome {
+    Outcome::error("journal", format!("{}: {e}", path.display()))
+}
+
+fn tampered(path: &Path) -> Outcome {
+    Outcome::error("tampered", format!("journal modified outside henki: {}", path.display()))
+}
+
+/// The sessions subdirectory of a cwd: FNV-1a of its realpath.
+fn scope(cwd: &Path) -> Result<String, Outcome> {
+    Ok(sys::fnv(fs::canonicalize(cwd).map_err(|e| jerr(cwd, e))?.as_os_str().as_bytes()))
+}
+
+/// The kinds `write` does not fdatasync: they explain no effect that a crash could leave behind.
+fn synced(t: &str) -> bool {
+    !matches!(t, "ask" | "approval" | "notice")
 }
 
 impl Journal {
     /// `sessions/<fnv(realpath(cwd))>/<id>.jsonl`: `sys::create_excl(path, 0o600, true)` (O_APPEND), `try_lock` held
     /// for the session.
     pub fn create(state: &Path, cwd: &Path) -> Result<Journal, Outcome> {
-        todo!()
+        let dir = state.join("sessions").join(scope(cwd)?);
+        sys::private_dir(&dir).map_err(|e| jerr(&dir, e))?;
+        let id = format!("{}-{}", sys::utc().1, sys::random4().map_err(|e| jerr(Path::new("/dev/urandom"), e))?);
+        Journal::start(dir.join(format!("{id}.jsonl")), id, state)
+    }
+
+    fn start(path: PathBuf, id: String, state: &Path) -> Result<Journal, Outcome> {
+        let file = sys::create_excl(&path, 0o600, true).map_err(|e| jerr(&path, e))?;
+        file.try_lock().map_err(|e| jerr(&path, e))?;
+        Ok(Journal { file, path, bytes: 0, id, spill: state.join("spill"), n: 0 })
     }
 
     /// Resume through one `sys::open_append` fd: pick, open, lock, read, truncate a torn tail (`set_len`), parse, check,
     /// rebuild, repair (appended through the same O_APPEND fd, synced).
     pub fn resume(state: &Path, cwd: &Path, id: Option<&str>, cfg: &Config) -> Result<Resumed, Outcome> {
-        todo!()
+        let (path, file) = pick(state, cwd, id)?;
+        let mut buf = Vec::new();
+        (&file).read_to_end(&mut buf).map_err(|e| jerr(&path, e))?;
+        let mut notices = Vec::new();
+        let keep = buf.iter().rposition(|&b| b == b'\n').map_or(0, |i| i + 1);
+        if keep < buf.len() {
+            file.set_len(keep as u64).map_err(|e| jerr(&path, e))?;
+            notices.push(format!("dropped an incomplete last line ({} bytes) from {}", buf.len() - keep, path.display()));
+            buf.truncate(keep);
+        }
+        let mut hist = replay(&buf, &path, cfg, cwd, &mut notices)?;
+        let id = path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
+        let prefix = format!("{id}-");
+        let spill = state.join("spill");
+        let names = fs::read_dir(&spill).into_iter().flatten().flatten().map(|e| e.file_name());
+        let n = names.filter_map(|f| f.to_str()?.strip_prefix(&prefix)?.strip_suffix(".log")?.parse().ok()).max().unwrap_or(0);
+        let mut journal = Journal { file, path, bytes: keep as u64, id, spill, n };
+        for (id, name) in dangling(&hist) {
+            hist.push(journal.write(rec::tool_result(&id, &name, tools::REPAIR, true, 0, 0))?);
+        }
+        Ok(Resumed { journal, hist, from_bytes: keep as u64, notices })
     }
 
     /// Adds `ts`; checks fstat size = bytes written (else `tampered`); one write(2) of `term::json_line` + "\n" on the
     /// O_APPEND fd; fdatasync unless the kind is `ask`, `approval` or `notice`. Returns the record as written.
-    pub fn write(&mut self, rec: Value) -> Result<Value, Outcome> {
-        todo!()
+    pub fn write(&mut self, mut rec: Value) -> Result<Value, Outcome> {
+        if let Some(o) = rec.as_object_mut() {
+            o.insert("ts".into(), sys::utc().0.into());
+        }
+        let line = term::json_line(&rec) + "\n";
+        let fail = |e: std::io::Error| Outcome::error("journal", format!("cannot write {}: {e}", self.path.display()));
+        if self.file.metadata().map_err(fail)?.len() != self.bytes {
+            return Err(tampered(&self.path));
+        }
+        // A short write leaves `bytes` behind the file, so every later write fails the size check instead of appending.
+        if (&self.file).write(line.as_bytes()).map_err(fail)? != line.len() {
+            return Err(fail(std::io::ErrorKind::WriteZero.into()));
+        }
+        self.bytes += line.len() as u64;
+        if synced(rec["t"].as_str().unwrap_or_default()) {
+            self.file.sync_data().map_err(fail)?;
+        }
+        Ok(rec)
     }
 
     pub fn id(&self) -> &str {
-        todo!()
+        &self.id
     }
 
     pub fn bytes(&self) -> u64 {
-        todo!()
+        self.bytes
     }
 
     /// The next spill name, `<id>-<n>.log` (n from the counter, never from a model string).
     pub fn spill(&mut self, home: &Path) -> Spill {
-        todo!()
+        self.n = self.n.saturating_add(1);
+        let path = self.spill.join(format!("{}-{}.log", self.id, self.n));
+        let shown = path.strip_prefix(home).map_or_else(|_| path.display().to_string(), |rest| format!("~/{}", rest.display()));
+        Spill { path, shown }
     }
+}
+
+/// The session to resume, opened and locked: `id` in any scope, or the newest unlocked one in this cwd's scope.
+fn pick(state: &Path, cwd: &Path, id: Option<&str>) -> Result<(PathBuf, File), Outcome> {
+    let ls = |d: PathBuf| fs::read_dir(d).into_iter().flatten().flatten().map(|e| e.path());
+    let sessions = state.join("sessions");
+    let paths: Vec<PathBuf> = match id {
+        Some(id) => ls(sessions).map(|d| d.join(format!("{id}.jsonl"))).filter(|_| !id.contains('/')).collect(),
+        None => ls(sessions.join(scope(cwd)?)).filter(|p| p.extension().is_some_and(|x| x == "jsonl")).collect(),
+    };
+    let mut found: Vec<(SystemTime, PathBuf)> = paths.into_iter().filter_map(|p| fs::symlink_metadata(&p).ok().filter(|m| m.is_file())?.modified().ok().map(|t| (t, p))).collect();
+    found.sort();
+    let mut busy = None;
+    for (_, path) in found.into_iter().rev() {
+        let file = sys::open_append(&path).map_err(|e| jerr(&path, e))?;
+        if file.try_lock().is_ok() {
+            return Ok((path, file));
+        }
+        busy.get_or_insert(path);
+    }
+    Err(match busy.as_ref().and_then(|p| p.file_stem()) {
+        Some(id) => Outcome::error("journal", format!("session {} is in use", id.to_string_lossy())),
+        None => Outcome::error("journal", format!("no session to resume in {}", cwd.display())),
+    })
+}
+
+/// Over whole lines: parse each, check the segment after the last `session` record, the dialect and what changed since,
+/// and rebuild the history from the message kinds with every `elide` applied.
+fn replay(buf: &[u8], path: &Path, cfg: &Config, cwd: &Path, notices: &mut Vec<String>) -> Result<Vec<Value>, Outcome> {
+    let (mut recs, mut off) = (Vec::new(), 0);
+    for (i, line) in buf.split_inclusive(|&b| b == b'\n').enumerate() {
+        match serde_json::from_slice::<Value>(line) {
+            Ok(v) if v.is_object() => recs.push((off, v)),
+            _ => return Err(Outcome::error("journal", format!("corrupt journal {}:{}", path.display(), i + 1))),
+        }
+        off += line.len();
+    }
+    let last = recs.iter().rposition(|(_, r)| r["t"] == "session");
+    let seg = recs.get(last.unwrap_or(0)..).unwrap_or_default();
+    match seg.iter().position(|(_, r)| r["t"] == "close") {
+        None => notices.push("previous run did not close cleanly".into()),
+        Some(i) if i + 1 == seg.len() && seg[i].1["bytes"].as_u64() == Some(seg[i].0 as u64) => {}
+        Some(_) => return Err(tampered(path)),
+    }
+    let s = last.map_or(&Value::Null, |i| &recs[i].1);
+    if s["dialect"] != "openai" {
+        return Err(Outcome::error("journal", format!("{}: the session's dialect is {}, not openai", path.display(), s["dialect"])));
+    }
+    for (k, now) in [("model", cfg.model.as_str().into()), ("tools", Value::from(cfg.tools.clone())), ("cwd", cwd.to_string_lossy().into())] {
+        if s[k] != now {
+            notices.push(format!("{k} changed since the session started: {} -> {now}", s[k]));
+        }
+    }
+    let mut hist: Vec<Value> = Vec::new();
+    for (_, r) in recs {
+        match r["t"].as_str() {
+            Some("user" | "assistant" | "tool_result") => hist.push(r),
+            Some("elide") => {
+                let ids = r["ids"].as_array().cloned().unwrap_or_default();
+                for h in hist.iter_mut().filter(|h| h["t"] == "tool_result" && ids.contains(&h["id"])) {
+                    shrink(h);
+                }
+            }
+            _ => {}
+        }
+    }
+    Ok(hist)
+}
+
+/// (id, name) of every call without a result, in history order.
+fn dangling(hist: &[Value]) -> Vec<(String, String)> {
+    let done: HashSet<&str> = hist.iter().filter(|r| r["t"] == "tool_result").filter_map(|r| r["id"].as_str()).collect();
+    let calls = hist.iter().filter(|r| r["t"] == "assistant").flat_map(|r| r["msg"]["tool_calls"].as_array().into_iter().flatten());
+    calls.filter_map(|c| Some((c["id"].as_str().filter(|id| !done.contains(id))?.to_string(), c["name"].as_str().unwrap_or_default().to_string()))).collect()
 }
 
 /// Over `user`, `assistant` and `tool_result` records only (every other kind is skipped, so this also checks a whole
 /// journal file): call ids unique; each call has exactly one result after its assistant record and before the next
 /// `assistant` or `user` record; no result without an open call.
 pub fn pairing(hist: &[Value]) -> Result<(), String> {
-    todo!()
+    let (mut seen, mut open) = (HashSet::new(), Vec::new());
+    for r in hist {
+        let t = r["t"].as_str().unwrap_or_default();
+        if t == "user" || t == "assistant" {
+            open.first().map_or(Ok(()), |id| Err(format!("call {id} has no result before the next {t} record")))?;
+            for c in r["msg"]["tool_calls"].as_array().into_iter().flatten() {
+                let id = c["id"].to_string();
+                seen.insert(id.clone()).then_some(()).ok_or_else(|| format!("call id {id} is used twice"))?;
+                open.push(id);
+            }
+        } else if t == "tool_result" {
+            let id = r["id"].to_string();
+            open.remove(open.iter().position(|o| *o == id).ok_or_else(|| format!("result {id} has no open call"))?);
+        }
+    }
+    open.first().map_or(Ok(()), |id| Err(format!("call {id} has no result")))
+}
+
+/// `[output elided: N bytes]` in place of a result's content (N = its length), unless it is elided already.
+fn shrink(r: &mut Value) -> bool {
+    let Some(c) = r["content"].as_str().filter(|c| !c.starts_with(ELIDED)) else { return false };
+    r["content"] = format!("{ELIDED}{} bytes]", term::num(c.len() as u64)).into();
+    true
 }
 
 /// Every tool_result older than the last two assistant records and not yet elided gets `[output elided: N bytes]`;
 /// returns their ids (empty: nothing to elide).
 pub fn elide(hist: &mut [Value]) -> Vec<String> {
-    todo!()
+    let Some(cut) = hist.iter().rposition(|r| r["t"] == "assistant").and_then(|i| hist[..i].iter().rposition(|r| r["t"] == "assistant")) else { return Vec::new() };
+    let olds = hist[..cut].iter_mut().filter(|r| r["t"] == "tool_result");
+    olds.filter_map(|r| shrink(r).then(|| r["id"].as_str().unwrap_or_default().to_string())).collect()
 }
 
 /// 1 + the highest `h<N>` call id in `hist` (1 when none).
 pub fn next_h(hist: &[Value]) -> u32 {
-    todo!()
+    let calls = hist.iter().filter(|r| r["t"] == "assistant").flat_map(|r| r["msg"]["tool_calls"].as_array().into_iter().flatten());
+    calls.filter_map(|c| c["id"].as_str()?.strip_prefix('h')?.parse::<u32>().ok()).max().map_or(1, |n| n.saturating_add(1))
 }
 
 /// One builder per record kind; each sets "t"; `write` adds "ts".
 pub mod rec {
     use crate::config::Config;
     use crate::types::{Call, Outcome, Usage};
-    use serde_json::Value;
+    use serde_json::{Value, json};
     use std::path::Path;
 
+    fn usage(u: Usage) -> Value {
+        json!({"cached": u.cached, "in": u.input, "out": u.output})
+    }
+
     pub fn session(cfg: &Config, id: &str, cwd: &Path, resumed: Option<u64>) -> Value {
-        todo!()
+        let u = &cfg.url;
+        let host = if u.host.contains(':') && !u.host.starts_with('[') { format!("[{}]", u.host) } else { u.host.clone() };
+        json!({"t": "session", "v": 1, "henki": env!("CARGO_PKG_VERSION"), "id": id, "cwd": cwd.to_string_lossy(), "model": cfg.model,
+            "dialect": "openai", "base_url": format!("http://{host}:{}{}", u.port, u.path), "base_url_from": cfg.url_from,
+            "approve": if cfg.auto { "auto" } else { "ask" }, "approve_from": cfg.approve_from, "config": cfg.file.as_ref().map(|f| f.to_string_lossy()),
+            "tools": cfg.tools, "shell": cfg.bash.to_string_lossy(), "exts": [], "pass_env": cfg.pass_env, "ctx": cfg.window,
+            "config_hash": cfg.hash, "allow_hash": null, "agents_hash": cfg.agents_hash, "project_agents_hash": null,
+            "resumed": resumed.map(|b| json!({"from_bytes": b}))})
     }
 
     pub fn user(content: &str) -> Value {
-        todo!()
+        json!({"t": "user", "msg": {"content": content, "role": "user"}})
     }
 
     /// "text" | "reasoning"; stdout only.
     pub fn delta(reasoning: bool, text: &str) -> Value {
-        todo!()
+        json!({"t": if reasoning { "reasoning" } else { "text" }, "delta": text})
     }
 
-    pub fn assistant(text: &str, calls: &[Call], finish: &str, usage: Usage) -> Value {
-        todo!()
+    pub fn assistant(text: &str, calls: &[Call], finish: &str, u: Usage) -> Value {
+        let calls: Vec<Value> = calls.iter().map(|c| with(json!({"args": c.args, "id": c.id, "name": c.name}), "raw", c.raw.as_deref())).collect();
+        json!({"t": "assistant", "msg": {"content": text, "role": "assistant", "tool_calls": calls}, "finish": finish, "usage": usage(u)})
     }
 
     pub fn ask(c: &Call, target: Option<&str>) -> Value {
-        todo!()
+        with(json!({"t": "ask", "id": c.id, "name": c.name, "args": c.args}), "target", target)
     }
 
     pub fn approval(id: &str, verdict: &str) -> Value {
-        todo!()
+        json!({"t": "approval", "id": id, "verdict": verdict})
     }
 
     pub fn tool_result(id: &str, name: &str, content: &str, is_error: bool, ms: u64, bytes: u64) -> Value {
-        todo!()
+        json!({"t": "tool_result", "id": id, "name": name, "content": content, "is_error": is_error, "ms": ms, "bytes": bytes})
     }
 
     pub fn notice(text: &str) -> Value {
-        todo!()
+        json!({"t": "notice", "text": text})
     }
 
     pub fn elide(ids: &[String]) -> Value {
-        todo!()
+        json!({"t": "elide", "ids": ids})
     }
 
-    pub fn turn_end(o: &Outcome, steps: u32, usage: Usage) -> Value {
-        todo!()
+    pub fn turn_end(o: &Outcome, steps: u32, u: Usage) -> Value {
+        with(json!({"t": "turn_end", "status": o.status(), "steps": steps, "usage": usage(u)}), "reason", o.reason())
     }
 
-    pub fn result(o: &Outcome, text: &str, usage: Usage, session: Option<&str>, steps: u32, duration_ms: u64) -> Value {
-        todo!()
+    pub fn result(o: &Outcome, text: &str, u: Usage, session: Option<&str>, steps: u32, duration_ms: u64) -> Value {
+        let tenths = duration_ms.saturating_add(50) / 100;
+        let v =
+            json!({"t": "result", "status": o.status(), "exit": o.exit(), "text": text, "usage": usage(u), "session": session, "steps": steps, "duration_s": tenths as f64 / 10.0});
+        let mut v = with(v, "reason", o.reason());
+        match o {
+            Outcome::Error { kind, message } => v["error"] = json!({"kind": kind, "message": message}),
+            Outcome::NeedsApproval(c) => v["call"] = json!({"args": c.args, "id": c.id, "name": c.name}),
+            _ => {}
+        }
+        v
     }
 
     pub fn close(bytes: u64) -> Value {
-        todo!()
+        json!({"t": "close", "bytes": bytes})
+    }
+
+    /// `v` with the optional field `k` when it is given.
+    fn with(mut v: Value, k: &str, x: Option<&str>) -> Value {
+        if let Some(x) = x {
+            v[k] = x.into();
+        }
+        v
     }
 }
+
+#[cfg(test)]
+mod tests;
