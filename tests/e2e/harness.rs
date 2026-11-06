@@ -1,8 +1,10 @@
 #![allow(clippy::disallowed_methods, clippy::print_stdout, clippy::print_stderr, clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::string_slice, unsafe_code)]
 //! The end-to-end harness: a `Run` is one throwaway HOME, XDG dirs, a git working directory and a config file; each
 //! `Cmd` starts `henki run` there; `Done::finish` checks what must hold after every run: no process with the run's
-//! marker survives, the journal pairs every call with one result, the records end `turn_end, result, close` with the
-//! right byte count, the exit code is the one of the `result` status, and `--json` stdout mirrors the journal.
+//! marker survives, nothing that must be escaped reaches an output raw, the journal pairs every call with one result,
+//! the records end `turn_end`, the final stop's notices, `result`, `close` with the right byte count, the exit code is
+//! the one of the `result` status, and `--json` stdout mirrors the journal.
+use crate::mock::{Mock, Step, shell};
 use serde_json::Value;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::ffi::OsString;
@@ -113,8 +115,14 @@ impl Run {
         self
     }
 
-    /// `exec sleep MARKER`: a call that runs until something kills it.
+    /// `sleep MARKER; :`: a call that runs until something kills it. bash forks the sleep, and a fork does not keep the
+    /// parent-death signal, so when henki exits only henki's own kill can have ended it.
     pub fn sleep(&self) -> String {
+        format!("sleep {}; :", self.marker)
+    }
+
+    /// `exec sleep MARKER`: the sleep is henki's direct child, which the parent-death signal ends with henki (Linux).
+    pub fn exec_sleep(&self) -> String {
         format!("exec sleep {}", self.marker)
     }
 
@@ -159,6 +167,7 @@ impl Run {
             timeout: Duration::from_secs(20),
             close_first: false,
             unread: false,
+            default_signals: false,
         }
     }
 
@@ -201,9 +210,17 @@ pub struct Cmd<'a> {
     timeout: Duration,
     close_first: bool,
     unread: bool,
+    default_signals: bool,
 }
 
 impl<'a> Cmd<'a> {
+    /// henki starts with HUP, INT, QUIT, PIPE and TERM at their default action, whatever the test process ignores.
+    #[cfg(target_os = "linux")]
+    pub fn default_signals(mut self) -> Cmd<'a> {
+        self.default_signals = true;
+        self
+    }
+
     pub fn stdin(mut self, i: In) -> Cmd<'a> {
         self.stdin = i;
         self
@@ -253,6 +270,18 @@ impl<'a> Cmd<'a> {
             In::Open => (Stdio::piped(), None, None),
         };
         c.stdin(stdio).stdout(Stdio::piped()).stderr(Stdio::piped());
+        if self.default_signals {
+            use std::os::unix::process::CommandExt;
+            // SAFETY: runs in the forked child before exec; signal(2) is async-signal-safe and touches no shared memory.
+            unsafe {
+                c.pre_exec(|| {
+                    for s in [libc::SIGHUP, libc::SIGINT, libc::SIGQUIT, libc::SIGPIPE, libc::SIGTERM] {
+                        libc::signal(s, libc::SIG_DFL);
+                    }
+                    Ok(())
+                });
+            }
+        }
         let started = Instant::now();
         let mut child = c.spawn().expect("start henki");
         let mut stdin = child.stdin.take();
@@ -356,6 +385,8 @@ fn reader(fd: OwnedFd, p: Arc<Pipe>, close_first: bool) {
 pub struct Live {
     pub pid: i32,
     child: Child,
+    /// Keeps a piped stdin open; only the Linux interrupt matrix writes to it.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     stdin: Option<ChildStdin>,
     out: Arc<Pipe>,
     err: Arc<Pipe>,
@@ -381,7 +412,9 @@ impl Live {
             // SAFETY: wait4 on our own child's pid with valid out-pointers; WNOHANG never blocks.
             let r = unsafe { libc::wait4(self.pid, &mut status, libc::WNOHANG, &mut ru) };
             if r == self.pid {
-                self.exit = Some((status, ru.ru_maxrss, Instant::now()));
+                // macOS counts ru_maxrss in bytes, Linux in KiB.
+                let kb = if cfg!(target_os = "macos") { ru.ru_maxrss / 1024 } else { ru.ru_maxrss };
+                self.exit = Some((status, kb, Instant::now()));
             }
         }
         self.exit.is_some()
@@ -404,6 +437,7 @@ impl Live {
         unsafe { libc::kill(self.pid, libc::SIGKILL) };
     }
 
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))] // only the Linux interrupt matrix uses it
     pub fn close_stdout(&self) {
         self.out.close.store(true, Ordering::SeqCst);
         let end = Instant::now() + SEC;
@@ -412,11 +446,13 @@ impl Live {
         }
     }
 
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))] // only the Linux interrupt matrix uses it
     pub fn write_stdin(&mut self, b: &[u8]) {
         use std::io::Write;
         let _ = self.stdin.as_mut().expect("stdin is open").write_all(b);
     }
 
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))] // only the Linux interrupt matrix uses it
     pub fn close_stdin(&mut self) {
         self.stdin = None;
     }
@@ -447,9 +483,20 @@ impl Live {
     }
 
     /// Until the main thread blocks INT, QUIT, TERM and HUP: from then on a signal is henki's to handle.
+    #[cfg(target_os = "linux")]
     pub fn ready(&mut self) {
         let pid = self.pid;
         self.until("the signal mask", 5 * SEC, |_| sigblk(pid) & 0x4007 == 0x4007);
+    }
+
+    /// Until henki has a second thread: henki blocks INT, QUIT, TERM and HUP before it starts any thread.
+    #[cfg(not(target_os = "linux"))]
+    pub fn ready(&mut self) {
+        let pid = self.pid.to_string();
+        self.until("a second thread", 5 * SEC, |_| {
+            let out = Command::new("ps").args(["-M", "-p", &pid]).output().expect("ps");
+            String::from_utf8_lossy(&out.stdout).lines().count() > 2
+        });
     }
 
     /// Until a stdout record satisfies `pred`; returns it.
@@ -669,11 +716,18 @@ impl Done {
 
     /// The universal postconditions.
     pub fn finish(&self) {
+        if self.killed && !cfg!(target_os = "linux") {
+            // Without a parent-death signal the shell outlives a SIGKILLed henki; that is expected there.
+            kill_marked(&self.marker);
+        }
         let survivors = survivors(&self.marker);
         self.check(survivors.is_empty(), &format!("processes with the marker survived: {survivors:?}"));
         self.check(self.killed || self.code.is_some(), "henki died of a signal the test did not send");
-        let all = self.stdout.iter().chain(&self.stderr);
-        self.check(!all.clone().any(|&b| b == 0x1b), "a raw ESC byte reached stdout or stderr");
+        for (name, b) in [("stdout", &self.stdout), ("stderr", &self.stderr), ("the journal", &self.journal_bytes)] {
+            if let Some(c) = raw_escapable(b) {
+                self.check(false, &format!("a raw U+{:04X} reached {name}", c as u32));
+            }
+        }
         if self.journal.is_some() {
             let bytes = &self.journal_bytes;
             self.check(bytes.ends_with(b"\n"), "the journal ends inside a line");
@@ -693,8 +747,12 @@ impl Done {
             let kinds = self.kinds();
             self.check(kinds.first().map(String::as_str) == Some("session"), "the run's records do not start with session");
             if !self.killed {
-                self.check(kinds.ends_with(&["turn_end".into(), "result".into(), "close".into()]), &format!("the run's records end {kinds:?}"));
+                // The session end: `turn_end`, notices of the final stop (`stopped N background processes at exit`), then
+                // `result` and `close`.
                 self.check(kinds.iter().filter(|k| *k == "turn_end").count() == 1, "not exactly one turn_end");
+                let tail = kinds.iter().position(|k| k == "turn_end").map_or(&kinds[..0], |t| &kinds[t + 1..]);
+                let order = tail.len() >= 2 && tail[tail.len() - 2..] == ["result", "close"] && tail[..tail.len() - 2].iter().all(|k| k == "notice");
+                self.check(order, &format!("the run's records do not end turn_end, notices, result, close: {kinds:?}"));
             }
         }
         if self.killed {
@@ -798,18 +856,44 @@ pub fn messages_prefix(body: &str) -> &str {
     &body[..i]
 }
 
-/// Every live process whose command line holds `marker`, with that command line.
+/// Every live process whose command line holds `marker`, with that command line. Panics when /proc cannot be listed,
+/// so a missing process table never passes for "no survivors".
+#[cfg(target_os = "linux")]
 pub fn marked(marker: &str) -> Vec<(i32, String)> {
     let mut out = Vec::new();
-    for e in fs::read_dir("/proc").into_iter().flatten().flatten() {
+    let mut me = false;
+    for e in fs::read_dir("/proc").expect("/proc").flatten() {
         let Some(pid) = e.file_name().to_str().and_then(|s| s.parse::<i32>().ok()) else { continue };
+        me |= pid == std::process::id() as i32;
         let Ok(cmd) = fs::read(e.path().join("cmdline")) else { continue };
         let cmd = String::from_utf8_lossy(&cmd).replace('\0', " ");
         if cmd.contains(marker) && state(pid).is_some_and(|s| s != 'Z') {
             out.push((pid, cmd));
         }
     }
+    assert!(me, "/proc does not list this test process");
     out
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn marked(marker: &str) -> Vec<(i32, String)> {
+    marked_ps(marker)
+}
+
+/// `marked` through `ps` (macOS has no /proc). Panics when the listing lacks this test process.
+pub fn marked_ps(marker: &str) -> Vec<(i32, String)> {
+    let out = Command::new("ps").args(["-A", "-ww", "-o", "pid=", "-o", "stat=", "-o", "command="]).output().expect("ps");
+    let text = String::from_utf8_lossy(&out.stdout);
+    let rows: Vec<(i32, &str, &str)> = text
+        .lines()
+        .filter_map(|l| {
+            let (pid, rest) = l.trim_start().split_once(' ')?;
+            let (stat, cmd) = rest.trim_start().split_once(' ').unwrap_or((rest.trim_start(), ""));
+            Some((pid.parse().ok()?, stat, cmd.trim_start()))
+        })
+        .collect();
+    assert!(out.status.success() && rows.iter().any(|r| r.0 == std::process::id() as i32), "ps does not list this test process:\n{text}");
+    rows.into_iter().filter(|(_, stat, cmd)| cmd.contains(marker) && !stat.starts_with('Z')).map(|(p, _, c)| (p, c.to_string())).collect()
 }
 
 /// SIGKILL to every live process with the marker (what PDEATHSIG does not reach after henki is killed).
@@ -834,20 +918,58 @@ fn survivors(marker: &str) -> Vec<(i32, String)> {
 }
 
 /// The state letter of /proc/PID/stat (after the last ')').
+#[cfg(target_os = "linux")]
 pub fn state(pid: i32) -> Option<char> {
     let s = fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
     s.rsplit_once(')')?.1.trim_start().chars().next()
 }
 
 /// The parent pid of a process.
+#[cfg(target_os = "linux")]
 pub fn ppid(pid: i32) -> Option<i32> {
     let s = fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
     s.rsplit_once(')')?.1.split_whitespace().nth(1)?.parse().ok()
 }
 
-fn sigblk(pid: i32) -> u64 {
+/// A hex mask line of /proc/PID/status (`SigBlk`, `SigIgn`); 0 when the process is gone.
+#[cfg(target_os = "linux")]
+pub fn sigmask(pid: i32, field: &str) -> u64 {
     let s = fs::read_to_string(format!("/proc/{pid}/status")).unwrap_or_default();
-    s.lines().find_map(|l| l.strip_prefix("SigBlk:")).and_then(|h| u64::from_str_radix(h.trim(), 16).ok()).unwrap_or(0)
+    s.lines().find_map(|l| l.strip_prefix(field)?.strip_prefix(':')).and_then(|h| u64::from_str_radix(h.trim(), 16).ok()).unwrap_or(0)
+}
+
+#[cfg(target_os = "linux")]
+fn sigblk(pid: i32) -> u64 {
+    sigmask(pid, "SigBlk")
+}
+
+/// The code points henki escapes on every output path: C0 except tab and newline, DEL, C1, the format and separator
+/// characters and the default ignorables. None of them may reach stdout, stderr or the journal raw.
+#[rustfmt::skip]
+const ESCAPED: &[(u32, u32)] = &[
+    (0x00, 0x08), (0x0B, 0x1F), (0x7F, 0x9F),
+    (0xA0, 0xA0), (0xAD, 0xAD), (0x34F, 0x34F), (0x600, 0x605), (0x61C, 0x61C), (0x6DD, 0x6DD), (0x70F, 0x70F), (0x890, 0x891), (0x8E2, 0x8E2),
+    (0x115F, 0x1160), (0x1680, 0x1680), (0x17B4, 0x17B5), (0x180B, 0x180F), (0x2000, 0x200F), (0x2028, 0x202F), (0x205F, 0x206F), (0x3000, 0x3000),
+    (0x3164, 0x3164), (0xFE00, 0xFE0F), (0xFEFF, 0xFEFF), (0xFFA0, 0xFFA0), (0xFFF0, 0xFFFB), (0x110BD, 0x110BD), (0x110CD, 0x110CD),
+    (0x13430, 0x1343F), (0x1BCA0, 0x1BCA3), (0x1D173, 0x1D17A), (0xE0000, 0xE0FFF),
+];
+
+/// The first code point of `b` that henki must never write raw.
+pub fn raw_escapable(b: &[u8]) -> Option<char> {
+    String::from_utf8_lossy(b).chars().find(|&c| ESCAPED.iter().any(|r| (r.0..=r.1).contains(&(c as u32))))
+}
+
+/// `2,941,512`: how numbers appear in text the model sees.
+pub fn num(n: usize) -> String {
+    let d = n.to_string();
+    let mut out = String::new();
+    for (i, c) in d.chars().enumerate() {
+        if i > 0 && (d.len() - i).is_multiple_of(3) {
+            out.push(',');
+        }
+        out.push(c);
+    }
+    out
 }
 
 /// Waits for `cond` up to `within`; false on timeout.
@@ -862,6 +984,20 @@ pub fn poll(within: Duration, mut cond: impl FnMut() -> bool) -> bool {
         }
         thread::sleep(Duration::from_millis(5));
     }
+}
+
+/// A shell call that leaves a background process ignoring TERM. Any later stop then waits out the grace before its
+/// SIGKILL, so henki lives on for a while after it has shut the model socket.
+pub fn term_proof(r: &Run) -> Step {
+    shell(&format!("trap '' TERM; sleep {} & echo started", r.marker))
+}
+
+/// henki shut request `n`'s socket itself, at least 150 ms before it exited (an exit closes every socket anyway).
+pub fn closed_before_exit(m: &Mock, n: usize, d: &Done) {
+    d.check(m.wait_closed(n, SEC), &format!("the socket of request {} stayed open", n + 1));
+    let done = m.log()[n].done.unwrap();
+    let ahead = d.exited.saturating_duration_since(done);
+    d.check(ahead >= Duration::from_millis(150), &format!("request {}'s socket closed only {ahead:?} before the exit", n + 1));
 }
 
 /// A port nothing listens on (bound, then released).

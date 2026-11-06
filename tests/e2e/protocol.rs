@@ -256,14 +256,15 @@ fn e2e_server_down_fix() {
 
 #[test]
 fn e2e_stall_budget() {
-    let m = Mock::start(vec![Step::Stall { before_first_byte: false, after_words: 2, for_ms: 30_000 }]);
-    let r = Run::new(&m.url());
+    let mut r = Run::new("");
+    let m = Mock::start(vec![term_proof(&r), Step::Stall { before_first_byte: false, after_words: 2, for_ms: 30_000 }]);
+    r.at(&m.url());
     let d = r.cmd(&["--json", "--max-seconds", "3", "talk"]).go();
     d.finish();
     assert_eq!((d.code, d.status().as_str()), (Some(124), "budget"), "{}", d.diag());
     assert!(d.elapsed <= Duration::from_secs(4), "exit after {:?}", d.elapsed);
-    assert!(m.wait_closed(0, SEC), "the mock never saw the socket close");
-    let a = &d.of("assistant")[0];
+    closed_before_exit(&m, 1, &d);
+    let a = &d.of("assistant")[1];
     assert_eq!((a["finish"].as_str(), a["msg"]["content"].as_str()), (Some("interrupted"), Some("w1 w2")), "the partial is journaled: {a}");
 }
 
@@ -306,56 +307,82 @@ fn e2e_proxy_env_ignored() {
     assert_eq!(m.log()[0].line, "POST /v1/chat/completions HTTP/1.1", "not a proxy request");
 }
 
+/// Two legs. Every address: where `localhost` resolves to both families, the mock listens only on the family resolved
+/// last, so henki must get past the first address. IPv6: `[::1]` reaches a mock on ::1. Each leg says why it skips.
 #[test]
 fn e2e_localhost_v6_first() {
     use std::net::ToSocketAddrs;
-    if std::net::TcpListener::bind("[::1]:0").is_err() {
-        println!("skipped: ::1 is absent here");
-        return;
-    }
-    let addrs: Vec<std::net::SocketAddr> = ("localhost", 1).to_socket_addrs().map(Iterator::collect).unwrap_or_default();
-    let both = addrs.iter().any(|a| a.is_ipv4()) && addrs.iter().any(|a| a.is_ipv6());
-    // With both families, the mock listens on the one resolved last, so henki must get past the first; else on ::1.
-    let (bind, host) = match addrs.last() {
-        Some(a) if both && a.is_ipv4() => ("127.0.0.1:0", "localhost"),
-        _ if both => ("[::1]:0", "localhost"),
-        _ => ("[::1]:0", "[::1]"),
+    let reach = |bind: &str, host: &str, why: &str| {
+        let m = Mock::start_at(bind.parse().unwrap(), vec![say("found it")]).unwrap();
+        let r = Run::new(&format!("http://{host}:{}/v1", m.port()));
+        let d = r.json("hello");
+        d.finish();
+        assert_eq!((d.code, m.log().len()), (Some(0), 1), "{why}: {host} on {bind}\n{}", d.diag());
     };
-    let m = Mock::start_at(bind.parse().unwrap(), vec![say("found it")]).unwrap();
-    let r = Run::new(&format!("http://{host}:{}/v1", m.port()));
-    let d = r.json("hello");
-    d.finish();
-    assert_eq!((d.code, m.log().len()), (Some(0), 1), "{host} ({addrs:?}) on {bind}\n{}", d.diag());
+    let v6 = std::net::TcpListener::bind("[::1]:0").is_ok();
+    let addrs: Vec<std::net::SocketAddr> = ("localhost", 1).to_socket_addrs().map(Iterator::collect).unwrap_or_default();
+    match addrs.last() {
+        Some(last) if v6 && addrs.iter().any(|a| a.is_ipv4()) && addrs.iter().any(|a| a.is_ipv6()) => {
+            let bind = if last.is_ipv4() { "127.0.0.1:0" } else { "[::1]:0" };
+            reach(bind, "localhost", &format!("every address of {addrs:?}"));
+        }
+        _ => println!("every-address leg skipped: localhost resolves to {addrs:?} here, not to both families"),
+    }
+    if v6 {
+        reach("[::1]:0", "[::1]", "the IPv6 loopback literal");
+    } else {
+        println!("IPv6 leg skipped: ::1 is absent here");
+    }
+}
+
+/// The raw UTF-8 of every code point the escape tests send.
+const RAW: [&[u8]; 7] = [b"\x1b", b"\x07", b"\xc2\x9b", b"\xc2\x9d", b"\xe2\x80\xae", b"\xe2\x80\x8b", b"\xf3\xa0\x80\x81"];
+
+fn holds(hay: &[u8], needle: &[u8]) -> bool {
+    hay.windows(needle.len()).any(|w| w == needle)
 }
 
 #[test]
 fn e2e_error_body_escaped() {
     let osc = "\u{1b}]52;c;aGVsbG8=\u{7}";
     let csi = "\u{1b}[31m";
-    let body = json!({"error": {"message": format!("bad {osc} and {csi}red")}}).to_string();
-    let tool = "printf 'out \\033]52;c;aGk=\\007 \\033[2J'";
+    // Code points serde_json writes raw: C1 CSI and OSC, a bidi override, a zero-width space, a tag character.
+    let wide = "\u{9b}2J\u{9d}0;t\u{202e}\u{200b}\u{e0001}";
+    let wide_json = "\\u009b2J\\u009d0;t\\u202e\\u200b\\udb40\\udc01";
+    let wide_plain = "\\x9b2J\\x9d0;t\\u{202e}\\u{200b}\\u{e0001}";
+    let body = json!({"error": {"message": format!("bad {osc} and {csi}red {wide}")}}).to_string();
+    let tool = "printf 'out \\033]52;c;aGk=\\007 \\033[2J \\302\\2332J\\302\\2350;t\\342\\200\\256\\342\\200\\213\\363\\240\\200\\201'";
+    let no_raw = |d: &Done| {
+        for (name, b) in [("stdout", &d.stdout), ("stderr", &d.stderr), ("the journal", &d.journal_bytes)] {
+            assert!(RAW.iter().all(|r| !holds(b, r)), "raw escapes written to {name}\n{}", d.diag());
+        }
+    };
     for json_mode in [false, true] {
         let flag: &[&str] = if json_mode { &["--json"] } else { &[] };
         let m = Mock::start(vec![error(404, &body, 1)]);
         let r = Run::new(&m.url());
         let d = r.cmd(&[flag, &["hello"]].concat()).go();
         d.finish();
-        let all = [d.stdout.clone(), d.stderr.clone(), d.journal_bytes.clone()].concat();
-        assert!(!all.iter().any(|&b| b == 0x1b || b == 0x07), "raw escapes written\n{}", d.diag());
-        let want = if json_mode { "\\u001b]52;c;aGVsbG8=\\u0007" } else { "\\x1b]52;c;aGVsbG8=\\x07" };
-        assert!(if json_mode { d.out() } else { d.err() }.contains(want), "{}", d.diag());
-        let m = Mock::start(vec![shell(tool), say(&format!("answer {csi}x {osc}"))]);
+        no_raw(&d);
+        let want =
+            if json_mode { format!("\\u001b]52;c;aGVsbG8=\\u0007 and \\u001b[31mred {wide_json}") } else { format!("\\x1b]52;c;aGVsbG8=\\x07 and \\x1b[31mred {wide_plain}") };
+        assert!(if json_mode { d.out() } else { d.err() }.contains(&want), "want {want}\n{}", d.diag());
+        assert!(String::from_utf8_lossy(&d.journal_bytes).contains(&format!("\\u001b[31mred {wide_json}")), "journal\n{}", d.diag());
+        let m = Mock::start(vec![shell(tool), say(&format!("answer {csi}x {osc} {wide}"))]);
         let r = Run::new(&m.url());
         let d = r.cmd(&[flag, &["hello"]].concat()).go();
         d.finish();
         assert_eq!(d.code, Some(0), "{}", d.diag());
-        let all = [d.stdout.clone(), d.stderr.clone(), d.journal_bytes.clone()].concat();
-        assert!(!all.iter().any(|&b| b == 0x1b || b == 0x07), "raw escapes written\n{}", d.diag());
+        no_raw(&d);
+        let journal = String::from_utf8_lossy(&d.journal_bytes).into_owned();
+        let tool_json = format!("out \\u001b]52;c;aGk=\\u0007 \\u001b[2J {wide_json}");
+        let answer_json = format!("answer \\u001b[31mx \\u001b]52;c;aGVsbG8=\\u0007 {wide_json}");
+        assert!(journal.contains(&tool_json) && journal.contains(&answer_json), "journal\n{}", d.diag());
         if json_mode {
-            assert!(d.out().contains("out \\u001b]52;c;aGk=\\u0007 \\u001b[2J"), "tool output escaped: {}", d.out());
-            assert!(d.out().contains("answer \\u001b[31mx \\u001b]52"), "{}", d.out());
+            assert!(d.out().contains(&tool_json), "tool output escaped: {}", d.out());
+            assert!(d.out().contains(&answer_json), "{}", d.out());
         } else {
-            assert_eq!(d.out(), "answer \\x1b[31mx \\x1b]52;c;aGVsbG8=\\x07\n");
+            assert_eq!(d.out(), format!("answer \\x1b[31mx \\x1b]52;c;aGVsbG8=\\x07 {wide_plain}\n"));
         }
     }
 }
@@ -408,7 +435,7 @@ fn e2e_ctx_elide_run() {
         let original = &d.results()[i]["content"];
         if elided.contains(&id) {
             assert!(i < 4, "one of the last two steps was elided");
-            assert_eq!(t["content"].as_str().unwrap(), format!("[output elided: {} bytes]", original.as_str().unwrap().len()));
+            assert_eq!(t["content"].as_str().unwrap(), format!("[output elided: {} bytes]", num(original.as_str().unwrap().len())));
         } else {
             assert_eq!(&t["content"], original);
         }
@@ -427,9 +454,14 @@ fn e2e_ctx_exceeded_bounded() {
     let d = r.json("overflow");
     d.finish();
     assert_eq!((d.code, d.result()["error"]["kind"].as_str()), (Some(2), Some("context_exceeded")), "{}", d.diag());
-    let n = m.log().len();
-    assert!((4..=5).contains(&n), "{n} requests: at most one elision and one more try");
-    assert_eq!(d.of("elide").len(), n - 4, "one elide record per extra try");
+    // The first result is older than the last two steps: one elision, one more try, then the error.
+    assert_eq!(m.log().len(), 5, "three steps, the overflow, one try after the elision, no third try");
+    let first = d.results()[0].clone();
+    let elides = d.of("elide");
+    assert_eq!((elides.len(), elides.first().map(|e| &e["ids"])), (1, Some(&json!([first["id"]]))), "{}", d.diag());
+    let tools: Vec<Value> = m.log()[4].messages().into_iter().filter(|x| x["role"] == "tool").collect();
+    let shrunk = format!("[output elided: {} bytes]", num(first["content"].as_str().unwrap().len()));
+    assert_eq!(tools.iter().map(|x| x["content"].as_str().unwrap() == shrunk).collect::<Vec<_>>(), [true, false, false], "only the oldest result shrinks");
 }
 
 #[test]

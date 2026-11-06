@@ -137,6 +137,7 @@ impl Mock {
     }
 
     /// Waits until `n` requests arrived; panics after `within`.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))] // only the Linux interrupt matrix uses it
     pub fn wait_requests(&self, n: usize, within: Duration) -> Vec<Logged> {
         let end = Instant::now() + within;
         loop {

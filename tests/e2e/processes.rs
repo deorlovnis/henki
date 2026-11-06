@@ -46,20 +46,35 @@ fn e2e_timeout_kills_call_tree() {
     assert!((1000..2500).contains(&ms), "{ms} ms");
 }
 
+/// The call ignores TERM, and (Linux) a grandchild in its own session holds the output pipe past the call's kill. The
+/// result keeps the output and comes after TERM, the grace, KILL and the capture's short wait, not when the pipe closes.
 #[test]
 fn e2e_timeout_late_tooldone() {
-    let (r, _m) = scripted(|r| vec![call("shell", json!({"command": format!("echo before; trap '' TERM; {}", r.sleep()), "timeout": 1})), say("timed out")]);
-    let d = r.json("ignore TERM");
+    let holder = cfg!(target_os = "linux");
+    let (r, m) = scripted(|r| {
+        let hold = if holder { format!("(setsid sleep {} &); ", r.marker) } else { String::new() };
+        let call = call("shell", json!({"command": format!("echo before; {hold}trap '' TERM; {}", r.sleep()), "timeout": 1}));
+        // The next request waits, so the holder can be counted before the session end sweeps it.
+        vec![call, Step::Stall { before_first_byte: true, after_words: 0, for_ms: 1500 }]
+    });
+    let mut l = r.cmd(&["--json", "ignore TERM"]).spawn();
+    l.until("the next request", 6 * SEC, |_| m.log().len() >= 2);
+    if holder {
+        let left = marked(&r.marker);
+        assert_eq!(left.len(), 1, "only the pipe holder outlives the call: {left:?}");
+    }
+    let d = l.wait();
     d.finish();
     assert_eq!(d.code, Some(0), "{}", d.diag());
     let c = content(&d, 0);
     assert!(c.starts_with("before\n") && c.ends_with("[timed out after 1 s; process group killed]"), "{c}");
     assert_eq!(d.results().len(), 1, "one result per call");
     let ms = d.results()[0]["ms"].as_u64().unwrap();
-    assert!((1200..2800).contains(&ms), "TERM, the grace, then KILL: {ms} ms");
+    assert!((1200..2200).contains(&ms), "TERM, the grace, KILL, then at most the capture's wait: {ms} ms");
 }
 
 #[test]
+#[cfg(target_os = "linux")]
 fn e2e_cancel_setsid_grandchild() {
     let (r, _m) = scripted(|r| vec![shell(&format!("setsid sleep {m} & (setsid sleep {m} &); exec sleep {m}", m = r.marker)), say("never")]);
     let mut l = r.cmd(&["--json", "escape the group"]).spawn();
@@ -73,12 +88,19 @@ fn e2e_cancel_setsid_grandchild() {
 
 #[test]
 fn e2e_run_exit_kills_background() {
-    let (r, _m) = scripted(|r| vec![shell(&format!("sleep {m} & setsid sleep {m} & echo started", m = r.marker)), say("done")]);
+    let (r, _m) = scripted(|r| {
+        let m = &r.marker;
+        // Linux also sweeps a process that left the call's group and session.
+        let escape = if cfg!(target_os = "linux") { format!("setsid sleep {m} & ") } else { String::new() };
+        vec![shell(&format!("sleep {m} & {escape}echo started")), say("done")]
+    });
     let d = r.json("leave something running");
     d.finish();
     assert_eq!(d.code, Some(0), "{}", d.diag());
-    let n = d.notices();
-    assert!(n.iter().any(|x| x.starts_with("stopped ") && x.ends_with(" background processes at exit")), "{n:?}");
+    let k = d.kinds();
+    let at = d.segment().iter().position(|x| x["t"] == "notice" && x["text"].as_str().is_some_and(|t| t.starts_with("stopped ") && t.ends_with(" background processes at exit")));
+    let at = at.unwrap_or_else(|| panic!("no at-exit notice: {:?}", d.notices()));
+    assert_eq!((k[at - 1].as_str(), k[at + 1].as_str()), ("turn_end", "result"), "the session end stops the background, then writes the result: {k:?}");
 }
 
 #[test]
@@ -98,6 +120,7 @@ fn e2e_reap_notice() {
 }
 
 #[test]
+#[cfg(target_os = "linux")]
 fn e2e_kill9_bash_dies() {
     let (r, _m) = scripted(|r| vec![shell(&format!("sleep {}; echo after", r.marker)), say("never")]);
     let mut l = r.cmd(&["--json", "wait"]).spawn();
@@ -112,17 +135,37 @@ fn e2e_kill9_bash_dies() {
     d.finish();
 }
 
+/// henki starts with HUP, INT, QUIT, PIPE and TERM at their default action. A tool child then has an empty mask, none of
+/// those five ignored, and nothing else ignored that henki's own parent (this test process) did not ignore.
 #[test]
+#[cfg(target_os = "linux")]
 fn e2e_child_signals_default() {
     let (r, _m) = scripted(|r| {
         let term = format!("sleep {} & pid=$!; kill -TERM $pid; wait $pid; echo status $?", r.marker);
         vec![shell("grep -E '^Sig(Blk|Ign)' /proc/self/status"), call("shell", json!({"command": term, "timeout": 5})), say("checked")]
     });
-    let d = r.json("check signals");
+    let d = r.cmd(&["--json", "check signals"]).default_signals().go();
     d.finish();
     assert_eq!(d.code, Some(0), "{}", d.diag());
-    assert!(content(&d, 0).starts_with("SigBlk:\t0000000000000000\nSigIgn:\t0000000000000000\n"), "{}", content(&d, 0));
+    let inherited = sigmask(std::process::id() as i32, "SigIgn") & !0x5007;
+    let want = format!("SigBlk:\t0000000000000000\nSigIgn:\t{inherited:016x}\n");
+    assert!(content(&d, 0).starts_with(&want), "want {want:?}, got {:?}", content(&d, 0));
     assert!(content(&d, 1).starts_with("status 143\n"), "TERM stops a tool child: {}", content(&d, 1));
+}
+
+/// The listing used where there is no /proc (`ps`) agrees with /proc: same pids, zombies left out.
+#[test]
+#[cfg(target_os = "linux")]
+fn harness_ps_matches_proc() {
+    let r = Run::new("http://127.0.0.1:9/v1");
+    let mut child = std::process::Command::new("sleep").arg(&r.marker).spawn().unwrap();
+    let pids = |v: Vec<(i32, String)>| v.into_iter().map(|p| (p.0, p.1.trim_end().to_string())).collect::<Vec<_>>();
+    assert!(poll(5 * SEC, || marked(&r.marker).len() == 1));
+    assert_eq!(pids(marked_ps(&r.marker)), pids(marked(&r.marker)));
+    child.kill().unwrap();
+    assert!(poll(5 * SEC, || state(child.id() as i32) == Some('Z')), "the sleep is a zombie until it is reaped");
+    assert_eq!((marked_ps(&r.marker), marked(&r.marker)), (vec![], vec![]));
+    child.wait().unwrap();
 }
 
 #[test]
@@ -132,7 +175,8 @@ fn e2e_shell_tty_enxio() {
     let d = r.json("open the terminal");
     d.finish();
     let c = content(&d, 0);
-    assert!(c.contains("No such device or address") && !c.contains("opened"), "{c}");
+    // ENXIO: Linux and macOS word it differently.
+    assert!((c.contains("No such device or address") || c.contains("Device not configured")) && !c.contains("opened"), "{c}");
     assert!(d.results()[0]["ms"].as_u64().unwrap() < 1000 && d.results()[0]["is_error"] == true);
 }
 
@@ -150,6 +194,7 @@ fn e2e_bash_env_ignored() {
 }
 
 #[test]
+#[cfg(target_os = "linux")]
 fn e2e_env_allowlist() {
     let m = Mock::start(vec![shell("tr '\\0' '\\n' < /proc/$$/environ | sort"), say("seen")]);
     let mut r = Run::new(&m.url());
@@ -176,6 +221,7 @@ fn e2e_env_allowlist() {
 }
 
 #[test]
+#[cfg(target_os = "linux")]
 fn e2e_dumpable_environ_eacces() {
     let m = Mock::start(vec![shell("cat /proc/$PPID/environ; echo \"rc=$?\""), say("ok")]);
     let r = Run::new(&m.url());
@@ -269,7 +315,7 @@ fn rss_read_1gb_le_16mb() {
     d.finish();
     assert_eq!(d.code, Some(0), "{}", d.diag());
     let c = content(&d, 0);
-    assert!(c.starts_with("a line of text\n") && c.ends_with("[lines 1-5 shown; file is 1,073,741,824 bytes; continue with offset=6]"), "{c}");
+    assert!(c.starts_with("a line of text\n") && c.trim_end().ends_with("[lines 1-5 shown; file is 1,073,741,824 bytes; continue with offset=6]"), "{c}");
     println!("peak RSS {} KiB in {:?}", d.maxrss_kb, t.elapsed());
     assert!(d.maxrss_kb <= 16 * 1024, "peak RSS {} KiB", d.maxrss_kb);
 }

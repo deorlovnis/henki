@@ -18,10 +18,10 @@ fn scripted(steps: impl FnOnce(&Run) -> Vec<Step>) -> (Run, Mock) {
 
 #[test]
 fn e2e_resume_kill9() {
-    let (mut r, m) = scripted(|r| vec![shell("echo one"), shell(&r.sleep()), say("never")]);
+    let (mut r, m) = scripted(|r| vec![shell("echo one"), shell(&r.exec_sleep()), say("never")]);
     let mut l = r.cmd(&["--json", "two calls"]).spawn();
     l.wait_marked(5 * SEC);
-    let sleeping = r.sleep();
+    let sleeping = r.exec_sleep();
     l.wait_journal(SEC, |x| x["t"] == "assistant" && x["msg"]["tool_calls"][0]["args"]["command"] == sleeping.as_str());
     l.kill9();
     let d = l.wait();
@@ -66,7 +66,7 @@ fn e2e_kill9_every_point() {
             let mut steps: Vec<Step> = (1..=3)
                 .map(|k| match p {
                     Point::Request(j) if j == k => Step::Stall { before_first_byte: k != 2, after_words: 2, for_ms: 30_000 },
-                    Point::Call(j) if j == k => shell(&format!("echo {k}; {}", r.sleep())),
+                    Point::Call(j) if j == k => shell(&format!("echo {k}; {}", r.exec_sleep())),
                     _ => shell(&format!("echo {k}")),
                 })
                 .collect();

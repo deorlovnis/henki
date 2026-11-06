@@ -18,7 +18,7 @@ fn signal_during_call(sig: i32) {
     let d = l.wait();
     d.finish();
     assert_eq!((d.code, d.status().as_str()), (Some(130), "interrupted"), "{}", d.diag());
-    assert!(d.exited - t < Duration::from_millis(1500), "exit {:?} after the signal", d.exited - t);
+    assert!(d.exited - t < Duration::from_millis(1000), "exit {:?} after the signal", d.exited - t);
     let c = d.results()[0]["content"].as_str().unwrap().to_string();
     assert!(c.ends_with("[interrupted; process group killed]") || c == "interrupted; the command may have partly run", "{c}");
     assert_eq!(m.log().len(), 1);
@@ -51,7 +51,8 @@ fn budget_exit(d: &Done, budget_s: u64) {
 fn e2e_budget_fifo() {
     let mut r = Run::new("");
     assert!(std::process::Command::new("mkfifo").arg(r.path("pipe")).status().unwrap().success());
-    let m = Mock::start(vec![call("read", serde_json::json!({"path": "pipe"})), shell(&format!("cat pipe; {}", r.sleep())), say("never")]);
+    // The shell's fork blocks opening the fifo; it carries the marker and, being a fork, no parent-death signal.
+    let m = Mock::start(vec![call("read", serde_json::json!({"path": "pipe"})), shell(&format!("sleep {} < pipe; :", r.marker)), say("never")]);
     r.at(&m.url());
     let d = r.cmd(&["--json", "--max-seconds", "2", "read the pipe"]).go();
     budget_exit(&d, 2);
@@ -61,11 +62,12 @@ fn e2e_budget_fifo() {
 
 #[test]
 fn e2e_budget_stalled_server() {
-    let m = Mock::start(vec![Step::Stall { before_first_byte: true, after_words: 0, for_ms: 30_000 }]);
-    let r = Run::new(&m.url());
+    let mut r = Run::new("");
+    let m = Mock::start(vec![term_proof(&r), Step::Stall { before_first_byte: true, after_words: 0, for_ms: 30_000 }]);
+    r.at(&m.url());
     let d = r.cmd(&["--json", "--max-seconds", "2", "wait"]).go();
     budget_exit(&d, 2);
-    assert!(m.wait_closed(0, SEC), "henki left the socket open");
+    closed_before_exit(&m, 1, &d);
 }
 
 #[test]
@@ -81,6 +83,7 @@ fn e2e_budget_stalled_stdout() {
     let d = r.cmd(&["--json", "--max-seconds", "2", "talk"]).unread_stdout().timeout(Duration::from_secs(10)).go();
     budget_exit(&d, 2);
     assert!(d.stdout.len() >= 60_000, "stdout was not blocked: only {} bytes", d.stdout.len());
+    closed_before_exit(&m, 0, &d);
 }
 
 #[test]
@@ -118,6 +121,7 @@ fn e2e_json_head_141() {
     assert!(d.records().iter().all(|x| x["t"] != "result"), "no stdout result");
 }
 
+#[cfg(target_os = "linux")]
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum State {
     Startup,
@@ -130,6 +134,7 @@ enum State {
     Stopping,
 }
 
+#[cfg(target_os = "linux")]
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum Cause {
     Signal(i32),
@@ -139,6 +144,7 @@ enum Cause {
 
 /// One case: reach `state`, apply `cause`, check the code. With `Epipe` every state resolves itself after about a
 /// second into a record write, which meets the closed stdout.
+#[cfg(target_os = "linux")]
 fn case(state: State, cause: Cause) {
     let quick = cause == Cause::Epipe;
     let hold = if quick { 1000 } else { 30_000 };
@@ -218,7 +224,9 @@ fn case(state: State, cause: Cause) {
     }
 }
 
+/// Linux only: the states and their timing are measured there.
 #[test]
+#[cfg(target_os = "linux")]
 fn e2e_interrupt_matrix() {
     let states = [State::Startup, State::Requesting, State::Streaming, State::Backoff, State::Running, State::Background, State::Escalating, State::Stopping];
     let causes = [Cause::Signal(libc::SIGINT), Cause::Signal(libc::SIGQUIT), Cause::Signal(libc::SIGTERM), Cause::Signal(libc::SIGHUP), Cause::Deadline, Cause::Epipe];
