@@ -178,14 +178,13 @@ fn case(state: State, cause: Cause) {
         State::Backoff => drop(l.wait_record(w, |x| x["t"] == "notice" && x["text"].as_str().is_some_and(|t| t.contains("retry 1/4")))),
         State::Running => drop(l.wait_record(w, |x| x["t"] == "approval")),
         State::Background => drop(m.wait_requests(2, w)),
-        State::Escalating => {
-            let flag = r.path("esc.flag");
-            l.until("the call's SIGTERM", w, |_| flag.exists());
-        }
+        // The deadline is timed to land in the grace after the call's SIGTERM; it ends the run wherever it lands.
+        State::Escalating if cause == Cause::Deadline => drop(poll(w, || r.path("esc.flag").exists() || !l.running())),
+        State::Escalating => l.until("the call's SIGTERM", w, |_| r.path("esc.flag").exists()),
         State::Stopping => {
             l.wait_marked(w);
             if cause == Cause::Deadline {
-                l.until("the deadline's eve", w, |l| l.started.elapsed() >= Duration::from_millis(1850));
+                l.until("the deadline's eve", w, |l| l.started.elapsed() >= Duration::from_millis(1700));
             }
             l.signal(libc::SIGINT);
         }

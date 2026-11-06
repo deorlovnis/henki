@@ -45,7 +45,7 @@ pub struct Run {
     pub dir: PathBuf,
     pub home: PathBuf,
     pub cwd: PathBuf,
-    /// `3133.<pid><n>`: unique, and a valid `sleep` argument.
+    /// `3133.<pid><n>` in fixed widths: unique, and a valid `sleep` argument.
     pub marker: String,
     pub config_path: PathBuf,
     keys: Vec<(String, String)>,
@@ -74,7 +74,7 @@ impl Run {
         }
         let keys = [("model", "\"mock-model\"".into()), ("base_url", format!("\"{url}\"")), ("approve", "\"auto\"".into()), ("context_window", "32768".into())];
         let keys = keys.into_iter().map(|(k, v)| (k.to_string(), v)).collect();
-        let marker = format!("3133.{}{n:04}", std::process::id());
+        let marker = format!("3133.{:07}{n:04}", std::process::id());
         Run { dir, home, cwd, marker, config_path, keys, raw: None, env }
     }
 
