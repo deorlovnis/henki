@@ -26,6 +26,11 @@ struct Seen {
 fn fake(parts: Vec<(u64, Vec<u8>)>, hold: bool) -> (Url, Receiver<Seen>) {
     let l = TcpListener::bind("127.0.0.1:0").unwrap();
     let url = Url { host: "127.0.0.1".into(), port: l.local_addr().unwrap().port(), path: "/v1".into() };
+    (url, serve(l, parts, hold))
+}
+
+/// `fake` on a listener the test bound itself.
+fn serve(l: TcpListener, parts: Vec<(u64, Vec<u8>)>, hold: bool) -> Receiver<Seen> {
     let (tx, rx) = mpsc::channel();
     thread::spawn(move || {
         let (mut s, _) = l.accept().unwrap();
@@ -42,7 +47,19 @@ fn fake(parts: Vec<(u64, Vec<u8>)>, hold: bool) -> (Url, Receiver<Seen>) {
         };
         let _ = tx.send(Seen { req, closed });
     });
-    (url, rx)
+    rx
+}
+
+/// A server that takes one connection and never reads or answers, until the returned sender is dropped (at most 10 s).
+fn deaf() -> (Url, mpsc::Sender<()>) {
+    let l = TcpListener::bind("127.0.0.1:0").unwrap();
+    let url = Url { host: "127.0.0.1".into(), port: l.local_addr().unwrap().port(), path: "/v1".into() };
+    let (tx, rx) = mpsc::channel::<()>();
+    thread::spawn(move || {
+        let _held = l.accept().unwrap();
+        let _ = rx.recv_timeout(Duration::from_secs(10));
+    });
+    (url, tx)
 }
 
 /// One whole reply written at once, then the close.
@@ -130,6 +147,18 @@ fn http_every_address() {
     let s = connect(&[dead, l.local_addr().unwrap()], LIM.connect).unwrap();
     assert_eq!(s.peer_addr().unwrap(), l.local_addr().unwrap());
     assert!(connect(&[dead], LIM.connect).is_none());
+    // Through `post`: a name whose first address is dead and whose last one answers. Only a host where `localhost`
+    // has two addresses (::1 and 127.0.0.1, say) can show it.
+    let addrs: Vec<SocketAddr> = ("localhost", 0).to_socket_addrs().unwrap().collect();
+    let (first, last) = (addrs[0], addrs[addrs.len() - 1]);
+    let Some(l) = TcpListener::bind(last).ok().filter(|_| first.ip() != last.ip()) else {
+        return println!("skipped the part through post: localhost resolves to {addrs:?}");
+    };
+    let port = l.local_addr().unwrap().port();
+    assert!(TcpStream::connect_timeout(&SocketAddr::new(first.ip(), port), LIM.connect).is_err(), "{first:?} must be dead on {port}");
+    let _rx = serve(l, vec![(0, format!("{SSE}data: a\n\n").into_bytes())], false);
+    let url = Url { host: "localhost".into(), port, path: "/v1".into() };
+    assert_eq!(events(&url).unwrap(), vec![ev("", "a")]);
 }
 
 #[test]
@@ -139,6 +168,18 @@ fn http_loopback_only_refuses() {
     assert_eq!((e.kind, e.retry), ("config", None));
     // without the rule the same URL is tried (and refused by the OS)
     assert!(post(&url, "/x", &[], b"", false, &LIM, &slot()).err().unwrap().retry.is_some());
+}
+
+#[test]
+fn http_loopback_resolved_refused() {
+    // The literal alone is not enough: every resolved address must be loopback too.
+    let a = |s: &str| s.parse::<SocketAddr>().unwrap();
+    assert!(loopback("localhost", &[a("127.0.0.1:80"), a("[::1]:80")]));
+    assert!(loopback("127.0.0.1", &[a("127.0.0.1:80")]));
+    assert!(!loopback("localhost", &[a("127.0.0.1:80"), a("10.0.0.7:80")]));
+    assert!(!loopback("localhost", &[a("[::ffff:127.0.0.1]:80")]));
+    assert!(!loopback("localhost", &[a("[fe80::1]:80"), a("[::1]:80")]));
+    assert!(!loopback("0.0.0.0", &[a("127.0.0.1:80")]));
 }
 
 #[test]
@@ -163,8 +204,47 @@ fn http_reset_before_status_retryable() {
 }
 
 #[test]
+fn http_rst_before_status_retryable() {
+    // The server closes with the request unread, so the kernel answers with a reset, not an orderly close.
+    let l = TcpListener::bind("127.0.0.1:0").unwrap();
+    let url = Url { host: "127.0.0.1".into(), port: l.local_addr().unwrap().port(), path: "/v1".into() };
+    thread::spawn(move || {
+        for _ in 0..2 {
+            let (s, _) = l.accept().unwrap();
+            let _ = s.peek(&mut [0; 1]); // the request has begun to arrive; dropping the socket now leaves it unread
+        }
+    });
+    let reset = Some("connection reset");
+    let e = post(&url, "/chat/completions", &[], b"{}", false, &LIM, &slot()).err().unwrap();
+    assert_eq!((e.kind, e.message, e.retry.as_deref()), ("provider", format!("connection reset by 127.0.0.1:{} before a response", url.port), reset));
+    // A request far larger than the socket buffers is still being written when the reset comes: the write fails.
+    let e = post(&url, "/chat/completions", &[], &vec![b' '; 32 << 20], false, &LIM, &slot()).err().unwrap();
+    assert_eq!((e.kind, e.retry.as_deref()), ("provider", reset));
+}
+
+#[test]
+fn http_write_timeout_not_retryable() {
+    // The server never reads, so a request larger than the socket buffers cannot be written within the stall limit.
+    let (url, _hold) = deaf();
+    let t = Instant::now();
+    let e = post(&url, "/chat/completions", &[], &vec![b' '; 64 << 20], false, &LIM, &slot()).err().unwrap();
+    assert_eq!((e.kind, e.message.as_str(), e.retry), ("provider", "the model server did not read the request for 0 s", None));
+    assert!(t.elapsed() >= LIM.stall && t.elapsed() < Duration::from_secs(5), "{:?}", t.elapsed());
+}
+
+#[test]
+fn http_dns_failure_message() {
+    // A name that does not resolve keeps the resolver's words, and is not a connect failure to retry.
+    let url = Url { host: "no-such-host.invalid".into(), port: 9, path: "/v1".into() };
+    let e = post(&url, "/chat/completions", &[], b"{}", false, &LIM, &slot()).err().unwrap();
+    assert_eq!((e.kind, e.retry), ("provider", None));
+    let resolver = e.message.strip_prefix("could not resolve no-such-host.invalid: ").unwrap_or_else(|| panic!("{}", e.message));
+    assert!(!resolver.is_empty());
+}
+
+#[test]
 fn loopback_literal_forms() {
-    for h in ["localhost", "127.0.0.1", "127.1.2.3", "127.255.255.255", "::1", "[::1]"] {
+    for h in ["localhost", "127.0.0.1", "127.1.2.3", "127.255.255.255", "::1"] {
         assert!(loopback_literal(h), "{h}");
     }
     for h in [
@@ -183,6 +263,7 @@ fn loopback_literal_forms() {
         "",
         "example.com",
         "127.0.0.256",
+        "[::1]", // the URL parser drops the brackets before the host gets here
     ] {
         assert!(!loopback_literal(h), "{h}");
     }
@@ -250,6 +331,28 @@ fn http_encoding_refused() {
 }
 
 #[test]
+fn http_retryable_status_with_encoding() {
+    // Only a 200 body is read as a reply; an error status keeps its own rule and its Retry-After.
+    let e = err(&reply("HTTP/1.1 503 Busy\r\nContent-Encoding: gzip\r\nRetry-After: 1\r\nContent-Length: 4\r\n\r\nbusy"));
+    assert_eq!((e.kind, e.retry.as_deref(), e.retry_after), ("provider", Some("HTTP 503"), Some(Duration::from_secs(1))));
+    let e = err(&reply("HTTP/1.1 401 No\r\nContent-Encoding: br\r\nContent-Length: 0\r\n\r\n"));
+    assert_eq!(e.kind, "auth");
+}
+
+#[test]
+fn http_1xx_interim() {
+    // Interim heads (but 101) come before the real one and are skipped; the real head's fields win.
+    let url = reply(&format!("HTTP/1.1 100 Continue\r\n\r\nHTTP/1.1 103 Early Hints\r\nLink: </a>\r\nContent-Type: text/html\r\n\r\n{SSE}data: a\n\n"));
+    assert_eq!(events(&url).unwrap(), vec![ev("", "a")]);
+    let url = reply("HTTP/1.1 101 Switching Protocols\r\nUpgrade: x\r\n\r\n");
+    assert_eq!(err(&url), perr("provider", format!("HTTP 101 from http://127.0.0.1:{}/v1: ", url.port)));
+    // The connection closing after an interim head is a close before the status line.
+    assert_eq!(err(&reply("HTTP/1.1 100 Continue\r\n\r\n")).retry.as_deref(), Some("connection reset"));
+    // Interim heads share the head limit, so they cannot go on forever.
+    assert_eq!(err(&reply(&"HTTP/1.1 100 Continue\r\n\r\n".repeat(3000))).message, "a response head over 64 KiB");
+}
+
+#[test]
 fn http_3xx_error() {
     let (url, rx) = fake(vec![(0, b"HTTP/1.1 301 Moved\r\nLocation: http://127.0.0.1:1/v1/chat/completions\r\nContent-Length: 5\r\n\r\nmoved".to_vec())], false);
     let e = err(&url);
@@ -264,9 +367,9 @@ fn http_2xx_other_type_error() {
     assert_eq!((e.kind, e.retry), ("provider", None));
     assert!(e.message.starts_with("HTTP 204 from http://127.0.0.1:"), "{}", e.message);
     let url = reply("HTTP/1.1 200 OK\r\nContent-Type: text/html\r\n\r\n<html>");
-    let e = err(&url);
-    assert_eq!(e.message, format!("HTTP 200 from http://127.0.0.1:{}/v1/chat/completions with Content-Type \"text/html\"", url.port));
-    assert_eq!(err(&reply("HTTP/1.1 200 OK\r\n\r\n{}")).kind, "provider");
+    assert_eq!(err(&url), perr("provider", format!("HTTP 200 from http://127.0.0.1:{}/v1: <html>", url.port)));
+    let url = reply("HTTP/1.1 200 OK\r\n\r\n{}");
+    assert_eq!(err(&url), perr("provider", format!("HTTP 200 from http://127.0.0.1:{}/v1: {{}}", url.port)));
 }
 
 #[test]
@@ -275,6 +378,23 @@ fn http_json_200() {
     let mut r = go(&url, &LIM).unwrap();
     assert!(!r.sse);
     assert_eq!(serde_json::from_slice::<Value>(&r.body(JSON_MAX)).unwrap(), json!({"ok": true}));
+}
+
+#[test]
+fn http_json_body_stall() {
+    // A completion's read errors fail the attempt with their own words instead of handing on a short body.
+    let head = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n";
+    let (url, _rx) = fake(vec![(0, format!("{head}Content-Length: 100\r\n\r\n{{\"a\":").into_bytes())], true);
+    let t = Instant::now();
+    assert_eq!(err(&url), perr("provider", "no data from the model for 0 s"));
+    assert!(t.elapsed() >= LIM.stall && t.elapsed() < Duration::from_secs(2), "{:?}", t.elapsed());
+    let (url, _rx) = fake(vec![(0, format!("{head}\r\n").into_bytes())], true);
+    assert_eq!(err(&url), perr("provider", "no first token within 0 s"));
+    let bad = format!("{head}Transfer-Encoding: chunked\r\n\r\n5\r\n{{\"a\":\r\nzz\r\n1}}\r\n0\r\n\r\n");
+    assert_eq!(err(&reply(&bad)), perr("provider", "a bad chunk size line"));
+    let at = |n: usize| format!("{head}\r\n\"{}\"", "x".repeat(n - 2));
+    assert_eq!(go(&reply(&at(JSON_MAX)), &LIM).unwrap().body(JSON_MAX).len(), JSON_MAX);
+    assert_eq!(err(&reply(&at(JSON_MAX + 1))), perr("provider", "a JSON completion over 4 MiB"));
 }
 
 #[test]
@@ -315,6 +435,18 @@ fn sse_line_over_1mib() {
     assert_eq!((e.kind, e.message.as_str(), e.retry), ("provider", "an event-stream line over 1 MiB", None));
     let e = events(&reply(&format!("{SSE}{exact}{}", "x".repeat(SSE_LINE_MAX)))).err().unwrap();
     assert_eq!(e.message, "an event-stream line over 1 MiB");
+}
+
+#[test]
+fn sse_event_over_1mib() {
+    // Many short data lines and no blank line: the joined event has the same cap as one line.
+    let lines = format!("data: {}\n", "x".repeat(1023)).repeat(1024); // joined: 1,024 × 1,023 + 1,023 newlines = 1 MiB - 1
+    let got = events(&reply(&format!("{SSE}{lines}data:\n\n"))).unwrap();
+    assert_eq!((got.len(), got[0].1.len()), (1, SSE_LINE_MAX));
+    let e = events(&reply(&format!("{SSE}{lines}data: y\n\n"))).err().unwrap();
+    assert_eq!((e.kind, e.message.as_str(), e.retry), ("provider", "an event-stream event over 1 MiB", None));
+    let e = events(&reply(&format!("{SSE}{}", format!("data: {}\n", "x".repeat(1000)).repeat(2000)))).err().unwrap();
+    assert_eq!(e.message, "an event-stream event over 1 MiB");
 }
 
 #[test]
@@ -425,6 +557,13 @@ fn error_map_row_1() {
 }
 
 #[test]
+fn http_200_halti_body_gateway() {
+    // A 200 that is neither an event stream nor JSON goes through the same rules as any other status.
+    let e = err(&reply("HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\n\r\nhalti: blocked\nmore\n"));
+    assert_eq!(e, perr("gateway", "halti: blocked"));
+}
+
+#[test]
 fn error_map_row_2() {
     let llama = br#"{"error":{"code":400,"message":"the request exceeds the available context size, try increasing it","type":"exceed_context_size_error"}}"#;
     let e = classify(400, llama, &url9(), None);
@@ -435,6 +574,11 @@ fn error_map_row_2() {
     assert_eq!(classify(400, br#"{"error":{"message":"maximum Context length is 8192"}}"#, &url9(), None).kind, "context_exceeded");
     assert_eq!(classify(500, b"context too long", &url9(), None).kind, "provider");
     assert_eq!(classify(400, br#"{"error":{"message":"bad tools"}}"#, &url9(), None), perr("provider", "bad tools"));
+    // The words count in the message or the error type, not in other fields of the body.
+    let param = br#"{"error":{"message":"invalid value for tools[0].function.parameters","param":"context","type":"invalid_request_error"}}"#;
+    assert_eq!(classify(400, param, &url9(), None), perr("provider", "invalid value for tools[0].function.parameters"));
+    let typed = br#"{"error":{"code":400,"message":"no room left","type":"exceed_context_size_error"}}"#;
+    assert_eq!(classify(400, typed, &url9(), None), perr("context_exceeded", "no room left"));
 }
 
 #[test]
@@ -467,7 +611,7 @@ fn error_map_row_4() {
 
 #[test]
 fn error_map_row_5() {
-    // The timeout rows: the strings come from the limits (exact bytes with the shipped ones: timeout_messages_exact).
+    // The timeouts: the strings come from the limits (exact bytes with the shipped ones: timeout_messages_exact).
     let port = closed_port();
     let url = Url { host: "localhost".into(), port, path: "/v1".into() };
     let e = post(&url, "/chat/completions", &[], b"{}", false, &LIMITS, &slot()).err().unwrap();
@@ -529,7 +673,17 @@ fn random_response(next: &mut impl FnMut() -> u64) -> Vec<u8> {
     }
     let status = ["HTTP/1.1 503 x\r\n", "HTTP/1.0 301\r\n", "HTTP/1.1 99999\r\n", "HTTP/1.1\r\n", "", "\n", "junk\r\n"];
     let mut v = if !next().is_multiple_of(4) { "HTTP/1.1 200 OK\r\n" } else { pick(next(), &status) }.to_string();
-    v += pick(next(), &["Content-Type: text/event-stream\r\n", "Content-Type: text/event-stream\r\n", "Content-Type: application/json\r\n", "Content-Type: text/html\r\n", ""]);
+    v += pick(
+        next(),
+        &[
+            "Content-Type: text/event-stream\r\n",
+            "Content-Type: text/event-stream\r\n",
+            "Content-Type: application/json\r\n",
+            "Content-Type: application/json\r\n",
+            "Content-Type: text/html\r\n",
+            "",
+        ],
+    );
     let headers = [
         "Content-Length: 7\r\n",
         "content-length: 99999999999999999999\r\n",

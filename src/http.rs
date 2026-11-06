@@ -29,7 +29,6 @@ pub const CHUNK_LINE_MAX: usize = 1 << 10;
 pub const SSE_LINE_MAX: usize = 1 << 20;
 pub const ERR_BODY_MAX: usize = 64 << 10;
 pub const JSON_MAX: usize = 4 << 20; // a non-streamed 200 completion
-const HEAD_OVER: &str = "a response head over 64 KiB";
 
 /// (cancelled, a clone of the attempt's socket): MAIN cancels through it.
 pub type Slot = Arc<Mutex<(bool, Option<TcpStream>)>>;
@@ -44,6 +43,7 @@ pub fn cancel(slot: &Slot) {
 pub struct Resp {
     pub sse: bool,
     r: BufReader<Body>,
+    json: Vec<u8>,
 }
 
 /// The socket with the read timeout of the moment: the first body byte is due by `first`, then each read waits `stall`,
@@ -66,57 +66,64 @@ struct Body {
 
 /// Resolve `url.host:url.port`; try every address in resolver order, each with `lim.connect`; when `loopback_only`,
 /// refuse unless every resolved address is loopback. Store a socket clone in `slot`. Write the request in one write.
-/// Read the status line and headers (≤ HEAD_MAX). Ok only for 200 with `text/event-stream` (sse) or `application/json`.
+/// Read the status line and headers (≤ HEAD_MAX, interim 1xx heads included). Ok only for 200 with `text/event-stream`
+/// (sse) or `application/json`; a JSON completion is read whole here (≤ JSON_MAX), so its read errors fail the attempt.
 pub fn post(url: &Url, suffix: &str, headers: &[(&'static str, String)], body: &[u8], loopback_only: bool, lim: &Limits, slot: &Slot) -> Result<Resp, ProviderError> {
     let hp = host_port(url);
-    let addrs: Vec<SocketAddr> = (url.host.trim_matches(['[', ']']), url.port).to_socket_addrs().map(Iterator::collect).unwrap_or_default();
-    if loopback_only && !(loopback_literal(&url.host) && addrs.iter().all(|a| a.ip().is_loopback())) {
+    let addrs: Vec<SocketAddr> = (url.host.as_str(), url.port).to_socket_addrs().map_err(|e| perr("provider", format!("could not resolve {}: {e}", url.host)))?.collect();
+    if loopback_only && !loopback(&url.host, &addrs) {
         return Err(perr("config", format!("{hp} is not a loopback address; a key or HENKI_BASE_URL is only sent to this machine")));
     }
     let Some(mut s) = connect(&addrs, lim.connect) else {
-        let n = addrs.len();
-        let cause = format!("could not connect to {hp}");
+        let (n, cause) = (addrs.len(), format!("could not connect to {hp}"));
         let message = format!("{cause} ({n} address{}, {} s each)", if n == 1 { "" } else { "es" }, lim.connect.as_secs());
         return Err(ProviderError { kind: "provider", message, retry: Some(cause), retry_after: None });
     };
-    let mut g = slot.lock().unwrap_or_else(PoisonError::into_inner);
-    if g.0 {
-        return Err(perr("provider", "cancelled")); // dropping the only handle closes the socket
+    match &mut *slot.lock().unwrap_or_else(PoisonError::into_inner) {
+        (true, _) => return Err(perr("provider", "cancelled")), // dropping the only handle closes the socket
+        (false, clone) => *clone = s.try_clone().ok(),
     }
-    g.1 = s.try_clone().ok();
-    drop(g);
     let (path, version, n) = (&url.path, env!("CARGO_PKG_VERSION"), body.len());
     let req = format!("POST {path}{suffix} HTTP/1.1\r\nHost: {hp}\r\nUser-Agent: henki/{version}\r\nContent-Type: application/json\r\nContent-Length: {n}\r\n");
     let req = headers.iter().fold(req + "Accept: text/event-stream\r\nConnection: close\r\n", |r, (k, v)| r + k + ": " + v + "\r\n");
     let reset = || ProviderError { kind: "provider", message: format!("connection reset by {hp} before a response"), retry: Some("connection reset".into()), retry_after: None };
-    s.set_write_timeout(Some(lim.stall)).and_then(|_| s.write_all(&[req.as_bytes(), b"\r\n", body].concat())).map_err(|_| reset())?;
+    let unread = || perr("provider", format!("the model server did not read the request for {} s", lim.stall.as_secs()));
+    let wrote = s.set_write_timeout(Some(lim.stall)).and_then(|_| s.write_all(&[req.as_bytes(), b"\r\n", body].concat()));
+    wrote.map_err(|e| if matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) { unread() } else { reset() })?;
     let mut r = BufReader::new(Sock { s, first: Instant::now() + lim.first_byte, started: false, finished: false, lim: *lim });
-    let head = |r: &mut BufReader<Sock>, max: usize| line(r, max, HEAD_OVER).map_err(|e| io_err(r.get_ref(), e));
-    let first = String::from_utf8_lossy(&head(&mut r, HEAD_MAX)?.ok_or_else(reset)?).into_owned();
-    let status = first.strip_prefix("HTTP/").and_then(|v| v.split_whitespace().nth(1)?.parse::<u16>().ok());
-    let status = status.ok_or_else(|| perr("provider", format!("not an HTTP response from {hp}")))?;
-    let (mut room, mut ctype, mut enc, mut len, mut chunked, mut ra) = (HEAD_MAX.saturating_sub(first.len()), String::new(), String::new(), None, false, None);
+    let head = |r: &mut BufReader<Sock>, max: usize| line(r, max, "a response head over 64 KiB").map_err(|e| io_err(r.get_ref(), e));
     let closed = || perr("provider", "the connection closed inside the response head");
-    while let Some(h) = Some(head(&mut r, room)?.ok_or_else(closed)?).filter(|h| !h.is_empty()) {
-        room = room.saturating_sub(h.len() + 2);
-        let h = String::from_utf8_lossy(&h).to_ascii_lowercase();
-        let (k, v) = h.split_once(':').unwrap_or((&h, ""));
-        match (k.trim(), v.trim()) {
-            ("content-type", v) => ctype = v.split(';').next().unwrap_or_default().trim().to_string(),
-            ("content-encoding", v) => enc = v.to_string(),
-            ("transfer-encoding", v) => chunked = v.contains("chunked"),
-            ("content-length", v) => len = v.parse::<u64>().ok(),
-            ("retry-after", v) => ra = retry_after(v),
-            _ => {}
+    let (mut status, mut room, mut ctype, mut enc, mut len, mut chunked, mut ra) = (100, HEAD_MAX, String::new(), String::new(), None, false, None);
+    while status / 100 == 1 && status != 101 {
+        // A 1xx head but 101 is an interim answer: the real head follows, within the same limit, and its fields win.
+        let first = String::from_utf8_lossy(&head(&mut r, room)?.ok_or_else(reset)?).into_owned();
+        let parsed = first.strip_prefix("HTTP/").and_then(|v| v.split_whitespace().nth(1)?.parse::<u16>().ok());
+        status = parsed.ok_or_else(|| perr("provider", format!("not an HTTP response from {hp}")))?;
+        room = room.saturating_sub(first.len() + 2);
+        while let Some(h) = Some(head(&mut r, room)?.ok_or_else(closed)?).filter(|h| !h.is_empty()) {
+            room = room.saturating_sub(h.len() + 2);
+            let h = String::from_utf8_lossy(&h).to_ascii_lowercase();
+            let (k, v) = h.split_once(':').unwrap_or((&h, ""));
+            match (k.trim(), v.trim()) {
+                ("content-type", v) => ctype = v.split(';').next().unwrap_or_default().trim().to_string(),
+                ("content-encoding", v) => enc = v.to_string(),
+                ("transfer-encoding", v) => chunked = v.contains("chunked"),
+                ("content-length", v) => len = v.parse::<u64>().ok(),
+                ("retry-after", v) => ra = retry_after(v),
+                _ => {}
+            }
         }
     }
     let left = if chunked { 0 } else { len.unwrap_or(u64::MAX) };
-    let mut resp = Resp { sse: ctype == "text/event-stream", r: BufReader::new(Body { r, chunked, left }) };
+    let mut resp = Resp { sse: ctype == "text/event-stream", r: BufReader::new(Body { r, chunked, left }), json: Vec::new() };
     match status {
-        _ if !matches!(enc.as_str(), "" | "identity") => Err(perr("provider", format!("the model server sent Content-Encoding {enc}; henki reads only identity"))),
-        200 if resp.sse || ctype == "application/json" => Ok(resp),
-        200 => Err(perr("provider", format!("HTTP 200 from http://{hp}{path}{suffix} with Content-Type {ctype:?}"))),
-        _ => Err(classify(status, &resp.body(ERR_BODY_MAX), url, ra)), // 3xx included: never followed
+        200 if !matches!(enc.as_str(), "" | "identity") => Err(perr("provider", format!("the model server sent Content-Encoding {enc}; henki reads only identity"))),
+        200 if resp.sse => Ok(resp),
+        200 if ctype == "application/json" => match resp.read(JSON_MAX + 1) {
+            (json, None) if json.len() <= JSON_MAX => Ok(Resp { json, ..resp }),
+            (_, e) => Err(e.unwrap_or_else(|| perr("provider", "a JSON completion over 4 MiB"))),
+        },
+        _ => Err(classify(status, &resp.read(ERR_BODY_MAX).0, url, ra)), // 3xx included: never followed; read errors keep the bytes so far
     }
 }
 
@@ -134,6 +141,7 @@ impl Resp {
                 _ if l.is_empty() && data.is_some() => break,
                 _ if l.is_empty() => event.clear(),
                 "event" => event = v.to_string(),
+                "data" if data.as_ref().map_or(0, |d| d.len() + 1) + v.len() > SSE_LINE_MAX => return Err(perr("provider", "an event-stream event over 1 MiB")),
                 "data" => data = Some(data.map_or_else(|| v.to_string(), |d| d + "\n" + v)),
                 _ => {} // a comment (its bytes already reset the stall timer), or a field henki does not use
             }
@@ -141,11 +149,16 @@ impl Resp {
         Ok(data.map(|d| (event, d)))
     }
 
-    /// The body (JSON completion or error), at most `max` bytes.
+    /// The JSON completion `post` read, at most `max` bytes (empty for an event stream, and once taken).
     pub fn body(&mut self, max: usize) -> Vec<u8> {
+        self.json.drain(..).take(max).collect()
+    }
+
+    /// At most `max` bytes of the body, and the read error that cut it short.
+    fn read(&mut self, max: usize) -> (Vec<u8>, Option<ProviderError>) {
         let mut v = Vec::new();
-        let _ = self.r.by_ref().take(max as u64).read_to_end(&mut v); // on an error the bytes so far are kept
-        v
+        let e = self.r.by_ref().take(max as u64).read_to_end(&mut v).err();
+        (v, e.map(|e| io_err(self.r.get_ref().r.get_ref(), e)))
     }
 }
 
@@ -180,7 +193,6 @@ impl Read for Body {
         }
         let max = self.left.min(b.len() as u64) as usize;
         let n = if max == 0 { 0 } else { self.r.read(&mut b[..max])? }; // never read into an empty slice: BufReader would wait
-
         self.left -= n as u64;
         self.r.get_mut().started |= n > 0;
         Ok(n)
@@ -202,8 +214,13 @@ fn connect(addrs: &[SocketAddr], t: Duration) -> Option<TcpStream> {
     addrs.iter().find_map(|a| TcpStream::connect_timeout(a, t).ok())
 }
 
+/// A key or `HENKI_BASE_URL` goes only to a loopback literal whose every resolved address is loopback.
+fn loopback(host: &str, addrs: &[SocketAddr]) -> bool {
+    loopback_literal(host) && addrs.iter().all(|a| a.ip().is_loopback())
+}
+
 fn host_port(url: &Url) -> String {
-    if url.host.contains(':') && !url.host.starts_with('[') { format!("[{}]:{}", url.host, url.port) } else { format!("{}:{}", url.host, url.port) }
+    if url.host.contains(':') { format!("[{}]:{}", url.host, url.port) } else { format!("{}:{}", url.host, url.port) }
 }
 
 /// Integer or decimal seconds; anything else (an HTTP-date) counts as absent.
@@ -211,31 +228,35 @@ fn retry_after(v: &str) -> Option<Duration> {
     v.parse::<f64>().ok().and_then(|s| Duration::try_from_secs_f64(s).ok())
 }
 
-/// The error table's rows 1-7, first match wins, for a non-200 response.
+/// The error rules, first match wins, for a response that is not a 200 event stream or JSON completion: a body starting
+/// `halti: ` is the gateway's own refusal; the rest go through `rules`.
 pub fn classify(status: u16, body: &[u8], url: &Url, retry_after: Option<Duration>) -> ProviderError {
     let text = String::from_utf8_lossy(body);
     if text.starts_with("halti: ") {
         return perr("gateway", text.lines().next().unwrap_or_default());
     }
     let v = serde_json::from_slice(body).unwrap_or(Value::Null);
-    rows(status, &v, &text, format!("HTTP {status} from http://{}{}: ", host_port(url), url.path), retry_after)
+    rules(status, &v, &text, format!("HTTP {status} from http://{}{}: ", host_port(url), url.path), retry_after)
 }
 
 /// The same rules for an `error` object found inside a 200 stream or completion; `first` = it was the first event.
 pub fn error_object(v: &Value, first: bool) -> ProviderError {
     let text = v.to_string();
-    let mut e = rows(0, v, &text, "the model sent an error: ".into(), None);
+    let mut e = rules(0, v, &text, "the model sent an error: ".into(), None);
     e.retry = e.retry.filter(|_| first);
     e
 }
 
-/// Rows 2, 3, 4 and 7 over an error body or event (`status` 0: inside a 200 reply). The message is the server's
-/// `error.message` (OpenAI and Anthropic shapes alike), else `prefix` and the first 200 bytes of `text`.
-fn rows(status: u16, v: &Value, text: &str, prefix: String, retry_after: Option<Duration>) -> ProviderError {
+/// The rules over an error body or event (`status` 0: inside a 200 reply), first match wins: context exceeded (its
+/// words in the message or type, or anywhere in a body without a message), auth, the retryable statuses and error
+/// types, else a plain provider error. The message is the server's `error.message` (OpenAI and Anthropic shapes alike),
+/// else `prefix` and the first 200 bytes of `text`.
+fn rules(status: u16, v: &Value, text: &str, prefix: String, retry_after: Option<Duration>) -> ProviderError {
     let e = v.get("error").unwrap_or(v);
     let ty = e.get("type").and_then(Value::as_str).unwrap_or_default();
-    let low = text.to_lowercase();
-    let context = matches!(status, 400 | 413) && ["context", "exceed", "too long", "too many tokens"].iter().any(|w| low.contains(w));
+    let msg = e.get("message").and_then(Value::as_str).or(e.as_str()).unwrap_or_default();
+    let words = if msg.is_empty() { text.to_lowercase() } else { format!("{msg} {ty}").to_lowercase() };
+    let context = matches!(status, 400 | 413) && ["context", "exceed", "too long", "too many tokens"].iter().any(|w| words.contains(w));
     let (kind, retry) = match (status, ty) {
         _ if context => ("context_exceeded", None),
         (401 | 403, _) | (_, "authentication_error" | "permission_error") => ("auth", None),
@@ -243,8 +264,8 @@ fn rows(status: u16, v: &Value, text: &str, prefix: String, retry_after: Option<
         (_, "rate_limit_error" | "overloaded_error" | "api_error") => ("provider", Some(ty.to_string())),
         _ => ("provider", None),
     };
-    let fix = if kind == "auth" && low.contains("blocked:no-standin") { "; fix: set api_key to the gateway's stand-in" } else { "" };
-    let message = match e.get("message").and_then(Value::as_str).or(e.as_str()).unwrap_or_default() {
+    let fix = if kind == "auth" && text.contains("blocked:no-standin") { "; fix: set api_key to the gateway's stand-in" } else { "" };
+    let message = match msg {
         "" => prefix + String::from_utf8_lossy(&text.as_bytes()[..text.len().min(200)]).trim(),
         m if retry.is_some() && status > 0 => format!("HTTP {status}: {m}"),
         m => m.to_string(),
@@ -263,7 +284,7 @@ pub fn perr(kind: &'static str, message: impl Into<String>) -> ProviderError {
 
 /// `localhost`, a dotted quad in 127.0.0.0/8 (no trailing dot, no other IPv4 forms), or `::1`.
 pub fn loopback_literal(host: &str) -> bool {
-    matches!(host, "localhost" | "::1" | "[::1]") || host.parse::<Ipv4Addr>().is_ok_and(|a| a.is_loopback())
+    matches!(host, "localhost" | "::1") || host.parse::<Ipv4Addr>().is_ok_and(|a| a.is_loopback())
 }
 
 #[cfg(test)]
