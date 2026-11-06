@@ -2,9 +2,17 @@
 use super::*;
 use crate::types::{Call, Usage};
 use serde_json::json;
+use std::cell::Cell;
 use std::ffi::OsString;
 use std::os::unix::fs::{MetadataExt, PermissionsExt, symlink};
+use std::process::Command;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::Instant;
+
+thread_local! {
+    /// How many fdatasync calls `write` made on this test's thread.
+    pub static SYNCS: Cell<usize> = const { Cell::new(0) };
+}
 
 /// A fresh, empty directory under the temp dir, removed when dropped.
 struct Tmp(PathBuf);
@@ -67,7 +75,12 @@ impl Fx {
     }
 
     fn resume(&self, id: Option<&str>) -> Result<Resumed, Outcome> {
-        Journal::resume(&self.state, &self.cwd, id, &self.cfg)
+        resume_at(&self.state, &self.cwd, id, &self.cfg)
+    }
+
+    /// One attempt, for the checks that expect a lock this test holds.
+    fn busy(&self, id: Option<&str>) -> String {
+        journal_err("journal", Journal::resume(&self.state, &self.cwd, id, &self.cfg))
     }
 
     /// Writes `lines` (records as compact JSON, one per line) as the session file `id` of this cwd.
@@ -78,6 +91,28 @@ impl Fx {
         fs::write(&path, lines.iter().map(|l| l.to_string() + "\n").collect::<String>()).unwrap();
         path
     }
+}
+
+/// `Journal::resume`, waiting out a lock that only a forked child of another test still holds: until the child execs, it
+/// shares the open file of a journal this test has already dropped, and with it the lock.
+fn resume_at(state: &Path, cwd: &Path, id: Option<&str>, cfg: &Config) -> Result<Resumed, Outcome> {
+    let until = Instant::now() + Duration::from_secs(5);
+    loop {
+        match Journal::resume(state, cwd, id, cfg) {
+            Err(Outcome::Error { message, .. }) if message.ends_with(" is in use") && Instant::now() < until => std::thread::sleep(Duration::from_millis(1)),
+            r => return r,
+        }
+    }
+}
+
+/// A lock on `p` held by the test itself, taken once no forked child of another test shares it (see `resume_at`).
+fn hold(p: &Path) -> File {
+    let (f, until) = (File::open(p).unwrap(), Instant::now() + Duration::from_secs(5));
+    while f.try_lock().is_err() {
+        assert!(Instant::now() < until, "{} stays locked", p.display());
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    f
 }
 
 fn mode(p: &Path) -> u32 {
@@ -203,12 +238,12 @@ fn journal_lock_in_use() {
     let id = j.id().to_string();
     j.write(rec::session(&f.cfg, &id, &f.cwd, None)).unwrap();
     let busy = format!("session {id} is in use");
-    assert_eq!(journal_err("journal", f.resume(Some(&id))), busy);
-    assert_eq!(journal_err("journal", f.resume(None)), busy);
+    assert_eq!(f.busy(Some(&id)), busy);
+    assert_eq!(f.busy(None), busy);
     drop(j);
     let r = f.resume(None).unwrap();
     assert_eq!(r.journal.id(), id);
-    assert_eq!(journal_err("journal", f.resume(Some(&id))), busy);
+    assert_eq!(f.busy(Some(&id)), busy);
     drop(r);
     assert!(f.resume(Some(&id)).is_ok());
 }
@@ -285,11 +320,26 @@ fn journal_record_shapes() {
 
 #[test]
 fn journal_sync_table() {
-    for t in ["session", "user", "assistant", "tool_result", "elide", "turn_end", "result", "close"] {
-        assert!(synced(t), "{t}");
-    }
-    for t in ["ask", "approval", "notice"] {
-        assert!(!synced(t), "{t}");
+    let f = fx();
+    let mut j = Journal::create(&f.state, &f.cwd).unwrap();
+    let c = call("h1");
+    let recs = [
+        (rec::session(&f.cfg, j.id(), &f.cwd, None), true),
+        (rec::user("u"), true),
+        (asst(&["h1"]), true),
+        (rec::ask(&c, None), false),
+        (rec::approval("h1", "auto"), false),
+        (res("h1"), true),
+        (rec::notice("n"), false),
+        (rec::elide(&["h1".into()]), true),
+        (rec::turn_end(&Outcome::Ok, 1, Usage::default()), true),
+        (rec::result(&Outcome::Ok, "", Usage::default(), Some("x"), 1, 0), true),
+        (rec::close(0), true),
+    ];
+    for (r, synced) in recs {
+        let before = SYNCS.with(Cell::get);
+        j.write(r.clone()).unwrap();
+        assert_eq!(SYNCS.with(Cell::get) - before, usize::from(synced), "{}", r["t"]);
     }
 }
 
@@ -344,7 +394,8 @@ fn journal_torn_every_offset() {
         fs::write(&path, &full[..cut]).unwrap();
         let keep = full[..cut].iter().rposition(|&b| b == b'\n').map_or(0, |i| i + 1);
         if cut < first {
-            journal_err("journal", f.resume(Some(&id)));
+            let e = if cut == 0 { format!("no session to resume in {}", f.cwd.display()) } else { format!("{}: no session record", path.display()) };
+            assert_eq!(journal_err("journal", f.resume(Some(&id))), e, "cut {cut}");
             assert_eq!(fs::metadata(&path).unwrap().len(), 0, "cut {cut}");
             continue;
         }
@@ -365,6 +416,11 @@ fn journal_torn_every_offset() {
         pairing(&r.hist).unwrap();
         assert_eq!(r.hist.last().unwrap()["msg"]["content"], "again");
     }
+    // The notice gives the size of what it dropped in grouped digits.
+    fs::write(&path, [&full[..], &[b'x'; 1500][..]].concat()).unwrap();
+    let r = f.resume(Some(&id)).unwrap();
+    assert_eq!(r.notices[0], format!("dropped an incomplete last line (1,500 bytes) from {}", path.display()));
+    assert_eq!(r.from_bytes, full.len() as u64);
 }
 
 #[test]
@@ -436,8 +492,8 @@ fn journal_resume_dialect_mismatch() {
     // The last session record decides.
     f.plant("d", &[open.clone(), rec::user("a"), other]);
     journal_err("journal", f.resume(None));
-    f.plant("d", &[rec::user("a")]);
-    journal_err("journal", f.resume(None));
+    let path = f.plant("d", &[rec::user("a")]);
+    assert_eq!(journal_err("journal", f.resume(None)), format!("{}: no session record", path.display()));
     let mut first = open.clone();
     first["dialect"] = "anthropic".into();
     f.plant("d", &[first, rec::user("a"), open]);
@@ -450,7 +506,7 @@ fn journal_resume_changes_noticed() {
     let (id, _) = f.session(&[rec::user("a")]);
     let mut cfg = Config::test(&f.tmp.0);
     (cfg.model, cfg.tools) = ("other".into(), vec!["read"]);
-    let r = Journal::resume(&f.state, &f.cwd, Some(&id), &cfg).unwrap();
+    let r = resume_at(&f.state, &f.cwd, Some(&id), &cfg).unwrap();
     assert_eq!(
         r.notices,
         [
@@ -546,7 +602,7 @@ fn journal_resume_scoped_cwd() {
     drop(j);
     set_mtime(&path_a, 3600);
     assert_eq!(f.resume(None).unwrap().journal.id(), a);
-    let r = Journal::resume(&f.state, &other, None, &f.cfg).unwrap();
+    let r = resume_at(&f.state, &other, None, &f.cfg).unwrap();
     assert_eq!((r.journal.id(), r.notices.len()), (b.as_str(), 1));
     drop(r);
     // An id is found in any scope; the moved cwd is noticed.
@@ -555,7 +611,7 @@ fn journal_resume_scoped_cwd() {
     assert!(r.notices.iter().any(|n| n.starts_with("cwd changed since the session started: ")), "{:?}", r.notices);
     let third = f.tmp.0.join("third");
     fs::create_dir(&third).unwrap();
-    assert_eq!(journal_err("journal", Journal::resume(&f.state, &third, None, &f.cfg)), format!("no session to resume in {}", third.display()));
+    assert_eq!(journal_err("journal", resume_at(&f.state, &third, None, &f.cfg)), format!("no session to resume in {}", third.display()));
 }
 
 #[test]
@@ -571,7 +627,7 @@ fn journal_resume_none() {
     fs::rename(&path, path.with_extension("log")).unwrap();
     symlink(path.with_extension("log"), &path).unwrap();
     assert_eq!(journal_err("journal", f.resume(None)), none);
-    assert_eq!(journal_err("journal", Journal::resume(&f.tmp.0.join("missing"), &f.cwd, None, &f.cfg)), none);
+    assert_eq!(journal_err("journal", resume_at(&f.tmp.0.join("missing"), &f.cwd, None, &f.cfg)), none);
 }
 
 #[test]
@@ -587,12 +643,52 @@ fn journal_resume_newest_unlocked() {
     set_mtime(&path_old, 60);
     assert_eq!(f.resume(None).unwrap().journal.id(), old);
     set_mtime(&path_old, 7200);
-    let held = File::open(&path_new).unwrap();
-    held.try_lock().unwrap();
+    let _held = hold(&path_new);
     assert_eq!(f.resume(None).unwrap().journal.id(), old);
-    let held_too = File::open(&path_old).unwrap();
-    held_too.try_lock().unwrap();
-    assert_eq!(journal_err("journal", f.resume(None)), format!("session {new} is in use"));
+    let _held_too = hold(&path_old);
+    assert_eq!(f.busy(None), format!("session {new} is in use"));
+}
+
+/// A run that died before its first record leaves an empty file, or one torn line; neither blocks `--resume` of the
+/// session before it.
+#[test]
+fn journal_resume_skips_empty() {
+    let f = fx();
+    let (old, path_old) = f.session(&[rec::user("a")]);
+    set_mtime(&path_old, 60);
+    let empty = f.plant("20990101T000000Z-0000", &[]);
+    assert_eq!(f.resume(None).unwrap().journal.id(), old);
+    let none = format!("no session to resume in {}", f.cwd.display());
+    assert_eq!(journal_err("journal", f.resume(Some("20990101T000000Z-0000"))), none);
+    // A torn first line is cut and reported once; the empty file left behind is then skipped.
+    fs::write(&empty, b"{\"t\":\"sess").unwrap();
+    assert_eq!(journal_err("journal", f.resume(None)), format!("{}: no session record", empty.display()));
+    assert_eq!(fs::metadata(&empty).unwrap().len(), 0);
+    assert_eq!(f.resume(None).unwrap().journal.id(), old);
+}
+
+/// A write the kernel cuts short (here at the file size limit) ends with its cause, and every later write finds the
+/// size off and stops instead of appending after the partial line.
+#[test]
+fn journal_short_write() {
+    // The size limit is per process, so the body runs in a child test process under `ulimit -f 1` (1 KiB), with
+    // SIGXFSZ ignored so that the write past the limit fails instead of killing it.
+    if std::env::var_os("HENKI_TEST_FSIZE").is_none() {
+        let script = r#"ulimit -f 1 && trap '' XFSZ && exec "$0" --exact journal::tests::journal_short_write --test-threads=1"#;
+        let out = Command::new("bash").args(["-c", script]).arg(std::env::current_exe().unwrap()).env("HENKI_TEST_FSIZE", "1").output().unwrap();
+        assert!(out.status.success() && String::from_utf8_lossy(&out.stdout).contains("1 passed"), "{out:?}");
+        return;
+    }
+    let f = fx();
+    let mut j = Journal::create(&f.state, &f.cwd).unwrap();
+    j.write(rec::notice(&"a".repeat(600))).unwrap();
+    let written = j.bytes();
+    let e = Outcome::error("journal", format!("cannot write {}: File too large (os error 27)", j.path.display()));
+    assert_eq!(j.write(rec::notice(&"b".repeat(600))).unwrap_err(), e);
+    assert_eq!((j.bytes(), fs::metadata(&j.path).unwrap().len()), (written, 1024));
+    let tampered = Outcome::error("tampered", format!("journal modified outside henki: {}", j.path.display()));
+    assert_eq!(j.write(rec::notice("c")).unwrap_err(), tampered);
+    assert_eq!(fs::metadata(&j.path).unwrap().len(), 1024);
 }
 
 #[test]
@@ -705,6 +801,18 @@ fn elide_nothing_left() {
     assert!(elide(&mut hist).is_empty());
 }
 
+/// Output that only starts like the marker is elided like any other; only the marker itself counts as elided.
+#[test]
+fn elide_marker_lookalike() {
+    let big = format!("{ELIDED}{}", "x".repeat(20_000));
+    let small = "[output elided: 3 bytes]";
+    let mut hist = vec![rec::user("u"), asst(&["h1", "h2"]), rec::tool_result("h1", "shell", &big, false, 1, 9), rec::tool_result("h2", "read", small, false, 1, 9)];
+    hist.extend([asst(&["h3"]), res("h3"), asst(&[])]);
+    assert_eq!(elide(&mut hist), ["h1"]);
+    assert_eq!((&hist[2]["content"], &hist[3]["content"]), (&json!("[output elided: 20,016 bytes]"), &json!(small)));
+    assert!(elide(&mut hist).is_empty());
+}
+
 #[test]
 fn next_h_max_plus_one() {
     assert_eq!(next_h(&[]), 1);
@@ -725,6 +833,25 @@ fn spill_name_counter() {
     assert_eq!((s.shown, s.path.clone()), (s.path.display().to_string(), f.state.join(format!("spill/{id}-2.log"))));
 }
 
+/// The 24 h sweep may remove a spill file whose name the history still holds; a resumed session never hands that name
+/// out again.
+#[test]
+fn spill_counter_after_sweep() {
+    let f = fx();
+    let mut j = Journal::create(&f.state, &f.cwd).unwrap();
+    let id = j.id().to_string();
+    j.write(rec::session(&f.cfg, &id, &f.cwd, None)).unwrap();
+    j.write(asst(&["h1", "h2"])).unwrap();
+    let first = j.spill(&f.tmp.0);
+    fs::write(&first.path, "full output").unwrap();
+    j.write(rec::tool_result("h1", "shell", &format!("head\n[full output: {}]", first.shown), false, 1, 11)).unwrap();
+    j.write(res("h2")).unwrap();
+    drop(j);
+    fs::remove_file(&first.path).unwrap();
+    let mut r = f.resume(Some(&id)).unwrap();
+    assert_eq!(r.journal.spill(&f.tmp.0).path, f.state.join(format!("spill/{id}-3.log")));
+}
+
 #[test]
 fn spill_sweep_24h() {
     let tmp = Tmp::new();
@@ -741,7 +868,8 @@ fn spill_sweep_24h() {
 }
 
 /// Random journals of records and record-like lines (wrong types, missing fields, duplicate ids, junk bytes) never panic
-/// any reader; the counters show the inputs reach the history, the repairs and the elision.
+/// any reader, nor `Journal::resume` over the same bytes as a file; the counters show the inputs reach the history, the
+/// repairs, the elision and both ends of resume.
 #[test]
 fn journal_line_never_panics() {
     let mut x = 0x2545_f491_4f6c_dd1d_u64;
@@ -780,7 +908,8 @@ fn journal_line_never_panics() {
     ];
     let f = fx();
     let path = f.tmp.0.join("fuzz.jsonl");
-    let (mut read, mut repaired, mut elided) = (0, 0, 0);
+    let session = f.plant("fuzz", &[]);
+    let (mut read, mut repaired, mut elided, mut resumed, mut refused) = (0, 0, 0, 0, 0);
     for _ in 0..10_000 {
         let mut buf = Vec::new();
         if next(4) != 0 {
@@ -815,6 +944,18 @@ fn journal_line_never_panics() {
             let _ = (pairing(&hist), next_h(&hist));
             elided += usize::from(!elide(&mut hist).is_empty());
         }
+        // One in ten goes through the whole file pipeline as well, with a torn tail now and then.
+        if next(10) == 0 {
+            fs::write(&session, &buf[..buf.len() - next(buf.len().min(30) + 1)]).unwrap();
+            match resume_at(&f.state, &f.cwd, Some("fuzz"), &f.cfg) {
+                Ok(r) => {
+                    let _ = (pairing(&r.hist), next_h(&r.hist));
+                    resumed += 1;
+                }
+                Err(_) => refused += 1,
+            }
+        }
     }
     assert!(read > 1000 && repaired > 100 && elided > 20, "read {read}, repaired {repaired}, elided {elided}");
+    assert!(resumed > 100 && refused > 100, "resumed {resumed}, refused {refused}");
 }

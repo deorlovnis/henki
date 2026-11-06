@@ -19,7 +19,7 @@ pub struct Journal {
     bytes: u64,
     id: String,
     spill: PathBuf,
-    n: u32,
+    n: usize,
 }
 
 pub struct Resumed {
@@ -40,9 +40,7 @@ pub fn state_dir(env: &Env, home: &Path) -> Result<PathBuf, String> {
         sys::private_dir(&d).map_err(|e| format!("state dir {}: {e}; fix: make it a directory you own, or set XDG_STATE_HOME", d.display()))?;
     }
     let old = |e: &fs::DirEntry| e.metadata().ok().and_then(|m| m.modified().ok()?.elapsed().ok()).is_some_and(|age| age > Duration::from_secs(86_400));
-    for e in fs::read_dir(dir.join("spill")).into_iter().flatten().flatten().filter(old) {
-        let _ = fs::remove_file(e.path());
-    }
+    fs::read_dir(dir.join("spill")).into_iter().flatten().flatten().filter(old).for_each(|e| _ = fs::remove_file(e.path()));
     Ok(dir)
 }
 
@@ -57,11 +55,6 @@ fn tampered(path: &Path) -> Outcome {
 /// The sessions subdirectory of a cwd: FNV-1a of its realpath.
 fn scope(cwd: &Path) -> Result<String, Outcome> {
     Ok(sys::fnv(fs::canonicalize(cwd).map_err(|e| jerr(cwd, e))?.as_os_str().as_bytes()))
-}
-
-/// The kinds `write` does not fdatasync: they explain no effect that a crash could leave behind.
-fn synced(t: &str) -> bool {
-    !matches!(t, "ask" | "approval" | "notice")
 }
 
 impl Journal {
@@ -90,7 +83,7 @@ impl Journal {
         let keep = buf.iter().rposition(|&b| b == b'\n').map_or(0, |i| i + 1);
         if keep < buf.len() {
             file.set_len(keep as u64).map_err(|e| jerr(&path, e))?;
-            notices.push(format!("dropped an incomplete last line ({} bytes) from {}", buf.len() - keep, path.display()));
+            notices.push(format!("dropped an incomplete last line ({} bytes) from {}", term::num((buf.len() - keep) as u64), path.display()));
             buf.truncate(keep);
         }
         let mut hist = replay(&buf, &path, cfg, cwd, &mut notices)?;
@@ -98,7 +91,8 @@ impl Journal {
         let prefix = format!("{id}-");
         let spill = state.join("spill");
         let names = fs::read_dir(&spill).into_iter().flatten().flatten().map(|e| e.file_name());
-        let n = names.filter_map(|f| f.to_str()?.strip_prefix(&prefix)?.strip_suffix(".log")?.parse().ok()).max().unwrap_or(0);
+        // A name whose file the 24 h sweep removed may still be named in the history: each call took at most one name.
+        let n = names.filter_map(|f| f.to_str()?.strip_prefix(&prefix)?.strip_suffix(".log")?.parse().ok()).max().unwrap_or(0).max(calls(&hist).count());
         let mut journal = Journal { file, path, bytes: keep as u64, id, spill, n };
         for (id, name) in dangling(&hist) {
             hist.push(journal.write(rec::tool_result(&id, &name, tools::REPAIR, true, 0, 0))?);
@@ -106,24 +100,24 @@ impl Journal {
         Ok(Resumed { journal, hist, from_bytes: keep as u64, notices })
     }
 
-    /// Adds `ts`; checks fstat size = bytes written (else `tampered`); one write(2) of `term::json_line` + "\n" on the
-    /// O_APPEND fd; fdatasync unless the kind is `ask`, `approval` or `notice`. Returns the record as written.
+    /// Adds `ts`; checks fstat size = bytes written (else `tampered`); appends `term::json_line` + "\n" on the O_APPEND
+    /// fd; fdatasync unless the kind is `ask`, `approval` or `notice`. Returns the record as written.
     pub fn write(&mut self, mut rec: Value) -> Result<Value, Outcome> {
-        if let Some(o) = rec.as_object_mut() {
-            o.insert("ts".into(), sys::utc().0.into());
-        }
+        rec.as_object_mut().map(|o| o.insert("ts".into(), sys::utc().0.into()));
         let line = term::json_line(&rec) + "\n";
         let fail = |e: std::io::Error| Outcome::error("journal", format!("cannot write {}: {e}", self.path.display()));
         if self.file.metadata().map_err(fail)?.len() != self.bytes {
             return Err(tampered(&self.path));
         }
-        // A short write leaves `bytes` behind the file, so every later write fails the size check instead of appending.
-        if (&self.file).write(line.as_bytes()).map_err(fail)? != line.len() {
-            return Err(fail(std::io::ErrorKind::WriteZero.into()));
-        }
+        // One write(2), and a second only after a short one (whose error then names the cause, e.g. a full disk). A
+        // failure leaves `bytes` behind the file, so every later write fails the size check instead of appending.
+        (&self.file).write_all(line.as_bytes()).map_err(fail)?;
         self.bytes += line.len() as u64;
-        if synced(rec["t"].as_str().unwrap_or_default()) {
+        // `ask`, `approval` and `notice` explain no effect that a crash could leave behind.
+        if !matches!(rec["t"].as_str(), Some("ask" | "approval" | "notice")) {
             self.file.sync_data().map_err(fail)?;
+            #[cfg(test)]
+            tests::SYNCS.with(|n| n.set(n.get() + 1));
         }
         Ok(rec)
     }
@@ -136,7 +130,8 @@ impl Journal {
         self.bytes
     }
 
-    /// The next spill name, `<id>-<n>.log` (n from the counter, never from a model string).
+    /// The next spill name, `<id>-<n>.log` (n from the counter, never from a model string). One per tool call at most:
+    /// resume continues the counter past both the names on disk and the number of calls in the history.
     pub fn spill(&mut self, home: &Path) -> Spill {
         self.n = self.n.saturating_add(1);
         let path = self.spill.join(format!("{}-{}.log", self.id, self.n));
@@ -145,7 +140,8 @@ impl Journal {
     }
 }
 
-/// The session to resume, opened and locked: `id` in any scope, or the newest unlocked one in this cwd's scope.
+/// The session to resume, opened and locked: `id` in any scope, or the newest unlocked one in this cwd's scope. Empty
+/// files (a run that died before its first record) are not sessions.
 fn pick(state: &Path, cwd: &Path, id: Option<&str>) -> Result<(PathBuf, File), Outcome> {
     let ls = |d: PathBuf| fs::read_dir(d).into_iter().flatten().flatten().map(|e| e.path());
     let sessions = state.join("sessions");
@@ -153,7 +149,8 @@ fn pick(state: &Path, cwd: &Path, id: Option<&str>) -> Result<(PathBuf, File), O
         Some(id) => ls(sessions).map(|d| d.join(format!("{id}.jsonl"))).filter(|_| !id.contains('/')).collect(),
         None => ls(sessions.join(scope(cwd)?)).filter(|p| p.extension().is_some_and(|x| x == "jsonl")).collect(),
     };
-    let mut found: Vec<(SystemTime, PathBuf)> = paths.into_iter().filter_map(|p| fs::symlink_metadata(&p).ok().filter(|m| m.is_file())?.modified().ok().map(|t| (t, p))).collect();
+    let mtime = |p: &Path| fs::symlink_metadata(p).ok().filter(|m| m.is_file() && m.len() > 0)?.modified().ok();
+    let mut found: Vec<(SystemTime, PathBuf)> = paths.into_iter().filter_map(|p| Some((mtime(&p)?, p))).collect();
     found.sort();
     let mut busy = None;
     for (_, path) in found.into_iter().rev() {
@@ -180,14 +177,14 @@ fn replay(buf: &[u8], path: &Path, cfg: &Config, cwd: &Path, notices: &mut Vec<S
         }
         off += line.len();
     }
-    let last = recs.iter().rposition(|(_, r)| r["t"] == "session");
-    let seg = recs.get(last.unwrap_or(0)..).unwrap_or_default();
+    let Some(last) = recs.iter().rposition(|(_, r)| r["t"] == "session") else { return Err(jerr(path, "no session record")) };
+    let seg = &recs[last..];
     match seg.iter().position(|(_, r)| r["t"] == "close") {
         None => notices.push("previous run did not close cleanly".into()),
         Some(i) if i + 1 == seg.len() && seg[i].1["bytes"].as_u64() == Some(seg[i].0 as u64) => {}
         Some(_) => return Err(tampered(path)),
     }
-    let s = last.map_or(&Value::Null, |i| &recs[i].1);
+    let s = &recs[last].1;
     if s["dialect"] != "openai" {
         return Err(Outcome::error("journal", format!("{}: the session's dialect is {}, not openai", path.display(), s["dialect"])));
     }
@@ -200,23 +197,22 @@ fn replay(buf: &[u8], path: &Path, cfg: &Config, cwd: &Path, notices: &mut Vec<S
     for (_, r) in recs {
         match r["t"].as_str() {
             Some("user" | "assistant" | "tool_result") => hist.push(r),
-            Some("elide") => {
-                let ids = r["ids"].as_array().cloned().unwrap_or_default();
-                for h in hist.iter_mut().filter(|h| h["t"] == "tool_result" && ids.contains(&h["id"])) {
-                    shrink(h);
-                }
-            }
+            Some("elide") => hist.iter_mut().filter(|h| h["t"] == "tool_result" && r["ids"].as_array().is_some_and(|ids| ids.contains(&h["id"]))).for_each(|h| _ = shrink(h)),
             _ => {}
         }
     }
     Ok(hist)
 }
 
+/// Every call of every assistant record, in history order.
+fn calls(hist: &[Value]) -> impl Iterator<Item = &Value> {
+    hist.iter().filter(|r| r["t"] == "assistant").flat_map(|r| r["msg"]["tool_calls"].as_array().into_iter().flatten())
+}
+
 /// (id, name) of every call without a result, in history order.
 fn dangling(hist: &[Value]) -> Vec<(String, String)> {
     let done: HashSet<&str> = hist.iter().filter(|r| r["t"] == "tool_result").filter_map(|r| r["id"].as_str()).collect();
-    let calls = hist.iter().filter(|r| r["t"] == "assistant").flat_map(|r| r["msg"]["tool_calls"].as_array().into_iter().flatten());
-    calls.filter_map(|c| Some((c["id"].as_str().filter(|id| !done.contains(id))?.to_string(), c["name"].as_str().unwrap_or_default().to_string()))).collect()
+    calls(hist).filter_map(|c| Some((c["id"].as_str().filter(|id| !done.contains(id))?.to_string(), c["name"].as_str().unwrap_or_default().to_string()))).collect()
 }
 
 /// Over `user`, `assistant` and `tool_result` records only (every other kind is skipped, so this also checks a whole
@@ -241,9 +237,10 @@ pub fn pairing(hist: &[Value]) -> Result<(), String> {
     open.first().map_or(Ok(()), |id| Err(format!("call {id} has no result")))
 }
 
-/// `[output elided: N bytes]` in place of a result's content (N = its length), unless it is elided already.
+/// `[output elided: N bytes]` in place of a result's content (N = its length), unless it is that marker already.
 fn shrink(r: &mut Value) -> bool {
-    let Some(c) = r["content"].as_str().filter(|c| !c.starts_with(ELIDED)) else { return false };
+    let marker = |c: &str| c.strip_prefix(ELIDED).and_then(|n| n.strip_suffix(" bytes]")).is_some_and(|n| n.bytes().all(|b| b.is_ascii_digit() || b == b','));
+    let Some(c) = r["content"].as_str().filter(|c| !marker(c)) else { return false };
     r["content"] = format!("{ELIDED}{} bytes]", term::num(c.len() as u64)).into();
     true
 }
@@ -258,20 +255,17 @@ pub fn elide(hist: &mut [Value]) -> Vec<String> {
 
 /// 1 + the highest `h<N>` call id in `hist` (1 when none).
 pub fn next_h(hist: &[Value]) -> u32 {
-    let calls = hist.iter().filter(|r| r["t"] == "assistant").flat_map(|r| r["msg"]["tool_calls"].as_array().into_iter().flatten());
-    calls.filter_map(|c| c["id"].as_str()?.strip_prefix('h')?.parse::<u32>().ok()).max().map_or(1, |n| n.saturating_add(1))
+    calls(hist).filter_map(|c| c["id"].as_str()?.strip_prefix('h')?.parse::<u32>().ok()).max().map_or(1, |n| n.saturating_add(1))
 }
 
-/// One builder per record kind; each sets "t"; `write` adds "ts".
+/// One builder per record kind; each sets "t"; `write` adds "ts". Laid out by hand, one line per short builder, so the
+/// module reads as the record table.
+#[rustfmt::skip]
 pub mod rec {
     use crate::config::Config;
     use crate::types::{Call, Outcome, Usage};
     use serde_json::{Value, json};
     use std::path::Path;
-
-    fn usage(u: Usage) -> Value {
-        json!({"cached": u.cached, "in": u.input, "out": u.output})
-    }
 
     pub fn session(cfg: &Config, id: &str, cwd: &Path, resumed: Option<u64>) -> Value {
         let u = &cfg.url;
@@ -283,49 +277,26 @@ pub mod rec {
             "config_hash": cfg.hash, "allow_hash": null, "agents_hash": cfg.agents_hash, "project_agents_hash": null,
             "resumed": resumed.map(|b| json!({"from_bytes": b}))})
     }
-
-    pub fn user(content: &str) -> Value {
-        json!({"t": "user", "msg": {"content": content, "role": "user"}})
-    }
-
+    pub fn user(content: &str) -> Value { json!({"t": "user", "msg": {"content": content, "role": "user"}}) }
     /// "text" | "reasoning"; stdout only.
-    pub fn delta(reasoning: bool, text: &str) -> Value {
-        json!({"t": if reasoning { "reasoning" } else { "text" }, "delta": text})
-    }
-
+    pub fn delta(reasoning: bool, text: &str) -> Value { json!({"t": if reasoning { "reasoning" } else { "text" }, "delta": text}) }
     pub fn assistant(text: &str, calls: &[Call], finish: &str, u: Usage) -> Value {
         let calls: Vec<Value> = calls.iter().map(|c| with(json!({"args": c.args, "id": c.id, "name": c.name}), "raw", c.raw.as_deref())).collect();
         json!({"t": "assistant", "msg": {"content": text, "role": "assistant", "tool_calls": calls}, "finish": finish, "usage": usage(u)})
     }
-
-    pub fn ask(c: &Call, target: Option<&str>) -> Value {
-        with(json!({"t": "ask", "id": c.id, "name": c.name, "args": c.args}), "target", target)
-    }
-
-    pub fn approval(id: &str, verdict: &str) -> Value {
-        json!({"t": "approval", "id": id, "verdict": verdict})
-    }
-
+    pub fn ask(c: &Call, target: Option<&str>) -> Value { with(json!({"t": "ask", "id": c.id, "name": c.name, "args": c.args}), "target", target) }
+    pub fn approval(id: &str, verdict: &str) -> Value { json!({"t": "approval", "id": id, "verdict": verdict}) }
     pub fn tool_result(id: &str, name: &str, content: &str, is_error: bool, ms: u64, bytes: u64) -> Value {
         json!({"t": "tool_result", "id": id, "name": name, "content": content, "is_error": is_error, "ms": ms, "bytes": bytes})
     }
-
-    pub fn notice(text: &str) -> Value {
-        json!({"t": "notice", "text": text})
-    }
-
-    pub fn elide(ids: &[String]) -> Value {
-        json!({"t": "elide", "ids": ids})
-    }
-
+    pub fn notice(text: &str) -> Value { json!({"t": "notice", "text": text}) }
+    pub fn elide(ids: &[String]) -> Value { json!({"t": "elide", "ids": ids}) }
     pub fn turn_end(o: &Outcome, steps: u32, u: Usage) -> Value {
         with(json!({"t": "turn_end", "status": o.status(), "steps": steps, "usage": usage(u)}), "reason", o.reason())
     }
-
     pub fn result(o: &Outcome, text: &str, u: Usage, session: Option<&str>, steps: u32, duration_ms: u64) -> Value {
-        let tenths = duration_ms.saturating_add(50) / 100;
-        let v =
-            json!({"t": "result", "status": o.status(), "exit": o.exit(), "text": text, "usage": usage(u), "session": session, "steps": steps, "duration_s": tenths as f64 / 10.0});
+        let v = json!({"t": "result", "status": o.status(), "exit": o.exit(), "text": text, "usage": usage(u), "session": session, "steps": steps,
+            "duration_s": (duration_ms.saturating_add(50) / 100) as f64 / 10.0});
         let mut v = with(v, "reason", o.reason());
         match o {
             Outcome::Error { kind, message } => v["error"] = json!({"kind": kind, "message": message}),
@@ -334,16 +305,12 @@ pub mod rec {
         }
         v
     }
+    pub fn close(bytes: u64) -> Value { json!({"t": "close", "bytes": bytes}) }
 
-    pub fn close(bytes: u64) -> Value {
-        json!({"t": "close", "bytes": bytes})
-    }
-
+    fn usage(u: Usage) -> Value { json!({"cached": u.cached, "in": u.input, "out": u.output}) }
     /// `v` with the optional field `k` when it is given.
     fn with(mut v: Value, k: &str, x: Option<&str>) -> Value {
-        if let Some(x) = x {
-            v[k] = x.into();
-        }
+        if let Some(x) = x { v[k] = x.into() }
         v
     }
 }
