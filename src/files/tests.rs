@@ -6,7 +6,15 @@ use std::os::unix::fs::{MetadataExt, symlink};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicUsize;
 use std::sync::mpsc::channel;
+use std::sync::{Mutex, MutexGuard};
 use std::time::Duration;
+
+/// Held by the test that measures the peak memory and by every test that holds megabytes, so neither sees the other.
+static MEMORY: Mutex<()> = Mutex::new(());
+
+fn memory() -> MutexGuard<'static, ()> {
+    MEMORY.lock().unwrap_or_else(|e| e.into_inner())
+}
 
 /// A fresh project directory under the temp dir (as its realpath), removed when dropped.
 struct Tmp(PathBuf);
@@ -206,12 +214,23 @@ fn read_dir_lists() {
     tmp.file("a/inner.txt", "x");
     symlink(tmp.join("a"), tmp.join("link")).unwrap();
     assert_eq!(tmp.go("read", json!({"path": "."})), (".hidden\na/\nb.txt\nlink\n[directory, 4 entries]\n".into(), false));
-    // Sorted bytewise on the names: `a.txt` before the directory `a`, uppercase first.
+    // Sorted bytewise on the names: the directory `a` before `a.txt`, uppercase first.
     tmp.file("a.txt", "x");
     tmp.file("Z", "x");
     assert_eq!(tmp.go("read", json!({"path": "."})).0, ".hidden\nZ\na/\na.txt\nb.txt\nlink\n[directory, 6 entries]\n");
     fs::create_dir(tmp.join("empty")).unwrap();
     assert_eq!(tmp.go("read", json!({"path": "empty"})), ("[directory, 0 entries]\n".into(), false));
+}
+
+#[test]
+fn read_dir_newline_name() {
+    let tmp = Tmp::new();
+    tmp.file("d/a\nb", "x");
+    tmp.file("d/c", "x");
+    // One entry, one line: the newline is shown as `\n`, and the count and the paging agree.
+    assert_eq!(tmp.go("read", json!({"path": "d"})), ("a\\nb\nc\n[directory, 2 entries]\n".into(), false));
+    assert_eq!(tmp.go("read", json!({"path": "d", "limit": 1})), ("a\\nb\n[entries 1-1 shown of 2; continue with offset=2]\n".into(), false));
+    assert_eq!(tmp.go("read", json!({"path": "d", "offset": 2})), ("c\n[directory, 2 entries]\n".into(), false));
 }
 
 #[test]
@@ -230,6 +249,7 @@ fn read_dir_pages() {
 
 #[test]
 fn read_long_line_bounded() {
+    let _alone = memory();
     let tmp = Tmp::new();
     // Written in chunks, so making the file does not raise the peak the check below measures.
     let mut f = fs::File::create(tmp.join("long.txt")).unwrap();
@@ -258,6 +278,25 @@ fn write_atomic_created() {
 }
 
 #[test]
+fn write_new_mode_umask() {
+    let tmp = Tmp::new();
+    // References made the usual way in the same process: a file opened with mode 0644, a directory with 0777.
+    fs::OpenOptions::new().write(true).create_new(true).mode(0o644).open(tmp.join("ref.txt")).unwrap();
+    fs::create_dir(tmp.join("ref.d")).unwrap();
+    tmp.go("write", json!({"path": "new/new.txt", "content": "x"}));
+    assert_eq!(mode(&tmp.join("new/new.txt")), mode(&tmp.join("ref.txt")));
+    assert_eq!(mode(&tmp.join("new")), mode(&tmp.join("ref.d")));
+}
+
+#[test]
+fn write_temp_private_when_replacing() {
+    // While it replaces a file the temp holds the new bytes before the old mode is applied: only the owner may read it.
+    assert_eq!(temp_mode(true), 0o600);
+    // A new file is created as it will stay, 0644 less the umask.
+    assert_eq!(temp_mode(false), 0o644);
+}
+
+#[test]
 fn write_atomic_replaced() {
     let tmp = Tmp::new();
     let p = tmp.file("f.txt", "old content\n");
@@ -276,19 +315,19 @@ fn write_mode_kept() {
     fs::set_permissions(&p, fs::Permissions::from_mode(0o750)).unwrap();
     tmp.go("write", json!({"path": "run.sh", "content": "#!/bin/sh\necho hi\n"}));
     assert_eq!(mode(&p), 0o750);
-    fs::set_permissions(&p, fs::Permissions::from_mode(0o1640)).unwrap();
+    fs::set_permissions(&p, fs::Permissions::from_mode(0o640)).unwrap();
     tmp.go("edit", json!({"path": "run.sh", "old_text": "hi", "new_text": "ho"}));
-    assert_eq!(mode(&p), 0o1640);
+    assert_eq!(mode(&p), 0o640);
 }
 
 #[test]
 fn write_setuid_dropped() {
     let tmp = Tmp::new();
     let p = tmp.file("tool", "x");
-    for m in [0o4755, 0o2755, 0o6755] {
-        fs::set_permissions(&p, fs::Permissions::from_mode(m)).unwrap();
-        if mode(&p) != m {
-            continue; // the file system or the group does not keep this bit
+    // The sticky bit goes too: it means nothing on a file, and macOS refuses to set it on one.
+    for m in [0o4755, 0o2755, 0o6755, 0o1755] {
+        if fs::set_permissions(&p, fs::Permissions::from_mode(m)).is_err() || mode(&p) != m {
+            continue; // the system, the file system or the group does not keep this bit
         }
         tmp.go("write", json!({"path": "tool", "content": "y"}));
         assert_eq!(mode(&p), 0o755, "from {m:o}");
@@ -327,6 +366,20 @@ fn write_parent_swap() {
     symlink(tmp.join("d.moved"), tmp.join("d.old")).unwrap();
     assert!(run(&c, &t, 16_384).end == End::File { failed: true });
     assert_eq!(fs::read(tmp.join("d.moved/f.txt")).unwrap(), b"old");
+}
+
+#[test]
+fn write_long_name() {
+    let tmp = Tmp::new();
+    // The longest name a file system takes; the temp beside it must still fit.
+    let name = "n".repeat(255);
+    assert_eq!(tmp.go("write", json!({"path": name, "content": "x"})), (format!("wrote 1 bytes to {name} (created)"), false));
+    assert!(!tmp.go("write", json!({"path": name, "content": "y"})).1);
+    assert_eq!(fs::read(tmp.join(&name)).unwrap(), b"y");
+    // Cut on a character boundary (a cut through `é` is no valid name on macOS).
+    let wide = format!("a{}", "é".repeat(127));
+    assert!(!tmp.go("write", json!({"path": wide, "content": "z"})).1);
+    assert!(tmp.temps(".").is_empty(), "{:?}", tmp.temps("."));
 }
 
 #[test]
@@ -409,6 +462,63 @@ fn edit_crlf_both() {
 }
 
 #[test]
+fn edit_crlf_keeps_crlf_new_text() {
+    let tmp = Tmp::new();
+    // new_text already in CRLF: no `\r\r\n`.
+    let p = tmp.file("w.txt", "one\r\ntwo\r\n");
+    assert_eq!(tmp.go("edit", json!({"path": "w.txt", "old_text": "one\ntwo", "new_text": "1\r\n2"})), ("edited w.txt: lines 1-2 (2) -> 2 lines".into(), false));
+    assert_eq!(fs::read(&p).unwrap(), b"1\r\n2\r\n");
+    // old_text with mixed endings matches a CRLF file.
+    let p = tmp.file("m.txt", "a\r\nb\r\nc\r\n");
+    assert_eq!(tmp.go("edit", json!({"path": "m.txt", "old_text": "a\r\nb\nc", "new_text": "x\ny"})), ("edited m.txt: lines 1-3 (3) -> 2 lines".into(), false));
+    assert_eq!(fs::read(&p).unwrap(), b"x\r\ny\r\n");
+    // An LF file is never converted.
+    let p = tmp.file("u.txt", "a\nb\n");
+    assert_eq!(tmp.go("edit", json!({"path": "u.txt", "old_text": "a\r\nb", "new_text": "c"})).0, "old_text not found in u.txt");
+    assert_eq!(fs::read(&p).unwrap(), b"a\nb\n");
+}
+
+#[test]
+fn edit_large_file_bounded() {
+    let _alone = memory();
+    let tmp = Tmp::new();
+    // One byte over the limit: refused before a byte is read, however big the file.
+    let p = tmp.file("big.log", "needle\n");
+    for len in [EDIT_MAX + 1, 1 << 30] {
+        fs::OpenOptions::new().write(true).open(&p).unwrap().set_len(len).unwrap();
+        let t0 = Instant::now();
+        let (text, failed) = tmp.go("edit", json!({"path": "big.log", "old_text": "needle", "new_text": "pin"}));
+        assert_eq!((text, failed), (format!("big.log is {} bytes; edit takes files up to 8 MiB; use the shell", num(len)), true));
+        assert!(t0.elapsed() < Duration::from_secs(1), "{:?}", t0.elapsed());
+    }
+    // At the limit it works, and bytes outside the span stay.
+    fs::OpenOptions::new().write(true).open(&p).unwrap().set_len(EDIT_MAX).unwrap();
+    assert_eq!(tmp.go("edit", json!({"path": "big.log", "old_text": "needle", "new_text": "pin"})), ("edited big.log: lines 1-1 (1) -> 1 lines".into(), false));
+    let f = fs::File::open(&p).unwrap();
+    assert_eq!(f.metadata().unwrap().len(), EDIT_MAX - 3);
+    let mut head = [0; 8];
+    f.take(8).read_exact(&mut head).unwrap();
+    assert_eq!(&head, b"pin\n\0\0\0\0");
+}
+
+#[test]
+fn edit_swapped_symlink_refused() {
+    let tmp = Tmp::new();
+    tmp.file("f.txt", "public = 1\n");
+    let secret = tmp.file("secret", "token = abc\npublic = 1\n");
+    let (c, t) = tmp.prepare("edit", json!({"path": "f.txt", "old_text": "public = 1", "new_text": "public = 2"}));
+    // After the target was shown, the file is swapped for a symlink to another file.
+    fs::remove_file(tmp.join("f.txt")).unwrap();
+    symlink(&secret, tmp.join("f.txt")).unwrap();
+    let out = run(&c, &t, 16_384);
+    assert_eq!(out.end, End::File { failed: true });
+    assert!(out.text.starts_with("f.txt: "), "{}", out.text);
+    assert!(fs::symlink_metadata(tmp.join("f.txt")).unwrap().file_type().is_symlink());
+    assert_eq!(fs::read(&secret).unwrap(), b"token = abc\npublic = 1\n");
+    assert!(tmp.temps(".").is_empty());
+}
+
+#[test]
 fn edit_keeps_invalid_utf8() {
     let tmp = Tmp::new();
     let p = tmp.file("latin1.ini", b"caf\xe9 = 1\nother = 2");
@@ -424,6 +534,26 @@ fn edit_result_lines() {
     assert_eq!(r, ("edited f.txt: lines 42-44 (3) -> 5 lines".into(), false));
     // A deleted span: no lines of new text.
     assert_eq!(tmp.go("edit", json!({"path": "f.txt", "old_text": "line 1\n", "new_text": ""})).0, "edited f.txt: lines 1-1 (1) -> 0 lines");
+}
+
+#[test]
+fn read_number_forms() {
+    // Counts and sizes have thousands separators; line numbers and offsets are positions the model sends back as
+    // `offset`, so they stay plain digits.
+    let tmp = Tmp::new();
+    tmp.file("n.txt", numbered(3_000));
+    let (text, _) = tmp.go("read", json!({"path": "n.txt", "offset": 1001, "limit": 1500}));
+    assert!(text.ends_with("line 2500\n[lines 1001-2500 shown; file is 28,893 bytes; continue with offset=2501]\n"), "{}", &text[text.len() - 100..]);
+    assert_eq!(tmp.go("read", json!({"path": "n.txt", "offset": 5000})), ("offset 5000 is past the end (file has 3,000 lines)".into(), true));
+    let old: String = (1234..=2533).map(|i| format!("line {i}\n")).collect();
+    let new: String = (1..=2000).map(|i| format!("new {i}\n")).collect();
+    assert_eq!(tmp.go("edit", json!({"path": "n.txt", "old_text": old, "new_text": new})), ("edited n.txt: lines 1234-2533 (1,300) -> 2,000 lines".into(), false));
+    for i in 1..=1001 {
+        tmp.file(&format!("d/{i:04}"), "");
+    }
+    assert!(tmp.go("read", json!({"path": "d", "limit": 1000})).0.ends_with("1000\n[entries 1-1000 shown of 1,001; continue with offset=1001]\n"));
+    assert!(tmp.go("read", json!({"path": "d", "offset": 1001})).0.ends_with("1001\n[directory, 1,001 entries]\n"));
+    assert_eq!(tmp.go("read", json!({"path": "d", "offset": 1002})).0, "offset 1002 is past the end (directory has 1,001 entries)");
 }
 
 #[test]
@@ -452,4 +582,89 @@ fn start_sends_one_event() {
     let Ev::Tool { tag, out } = rx.recv_timeout(Duration::from_secs(5)).unwrap() else { panic!() };
     assert_eq!((tag, out.text.as_str(), out.end), (42, "hi\n", End::File { failed: false }));
     assert!(rx.recv_timeout(Duration::from_millis(100)).is_err());
+}
+
+/// xorshift64: the same inputs on every run.
+struct Rng(u64);
+
+impl Rng {
+    fn next(&mut self) -> u64 {
+        self.0 ^= self.0 << 13;
+        self.0 ^= self.0 >> 7;
+        self.0 ^= self.0 << 17;
+        self.0
+    }
+    fn below(&mut self, n: u64) -> u64 {
+        self.next() % n
+    }
+}
+
+/// Reads `name` page by page, following each paging hint, and checks every page: not empty, within its bounds, and
+/// moving on. Returns the pages' text without the hints and trailers, or the single message a read gave.
+fn follow(tmp: &Tmp, name: &str, limit: u64, cap: usize) -> String {
+    let (mut all, mut offset) = (String::new(), 1);
+    loop {
+        let (text, failed) = tmp.go_cap("read", json!({"path": name, "offset": offset, "limit": limit}), cap);
+        if failed || text == "(empty file)" {
+            assert_eq!(offset, 1, "{text}");
+            return text;
+        }
+        // U+FFFD takes three bytes for one; the cut marker, the hint and the trailer are short.
+        assert!(text.len() <= 3 * READ_MAX.min(cap) + 200, "{} bytes from cap {cap}", text.len());
+        let body: String = text.split_inclusive('\n').take_while(|l| !l.starts_with("[lines ") && !l.starts_with("[invalid UTF-8")).collect();
+        assert!(!body.is_empty(), "an empty page at offset {offset}");
+        all.push_str(&body);
+        let Some(hint) = text.split("; continue with offset=").nth(1) else { return all };
+        let next: u64 = hint.split(']').next().unwrap().parse().unwrap();
+        assert!(next > offset && next <= offset + limit, "offset {offset} -> {next}");
+        offset = next;
+    }
+}
+
+#[test]
+fn read_pages_roundtrip() {
+    let tmp = Tmp::new();
+    let mut rng = Rng(0x9E37_79B9_7F4A_7C15);
+    for i in 0..300 {
+        // Lines shorter than the page, so nothing is cut and the pages give the file back.
+        let lines: Vec<String> = (0..rng.below(400)).map(|_| (0..rng.below(300)).map(|_| char::from(b'a' + rng.below(26) as u8)).collect()).collect();
+        let mut text = lines.join("\n");
+        if !lines.is_empty() && rng.below(2) == 0 {
+            text.push('\n');
+        }
+        let name = format!("f{i}.txt");
+        tmp.file(&name, &text);
+        let (limit, cap) = (1 + rng.below(60), 302 + rng.below(3_000) as usize);
+        let got = follow(&tmp, &name, limit, cap);
+        // Every line comes back with its newline, the last one too.
+        let want = if text.is_empty() {
+            "(empty file)".into()
+        } else if text.ends_with('\n') {
+            text
+        } else {
+            text + "\n"
+        };
+        assert_eq!(got, want, "limit {limit} cap {cap}");
+    }
+}
+
+#[test]
+fn read_pager_never_panics() {
+    let tmp = Tmp::new();
+    let mut rng = Rng(0x2545_F491_4F6C_DD1D);
+    let bytes = [b'a', b'b', b' ', b'\n', b'\n', b'\r', 0xC3, 0xA9, 0xFF, 0xE2, 0x82, 0xAC, 0xF0];
+    for i in 0..300 {
+        let mut data: Vec<u8> = (0..rng.below(6_000)).map(|_| bytes[rng.below(bytes.len() as u64) as usize]).collect();
+        if rng.below(10) == 0 {
+            data.push(0);
+        }
+        let name = format!("r{i}.bin");
+        tmp.file(&name, &data);
+        let (limit, cap) = (1 + rng.below(40), rng.below(2_000) as usize);
+        follow(&tmp, &name, limit, cap);
+        // Any offset gives a page, the past-the-end message or the binary refusal; never a panic.
+        let offset = 1 + rng.below(200);
+        let (text, _) = tmp.go_cap("read", json!({"path": name, "offset": offset, "limit": limit}), cap);
+        assert!(!text.is_empty());
+    }
 }

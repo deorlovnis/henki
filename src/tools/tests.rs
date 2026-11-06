@@ -103,6 +103,16 @@ fn string_too_big() {
     c.raw = Some(format!("{{\"command\": \"{}\"}}", "x".repeat(ARGS_MAX)));
     validate(&mut c, &ALL);
     assert_eq!(c.error.unwrap(), "arguments over 1 MiB; not run");
+    // The size is checked before the JSON: an oversized string that is not JSON either gets the size error.
+    let mut c = call("shell", json!({}));
+    c.raw = Some(format!("{{\"command\": \"{}", "x".repeat(ARGS_MAX)));
+    validate(&mut c, &ALL);
+    assert_eq!(c.error.unwrap(), "arguments over 1 MiB; not run");
+    // Exactly at the limit, the JSON check applies.
+    let mut c = call("shell", json!({}));
+    c.raw = Some(format!("[{}", " ".repeat(ARGS_MAX - 1)));
+    validate(&mut c, &ALL);
+    assert!(c.error.unwrap().starts_with("arguments are not valid JSON (line 1 col "));
 }
 
 #[test]
@@ -268,6 +278,37 @@ fn write_protected_realpath() {
 }
 
 #[test]
+fn write_protected_missing_through_symlink() {
+    // HOME is reached through a symlink, and the config dir under it does not exist yet.
+    let tmp = Tmp::new();
+    fs::create_dir_all(tmp.join("data/home/u")).unwrap();
+    symlink(tmp.join("data/home"), tmp.join("home")).unwrap();
+    let home = tmp.join("home/u");
+    let protected = [home.join(".config/henki")];
+    let cx = Ctx { cwd: &home, root: &home, home: &home, protected: &protected };
+    let msg = |p: &str| format!("protected: {p} is henki's own file; change it through shell so the user sees it");
+    // `..` from the real home dir (data/home/u) leads to data: the last one names the dir by its real path.
+    for p in ["~/.config/henki/config.toml", "~/.config/henki", "../../home/u/.config/henki/allow"] {
+        assert_eq!(target(p, true, &cx).err().unwrap(), msg(p));
+    }
+    // A sibling is not protected.
+    assert!(target("~/.config/other/x", true, &cx).is_ok());
+}
+
+#[test]
+fn string_symlink_loop() {
+    let tmp = Tmp::new();
+    symlink(tmp.join("l2"), tmp.join("l1")).unwrap();
+    symlink(tmp.join("l1"), tmp.join("l2")).unwrap();
+    for write in [true, false] {
+        assert_eq!(target("l1", write, &tmp.ctx(&[])).err().unwrap(), "l1: Too many levels of symbolic links");
+    }
+    // A link that leads nowhere is still a dangling symlink.
+    symlink(tmp.join("gone/x"), tmp.join("l3")).unwrap();
+    assert_eq!(tmp.write("l3").err().unwrap(), format!("dangling symlink: l3 -> {}", tmp.join("gone/x").display()));
+}
+
+#[test]
 fn read_refuses_proc() {
     let tmp = Tmp::new();
     if cfg!(target_os = "linux") {
@@ -422,4 +463,117 @@ fn cap_window_half() {
     assert_eq!(cap(16_384, 8_192), 4_096);
     assert_eq!(cap(16_384, 16_385), 8_192);
     assert_eq!(cap(1_000, 1 << 40), 1_000);
+}
+
+/// xorshift64: the same inputs on every run.
+struct Rng(u64);
+
+impl Rng {
+    fn next(&mut self) -> u64 {
+        self.0 ^= self.0 << 13;
+        self.0 ^= self.0 >> 7;
+        self.0 ^= self.0 << 17;
+        self.0
+    }
+    fn pick<'a, T>(&mut self, xs: &'a [T]) -> &'a T {
+        &xs[(self.next() % xs.len() as u64) as usize]
+    }
+}
+
+#[test]
+fn validate_never_panics() {
+    let mut rng = Rng(0x9E37_79B9_7F4A_7C15);
+    let values = [
+        json!(0),
+        json!(-1),
+        json!(1),
+        json!(600),
+        json!(601),
+        json!(1.5),
+        json!(2.0),
+        json!(-0.0),
+        json!(1e300),
+        json!(u64::MAX),
+        json!(i64::MIN),
+        json!("12"),
+        json!("0"),
+        json!("-5"),
+        json!(""),
+        json!("abc"),
+        json!("99999999999999999999999"),
+        json!("1e3"),
+        json!(" 7"),
+        Value::Null,
+        json!(true),
+        json!([]),
+        json!({}),
+        json!([1]),
+    ];
+    let keys = ["path", "command", "content", "old_text", "new_text", "timeout", "offset", "limit", "junk"];
+    let names = ["shell", "read", "write", "edit", "grep", "", "Shell"];
+    let sets: [&[&'static str]; 4] = [&ALL, &["read"], &["shell", "edit"], &[]];
+    let bits = ["{", "}", "[", "]", "\"path\"", "\"x\"", ":", ",", "1", "-", ".5", "é", "\n", "\\", "\"", "\u{0}", " ", "null", "\u{1F600}"];
+    for _ in 0..10_000 {
+        let args = if rng.next().is_multiple_of(8) {
+            rng.pick(&values).clone()
+        } else {
+            let n = rng.next() % 6;
+            Value::Object((0..n).map(|_| (rng.pick(&keys).to_string(), rng.pick(&values).clone())).collect())
+        };
+        let mut c = call(rng.pick::<&str>(&names), args);
+        if rng.next().is_multiple_of(4) {
+            let n = rng.next() % 300;
+            c.raw = Some((0..n).map(|_| *rng.pick(&bits)).collect());
+        }
+        let enabled = *rng.pick(&sets);
+        validate(&mut c, enabled);
+        let Some(e) = &c.error else {
+            // Accepted: an enabled tool, its strings present, every integer field normalized.
+            let (_, strings, ints) = ARGS.iter().find(|a| a.0 == c.name).unwrap();
+            assert!(enabled.contains(&c.name.as_str()) && c.raw.as_deref().is_none_or(|r| serde_json::from_str::<Value>(r).is_ok()), "{c:?}");
+            assert!(strings.iter().all(|k| c.args[k].is_string()), "{c:?}");
+            for k in *ints {
+                let v = &c.args[k];
+                assert!(v.is_null() || v.as_u64().is_some_and(|n| n >= 1 && (*k != "timeout" || n <= 600)), "{c:?}");
+            }
+            continue;
+        };
+        let known = ["unknown tool ", "arguments over 1 MiB", "arguments are not valid JSON (line ", "arguments must be a JSON object with: ", "missing string argument \""];
+        assert!(known.iter().any(|k| e.starts_with(k)) || e.ends_with("\" must be an integer"), "{e}");
+    }
+}
+
+#[test]
+fn target_never_panics() {
+    let tmp = Tmp::new();
+    tmp.file("f", "x");
+    fs::create_dir_all(tmp.join("d/e")).unwrap();
+    symlink(tmp.join("l2"), tmp.join("l1")).unwrap();
+    symlink(tmp.join("l1"), tmp.join("l2")).unwrap();
+    symlink("/nonexistent-henki-target", tmp.join("dl")).unwrap();
+    symlink("/proc/self", tmp.join("pl")).unwrap();
+    symlink("..", tmp.join("up")).unwrap();
+    symlink(tmp.join("d"), tmp.join("dlink")).unwrap();
+    let protected = [tmp.join("d"), tmp.join("prot/henki")];
+    let cx = tmp.ctx(&protected);
+    let long = "a".repeat(300);
+    let bits = ["~", "~/", ".", "..", "", "f", "d", "e", "l1", "dl", "pl", "up", "dlink", "prot", "henki", "x", "é", "a\0b", "/proc", "/dev", "/sys", "/tmp", long.as_str()];
+    let mut rng = Rng(0x2545_F491_4F6C_DD1D);
+    for _ in 0..10_000 {
+        let n = 1 + rng.next() % 6;
+        let mut path = (0..n).map(|_| *rng.pick(&bits)).collect::<Vec<_>>().join("/");
+        if rng.next().is_multiple_of(5) {
+            path.insert(0, '/');
+        }
+        let write = rng.next().is_multiple_of(2);
+        let Ok(t) = target(&path, write, &cx) else { continue };
+        for d in ["/proc", "/sys", "/dev"] {
+            assert!(!t.path.starts_with(d), "{path:?} -> {}", t.path.display());
+        }
+        if write {
+            assert!(!t.name.is_empty() && t.missing.iter().all(|m| m != "." && m != ".."), "{path:?}");
+            assert!(!t.path.starts_with(tmp.join("d")) && !t.path.starts_with(tmp.join("prot/henki")), "{path:?} -> {}", t.path.display());
+            assert_eq!(t.path, t.base.join(t.missing.iter().collect::<PathBuf>()).join(&t.name), "{path:?}");
+        }
+    }
 }

@@ -41,7 +41,8 @@ fn check(c: &mut Call, enabled: &[&'static str]) -> Result<(), String> {
     let Some(&(_, strings, ints)) = ARGS.iter().find(|a| a.0 == c.name && enabled.contains(&a.0)) else {
         return Err(format!("unknown tool {}; available: {}", c.name, enabled.join(", ")));
     };
-    match c.raw.as_deref().map(|r| (r, serde_json::from_str::<Value>(r).err())) {
+    // The size first: an argument string over the limit is never parsed.
+    match c.raw.as_deref().map(|r| (r, (r.len() <= ARGS_MAX).then(|| serde_json::from_str::<Value>(r).err()).flatten())) {
         Some((r, _)) if r.len() > ARGS_MAX => return Err("arguments over 1 MiB; not run".into()),
         Some((r, Some(e))) => {
             return Err(format!("arguments are not valid JSON (line {} col {}): {}", e.line(), e.column(), r.get(..r.floor_char_boundary(200)).unwrap_or_default()));
@@ -109,8 +110,8 @@ pub fn target(path: &str, write: bool, cx: &Ctx) -> Result<Target, String> {
         }
     };
     let real = fs::canonicalize(at).map_err(|e| match fs::read_link(at) {
-        Ok(to) => format!("dangling symlink: {path} -> {}", to.display()),
-        Err(_) => fail(e),
+        Ok(to) if e.kind() == io::ErrorKind::NotFound => format!("dangling symlink: {path} -> {}", to.display()),
+        _ => fail(e),
     })?;
     let mut resolved = real.clone();
     resolved.extend(missing.iter().rev());
@@ -121,7 +122,10 @@ pub fn target(path: &str, write: bool, cx: &Ctx) -> Result<Target, String> {
     if write && missing.is_empty() && !meta.is_file() {
         return Err(not_regular(path, meta.file_type()));
     }
-    if write && cx.protected.iter().any(|p| resolved.starts_with(p) || fs::canonicalize(p).is_ok_and(|r| resolved.starts_with(r))) {
+    // Each protected path is resolved as a target is (realpath of its nearest existing ancestor, then the rest), so one
+    // that does not exist yet still matches when it is named through a symlink.
+    let resolve = |p: &Path| p.ancestors().find_map(|a| Some(fs::canonicalize(a).ok()?.join(p.strip_prefix(a).ok()?)));
+    if write && cx.protected.iter().filter_map(|p| resolve(p)).any(|p| resolved.starts_with(p)) {
         return Err(format!("protected: {path} is henki's own file; change it through shell so the user sees it"));
     }
     let root = fs::canonicalize(cx.root).unwrap_or_else(|_| cx.root.to_path_buf());
@@ -164,10 +168,7 @@ pub fn result_text(name: &str, out: &ToolOutput, killed: Option<&Killed>) -> (St
     if name != "shell" {
         return (out.text.clone(), err);
     }
-    let foot = match killed {
-        Some(k) => format!("[{}; process group killed]", why(k)),
-        None => format!("[{}]", ended(out, err)),
-    };
+    let foot = format!("[{}{}]", ended(Some(out), killed, err), if killed.is_some() { "; process group killed" } else { "" });
     let text = match (out.text.as_str(), killed) {
         ("", Some(_)) => foot,
         ("", None) => format!("(no output)\n{foot}"),
@@ -176,22 +177,17 @@ pub fn result_text(name: &str, out: &ToolOutput, killed: Option<&Killed>) -> (St
     (text, err)
 }
 
-/// `timed out after 120 s` or `interrupted`.
-fn why(k: &Killed) -> String {
-    match k {
-        Killed::Timeout(s) => format!("timed out after {} s", term::num(*s)),
-        Killed::Interrupted => "interrupted".into(),
+/// How a call ended: `timed out after 120 s`, `interrupted`, `exit 1, 2.4 s`, `killed by signal 9, 2.4 s`, for a file
+/// call `ok, 0.0 s` or `error, 0.0 s`, and for a call with no output to report (it never ran) `ok` or `error`.
+fn ended(out: Option<&ToolOutput>, killed: Option<&Killed>, err: bool) -> String {
+    let time = out.map_or(String::new(), |o| format!(", {} s", term::secs(o.ms)));
+    match (killed, out.map(|o| o.end)) {
+        (Some(Killed::Timeout(s)), _) => format!("timed out after {} s", term::num(*s)),
+        (Some(Killed::Interrupted), _) => "interrupted".into(),
+        (None, Some(End::Exit(c))) => format!("exit {c}{time}"),
+        (None, Some(End::Signal(s))) => format!("killed by signal {s}{time}"),
+        _ => format!("{}{time}", if err { "error" } else { "ok" }),
     }
-}
-
-/// `exit 1, 2.4 s`, `killed by signal 9, 2.4 s`; for a file call `ok, 0.0 s` or `error, 0.0 s`.
-fn ended(out: &ToolOutput, err: bool) -> String {
-    let how = match out.end {
-        End::Exit(c) => format!("exit {c}"),
-        End::Signal(s) => format!("killed by signal {s}"),
-        End::File { .. } => (if err { "error" } else { "ok" }).into(),
-    };
-    format!("{how}, {} s", term::secs(out.ms))
 }
 
 /// `[not started: ENOENT bash]`.
@@ -208,12 +204,7 @@ pub fn call_line(c: &Call, out: Option<&ToolOutput>, killed: Option<&Killed>, is
         (name, _, Some(p)) => format!("{name} {p}"),
         (name, ..) => name.to_string(),
     };
-    let tail = match (killed, out) {
-        (Some(k), _) => why(k),
-        (None, Some(o)) => ended(o, is_error),
-        (None, None) => (if is_error { "error" } else { "ok" }).into(),
-    };
-    format!("{head} -> {tail}")
+    format!("{head} -> {}", ended(out, killed, is_error))
 }
 
 /// min(output_cap, window / 2) bytes.

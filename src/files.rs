@@ -6,19 +6,19 @@ use crate::tools::{self, READ_MAX, Target};
 use crate::types::{Call, End, Ev, ToolOutput};
 use std::ffi::OsString;
 use std::io::{self, BufRead, BufReader, Cursor, Read, Write};
-use std::os::unix::{ffi::OsStrExt, fs::PermissionsExt};
+use std::os::unix::{ffi::OsStrExt, fs::OpenOptionsExt, fs::PermissionsExt};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::mpsc::Sender;
 use std::time::Instant;
 use std::{fs, thread};
 
+/// The largest file `edit` takes: it holds the whole file while it works.
+const EDIT_MAX: u64 = 8 << 20;
+
 /// Starts the worker for one validated file call; it sends exactly one `Ev::Tool { tag, .. }`.
 pub fn start(c: Call, t: Target, cap: usize, tag: u32, tx: &Sender<Ev>) {
     let worker = tx.clone();
-    let spawned = thread::Builder::new().name("file".into()).spawn(move || {
-        let _ = worker.send(Ev::Tool { tag, out: run(&c, &t, cap) });
-    });
-    if let Err(e) = spawned {
+    if let Err(e) = thread::Builder::new().name("file".into()).spawn(move || worker.send(Ev::Tool { tag, out: run(&c, &t, cap) })) {
         let text = format!("not started: {e}");
         let _ = tx.send(Ev::Tool { tag, out: ToolOutput { bytes: text.len() as u64, text, ms: 0, end: End::File { failed: true } } });
     }
@@ -46,10 +46,12 @@ fn read(p: &str, t: &Target, offset: u64, limit: u64, max: usize) -> Result<Stri
     let (dir, mut total) = (m.is_dir(), m.len());
     let (what, unit) = if dir { ("directory", "entries") } else { ("file", "lines") };
     let mut r: Box<dyn BufRead> = if dir {
-        let mut names: Vec<_> = fs::read_dir(&t.path).map_err(fail)?.flatten().map(|e| (e.file_name(), e.file_type().is_ok_and(|t| t.is_dir()))).collect();
+        // One entry per line: a newline inside a name is shown as `\n`.
+        let entry = |e: fs::DirEntry| (e.file_name().as_bytes().split(|&b| b == b'\n').collect::<Vec<_>>().join(&b"\\n"[..]), e.file_type().is_ok_and(|t| t.is_dir()));
+        let mut names: Vec<_> = fs::read_dir(&t.path).map_err(fail)?.flatten().map(entry).collect();
         names.sort();
         total = names.len() as u64;
-        let list: Vec<u8> = names.iter().flat_map(|(n, d)| [n.as_bytes(), if *d { &b"/\n"[..] } else { b"\n" }]).flatten().copied().collect();
+        let list: Vec<u8> = names.iter().flat_map(|(n, d)| [&n[..], if *d { &b"/\n"[..] } else { b"\n" }]).flatten().copied().collect();
         Box::new(Cursor::new(list))
     } else if m.is_file() {
         Box::new(BufReader::with_capacity(64 << 10, f))
@@ -129,22 +131,28 @@ fn line(r: &mut dyn BufRead, keep: usize, out: &mut Vec<u8>) -> io::Result<Optio
 }
 
 /// Bytes, one exact span: `old_text` must occur exactly once (overlapping matches count); with no match, a `\n` in it
-/// and `\r\n` in the file, both texts are matched again in CRLF form. Nothing outside the span changes.
+/// and `\r\n` in the file, both texts are matched again with every line ending as `\r\n`. Nothing outside the span
+/// changes. The file is opened without following a symlink: one swapped in since the target was resolved is refused.
 fn edit(p: &str, t: &Target, old: &str, new: &str) -> Result<String, String> {
     if old.is_empty() {
         return Err("old_text is empty".into());
     }
     let fail = tools::io_error(p);
-    let (mut f, m) = sys::open_read(&t.path).map_err(fail)?;
+    let f = fs::OpenOptions::new().read(true).custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_NOCTTY).open(&t.path).map_err(fail)?;
+    let m = f.metadata().map_err(fail)?;
     if !m.is_file() {
         return Err(tools::not_regular(p, m.file_type()));
     }
     let mut data = Vec::new();
-    f.read_to_end(&mut data).map_err(fail)?;
+    // One byte past the limit is read, so a file that grew since the stat is refused too, never cut short.
+    if m.len() > EDIT_MAX || f.take(EDIT_MAX + 1).read_to_end(&mut data).map_err(fail)? as u64 > EDIT_MAX {
+        return Err(format!("{p} is {} bytes; edit takes files up to 8 MiB; use the shell", num(m.len().max(data.len() as u64))));
+    }
     let (mut old, mut new) = (old.to_string(), new.to_string());
     let mut found = find(&data, old.as_bytes());
     if found.1 == 0 && old.contains('\n') && find(&data, b"\r\n").1 > 0 {
-        (old, new) = (old.replace('\n', "\r\n"), new.replace('\n', "\r\n"));
+        let crlf = |s: &str| s.replace("\r\n", "\n").replace('\n', "\r\n");
+        (old, new) = (crlf(&old), crlf(&new));
         found = find(&data, old.as_bytes());
     }
     let at = match found {
@@ -156,7 +164,7 @@ fn edit(p: &str, t: &Target, old: &str, new: &str) -> Result<String, String> {
     data.splice(at..at + old.len(), new.bytes());
     put(p, t, &data)?;
     let (o, n) = (lines(old.as_bytes()), lines(new.as_bytes()));
-    Ok(format!("edited {p}: lines {first}-{} ({o}) -> {n} lines", first + o - 1))
+    Ok(format!("edited {p}: lines {first}-{} ({}) -> {} lines", first + o - 1, num(o as u64), num(n as u64)))
 }
 
 /// The first match of `needle` (not empty) in `hay` and the number of matches, overlapping ones included.
@@ -172,8 +180,9 @@ fn lines(b: &[u8]) -> usize {
 }
 
 /// The atomic write through the directory's descriptor: missing parents made, the temp `.NAME.henki-PID-N` created
-/// beside the target, written, synced, given the old mode without setuid and setgid, and renamed over the name; the temp
-/// is unlinked on every error path. A symlink stays a symlink, because the target is already resolved.
+/// beside the target (NAME cut to 100 bytes, so a long name still fits), written, synced, given the old mode without
+/// setuid, setgid and sticky bits, and renamed over the name; the temp is unlinked on every error path. A symlink stays a
+/// symlink, because the target is already resolved.
 fn put(p: &str, t: &Target, data: &[u8]) -> Result<(), String> {
     static N: AtomicU32 = AtomicU32::new(0);
     let fail = tools::io_error(p);
@@ -184,15 +193,14 @@ fn put(p: &str, t: &Target, data: &[u8]) -> Result<(), String> {
     for m in &t.missing {
         dir = dir.sub(m, true).map_err(fail)?;
     }
-    let mut tmp = OsString::from(".");
-    tmp.push(&t.name);
-    tmp.push(format!(".henki-{}-{}", std::process::id(), N.fetch_add(1, Ordering::Relaxed)));
-    let mut f = dir.create(&tmp, if t.mode.is_some() { 0o600 } else { 0o644 }).map_err(fail)?;
+    let name = t.name.to_string_lossy();
+    let tmp = OsString::from(format!(".{}.henki-{}-{}", name.get(..name.floor_char_boundary(100)).unwrap_or_default(), std::process::id(), N.fetch_add(1, Ordering::Relaxed)));
+    let mut f = dir.create(&tmp, temp_mode(t.mode.is_some())).map_err(fail)?;
     let r = (|| {
         f.write_all(data)?;
         f.sync_all()?;
         if let Some(mode) = t.mode {
-            f.set_permissions(fs::Permissions::from_mode(mode & 0o1777))?;
+            f.set_permissions(fs::Permissions::from_mode(mode & 0o777))?;
         }
         dir.rename(&tmp, &t.name)
     })();
@@ -200,6 +208,12 @@ fn put(p: &str, t: &Target, data: &[u8]) -> Result<(), String> {
         dir.unlink(&tmp);
     }
     r.map_err(fail)
+}
+
+/// The temp's mode: private while it replaces a file (the old mode is applied after the write), 0644 for a new file so
+/// the umask applies.
+fn temp_mode(replacing: bool) -> u32 {
+    if replacing { 0o600 } else { 0o644 }
 }
 
 #[cfg(test)]
