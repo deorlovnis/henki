@@ -309,19 +309,23 @@ fn e2e_proxy_env_ignored() {
 #[test]
 fn e2e_localhost_v6_first() {
     use std::net::ToSocketAddrs;
-    let addrs: Vec<std::net::SocketAddr> = ("localhost", 1).to_socket_addrs().map(Iterator::collect).unwrap_or_default();
-    let (v4, v6) = (addrs.iter().any(|a| a.is_ipv4()), addrs.iter().any(|a| a.is_ipv6()));
-    if !(v4 && v6) || std::net::TcpListener::bind("[::1]:0").is_err() {
-        println!("skipped: localhost does not resolve to both ::1 and 127.0.0.1 here ({addrs:?})");
+    if std::net::TcpListener::bind("[::1]:0").is_err() {
+        println!("skipped: ::1 is absent here");
         return;
     }
-    let last = *addrs.last().unwrap();
-    let bind = if last.is_ipv6() { "[::1]:0" } else { "127.0.0.1:0" };
+    let addrs: Vec<std::net::SocketAddr> = ("localhost", 1).to_socket_addrs().map(Iterator::collect).unwrap_or_default();
+    let both = addrs.iter().any(|a| a.is_ipv4()) && addrs.iter().any(|a| a.is_ipv6());
+    // With both families, the mock listens on the one resolved last, so henki must get past the first; else on ::1.
+    let (bind, host) = match addrs.last() {
+        Some(a) if both && a.is_ipv4() => ("127.0.0.1:0", "localhost"),
+        _ if both => ("[::1]:0", "localhost"),
+        _ => ("[::1]:0", "[::1]"),
+    };
     let m = Mock::start_at(bind.parse().unwrap(), vec![say("found it")]).unwrap();
-    let r = Run::new(&format!("http://localhost:{}/v1", m.port()));
+    let r = Run::new(&format!("http://{host}:{}/v1", m.port()));
     let d = r.json("hello");
     d.finish();
-    assert_eq!((d.code, m.log().len()), (Some(0), 1), "henki must try every address\n{}", d.diag());
+    assert_eq!((d.code, m.log().len()), (Some(0), 1), "{host} ({addrs:?}) on {bind}\n{}", d.diag());
 }
 
 #[test]
