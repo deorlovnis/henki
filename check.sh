@@ -1,36 +1,46 @@
 #!/usr/bin/env bash
 # Everything a change must pass that needs no human, in order, stopping at the first failure:
-# no private references, formatting, lints, the tests, and the size budgets (lines of code, crates
-# in the dependency tree, release binary bytes). Run it before pushing. Bash on macOS and Linux.
+# no private references, formatting, lints, the tests, the size budgets (lines of code, crates
+# in the dependency tree, release binary bytes), then the release gates: the tests marked
+# #[ignore = "release gate"] (timing and memory limits), built and run with the release profile.
+# Run it before pushing. Bash on macOS and Linux.
 #
 # Environment:
 #   CARGO_BUILD_JOBS  parallel jobs (default 2; release builds with LTO need the memory)
 #   CARGO_TARGET_DIR  build output (default target/)
-#   RUSTUP_HOME       a rustup home whose 1.92.0 toolchain has the static musl target; without
-#                     it the musl size check prints "skipped" (rustup target add <arch>-unknown-linux-musl)
+#   RUSTUP_HOME       a rustup home whose 1.92.0 toolchain has the static musl target; on Linux the
+#                     check fails without it (rustup target add <arch>-unknown-linux-musl)
+#   CHECK_FROM_HOOK   set by the pre-push hook: a missing pattern file fails instead of skipping
 #
 # `./check.sh refs [RANGE]` runs only the first step against the private references listed in
 # .git/info/private-patterns: one extended regex per line, blank lines and # comments ignored.
-# That file is never committed; without it the step prints "skipped". With no RANGE it searches
+# That file is never committed. Without it (or with no pattern in it) a run by hand prints a loud
+# SKIPPED line and goes on, and a run from the pre-push hook fails. With no RANGE it searches
 # the working tree (tracked and untracked files, minus ignored ones). With a RANGE (`A..B`,
 # `HEAD`, or `B --not --remotes`) it searches every commit message in it and every line those
 # commits add, so a reference added and later removed is still found. In a range a matched line
 # is shown as "COMMIT: +LINE", so a pattern anchored with ^ only matches in files.
-# `./check.sh install-hook` makes git run it on the commits of every push.
+# `./check.sh install-hook` makes every git push run the full check, then the reference check on
+# the commits it pushes; it refuses to install without the pattern file.
 set -euo pipefail
 cd "$(dirname "$0")"
 
 refs() {
   local file args=() p found=0 rc log
   file="$(git rev-parse --git-path info/private-patterns)"
-  if [ ! -f "$file" ]; then
-    echo "skipped: no $file"
+  if [ -f "$file" ]; then
+    while IFS= read -r p || [ -n "$p" ]; do
+      case "$p" in '' | '#'*) ;; *) args+=(-e "$p") ;; esac
+    done <"$file"
+  fi
+  if [ "${#args[@]}" = 0 ]; then
+    if [ -n "${CHECK_FROM_HOOK:-}" ]; then
+      echo "check.sh: no patterns in $file; the pre-push hook does not pass without them" >&2
+      return 1
+    fi
+    echo "check.sh: WARNING: no patterns in $file, so the private reference check was SKIPPED" >&2
     return 0
   fi
-  while IFS= read -r p || [ -n "$p" ]; do
-    case "$p" in '' | '#'*) ;; *) args+=(-e "$p") ;; esac
-  done <"$file"
-  [ "${#args[@]}" -gt 0 ] || return 0
   # grep exits 1 for no match; anything above that is an error and fails the check.
   rc=0
   if [ -z "${1:-}" ]; then
@@ -55,14 +65,22 @@ case "${1:-}" in
     exit
     ;;
   install-hook)
+    file="$(git rev-parse --git-path info/private-patterns)"
+    if ! grep -qvE '^(#|$)' "$file" 2>/dev/null; then
+      echo "check.sh: no patterns in $file; write them first (the hook fails without them)" >&2
+      exit 1
+    fi
     hook="$(git rev-parse --git-path hooks)/pre-push"
     cat >"$hook" <<'HOOK'
 #!/usr/bin/env bash
-# Installed by `./check.sh install-hook`: refuse a push whose commits (messages or added lines)
-# match the private references in .git/info/private-patterns. Checks every pushed commit that no
-# remote-tracking branch of this remote already has.
+# Installed by `./check.sh install-hook`: run the full check on the working tree, then refuse a
+# push whose commits (messages or added lines) match the private references in
+# .git/info/private-patterns. Checks every pushed commit that no remote-tracking branch of this
+# remote already has. Without the pattern file the push fails.
 set -euo pipefail
 cd "$(git rev-parse --show-toplevel)"
+export CHECK_FROM_HOOK=1
+./check.sh </dev/null
 zero=0000000000000000000000000000000000000000
 while read -r _ local_sha _ remote_sha; do
   [ "$local_sha" = "$zero" ] && continue
@@ -232,8 +250,13 @@ if [ "$(uname -s)" = Linux ]; then
   elif [ -d "$(rustc --print sysroot)/lib/rustlib/$musl/lib" ]; then
     size_gate "$target/$musl/release/henki" --target "$musl"
   else
-    echo "skipped: the $musl target is not installed (rustup target add $musl, or set RUSTUP_HOME)"
+    fail "the $musl target is not installed (rustup target add $musl, or set RUSTUP_HOME to a rustup home that has it)"
   fi
 fi
+
+# Limits that hold only for an optimized build (timings, memory), as tests marked
+# #[ignore = "release gate"]; #[ignore] is used for nothing else, so none is skipped silently.
+step "release gates (ignored tests, release profile)"
+cargo test --locked --release -- --ignored
 
 step "all checks passed"

@@ -1,0 +1,22 @@
+# Test code may unwrap, expect, panic and print. Files of test code (src/*/tests.rs, tests/) also start with one fixed
+# #![allow(...)] line, because disallowed-methods has no test option and helpers outside #[test] functions are not covered.
+allow-unwrap-in-tests = true
+allow-expect-in-tests = true
+allow-panic-in-tests = true
+allow-print-in-tests = true
+# supervise::spawn takes eight.
+too-many-arguments-threshold = 8
+# types::Outcome is every turn function's error and carries a whole Call (128 bytes); clippy's default flags 128.
+large-error-threshold = 160
+
+disallowed-methods = [
+  { path = "std::process::Command::spawn", reason = "tool processes start only in supervise::spawn, on the main thread" },
+  { path = "std::io::stdout", reason = "every byte to stdout goes through term::Out" },
+  { path = "std::io::stderr", reason = "every byte to stderr goes through term::Out (or term::panic_line)" },
+  { path = "std::fs::File::create", reason = "create files with sys::create_excl (O_EXCL, O_NOFOLLOW, an explicit mode)" },
+  { path = "std::fs::write", reason = "create files with sys::create_excl; the write tool goes through sys::Dir" },
+  { path = "std::fs::read", reason = "read through sys::open_regular or sys::open_read, which never block on a FIFO" },
+  { path = "std::fs::read_to_string", reason = "read through sys::open_regular or sys::open_read, which never block on a FIFO" },
+  { path = "std::fs::create_dir_all", reason = "state directories go through sys::private_dir, the write tool through sys::Dir::sub" },
+  { path = "std::thread::sleep", reason = "the main thread waits only on its channel (turn's wait); workers block on IO" },
+]
