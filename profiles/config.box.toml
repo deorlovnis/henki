@@ -1,0 +1,13 @@
+# henki inside an isolated box, as the read-only mount /mnt/henki/config.toml; the box starts it with
+# henki run --config /mnt/henki/config.toml.
+model = "claude-opus-5-5"               # an API model the box may use; set when the box is provisioned
+dialect = "anthropic"
+base_url = "http://127.0.0.2/model"     # the box's model gateway; henki appends /v1/messages
+api_key = "cred-managed"                # a stand-in; the gateway adds the real token
+approve = "auto"
+ext = ["/mnt/henki/ext"]
+context_window = 1000000                # the model's window; anthropic never elides, and the gateway caps spend
+max_tokens = 32768                      # room for the model's thinking plus the answer
+max_steps = 100                         # real multi-file work; the gateway's token budget and --max-seconds bound it
+output_cap = 32768
+pass_env = ["GH_TOKEN", "NODE_EXTRA_CA_CERTS", "REQUESTS_CA_BUNDLE", "CURL_CA_BUNDLE", "PIP_CERT", "GIT_SSL_CAINFO", "NODE_USE_ENV_PROXY", "JAVA_TOOL_OPTIONS"]  # GH_TOKEN holds a stand-in too
