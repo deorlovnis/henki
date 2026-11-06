@@ -19,7 +19,7 @@ impl Session {
             }
             let (tag, len) = (self.next_tag(), body.len());
             (self.partial, self.opened) = (String::new(), Vec::new());
-            self.conn = Some(self.provider(tag, body));
+            self.conn = Some(self.provider(tag, body).map_err(|e| Outcome::error("internal", format!("cannot start a thread: {e}")))?);
             let r = match self.wait(tag, Some(Instant::now() + self.lim.request)) {
                 Ok(Some(Ev::Reply { reply, .. })) => reply,
                 Ok(_) => Err(http::perr("provider", format!("request took over {} s", term::num(self.lim.request.as_secs())))),
@@ -29,8 +29,10 @@ impl Session {
                 http::cancel(&slot);
             }
             match r {
-                Ok(rep) => {
-                    (self.ctx, self.opened) = ((rep.usage.input + rep.usage.output, len), Vec::new());
+                Ok(mut rep) => {
+                    let u = &mut rep.usage; // the server's counts, capped so that no sum of them overflows
+                    (u.input, u.output, u.cached) = (u.input.min(1 << 32), u.output.min(1 << 32), u.cached.min(1 << 32));
+                    (self.ctx, self.opened) = ((u.input + u.output, len), Vec::new());
                     return Ok(rep);
                 }
                 Err(e) if e.retry.is_some() && attempt < ATTEMPTS => {
@@ -52,11 +54,11 @@ impl Session {
 
     /// One attempt on its own thread: it sends the streamed pieces, then exactly one `Ev::Reply`. MAIN cancels it
     /// through the returned slot.
-    fn provider(&self, tag: u32, body: Vec<u8>) -> http::Slot {
+    fn provider(&self, tag: u32, body: Vec<u8>) -> std::io::Result<http::Slot> {
         let slot: http::Slot = Arc::new(Mutex::new((false, None)));
         let (tx, url, key, offered, s) = (self.tx.clone(), self.cfg.url.clone(), self.cfg.api_key.clone(), self.cfg.tools.clone(), slot.clone());
         let (loopback_only, lim) = (!key.is_empty() || self.cfg.url_from == "HENKI_BASE_URL", self.lim);
-        std::thread::spawn(move || {
+        std::thread::Builder::new().spawn(move || {
             let attempt = || {
                 let mut resp = http::post(&url, openai::PATH, &openai::headers(&key), &body, loopback_only, &lim, &s)?;
                 let mut acc = openai::Acc::new(&offered);
@@ -76,8 +78,8 @@ impl Session {
             };
             let reply = attempt();
             let _ = tx.send(Ev::Reply { tag, reply });
-        });
-        slot
+        })?;
+        Ok(slot)
     }
 
     /// A streamed piece of the attempt MAIN waits for: a `--json` delta, the partial text, an opened call's name.
@@ -107,14 +109,15 @@ impl Session {
 
     /// The error as the turn's outcome. After the last retry it says so, and a loopback server that refused every
     /// connect gets the fix.
-    fn gave_up(&self, e: ProviderError, attempt: u32) -> Outcome {
+    pub(super) fn gave_up(&self, e: ProviderError, attempt: u32) -> Outcome {
         let mut m = e.message;
         if let Some(cause) = e.retry {
             m += &format!(" (gave up after {attempt} attempts)");
             let (u, file) = (&self.cfg.url, self.cfg.file.as_ref().filter(|_| self.cfg.url_from == "config"));
             if cause.starts_with("could not connect") && http::loopback_literal(&u.host) {
                 let set = if let Some(f) = file { format!("base_url in {}", f.display()) } else { "HENKI_BASE_URL".into() };
-                m += &format!("; fix: start the model server on {}:{} or set {set}", u.host, u.port);
+                let host = if u.host.contains(':') { format!("[{}]", u.host) } else { u.host.clone() };
+                m += &format!("; fix: start the model server on {host}:{} or set {set}", u.port);
             }
         }
         Outcome::error(e.kind, m)

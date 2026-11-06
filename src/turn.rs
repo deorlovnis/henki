@@ -3,7 +3,7 @@ use crate::journal::{self, Journal, rec};
 use crate::term::{self, Out};
 use crate::tools::{self, Killed};
 use crate::{config::Config, http, supervise, types::*};
-use call::{Live, Stuck};
+use call::Stuck;
 use serde_json::Value;
 use std::convert::Infallible;
 use std::ffi::OsString;
@@ -44,7 +44,8 @@ pub struct Session {
     opened: Vec<String>,
     /// This step's calls that have no result yet, and whether each started.
     open: Vec<(Call, bool)>,
-    live: Option<Live>,
+    /// The running call's tag and id: MAIN waits on the tag, and FINISHING gives the call its output.
+    live: Option<(u32, String)>,
     steps: u32,
     usage_turn: Usage,
     usage_proc: Usage,
@@ -61,44 +62,91 @@ pub struct Session {
 
 impl Session {
     /// Takes the child environment from `cfg.env`, `cfg.pass_env`, `cfg.user_path` and `j.id()`; the cwd is `cfg.cwd`.
-    #[rustfmt::skip]
     pub fn new(cfg: Config, j: Journal, hist: Vec<Value>, out: Out, tx: Sender<Ev>, rx: Receiver<Ev>, deadline: Option<Instant>) -> Session {
         let env = supervise::child_env(&cfg.env, &cfg.pass_env, &cfg.user_path, j.id());
         let (system, tools, next_h) = (tools::system(cfg.agents.as_deref()), tools::schema(&cfg.tools), journal::next_h(&hist));
-        Session { cfg, j, out, hist, tx, rx, deadline, lim: http::LIMITS, env, system, tools, next_h, tag: 0, conn: None,
-            partial: String::new(), opened: Vec::new(), open: Vec::new(), live: None, steps: 0, usage_turn: Usage::default(),
-            usage_proc: Usage::default(), text: String::new(), stuck: Stuck::default(), ctx: (0, 0), bg: 0, finishing: false, hurry: false }
+        Session {
+            cfg,
+            j,
+            out,
+            hist,
+            tx,
+            rx,
+            deadline,
+            lim: http::LIMITS,
+            env,
+            system,
+            tools,
+            next_h,
+            tag: 0,
+            conn: None,
+            partial: String::new(),
+            opened: Vec::new(),
+            open: Vec::new(),
+            live: None,
+            steps: 0,
+            usage_turn: Usage::default(),
+            usage_proc: Usage::default(),
+            text: String::new(),
+            stuck: Stuck::default(),
+            ctx: (0, 0),
+            bg: 0,
+            finishing: false,
+            hurry: false,
+        }
     }
 
     /// One turn: the `user` record (none for `run --resume` without TASK), then steps until an outcome. Every call of the
-    /// last step has a result and `turn_end` is written before this returns. Never exits the process. A finished turn
-    /// whose stdout reader went away ends `output_closed`: the reader never got what it waited for.
+    /// last step has a result and `turn_end` is written before this returns. Never exits the process.
     pub fn turn(&mut self, task: Option<String>) -> Outcome {
         let Err(o) = self.step_loop(task);
-        let closed = self.out.closed() && matches!(o, Outcome::Ok | Outcome::GaveUp(_) | Outcome::NeedsApproval(_));
-        self.finish(if closed { Outcome::OutputClosed } else { o })
+        self.finish(o)
     }
 
     /// Session end: kill and sweep everything henki started (every path, `ok` included), then `result` (when given),
-    /// then `close`.
+    /// then `close`. A journal failure is the `Err`, and the `--json` reader still gets one result.
     pub fn close(&mut self, result: Option<Value>) -> Result<(), Outcome> {
         self.finishing = true;
         let (_, n) = self.stop_all();
-        if n > 0 {
-            self.notice(&format!("stopped {} background processes at exit", term::num(n as u64)))?;
-        }
-        if let Some(r) = result {
-            let r = self.j.write(r)?;
-            self.out.record(&r);
-            if r["status"] == "ok" {
+        self.end(n, result)
+    }
+
+    /// The last records: the kill notice, `result`, `close`; then the result on `--json` stdout, or in plain mode the
+    /// answer of an `ok` run. After a failed write the stdout result is the given one when it is already an error (that
+    /// error stays the run's end), else one for the failure.
+    fn end(&mut self, killed: usize, result: Option<Value>) -> Result<(), Outcome> {
+        let written = (|| {
+            if killed > 0 {
+                self.notice(&format!("stopped {} background processes at exit", term::num(killed as u64)))?;
+            }
+            let r = result.clone().map(|r| self.j.write(r)).transpose()?;
+            self.j.write(rec::close(self.j.bytes())).map(|_| r)
+        })();
+        let (r, end) = match written {
+            Ok(r) => (r, Ok(())),
+            Err(e) => {
+                let ms = |r: &Value| (r["duration_s"].as_f64().unwrap_or_default() * 1e3) as u64;
+                let failed = |r: Value| if r["status"] == "error" { r } else { rec::result(&e, &self.text, self.usage_proc, Some(self.j.id()), self.steps, ms(&r)) };
+                (result.map(failed), Err(e))
+            }
+        };
+        if let Some(r) = r {
+            if self.out.json() {
+                self.out.record(&r);
+            } else if r["status"] == "ok" {
                 self.out.answer(&self.text);
             }
         }
-        self.j.write(rec::close(self.j.bytes())).map(drop)
+        end
     }
 
     pub fn id(&self) -> &str {
         self.j.id()
+    }
+
+    /// The terminal, for `main`'s outcome line.
+    pub fn out(&self) -> &Out {
+        &self.out
     }
 
     /// The last assistant text, or "".
@@ -156,8 +204,8 @@ impl Session {
             }
             self.open = calls.iter().map(|c| (c.clone(), false)).collect();
             for c in &calls {
-                let res = self.dispatch(c)?;
-                self.answer(c, res)?;
+                self.poll()?; // calls that never wait still end at the deadline or a signal
+                self.dispatch(c)?;
             }
             if self.stuck.run >= STUCK_RUN {
                 return Err(Outcome::GaveUp("stuck"));
@@ -195,7 +243,7 @@ impl Session {
         let live = self.live.take();
         for (c, started) in std::mem::take(&mut self.open) {
             let (text, ms, bytes) = match (&got, &live) {
-                (Some(out), Some(l)) if l.id == c.id => (tools::result_text(&c.name, out, Some(&Killed::Interrupted)).0, out.ms, out.bytes),
+                (Some(out), Some(l)) if l.1 == c.id => (tools::result_text(&c.name, out, Some(&Killed::Interrupted)).0, out.ms, out.bytes),
                 _ if started => (tools::REPAIR.to_string(), 0, 0),
                 _ => (format!("not run: {}", o.not_run()), 0, 0),
             };
@@ -234,6 +282,20 @@ impl Session {
                 _ => {} // stale: an ended attempt, a timer, an answered call
             }
         }
+    }
+
+    /// `wait` without waiting, between calls: the deadline, then a signal or a closed stdout already queued. Everything
+    /// else queued is stale here and dropped.
+    fn poll(&mut self) -> Result<(), Stop> {
+        if self.deadline.is_some_and(|d| Instant::now() >= d) {
+            return Err(Stop::Budget);
+        }
+        let stop = |ev| match ev {
+            Ev::Signal(s) => Some(Stop::Signal(s)),
+            Ev::OutputClosed => Some(Stop::Closed),
+            _ => None,
+        };
+        self.rx.try_iter().find_map(stop).map_or(Ok(()), Err)
     }
 
     /// The journal first, then the `--json` line; only `user`, `assistant` and `tool_result` enter the history.

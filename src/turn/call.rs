@@ -5,21 +5,6 @@ use crate::tools::{self, Killed, Target};
 use crate::{files, journal::rec, sys, term, types::*};
 use std::time::{Duration, Instant};
 
-/// The running call: MAIN waits on its tag, and FINISHING gives it its output.
-pub(super) struct Live {
-    pub tag: u32,
-    pub id: String,
-}
-
-/// A call's result before it is journaled; `out` is what its worker reported.
-#[derive(Default)]
-pub(super) struct Res {
-    text: String,
-    is_error: bool,
-    out: Option<ToolOutput>,
-    killed: Option<Killed>,
-}
-
 /// A call extends the run when it repeats the previous call (name and arguments) and both failed; another failure
 /// starts a run of 1, a success ends it. Identical successes never count.
 #[derive(Default)]
@@ -43,7 +28,7 @@ impl Session {
         for c in &mut calls {
             while c.id.is_empty() || used.contains(&c.id) {
                 c.id = format!("h{}", self.next_h);
-                self.next_h += 1;
+                self.next_h = self.next_h.wrapping_add(1); // past u32::MAX it starts again at h0; `used` keeps ids unique
             }
             used.push(c.id.clone());
             tools::validate(c, &self.cfg.tools);
@@ -51,15 +36,15 @@ impl Session {
         calls
     }
 
-    /// One call of the step: its error, or the question `ask` mode puts to a human, or the approved run.
-    pub(super) fn dispatch(&mut self, c: &Call) -> Result<Res, Outcome> {
+    /// One call of the step and its result: its error, or the question `ask` mode puts to a human, or the approved run.
+    pub(super) fn dispatch(&mut self, c: &Call) -> Result<(), Outcome> {
         if let Some(e) = &c.error {
-            return Ok(Res { text: e.clone(), is_error: true, ..Res::default() });
+            return self.answer(c, e, true, None, None);
         }
         // A file tool's target is resolved before anything is shown or run.
         let cx = tools::Ctx { cwd: &self.cfg.cwd, root: &self.cfg.root, home: &self.cfg.home, protected: &self.cfg.protected };
         let t = match (c.name != "shell").then(|| tools::target(c.args["path"].as_str().unwrap_or_default(), c.name != "read", &cx)) {
-            Some(Err(text)) => return Ok(Res { text, is_error: true, ..Res::default() }),
+            Some(Err(text)) => return self.answer(c, &text, true, None, None),
             t => t.and_then(Result::ok),
         };
         if tools::needs_approval(&c.name, t.as_ref(), self.cfg.auto) {
@@ -73,7 +58,7 @@ impl Session {
     /// Runs an approved call and waits for its output. A shell call past its timeout gets SIGTERM, then after `GRACE` the
     /// kill of its group and session, then up to `LATE` for its output. These are the ordinary waits: a signal or the
     /// deadline returns with the call still live, and FINISHING kills it.
-    fn call(&mut self, c: &Call, t: Option<Target>) -> Result<Res, Outcome> {
+    fn call(&mut self, c: &Call, t: Option<Target>) -> Result<(), Outcome> {
         let (tag, cap, t0) = (self.next_tag(), tools::cap(self.cfg.output_cap, self.cfg.window), Instant::now());
         let secs = c.args["timeout"].as_u64().unwrap_or(self.cfg.tool_timeout_s).min(CALL_MAX_S);
         let (cmd, mut pgid) = (c.args["command"].as_str().unwrap_or_default(), None);
@@ -82,11 +67,11 @@ impl Session {
         } else {
             match supervise::spawn(&self.cfg.bash, cmd, &self.cfg.cwd, &self.env, cap, self.j.spill(&self.cfg.home), tag, &self.tx) {
                 Ok(p) => pgid = Some(p),
-                Err(e) => return Ok(Res { text: tools::not_started(&e), is_error: true, ..Res::default() }),
+                Err(e) => return self.answer(c, &tools::not_started(&e), true, None, None),
             }
         }
         self.open.iter_mut().filter(|o| o.0.id == c.id).for_each(|o| o.1 = true);
-        self.live = Some(Live { tag, id: c.id.clone() });
+        self.live = Some((tag, c.id.clone()));
         let mut ev = self.wait(tag, pgid.map(|_| t0 + Duration::from_secs(secs)))?;
         let killed = ev.is_none().then_some(Killed::Timeout(secs));
         if let (None, Some(pgid)) = (&ev, pgid) {
@@ -98,31 +83,31 @@ impl Session {
             }
         }
         self.live = None;
-        Ok(match ev {
+        match ev {
             Some(Ev::Tool { out, .. }) => {
                 let (text, is_error) = tools::result_text(&c.name, &out, killed.as_ref());
-                Res { text, is_error, out: Some(out), killed }
+                self.answer(c, &text, is_error, Some(&out), killed.as_ref())
             }
             _ => {
                 let out = ToolOutput { text: String::new(), bytes: 0, ms: t0.elapsed().as_millis() as u64, end: End::Signal(libc::SIGKILL) };
-                Res { text: format!("[timed out after {secs} s; process group killed]"), is_error: true, out: Some(out), killed }
+                self.answer(c, &format!("[timed out after {secs} s; process group killed]"), true, Some(&out), killed.as_ref())
             }
-        })
+        }
     }
 
-    /// Journals a call's result, prints its plain-mode line, reaps (noticing when the background count changes) and
-    /// feeds the stuck rule.
-    pub(super) fn answer(&mut self, c: &Call, r: Res) -> Result<(), Outcome> {
-        let (ms, bytes) = r.out.as_ref().map_or((0, r.text.len() as u64), |o| (o.ms, o.bytes));
-        self.record(rec::tool_result(&c.id, &c.name, &r.text, r.is_error, ms, bytes))?;
+    /// Journals a call's result (`out`: what its worker reported, none when it never ran), prints its plain-mode line,
+    /// reaps after a call that ran (noticing when the background count changes) and feeds the stuck rule.
+    fn answer(&mut self, c: &Call, text: &str, is_error: bool, out: Option<&ToolOutput>, killed: Option<&Killed>) -> Result<(), Outcome> {
+        let (ms, bytes) = out.map_or((0, text.len() as u64), |o| (o.ms, o.bytes));
+        self.record(rec::tool_result(&c.id, &c.name, text, is_error, ms, bytes))?;
         self.open.retain(|o| o.0.id != c.id);
-        self.out.line(&tools::call_line(c, r.out.as_ref(), r.killed.as_ref(), r.is_error));
-        let bg = supervise::reap();
+        self.out.line(&tools::call_line(c, out, killed, is_error));
+        let bg = if out.is_some() { supervise::reap() } else { self.bg };
         if bg != self.bg {
             self.bg = bg;
             self.notice(&format!("{} background processes from earlier calls still run", term::num(bg as u64)))?;
         }
-        self.stuck.feed(format!("{}\0{}", c.name, c.raw.clone().unwrap_or_else(|| c.args.to_string())), r.is_error);
+        self.stuck.feed(format!("{}\0{}", c.name, c.raw.clone().unwrap_or_else(|| c.args.to_string())), is_error);
         Ok(())
     }
 
@@ -130,7 +115,7 @@ impl Session {
     /// (ended early when all are gone, or by a second signal), then SIGKILL and up to five sweeps of what is left; with
     /// nothing live, no wait at all. Returns the live call's output if it reported, and how many processes were signalled.
     pub(super) fn stop_all(&mut self) -> (Option<ToolOutput>, usize) {
-        let (tag, mut got) = (self.live.as_ref().map_or(0, |l| l.tag), None);
+        let (tag, mut got) = (self.live.as_ref().map_or(0, |l| l.0), None);
         let (mut left, end) = (supervise::signal_groups(libc::SIGTERM), Instant::now() + GRACE);
         let mut n = left;
         while left > 0 && !self.hurry && Instant::now() < end {

@@ -118,14 +118,24 @@ fn run(a: Args, out: Out, tx: Sender<Ev>, rx: Receiver<Ev>, t0: Instant, early: 
     };
     out.record(&session);
     let mut s = Session::new(cfg, j, hist, out, tx, rx, deadline);
-    let o = s.turn(task);
+    // A finished turn whose stdout reader went away never gave the reader what it waited for.
+    let o = match s.turn(task) {
+        Outcome::Ok | Outcome::GaveUp(_) | Outcome::NeedsApproval(_) if s.out().closed() => Outcome::OutputClosed,
+        o => o,
+    };
     let result = rec::result(&o, s.text(), s.usage(), Some(s.id()), s.steps(), ms(t0));
-    let o = s.close(Some(result)).err().unwrap_or(o);
-    let out = s.into_out();
     if o != Outcome::Ok {
-        out.line(&outcome_line(&o));
+        s.out().line(&outcome_line(&o));
     }
-    code(out, &o, deadline)
+    // A journal failure at the end is the run's end, unless the turn already failed.
+    let o = match s.close(Some(result)) {
+        Err(e) if !matches!(o, Outcome::Error { .. }) => {
+            s.out().line(&outcome_line(&e));
+            e
+        }
+        _ => o,
+    };
+    code(s.into_out(), &o, deadline)
 }
 
 /// What startup hands to the session: the config, the journal, the history, the task and the `session` record.
@@ -175,11 +185,12 @@ fn start(a: Args, tx: &Sender<Ev>, rx: &Receiver<Ev>, t0: Instant, early: io::Re
 /// `run -`: stdin to EOF on its own thread, so that a signal or the deadline still ends the wait.
 fn stdin_task(tx: &Sender<Ev>, rx: &Receiver<Ev>, deadline: Option<Instant>) -> Result<String, Outcome> {
     let tx = tx.clone();
-    std::thread::spawn(move || {
+    let read = move || {
         let mut b = Vec::new();
         let ok = io::stdin().lock().take(TASK_MAX + 1).read_to_end(&mut b).is_ok() && b.len() as u64 <= TASK_MAX;
         let _ = tx.send(Ev::Line(ok.then(|| String::from_utf8_lossy(&b).into_owned())));
-    });
+    };
+    std::thread::Builder::new().spawn(read).map_err(|e| Outcome::error("internal", format!("cannot start a thread: {e}")))?;
     loop {
         match deadline.map_or_else(|| rx.recv().ok(), |d| rx.recv_timeout(d.saturating_duration_since(Instant::now())).ok()) {
             Some(Ev::Line(Some(t))) => return Ok(t),
