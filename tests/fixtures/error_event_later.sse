@@ -1,0 +1,10 @@
+data: {"choices":[{"finish_reason":null,"index":0,"delta":{"role":"assistant","content":null}}],"created":1762401000,"id":"chatcmpl-fx","model":"local-model","system_fingerprint":"b7000-fx","object":"chat.completion.chunk"}
+
+data: {"choices":[{"finish_reason":null,"index":0,"delta":{"content":"Part"}}],"created":1762401000,"id":"chatcmpl-fx","model":"local-model","system_fingerprint":"b7000-fx","object":"chat.completion.chunk"}
+
+data: {"choices":[{"finish_reason":null,"index":0,"delta":{"content":"ial "}}],"created":1762401000,"id":"chatcmpl-fx","model":"local-model","system_fingerprint":"b7000-fx","object":"chat.completion.chunk"}
+
+data: {"choices":[{"finish_reason":null,"index":0,"delta":{"content":"ans"}}],"created":1762401000,"id":"chatcmpl-fx","model":"local-model","system_fingerprint":"b7000-fx","object":"chat.completion.chunk"}
+
+data: {"error":{"code":500,"message":"generation failed","type":"server_error"}}
+
