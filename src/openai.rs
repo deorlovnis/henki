@@ -1,14 +1,13 @@
 //! The OpenAI-compatible chat-completions wire format: the request body, the stream accumulator with its defensive
 //! call parser, and text calls for servers that leave tool markup in the content.
 use crate::http::{error_object, perr};
+use crate::tools::ARGS_MAX;
 use crate::types::{Call, Part, ProviderError, Reply, Usage};
 use serde_json::{Map, Value, json};
 
 pub const PATH: &str = "/chat/completions";
 pub const CUT_ARGS: &str = "arguments cut at max_tokens; not run. Send a shorter call.";
 pub const INCOMPLETE: &str = "incomplete tool call";
-/// Arguments longer than this are not parsed; validation refuses them.
-const ARGS_MAX: usize = 1 << 20;
 
 /// `Authorization: Bearer KEY` only when `key` is not empty.
 pub fn headers(key: &str) -> Vec<(&'static str, String)> {
@@ -51,7 +50,6 @@ pub enum Flow {
 }
 
 /// One reply as it arrives. A call slot is (its `index`, the call so far with its arguments' text in `raw`).
-#[derive(Default)]
 pub struct Acc {
     text: String,
     reasoning: String,
@@ -64,7 +62,7 @@ pub struct Acc {
 
 impl Acc {
     pub fn new(offered: &[&'static str]) -> Acc {
-        Acc { offered: offered.to_vec(), ..Acc::default() }
+        Acc { text: String::new(), reasoning: String::new(), slots: vec![], finish: String::new(), usage: Usage::default(), offered: offered.to_vec(), seen: false }
     }
 
     /// One SSE `data` payload; streamed pieces go to `part`.
@@ -73,7 +71,7 @@ impl Acc {
             "[DONE]" => return Ok(Flow::Done),
             "" => {} // an empty event (a keep-alive) changes nothing
             d => {
-                let v = serde_json::from_str(d).map_err(|e| not_json("stream data", d, e))?;
+                let v = serde_json::from_str(d).map_err(|e| bad(&format!("stream data is not JSON ({e})"), d))?;
                 let first = !std::mem::replace(&mut self.seen, true);
                 self.take(&v, "delta", first, part)?;
             }
@@ -83,8 +81,9 @@ impl Acc {
 
     /// A 200 `application/json` completion: the same rules applied to `choices[0].message`.
     pub fn json(mut self, body: &[u8]) -> Result<Reply, ProviderError> {
-        let v = serde_json::from_slice(body).map_err(|e| not_json("the completion", &String::from_utf8_lossy(body), e))?;
+        let v: Value = serde_json::from_slice(body).map_err(|e| bad(&format!("the completion is not JSON ({e})"), &String::from_utf8_lossy(body)))?;
         self.take(&v, "message", true, &mut |_| {})?;
+        v["choices"][0]["message"].as_object().ok_or_else(|| bad("the completion has no choices[0].message", &String::from_utf8_lossy(body)))?;
         self.finish(true)
     }
 
@@ -122,8 +121,7 @@ impl Acc {
             *n = f.as_u64().unwrap_or(*n);
         }
         us.cached = v["timings"]["cache_n"].as_u64().unwrap_or(us.cached); // llama.cpp
-        let (ch, whole) = (&v["choices"][0], key == "message");
-        let d = &ch[key];
+        let (ch, d, whole) = (&v["choices"][0], &v["choices"][0][key], key == "message");
         if let Some(t) = d["content"].as_str().filter(|t| !t.is_empty()) {
             self.text += t;
             part(Part::Text(t.into()));
@@ -132,9 +130,9 @@ impl Acc {
             self.reasoning += t;
             part(Part::Reasoning(t.into()));
         }
-        // A whole message lists one call per entry; a stream keys its fragments by `index` when it sends one.
-        for (k, tc) in d["tool_calls"].as_array().into_iter().flatten().enumerate() {
-            self.call(tc, if whole { Some(k as u64) } else { tc["index"].as_u64() }, part);
+        // A whole message has a call per entry; a stream keys fragments by `index`, and a later entry of a chunk without one is a new call.
+        for (k, tc) in d["tool_calls"].as_array().into_iter().flatten().filter(|tc| tc.is_object()).enumerate() {
+            self.call(tc, if whole { Some(k as u64) } else { tc["index"].as_u64() }, k > 0, part);
         }
         if let Some(f) = ch["finish_reason"].as_str() {
             self.finish = f.into();
@@ -143,12 +141,12 @@ impl Acc {
     }
 
     /// One `tool_calls` fragment. With an index: that slot, unless a different id arrives on a slot that has one. Without:
-    /// the last slot, unless the fragment brings a new id. A new slot is announced with its name so far.
-    fn call(&mut self, tc: &Value, index: Option<u64>, part: &mut dyn FnMut(Part)) {
+    /// the last slot, unless the fragment brings a new id or is a `later` entry of its chunk. A new slot shows its name.
+    fn call(&mut self, tc: &Value, index: Option<u64>, later: bool, part: &mut dyn FnMut(Part)) {
         let id = tc["id"].as_str().unwrap_or("");
         let at = match index {
             Some(_) => self.slots.iter().rposition(|s| s.0 == index).filter(|&i| id.is_empty() || [id, ""].contains(&self.slots[i].1.id.as_str())),
-            None => self.slots.len().checked_sub(1).filter(|&i| id.is_empty() || self.slots[i].1.id == id),
+            None => self.slots.len().checked_sub(1).filter(|&i| !later && (id.is_empty() || self.slots[i].1.id == id)),
         };
         let i = at.unwrap_or(self.slots.len());
         if at.is_none() {
@@ -180,39 +178,61 @@ pub fn text_calls(text: &str, offered: &[&str]) -> (Vec<Call>, String) {
     if let Some(c) = fenced(text, offered) {
         return (vec![c], String::new());
     }
-    let (mut calls, mut rest, mut s) = (vec![], String::new(), text);
-    while let Some(i) = [s.find("<tool_call>"), s.find("<function="), fence(s)].into_iter().flatten().min() {
-        let Some((before, at)) = s.split_at_checked(i) else { break };
-        let (len, call) = markup(at, offered);
-        let Some((m, after)) = at.split_at_checked(len) else { break };
-        rest.extend([before, if call.is_some() { "" } else { m }]);
-        calls.extend(call);
-        s = after;
+    // Each candidate is looked at once and markup is skipped whole: one pass over the text.
+    let starts = |i: usize| text.get(i..).is_some_and(|r| r.starts_with("<tool_call>") || r.starts_with("<function=")) || fence_at(text, i);
+    let (mut calls, mut rest, mut pos) = (vec![], String::new(), 0);
+    while let Some(i) = text.get(pos..).and_then(|r| r.match_indices(['<', '`']).map(|(i, _)| pos + i).find(|&i| starts(i))) {
+        let at = text.get(i..).unwrap_or_default();
+        let (len, found) = markup(at, offered);
+        rest.extend([text.get(pos..i).unwrap_or_default(), if found.is_empty() { at.get(..len).unwrap_or_default() } else { "" }]);
+        calls.extend(found);
+        pos = i + len;
     }
-    if calls.is_empty() { (calls, text.into()) } else { (calls, (rest + s).trim().into()) }
+    if calls.is_empty() { (calls, text.into()) } else { (calls, (rest + text.get(pos..).unwrap_or_default()).trim().into()) }
 }
 
-/// The markup at the start of `s` (a fence, `<tool_call>` or `<function=`): its length and the call it holds. No call
-/// means prose, which stays in the text. A fence runs to the end of the text when it is not closed.
-fn markup(s: &str, offered: &[&str]) -> (usize, Option<Call>) {
+/// The markup at the start of `s` (a fence, `<tool_call>` or `<function=`): its length (never 0) and the calls it holds.
+/// No call means prose, which stays in the text. A fence runs to the end of the text when it is not closed.
+fn markup(s: &str, offered: &[&str]) -> (usize, Vec<Call>) {
     if let Some(r) = s.strip_prefix("```") {
         let (lang, body) = r.split_once('\n').unwrap_or((r, ""));
-        let e = fence(body);
+        let e = body.match_indices("```").map(|(i, _)| i).find(|&i| fence_at(body, i));
         let call = if matches!(lang.trim(), "" | "json") { body.get(..e.unwrap_or(body.len())).and_then(|b| fenced(b, offered)) } else { None };
-        return (e.map_or(s.len(), |e| s.len() - body.len() + e + 3), call);
+        return (e.map_or(s.len(), |e| s.len() - body.len() + e + 3), call.into_iter().collect());
     }
-    let tagged = s.starts_with("<tool_call>");
-    let close = if tagged { "</tool_call>" } else { "</function>" };
-    let Some(e) = s.find(close) else { return (s.len(), Some(incomplete(s))) };
-    let body = if tagged { s.get(11..e) } else { s.get(..e + close.len()) }.unwrap_or_default().trim();
-    let call = serde_json::from_str(body).ok().and_then(|v| json_call(&v, "parameters")).or_else(|| qwen(body)).unwrap_or_else(|| incomplete(body));
-    (e + close.len(), Some(call))
+    let Some(r) = s.strip_prefix("<tool_call>") else { return qwen(s) };
+    let Some((body, _)) = r.split_once("</tool_call>") else { return (s.len(), vec![incomplete(s)]) };
+    // Hermes JSON, else each Qwen XML block in it is a call of its own (the body holds no `</tool_call>`: one level deep).
+    let calls = serde_json::from_str(body.trim()).ok().and_then(|v| json_call(&v, "parameters")).map_or_else(|| text_calls(body, offered).0, |c| vec![c]);
+    (s.len() - r.len() + body.len() + "</tool_call>".len(), if calls.is_empty() { vec![incomplete(body)] } else { calls })
 }
 
-/// The first "```" in `s` that starts a line (`s` itself starts one).
-fn fence(s: &str) -> Option<usize> {
-    let starts_line = |i: usize| s.get(..i).map(|p| p.trim_end_matches([' ', '\t'])).is_some_and(|p| p.is_empty() || p.ends_with('\n'));
-    s.match_indices("```").map(|(i, _)| i).find(|&i| starts_line(i))
+/// Qwen XML from `s` to its first `</function>`: `<function=NAME>`, `<parameter=K>V</parameter>`s (V opaque, one leading
+/// and one trailing newline dropped, kept a string). A `<function=` where a parameter could start begins the next call and
+/// leaves the one before it unclosed; an unclosed or malformed call is incomplete (a malformed one takes the rest).
+fn qwen(s: &str) -> (usize, Vec<Call>) {
+    let Some(e) = s.find("</function>") else { return (s.len(), vec![incomplete(s)]) };
+    let (mut calls, mut b) = (vec![], s.get(..e).unwrap_or_default());
+    while let Some(r) = b.strip_prefix("<function=") {
+        let ((name, mut r), mut args) = (r.split_once('>').unwrap_or_default(), Map::new());
+        while let Some((k, p)) = r.trim_start().strip_prefix("<parameter=").and_then(|p| p.split_once('>')) {
+            let Some((v, a)) = p.split_once("</parameter>") else { break };
+            let v = v.strip_prefix('\n').unwrap_or(v);
+            args.insert(k.trim().into(), v.strip_suffix('\n').unwrap_or(v).into());
+            r = a;
+        }
+        let (r, name) = (r.trim_start(), name.trim());
+        let next = if r.starts_with("<function=") { r } else { "" };
+        let closed = r.is_empty() && !name.is_empty() && !name.contains(['<', '\n']);
+        calls.push(if closed { Call { name: name.into(), args: args.into(), ..Call::default() } } else { incomplete(b.get(..b.len() - next.len()).unwrap_or_default()) });
+        b = next;
+    }
+    (e + "</function>".len(), calls)
+}
+
+/// Whether a fence, "```" at the start of a line, begins at `i` in `t`.
+fn fence_at(t: &str, i: usize) -> bool {
+    t.get(i..).is_some_and(|r| r.starts_with("```")) && t.get(..i).map(|p| p.trim_end_matches([' ', '\t'])).is_some_and(|p| p.is_empty() || p.ends_with('\n'))
 }
 
 /// A fence, or the whole text, holding `{name, arguments}`: a call only when the name is offered.
@@ -224,38 +244,22 @@ fn fenced(s: &str, offered: &[&str]) -> Option<Call> {
 fn json_call(v: &Value, alt: &str) -> Option<Call> {
     let a = v.get("arguments").or_else(|| v.get(alt))?;
     let mut c = Call { name: v["name"].as_str()?.into(), args: a.clone(), raw: a.as_str().map(String::from), ..Call::default() };
-    if c.raw.is_some() {
-        set_args(&mut c);
-    }
+    set_args(&mut c);
     Some(c)
 }
 
-/// `<function=NAME><parameter=K>V</parameter>…</function>`; V loses one leading and one trailing newline.
-fn qwen(s: &str) -> Option<Call> {
-    let (name, mut rest) = s.strip_prefix("<function=")?.strip_suffix("</function>")?.split_once('>')?;
-    let mut args = Map::new();
-    while let Some((_, r)) = rest.split_once("<parameter=") {
-        let (k, r) = r.split_once('>')?;
-        let (v, r) = r.split_once("</parameter>")?;
-        let v = v.strip_prefix('\n').unwrap_or(v);
-        args.insert(k.trim().into(), v.strip_suffix('\n').unwrap_or(v).into());
-        rest = r;
-    }
-    Some(Call { name: name.trim().into(), args: args.into(), ..Call::default() })
-}
-
 /// Markup opened and not closed, or closed around neither JSON nor Qwen XML: a call that does not run, named by the
-/// markup when it shows a name.
+/// markup when it shows a name (a Qwen XML name ends at `>`, `<` or a newline).
 fn incomplete(s: &str) -> Call {
-    let xml = s.split_once("<function=").and_then(|(_, r)| r.split_once('>')).map(|(n, _)| n);
+    let xml = s.split_once("<function=").and_then(|(_, r)| r.split(['>', '<', '\n']).next());
     let json = || s.split_once("\"name\"")?.1.trim_start().strip_prefix(':')?.trim_start().strip_prefix('"')?.split_once('"').map(|(n, _)| n);
     let name = xml.or_else(json).map(str::trim).filter(|n| !n.is_empty()).unwrap_or("unknown");
     Call { name: name.into(), args: json!({}), error: Some(INCOMPLETE.into()), ..Call::default() }
 }
 
-/// `args` = the arguments' text in `raw`, parsed; over 1 MiB or not JSON: `{}`, and `raw` stays for validation to name.
+/// `args` = the arguments' text in `raw` (if any), parsed; over 1 MiB or not JSON: `{}`, and `raw` stays for validation.
 fn set_args(c: &mut Call) {
-    let a = c.raw.take().unwrap_or_default();
+    let Some(a) = c.raw.take() else { return };
     if a.len() <= ARGS_MAX
         && let Ok(v) = serde_json::from_str(&a)
     {
@@ -269,8 +273,8 @@ fn shown(name: &str) -> &str {
     if name.is_empty() { "unknown" } else { name }
 }
 
-fn not_json(what: &str, data: &str, e: serde_json::Error) -> ProviderError {
-    perr("provider", format!("{what} is not JSON ({e}): {}", data.chars().take(200).collect::<String>()))
+fn bad(what: &str, data: &str) -> ProviderError {
+    perr("provider", format!("{what}: {}", data.chars().take(200).collect::<String>()))
 }
 
 #[cfg(test)]

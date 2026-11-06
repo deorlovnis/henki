@@ -368,6 +368,34 @@ fn parser_two_empty_id_calls() {
 }
 
 #[test]
+fn parse_no_index_empty_ids() {
+    // Entries of one chunk's array without an index are calls of their own, as in a whole completion.
+    let (r, parts) = run(&[
+        calls_chunk(vec![tc(None, None, Some("shell"), Some(r#"{"command":"echo 1"}"#)), tc(None, Some(""), Some("read"), Some(r#"{"path":"x"}"#))]),
+        finish_chunk("tool_calls"),
+    ]);
+    let got: Vec<(&str, &Value)> = r.calls.iter().map(|c| (c.name.as_str(), &c.args)).collect();
+    assert_eq!(got, [("shell", &json!({"command": "echo 1"})), ("read", &json!({"path": "x"}))]);
+    assert_eq!(parts, vec![Part::Call("shell".into()), Part::Call("read".into())]);
+    // Across chunks, a fragment with no index and no new id continues the last call.
+    let (r, _) =
+        run(&[calls_chunk(vec![tc(None, None, Some("shell"), Some(r#"{"command":"#))]), calls_chunk(vec![tc(None, Some(""), None, Some(r#""ls"}"#))]), finish_chunk("tool_calls")]);
+    assert_eq!((names(&r), &r.calls[0].args), (vec!["shell"], &json!({"command": "ls"})));
+}
+
+#[test]
+fn parse_tool_calls_non_object_entry() {
+    // An entry that is not an object opens no call, so the text is still scanned for calls.
+    let hermes = "<tool_call>{\"name\": \"shell\", \"arguments\": {\"command\": \"ls\"}}</tool_call>";
+    let (r, parts) = run(&[chunk(json!({"content": hermes})), calls_chunk(vec![json!(null), json!(7), json!("x"), json!([1])]), finish_chunk("stop")]);
+    assert_eq!((names(&r), r.calls[0].error.as_ref()), (vec!["shell"], None));
+    assert_eq!(parts, vec![Part::Text(hermes.into())]);
+    // Next to a real entry, only the real entry counts.
+    let (r, _) = run(&[calls_chunk(vec![json!(null), tc(Some(0), Some("a"), Some("read"), Some(r#"{"path":"x"}"#))]), finish_chunk("tool_calls")]);
+    assert_eq!((names(&r), &r.calls[0].args), (vec!["read"], &json!({"path": "x"})));
+}
+
+#[test]
 fn after_incomplete_names_calls() {
     let mut acc = Acc::new(&OFFERED);
     for d in [
@@ -507,6 +535,84 @@ fn text_qwen_xml_newlines() {
     assert_eq!(calls[0].args, json!({"content": "\nline 1\n  line 2\n", "path": "a.txt"}));
 }
 
+fn incomplete_call(name: &str) -> Call {
+    Call { name: name.into(), args: json!({}), error: Some(INCOMPLETE.into()), ..Call::default() }
+}
+
+#[test]
+fn text_qwen_xml_two_in_one_wrapper() {
+    // Each block in one wrapper is a call of its own: never one call with both blocks' parameters.
+    let t = "On it.\n<tool_call>\n<function=write>\n<parameter=path>\nnotes.txt\n</parameter>\n<parameter=content>\nhello\n</parameter>\n</function>\n\
+             <function=read>\n<parameter=path>\nsrc/main.rs\n</parameter>\n</function>\n</tool_call>";
+    let (calls, rest) = texts(t);
+    let want = vec![
+        Call { name: "write".into(), args: json!({"content": "hello", "path": "notes.txt"}), ..Call::default() },
+        Call { name: "read".into(), args: json!({"path": "src/main.rs"}), ..Call::default() },
+    ];
+    assert_eq!((calls, rest.as_str()), (want, "On it."));
+    // A block in the wrapper that is not closed is an incomplete call; the closed one before it still counts.
+    let t = "<tool_call><function=read><parameter=path>a</parameter></function>\n<function=shell><parameter=command>ls</parameter>\n</tool_call>";
+    let (calls, rest) = texts(t);
+    assert_eq!((calls, rest.as_str()), (vec![Call { name: "read".into(), args: json!({"path": "a"}), ..Call::default() }, incomplete_call("shell")], ""));
+}
+
+#[test]
+fn text_qwen_xml_unclosed_then_next() {
+    // A block that lost its `</function>` ends where the next block starts: it does not run, the next one does.
+    let t = "<function=shell>\n<parameter=command>\nls\n</parameter>\n<function=read>\n<parameter=path>\na.txt\n</parameter>\n</function>\nDone.";
+    let (calls, rest) = texts(t);
+    assert_eq!((calls, rest.as_str()), (vec![incomplete_call("shell"), Call { name: "read".into(), args: json!({"path": "a.txt"}), ..Call::default() }], "Done."));
+}
+
+#[test]
+fn text_qwen_xml_value_is_opaque() {
+    // Markup inside a parameter value is part of the value: it neither cuts the call nor becomes a call of its own.
+    let t = "<function=write>\n<parameter=path>\nnotes.md\n</parameter>\n<parameter=content>\nThe parser reads <function=NAME> tags.\n</parameter>\n</function>";
+    assert_eq!(texts(t).0, vec![Call { name: "write".into(), args: json!({"content": "The parser reads <function=NAME> tags.", "path": "notes.md"}), ..Call::default() }]);
+    let t = "<function=write>\n<parameter=path>\nREADME.md\n</parameter>\n<parameter=content>\nRun: <function=shell><parameter=command>make clean</parameter></function>\n\
+             </parameter>\n</function>";
+    assert_eq!(names(&Reply { calls: texts(t).0, ..Reply::default() }), ["write"], "an example call in a value never runs");
+    // A value holding `</function>` cuts the call there, so it does not run.
+    let t = "<function=write>\n<parameter=path>\na.md\n</parameter>\n<parameter=content>\nEnd it with </function>.\n</parameter>\n</function>";
+    assert_eq!(texts(t).0, vec![incomplete_call("write")]);
+}
+
+#[test]
+fn text_qwen_xml_empty_name_unknown() {
+    for (t, name) in [
+        ("<function=></function>", "unknown"),
+        ("<function= ><parameter=path>x</parameter></function>", "unknown"),
+        ("<tool_call><function=></function></tool_call>", "unknown"),
+        // A name not ended by `>` is malformed; it still names the call.
+        ("<function=read\n<parameter=path>x</parameter></function>", "read"),
+        ("<function=read<parameter=path>x</parameter></function>", "read"),
+        ("<function=read\n", "read"),
+    ] {
+        assert_eq!(texts(t), (vec![incomplete_call(name)], String::new()), "{t:?}");
+    }
+}
+
+#[test]
+fn text_calls_linear() {
+    // The scan is one pass: 1 MiB of dense markup or of many fences takes well under a second. Searching the rest of the
+    // text again for every match would take minutes here.
+    for unit in [
+        "<tool_call></tool_call>",
+        "<function=a>",
+        "x\n```\n",
+        "a```b <function=shell><parameter=command>ls</parameter></function>\n",
+        "<tool_call>{\"name\": \"read\", \"arguments\": {\"path\": \"a\"}}</tool_call>",
+        "<tool_call><function=a></function><function=b>",
+    ] {
+        let t = unit.repeat((1 << 20) / unit.len() + 1);
+        let start = Instant::now();
+        let (calls, _) = texts(&t);
+        let took = start.elapsed();
+        assert!(!calls.is_empty() || unit.starts_with('x'), "{unit:?}");
+        assert!(took.as_millis() < 3000, "{} calls from 1 MiB of {unit:?} took {took:?}", calls.len());
+    }
+}
+
 #[test]
 fn text_fenced_json_offered() {
     let (calls, rest) = texts("Running it:\n```json\n{\n  \"name\": \"shell\",\n  \"arguments\": {\n    \"command\": \"make\"\n  }\n}\n```\nDone soon.");
@@ -586,6 +692,10 @@ fn text_closed_unparseable_incomplete() {
         ("<tool_call>{\"name\": \"shell\"}</tool_call>", "shell"),
         ("<tool_call><function=edit><parameter=path>a</function></tool_call>", "edit"),
         ("<function=shell><parameter=command>ls</function>", "shell"),
+        // Only parameters and white space may stand between the name and `</function>`.
+        ("<function=shell>\nls\n</function>", "shell"),
+        ("<function=shell><parameter=command>ls</parameter> and then</function>", "shell"),
+        ("<tool_call><function=read>x<parameter=path>a</parameter></function></tool_call>", "read"),
     ];
     for (t, name) in cases {
         let (calls, rest) = texts(t);
@@ -641,6 +751,18 @@ fn json_completion_calls() {
     let got: Vec<(&str, &str, &Value, Option<&str>)> = r.calls.iter().map(|c| (c.id.as_str(), c.name.as_str(), &c.args, c.raw.as_deref())).collect();
     assert_eq!(got, [("", "shell", &json!({"command": "ls"}), None), ("", "read", &json!({"path": "a"}), None), ("c3", "shell", &json!({}), Some("{bad"))]);
     assert_eq!((r.text.as_str(), r.finish.as_str()), ("", "tool_calls"));
+}
+
+#[test]
+fn json_completion_no_choices() {
+    // Valid JSON that is not a chat completion (a wrong path on some servers) is a provider error, not an empty answer.
+    for b in [r#"{"detail": "Not Found"}"#, r#"{"choices": []}"#, r#"{"choices": [{"text": "hi"}]}"#, "[]", "null"] {
+        let e = Acc::new(&OFFERED).json(b.as_bytes()).err().unwrap();
+        assert_eq!((e.kind, e.message.as_str(), e.retry), ("provider", format!("the completion has no choices[0].message: {b}").as_str(), None), "{b}");
+    }
+    // A message with no content and no calls is still a completion.
+    let r = Acc::new(&OFFERED).json(br#"{"choices": [{"finish_reason": "stop", "message": {"content": null}}]}"#).unwrap();
+    assert_eq!((r.text.as_str(), r.finish.as_str()), ("", "stop"));
 }
 
 /// xorshift64: reproducible noise without a crate.
