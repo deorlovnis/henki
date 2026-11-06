@@ -5,8 +5,8 @@ use crate::{http, sys, term};
 use serde_json::Value;
 use std::ffi::{OsStr, OsString};
 use std::os::unix::{ffi::OsStrExt, fs::MetadataExt};
-use std::path::{Path, PathBuf};
-use std::{fs, io::ErrorKind, io::Read, iter, net::Ipv6Addr};
+use std::path::{Component, Path, PathBuf};
+use std::{fs, io::ErrorKind, io::Read, net::Ipv6Addr};
 
 /// A snapshot of the process environment, taken once in `main`; tests build their own with `Env(vec![...])`.
 #[derive(Clone, Debug, Default)]
@@ -79,8 +79,12 @@ pub fn load(f: &Flags, env: &Env, cwd: &Path) -> Result<Config, String> {
     let home = PathBuf::from(env.get("HOME").filter(|h| Path::new(h).is_absolute()).ok_or("HOME is not set; fix: set HOME to your home directory")?);
     let var = |name: &str| env.get(name).filter(|v| !v.is_empty()).map(|v| v.to_str().map(Value::from).ok_or(format!("{name} is not UTF-8; fix: unset it"))).transpose();
     let (env_model, env_url) = (var("HENKI_MODEL")?, var("HENKI_BASE_URL")?);
-    let file = f.config.as_ref().map_or_else(|| home.join(".config/henki/config.toml"), |p| cwd.join(p));
-    let (dir, explicit, root) = (file.parent().unwrap_or(&home).to_path_buf(), f.config.is_some(), project_root(cwd, &home));
+    let real = |p: &Path| fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
+    // A relative --config is taken from the cwd, a real path (getcwd's), so each leading `..` drops one of its names.
+    let up = f.config.as_ref().map_or(0, |p| p.components().take_while(|c| *c == Component::ParentDir).count());
+    let base = cwd.ancestors().nth(up).unwrap_or(Path::new("/"));
+    let file = f.config.as_ref().map_or_else(|| home.join(".config/henki/config.toml"), |p| base.join(p.components().skip(up).collect::<PathBuf>()));
+    let (dir, explicit, root) = (file.parent().unwrap_or(&home).to_path_buf(), f.config.is_some(), project_root(cwd, &real(&home)));
     #[rustfmt::skip]
     let mut c = Config { model: String::new(), url: Url { host: String::new(), port: 80, path: String::new() }, url_from: "config", api_key: String::new(),
         auto: false, approve_from: "default".into(), tools: TOOLS.to_vec(), pass_env: Vec::new(), max_steps: 50, max_seconds: 0, tool_timeout_s: 120,
@@ -89,13 +93,12 @@ pub fn load(f: &Flags, env: &Env, cwd: &Path) -> Result<Config, String> {
     // Each layer is (where, key, value): the file's lines, then the two variables, then the flags; the last one wins.
     let mut layers: Vec<(String, String, Value)> = Vec::new();
     if explicit || file.exists() {
-        let (bytes, m) = read(&file, 64 << 10)?;
-        owner_mode(&file, m.mode(), m.uid(), sys::euid(), false)?;
-        let real = |p: &Path| fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
-        if c.root != c.home && c.root != Path::new("/") && (file.starts_with(&c.root) || real(&file).starts_with(real(&c.root))) {
-            return Err(format!("{} is inside the project {}; fix: keep the config outside the project, in ~/.config/henki", file.display(), c.root.display()));
+        let text = read(&file, 64 << 10)?;
+        // Named through the project (even by a link out of it) or stored in it, the project could choose the config.
+        if real(&c.root) != real(&c.home) && c.root != Path::new("/") && (file.starts_with(&c.root) || real(&file).starts_with(real(&c.root))) {
+            let fix = "fix: keep the config outside the project, in ~/.config/henki, and name it by a path outside the project";
+            return Err(format!("{} is inside the project {} or named through it; {fix}", file.display(), c.root.display()));
         }
-        let text = String::from_utf8(bytes).map_err(|_| format!("{}: not UTF-8; fix: save it as UTF-8", file.display()))?;
         let lines = parse(&text).map_err(|e| format!("{}:{e}", file.display()))?;
         layers.extend(lines.into_iter().map(|(n, k, v)| (format!("{}:{n}", file.display()), k, v)));
         (c.hash, c.file) = (Some(sys::fnv(text.as_bytes())), Some(file.clone()));
@@ -135,8 +138,9 @@ pub fn load(f: &Flags, env: &Env, cwd: &Path) -> Result<Config, String> {
     c.notices.extend(unknown.map(|k| format!("ignoring {k}: henki does not read it")));
     let listed = at("ext");
     let paths = listed.map_or_else(|| vec![c.dir.join("ext")], |l| l.2.as_array().into_iter().flatten().filter_map(Value::as_str).map(|p| expand(p, &c.home)).collect());
+    let from = listed.map(|l| l.0.clone()).or_else(|| c.file.as_ref().map(|f| f.display().to_string()));
     for p in paths {
-        ext(&p, listed.is_none() && !c.explicit).map_err(|e| listed.map_or_else(|| e.clone(), |l| format!("{}: {e}", l.0)))?;
+        ext(&p, listed.is_none() && !c.explicit).map_err(|e| from.as_ref().map_or_else(|| e.clone(), |at| format!("{at}: {e}")))?;
     }
     let dirs: Vec<String> = std::env::split_paths(env.get("PATH").unwrap_or_default()).filter(|p| p.is_absolute()).filter_map(|p| p.into_os_string().into_string().ok()).collect();
     c.user_path = dirs.join(":");
@@ -144,7 +148,7 @@ pub fn load(f: &Flags, env: &Env, cwd: &Path) -> Result<Config, String> {
     c.bash = dirs.iter().map(|d| Path::new(d).join("bash")).find(exe).ok_or("bash is not on PATH; fix: install bash, or add its directory to PATH")?;
     let agents = c.dir.join("AGENTS.md");
     if agents.exists() {
-        let text = String::from_utf8(read(&agents, 4 << 10)?.0).map_err(|_| format!("{}: not UTF-8; fix: save it as UTF-8", agents.display()))?;
+        let text = read(&agents, 4 << 10)?;
         if let Some((i, ch)) = text.split('\n').enumerate().find_map(|(i, l)| Some((i, l.chars().find(|&ch| term::escaped(ch))?))) {
             return Err(format!("{}:{}: holds U+{:04X}, which a terminal does not show; fix: remove it", agents.display(), i + 1, ch as u32));
         }
@@ -154,10 +158,7 @@ pub fn load(f: &Flags, env: &Env, cwd: &Path) -> Result<Config, String> {
         c.window = 32_768;
         c.notices.push("context_window is unknown; using 32,768 tokens".into());
     }
-    for p in c.file.iter().chain(iter::once(&c.dir)) {
-        let real = fs::canonicalize(p).ok().filter(|r| r != p);
-        c.protected.extend(iter::once(p.clone()).chain(real));
-    }
+    c.protected = c.file.iter().chain([&c.dir]).flat_map(|p| [Some(p.clone()), fs::canonicalize(p).ok().filter(|r| r != p)]).flatten().collect();
     Ok(c)
 }
 
@@ -179,9 +180,13 @@ fn set(c: &mut Config, k: &str, v: &Value) -> Result<(), String> {
         "tools" => c.tools = tools(&list()?)?,
         "ext" => drop(list()?), // checked once the config dir and the flags are known
         "pass_env" => c.pass_env = pass_env(&list()?, c.explicit)?,
-        _ if INTS.iter().all(|i| i.0 != k) => return Err(format!("unknown key {k}; fix: remove it (this build knows {KEYS})")),
         _ => {
-            let n = int(k, v.as_u64().ok_or(format!("{k} must be an integer; fix: write it without quotes"))?)?;
+            let Some(&(_, lo, hi)) = INTS.iter().find(|i| i.0 == k) else { return Err(format!("unknown key {k}; fix: remove it (this build knows {KEYS})")) };
+            let n = v.as_u64().ok_or(format!("{k} must be an integer; fix: write it without quotes"))?;
+            let zero = if k == "context_window" { ", or 0 when unknown" } else { "" };
+            if !(lo..=hi).contains(&n) && (n > 0 || zero.is_empty()) {
+                return Err(format!("{k} = {n} is out of range; fix: use {} to {}{zero}", term::num(lo), term::num(hi)));
+            }
             match k {
                 "max_steps" => c.max_steps = n as u32,
                 "max_seconds" => c.max_seconds = n,
@@ -193,16 +198,6 @@ fn set(c: &mut Config, k: &str, v: &Value) -> Result<(), String> {
         }
     }
     Ok(())
-}
-
-/// `n` if it is in `key`'s range.
-fn int(key: &str, n: u64) -> Result<u64, String> {
-    let (lo, hi) = INTS.iter().find(|i| i.0 == key).map_or((0, u64::MAX), |i| (i.1, i.2));
-    let zero = if key == "context_window" { ", or 0 when unknown" } else { "" };
-    if (lo..=hi).contains(&n) || (n == 0 && !zero.is_empty()) {
-        return Ok(n);
-    }
-    Err(format!("{key} = {n} is out of range; fix: use {} to {}{zero}", term::num(lo), term::num(hi)))
 }
 
 /// A non-empty set of the built-in tools without repeats, in canonical order.
@@ -240,7 +235,7 @@ fn ext(p: &Path, optional: bool) -> Result<(), String> {
     }
     let names = match fs::read_dir(p) {
         Err(e) if optional && e.kind() == ErrorKind::NotFound => return Ok(()),
-        r => r.map_err(|e| format!("ext {d}: {e}; fix: create the directory, or list existing ones in ext"))?,
+        r => r.map_err(|e| format!("ext {d}: {e}; fix: make it a readable directory, or set ext to readable ones"))?,
     };
     match names.filter_map(|e| Some(e.ok()?.file_name())).find(|n| !n.as_bytes().starts_with(b".")) {
         Some(n) => Err(format!("ext {d}: {0}: extensions are not supported by this build; fix: move {0} out of {d}", n.to_string_lossy())),
@@ -248,8 +243,9 @@ fn ext(p: &Path, optional: bool) -> Result<(), String> {
     }
 }
 
-/// A regular file of at most `max` bytes, opened without blocking on a FIFO, with its metadata.
-fn read(path: &Path, max: u64) -> Result<(Vec<u8>, fs::Metadata), String> {
+/// A UTF-8 regular file of at most `max` bytes, opened without blocking on a FIFO, that no other user can write (the
+/// config file and AGENTS.md: both steer what henki runs).
+fn read(path: &Path, max: u64) -> Result<String, String> {
     let fail = |e: String| format!("{e}; fix: make {} a readable regular file", path.display());
     let (f, _) = sys::open_regular(path).map_err(fail)?;
     let mut b = Vec::new();
@@ -257,7 +253,8 @@ fn read(path: &Path, max: u64) -> Result<(Vec<u8>, fs::Metadata), String> {
     if b.len() as u64 > max {
         return Err(format!("{}: over {} bytes; fix: shorten it", path.display(), term::num(max)));
     }
-    Ok((b, m))
+    owner_mode(path, m.mode(), m.uid(), sys::euid(), false)?;
+    String::from_utf8(b).map_err(|_| format!("{}: not UTF-8; fix: save it as UTF-8", path.display()))
 }
 
 /// The config file (`dir` false) may be owned by the euid or root, its directory only by the euid; neither may be
@@ -276,9 +273,9 @@ fn owner_mode(path: &Path, mode: u32, uid: u32, euid: u32, dir: bool) -> Result<
 /// The TOML subset: (line, key, value) per assignment; Err("LINE: PROBLEM").
 pub fn parse(text: &str) -> Result<Vec<(usize, String, Value)>, String> {
     let mut out: Vec<(usize, String, Value)> = Vec::new();
-    for (i, line) in text.strip_prefix('\u{feff}').unwrap_or(text).split('\n').enumerate() {
+    let text = text.strip_prefix('\u{feff}').unwrap_or(text).replace("\r\n", "\n");
+    for (i, line) in text.split('\n').enumerate() {
         let err = |p: String| format!("{}: {p}", i + 1);
-        let line = line.strip_suffix('\r').unwrap_or(line);
         if line.contains(|c: char| c.is_control() && c != '\t') {
             return Err(err("a raw control character; fix: remove it, or write it as an escape inside a string".into()));
         }
@@ -318,21 +315,13 @@ fn value(s: &str) -> Option<(Value, &str)> {
     }
 }
 
-/// A JSON string (its escapes keep their JSON meaning), `true`, `false`, or the digits of an integer up to 2^31-1 (no
-/// sign, exponent, fraction, `_` or leading zero), and the text after it.
+/// A JSON string (its escapes keep their JSON meaning), `true`, `false` or an integer from 0 to 2^31-1 (JSON's grammar
+/// without a sign, fraction or exponent), and the text after it. A `#` ends a bare value: `7#c` is 7 and a comment.
 fn scalar(s: &str) -> Option<(Value, &str)> {
-    let digits = s.find(|c: char| !c.is_ascii_digit()).unwrap_or(s.len());
-    if digits > 0 {
-        let (d, rest) = s.split_at(digits);
-        return serde_json::from_str::<u32>(d).ok().filter(|&n| n <= 2_147_483_647).map(|n| (n.into(), rest));
-    }
-    let word = |w: &str, b: bool| s.strip_prefix(w).map(|rest| (Value::Bool(b), rest));
-    if let Some(found) = word("true", true).or_else(|| word("false", false)) {
-        return Some(found);
-    }
-    let mut it = serde_json::Deserializer::from_str(s).into_iter::<String>();
-    let v = it.next()?.ok()?;
-    Some((v.into(), s.get(it.byte_offset()..)?))
+    let bare = s.get(..s.find('#').filter(|_| !s.starts_with('"')).unwrap_or(s.len()))?;
+    let mut it = serde_json::Deserializer::from_str(bare).into_iter::<Value>();
+    let v = it.next()?.ok().filter(|v| v.is_string() || v.is_boolean() || (!s.starts_with('-') && v.as_u64().is_some_and(|n| n <= 2_147_483_647)))?;
+    Some((v, s.get(it.byte_offset()..)?))
 }
 
 /// `http://HOST[:PORT]/PATH`: http only (`https is not supported in henki v1`), no userinfo, no query, one trailing `/` stripped.
@@ -347,7 +336,7 @@ pub fn parse_url(s: &str) -> Result<Url, String> {
         return Err(bad("holds a user name, password, query or fragment"));
     }
     let (host, port) = match auth.rsplit_once(':') {
-        Some((h, p)) if !p.contains(']') => (h, p.parse::<u16>().ok().filter(|&p| p > 0)),
+        Some((h, p)) if !p.contains(']') => (h, p.parse::<u16>().ok().filter(|&n| n > 0 && p.bytes().all(|b| b.is_ascii_digit()))),
         _ => (auth, Some(80)),
     };
     let v6 = host.strip_prefix('[').and_then(|h| h.strip_suffix(']'));

@@ -275,3 +275,83 @@ fn out_order_across_streams() {
     let want = [(2, "henki: one\n"), (2, "$ two -> exit 0, 0.1 s\n"), (1, "three\n"), (2, "henki: four\n"), (1, "five\n")];
     assert_eq!(got, want.map(|(fd, s)| (fd, s.to_string())));
 }
+
+#[test]
+fn out_flush_past_deadline() {
+    let (tx, _rx) = mpsc::channel();
+    let (release, hold) = mpsc::channel();
+    let until = Instant::now();
+    let out = Out::with(true, tx, Box::new(Stuck(hold)), Box::new(io::sink()));
+    out.record(&json!({"t": "result"}));
+    assert!(!out.flush(until));
+    assert!(until.elapsed() < Duration::from_millis(500), "{:?}", until.elapsed());
+    drop(release);
+}
+
+#[test]
+fn panic_line_bounded() {
+    // Another thread holds std's stderr lock, as the writer thread does while it is blocked on a full stderr pipe.
+    let (locked, is_locked) = mpsc::channel();
+    let (release, hold) = mpsc::channel::<()>();
+    let holder = std::thread::spawn(move || {
+        let _guard = std::io::stderr().lock();
+        locked.send(()).unwrap();
+        let _ = hold.recv();
+    });
+    is_locked.recv().unwrap();
+    let t0 = Instant::now();
+    panic_line("a test of the panic line, not a failure");
+    assert!(t0.elapsed() < Duration::from_secs(2), "{:?}", t0.elapsed());
+    drop(release);
+    holder.join().unwrap();
+}
+
+/// `n` strings of up to 11 random code points: ASCII, the escaped ranges, and any plane.
+fn random_strings(n: usize) -> Vec<String> {
+    let mut x: u64 = 0x2545_f491_4f6c_dd1d;
+    let mut next = move || {
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        x
+    };
+    let mut point = move || {
+        let r = next();
+        let (a, b) = ESCAPE[(r >> 8) as usize % ESCAPE.len()];
+        char::from_u32(match r % 4 {
+            0 => (r >> 16) as u32 % 0x80,
+            1 => a + (r >> 32) as u32 % (b - a + 1),
+            _ => (r >> 16) as u32 % 0x11_0000,
+        })
+    };
+    (0..n).map(|i| (0..i % 12).filter_map(|_| point()).collect()).collect()
+}
+
+#[test]
+fn term_escape_never_panics() {
+    for s in random_strings(50_000) {
+        let want: String = s
+            .chars()
+            .map(|c| match c as u32 {
+                _ if !escaped(c) => c.to_string(),
+                u if u < 0x100 => format!("\\x{u:02x}"),
+                u => format!("\\u{{{u:04x}}}"),
+            })
+            .collect();
+        let got = escape(&s);
+        assert!(!got.chars().any(escaped), "{s:?}");
+        assert_eq!(got, want);
+    }
+}
+
+#[test]
+fn json_line_roundtrip_fuzz() {
+    for s in random_strings(50_000) {
+        let mut m = serde_json::Map::new();
+        m.insert(s.clone(), json!([s, 1]));
+        let v = Value::Object(m);
+        let line = json_line(&v);
+        assert!(!line.chars().any(escaped) && !line.contains('\n'), "{line:?}");
+        assert_eq!(serde_json::from_str::<Value>(&line).unwrap(), v);
+    }
+}

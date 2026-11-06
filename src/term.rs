@@ -144,10 +144,13 @@ impl Out {
     }
 }
 
-/// The panic hook's line, written synchronously to fd 2: `henki: MSG`, escaped.
+/// The panic hook's line to fd 2: `henki: MSG`, escaped. A helper thread writes it and the hook waits at most 100 ms, so
+/// a stderr nobody reads (or the writer thread blocked on one, holding std's stderr lock) never holds up the abort.
 #[allow(clippy::disallowed_methods)] // the hook cannot rely on the writer thread, which may be the one that panicked
 pub fn panic_line(msg: &str) {
-    let _ = std::io::stderr().write_all(format!("henki: {}\n", escape(msg)).as_bytes());
+    let (line, (done, wait)) = (format!("henki: {}\n", escape(msg)), mpsc::channel::<()>());
+    let write = move || drop((std::io::stderr().write_all(line.as_bytes()), done)); // `wait` ends when `done` drops
+    let _ = std::thread::Builder::new().spawn(write).map(|_| wait.recv_timeout(std::time::Duration::from_millis(100)));
 }
 
 #[cfg(test)]

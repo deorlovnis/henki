@@ -21,6 +21,9 @@ impl T {
         static N: AtomicUsize = AtomicUsize::new(0);
         let dir = std::env::temp_dir().join(format!("henki-config-{}-{}", std::process::id(), N.fetch_add(1, Ordering::SeqCst)));
         let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        // Its real path, so test paths equal the realpaths `load` derives (on macOS the temp dir sits behind a link).
+        let dir = fs::canonicalize(&dir).unwrap();
         let t = T { home: dir.join("home"), cwd: dir.join("work"), bin: dir.join("bin"), dir };
         fs::create_dir_all(t.cfg_dir()).unwrap();
         chmod(&t.cfg_dir(), 0o700);
@@ -161,6 +164,8 @@ fn toml_subset_bom_crlf() {
     refused("a = 1\r\r\n");
     refused("a = \"x\ry\"\n");
     refused("b = 1\n\u{feff}a = 1\n");
+    // A \r is stripped only before a \n.
+    refused("a = 1\r");
 }
 
 #[test]
@@ -543,7 +548,7 @@ fn config_inside_project() {
     put(&t.cwd.join("henki.toml"), BASE, 0o600);
     chmod(&t.cwd, 0o700);
     let e = load(&Flags { config: Some(t.cwd.join("henki.toml")), ..flags() }, &t.env(&[]), &t.cwd).err().unwrap();
-    has(&e, &format!("henki.toml is inside the project {}; fix: ", t.cwd.display()));
+    has(&e, &format!("henki.toml is inside the project {} or named through it; fix: ", t.cwd.display()));
     // The default file, linked from inside the project.
     symlink(t.cwd.join("henki.toml"), t.cfg()).unwrap();
     has(&load(&flags(), &t.env(&[]), &t.cwd).err().unwrap(), "is inside the project");
@@ -605,8 +610,9 @@ fn config_ext_default_missing_explicit() {
     assert!(t.explicit(BASE).is_ok());
     let ext = t.dir.join("cfg/ext");
     fs::remove_dir(&ext).unwrap();
-    let e = load(&Flags { config: Some(t.dir.join("cfg/config.toml")), ..flags() }, &t.env(&[]), &t.cwd).err().unwrap();
-    assert!(e.starts_with(&format!("ext {}: ", ext.display())) && e.contains("; fix: "), "{e}");
+    let file = t.dir.join("cfg/config.toml");
+    let e = load(&Flags { config: Some(file.clone()), ..flags() }, &t.env(&[]), &t.cwd).err().unwrap();
+    assert!(e.starts_with(&format!("{}: ext {}: ", file.display(), ext.display())) && e.contains("; fix: "), "{e}");
 }
 
 #[test]
@@ -618,7 +624,7 @@ fn config_ext_present_fails_closed() {
     assert!(t.load(BASE).is_ok(), "dot entries are ignored");
     fs::create_dir_all(ext.join("halti")).unwrap();
     let e = t.err(BASE);
-    assert!(e.starts_with(&format!("ext {}: halti: extensions are not supported by this build; fix: ", ext.display())), "{e}");
+    assert!(e.starts_with(&format!("{}: ext {}: halti: extensions are not supported by this build; fix: ", t.cfg().display(), ext.display())), "{e}");
     let e = t.err(&format!("{BASE}ext = [\"~/.config/henki/ext\"]\n"));
     has(&e, &format!("config.toml:3: ext {}: halti: extensions are not supported by this build", ext.display()));
 }
@@ -814,4 +820,107 @@ fn config_too_big() {
     assert!(pad.len() > 64 << 10);
     assert_eq!(t.err(&pad), format!("{}: over 65,536 bytes; fix: shorten it", t.cfg().display()));
     assert!(t.load(&pad[..64 << 10]).is_ok());
+}
+
+#[test]
+fn config_agents_mode() {
+    let t = T::new();
+    let p = t.cfg_dir().join("AGENTS.md");
+    for mode in [0o620, 0o602, 0o666] {
+        put(&p, "be brief\n", mode);
+        assert_eq!(t.err(BASE), format!("{0} is group- or world-writable; fix: chmod go-w {0}", p.display()));
+    }
+    // A link is judged by the file it reaches.
+    let shared = t.dir.join("shared.md");
+    put(&shared, "be brief\n", 0o666);
+    fs::remove_file(&p).unwrap();
+    symlink(&shared, &p).unwrap();
+    has(&t.err(BASE), "AGENTS.md is group- or world-writable");
+    put(&p, "be brief\n", 0o644);
+    assert_eq!(t.load(BASE).unwrap().agents.as_deref(), Some("be brief"));
+}
+
+#[test]
+fn config_home_symlinked() {
+    // HOME names the home directory through a link; the cwd is its real path, as getcwd reports it.
+    let t = T::new();
+    put(&t.cfg(), BASE, 0o600);
+    let link = t.dir.join("homelink");
+    symlink(&t.home, &link).unwrap();
+    let env = Env(vec![("HOME".into(), link.clone().into()), ("PATH".into(), t.bin.clone().into())]);
+    let c = load(&flags(), &env, &t.home).unwrap();
+    assert_eq!((c.root, c.home, c.file), (t.home.clone(), link.clone(), Some(link.join(".config/henki/config.toml"))));
+    // A repository at home is the project of a directory below it, and may hold the config.
+    let notes = t.home.join("notes");
+    fs::create_dir_all(t.home.join(".git")).unwrap();
+    fs::create_dir_all(&notes).unwrap();
+    assert_eq!(load(&flags(), &env, &notes).unwrap().root, t.home);
+    // The walk stops at home: a repository above it is not the project.
+    fs::remove_dir(t.home.join(".git")).unwrap();
+    fs::create_dir_all(t.dir.join(".git")).unwrap();
+    assert_eq!(load(&flags(), &env, &notes).unwrap().root, notes);
+}
+
+#[test]
+fn config_explicit_relative_dotdot() {
+    let t = T::new();
+    t.explicit(BASE).unwrap();
+    let file = t.dir.join("cfg/config.toml");
+    let sub = t.cwd.join("sub");
+    fs::create_dir_all(&sub).unwrap();
+    let named = |p: &Path, cwd: &Path| load(&Flags { config: Some(p.into()), ..flags() }, &t.env(&[]), cwd);
+    // Leading `..` climb the cwd itself, so the file named is the one outside the project.
+    assert_eq!(named(Path::new("../../cfg/config.toml"), &sub).unwrap().file, Some(file.clone()));
+    assert_eq!(named(Path::new("../cfg/./config.toml"), &t.bin).unwrap().file, Some(file.clone()));
+    // A `..` after a name in the project stays refused: the project may turn that name into a link to anywhere.
+    has(&named(Path::new("sub/../../cfg/config.toml"), &t.cwd).err().unwrap(), "or named through it; fix: ");
+    // So does a link in the project to the config dir outside it.
+    symlink(t.dir.join("cfg"), t.cwd.join("cfg")).unwrap();
+    let e = named(Path::new("cfg/config.toml"), &t.cwd).err().unwrap();
+    has(&e, &format!("work/cfg/config.toml is inside the project {} or named through it", t.cwd.display()));
+    assert!(named(&file, &sub).is_ok());
+}
+
+#[test]
+fn config_henki_base_url_overrides_file() {
+    let t = T::new();
+    let text = "model = \"m\"\nbase_url = \"http://10.1.2.3:8080/v1\"\napi_key = \"sk-1\"\n";
+    has(&t.err(text), "config.toml:3: api_key is sent only to a loopback host, not to 10.1.2.3");
+    // The key goes where the requests go: HENKI_BASE_URL replaces the remote base_url with a loopback one.
+    let c = t.load_env(text, &[("HENKI_BASE_URL", "http://127.0.0.1:9931/v1")]).unwrap();
+    assert_eq!((c.url.host.as_str(), c.url.port, c.url_from, c.api_key.as_str()), ("127.0.0.1", 9931, "HENKI_BASE_URL", "sk-1"));
+    // An empty HENKI_BASE_URL is unset.
+    assert_eq!(t.load_env(BASE, &[("HENKI_BASE_URL", "")]).unwrap().url_from, "config");
+}
+
+#[test]
+fn config_ext_unreadable() {
+    if sys::euid() == 0 {
+        eprintln!("config_ext_unreadable skipped: root reads any directory");
+        return;
+    }
+    let t = T::new();
+    let exts = t.home.join("exts");
+    fs::create_dir_all(&exts).unwrap();
+    chmod(&exts, 0o000);
+    let listed = t.err(&format!("{BASE}ext = [\"~/exts\"]\n"));
+    chmod(&exts, 0o700);
+    assert!(listed.starts_with(&format!("{}:3: ext {}: ", t.cfg().display(), exts.display())), "{listed}");
+    has(&listed, "; fix: make it a readable directory");
+    // The default ext path may be absent, but an unreadable one fails closed too.
+    let ext = t.cfg_dir().join("ext");
+    fs::create_dir_all(&ext).unwrap();
+    chmod(&ext, 0o000);
+    let default = t.err(BASE);
+    chmod(&ext, 0o700);
+    assert!(default.starts_with(&format!("{}: ext {}: ", t.cfg().display(), ext.display())), "{default}");
+}
+
+#[test]
+fn parse_url_port_grammar() {
+    for bad in ["http://127.0.0.1:+80/v1", "http://[::1]:+9931/", "http://localhost:+1"] {
+        assert!(parse_url(bad).is_err(), "{bad:?} parsed");
+    }
+    // A port is digits; leading zeros are digits too.
+    assert_eq!(parse_url("http://127.0.0.1:0080/v1").unwrap().port, 80);
 }
