@@ -14,46 +14,209 @@ mod tools;
 mod turn;
 mod types;
 
-use std::io::Write;
+use config::{Config, Env, Flags};
+use journal::{Journal, rec};
+use serde_json::Value;
+use std::io::{self, Read};
 use std::process::ExitCode;
+use std::sync::mpsc::{self, Receiver, Sender};
+use std::time::{Duration, Instant};
+use term::Out;
+use turn::Session;
+use types::{Ev, Outcome, Usage};
 
 const USAGE: &str = "usage: henki run [--json] [--max-steps N] [--max-seconds N] [--approve ask|auto] [--config FILE] [--model NAME] [--resume[=ID]] [--nested] [TASK | -]
-       henki --version | --help
-";
+       henki --version | --help";
+/// The most `run -` takes from stdin.
+const TASK_MAX: u64 = 1 << 20;
 
-fn main() -> ExitCode {
-    match args() {
-        Ok(text) => {
-            write(true, &text);
-            ExitCode::SUCCESS
-        }
-        Err(e) => {
-            write(false, &format!("henki: {e}\n{USAGE}"));
-            ExitCode::from(2)
-        }
-    }
+/// The arguments of `run`.
+struct Args {
+    json: bool,
+    flags: Flags,
+    resume: Option<Option<String>>,
+    nested: bool,
+    task: Option<String>,
 }
 
-/// `--version` or `--help`; `run` is not wired yet, so it is refused like any other argument.
-fn args() -> Result<String, lexopt::Error> {
+fn main() -> ExitCode {
+    let t0 = Instant::now();
+    let (tx, rx) = mpsc::channel();
+    // First, while this is the only thread: every thread started later inherits the blocked signals.
+    let early = sys::signals(tx.clone()).and_then(|()| sys::harden());
+    std::panic::set_hook(Box::new(|info| {
+        supervise::panic_kill();
+        term::panic_line(&info.to_string());
+    }));
+    let flags = Flags { config: None, approve: None, model: None, max_steps: None, max_seconds: None };
+    let mut a = Args { json: false, flags, resume: None, nested: false, task: None };
+    let cmd = parse(&mut a);
+    let out = Out::start(a.json, tx.clone());
+    ExitCode::from(match cmd {
+        Ok(None) => run(a, out, tx, rx, t0, early),
+        Ok(Some(text)) => {
+            out.answer(&text);
+            code(out, &Outcome::Ok, None)
+        }
+        Err(e) => {
+            let o = Outcome::error("config", e.to_string());
+            refuse(&out, &o, t0);
+            out.line(USAGE);
+            code(out, &o, None)
+        }
+    })
+}
+
+/// The command line, parsed before any output: the text of `--version` or `--help`, or None for `run` with its
+/// arguments in `a`. On an error, `a.json` says whether `--json` came before the bad argument.
+fn parse(a: &mut Args) -> Result<Option<String>, lexopt::Error> {
     use lexopt::prelude::*;
     let mut p = lexopt::Parser::from_env();
+    let (version, arch, os) = (env!("CARGO_PKG_VERSION"), std::env::consts::ARCH, std::env::consts::OS);
     let text = match p.next()? {
-        Some(Long("version")) => {
-            let commit = option_env!("HENKI_COMMIT").unwrap_or("unknown");
-            format!("henki {} ({commit}, {}-{})\n", env!("CARGO_PKG_VERSION"), std::env::consts::ARCH, std::env::consts::OS)
-        }
-        Some(Long("help")) => format!("henki {}: a small terminal agent\n\n{USAGE}", env!("CARGO_PKG_VERSION")),
+        Some(Long("version")) => format!("henki {version} ({}, {arch}-{os})", option_env!("HENKI_COMMIT").unwrap_or("unknown")),
+        Some(Long("help")) => format!("henki {version}: a small terminal agent\n\n{USAGE}"),
+        Some(Value(v)) if v == "run" => String::new(),
         Some(arg) => return Err(arg.unexpected()),
         None => return Err("no command given".into()),
     };
-    if let Some(arg) = p.next()? {
-        return Err(arg.unexpected());
+    if !text.is_empty() {
+        return p.next()?.map_or(Ok(Some(text)), |arg| Err(arg.unexpected()));
     }
-    Ok(text)
+    while let Some(arg) = p.next()? {
+        match arg {
+            Long("json") => a.json = true,
+            Long("max-steps") => a.flags.max_steps = Some(p.value()?.parse()?),
+            Long("max-seconds") => a.flags.max_seconds = Some(p.value()?.parse()?),
+            Long("approve") => match p.value()?.string()?.as_str() {
+                m @ ("ask" | "auto") => a.flags.approve = Some(m == "auto"),
+                m => return Err(format!("--approve takes ask or auto, not {m}").into()),
+            },
+            Long("config") => a.flags.config = Some(p.value()?.into()),
+            Long("model") => a.flags.model = Some(p.value()?.string()?),
+            Long("resume") => a.resume = Some(p.optional_value().map(|v| v.string()).transpose()?),
+            Long("nested") => a.nested = true,
+            Value(v) if a.task.is_none() => a.task = Some(v.string()?),
+            arg => return Err(arg.unexpected()),
+        }
+    }
+    if a.task.is_none() && a.resume.is_none() {
+        return Err("missing TASK".into());
+    }
+    Ok(None)
 }
 
-#[allow(clippy::disallowed_methods)] // temporary: main writes through term::Out once the modules are wired
-fn write(stdout: bool, text: &str) {
-    let _ = if stdout { std::io::stdout().lock().write_all(text.as_bytes()) } else { std::io::stderr().lock().write_all(text.as_bytes()) };
+/// `henki run`: startup, one turn, the `result`, the session end.
+fn run(a: Args, out: Out, tx: Sender<Ev>, rx: Receiver<Ev>, t0: Instant, early: io::Result<()>) -> u8 {
+    let mut deadline = None;
+    let (cfg, j, hist, task, session) = match start(a, &tx, &rx, t0, early, &mut deadline) {
+        Ok(r) => r,
+        Err(o) => {
+            refuse(&out, &o, t0);
+            return code(out, &o, deadline);
+        }
+    };
+    out.record(&session);
+    let mut s = Session::new(cfg, j, hist, out, tx, rx, deadline);
+    let o = s.turn(task);
+    let result = rec::result(&o, s.text(), s.usage(), Some(s.id()), s.steps(), ms(t0));
+    let o = s.close(Some(result)).err().unwrap_or(o);
+    let out = s.into_out();
+    if o != Outcome::Ok {
+        out.line(&outcome_line(&o));
+    }
+    code(out, &o, deadline)
+}
+
+/// What startup hands to the session: the config, the journal, the history, the task and the `session` record.
+type Started = (Config, Journal, Vec<Value>, Option<String>, Value);
+
+/// Startup up to the `session` record. An error ends the run before a session exists.
+fn start(a: Args, tx: &Sender<Ev>, rx: &Receiver<Ev>, t0: Instant, early: io::Result<()>, deadline: &mut Option<Instant>) -> Result<Started, Outcome> {
+    let bad = |m: String| Outcome::error("config", m);
+    early.map_err(|e| Outcome::error("internal", e.to_string()))?;
+    let env = Env::os();
+    let depth = env.get("HENKI_DEPTH").and_then(|d| d.to_str()).unwrap_or_default();
+    if !a.nested && depth.parse::<u32>().is_ok_and(|d| d >= 1) {
+        return Err(Outcome::error("nested", format!("refusing to start inside henki (HENKI_DEPTH={depth}); pass --nested if this is intended")));
+    }
+    let cwd = std::env::current_dir().map_err(|e| bad(format!("cannot read the working directory: {e}")))?;
+    let mut cfg = config::load(&a.flags, &env, &cwd).map_err(bad)?;
+    *deadline = (cfg.max_seconds > 0).then(|| t0 + Duration::from_secs(cfg.max_seconds));
+    let state = journal::state_dir(&cfg.env, &cfg.home).map_err(bad)?;
+    cfg.protected.extend(state.canonicalize().ok());
+    cfg.protected.push(state.clone());
+    let task = match a.task {
+        Some(t) if t == "-" => Some(stdin_task(tx, rx, *deadline)?),
+        t => t,
+    };
+    if task.as_deref().is_some_and(|t| t.trim().is_empty()) {
+        return Err(bad("task is empty".into()));
+    }
+    // A signal or the deadline that came during startup ends it here, before the session file exists.
+    if let Ok(Ev::Signal(_)) = rx.try_recv() {
+        return Err(Outcome::Interrupted);
+    }
+    if deadline.is_some_and(|d| Instant::now() >= d) {
+        return Err(Outcome::Budget);
+    }
+    let (mut j, hist, from) = match &a.resume {
+        None => (Journal::create(&state, &cfg.cwd)?, Vec::new(), None),
+        Some(id) => {
+            let r = Journal::resume(&state, &cfg.cwd, id.as_deref(), &cfg)?;
+            cfg.notices.extend(r.notices);
+            (r.journal, r.hist, Some(r.from_bytes))
+        }
+    };
+    let session = j.write(rec::session(&cfg, j.id(), &cfg.cwd, from))?;
+    Ok((cfg, j, hist, task, session))
+}
+
+/// `run -`: stdin to EOF on its own thread, so that a signal or the deadline still ends the wait.
+fn stdin_task(tx: &Sender<Ev>, rx: &Receiver<Ev>, deadline: Option<Instant>) -> Result<String, Outcome> {
+    let tx = tx.clone();
+    std::thread::spawn(move || {
+        let mut b = Vec::new();
+        let ok = io::stdin().lock().take(TASK_MAX + 1).read_to_end(&mut b).is_ok() && b.len() as u64 <= TASK_MAX;
+        let _ = tx.send(Ev::Line(ok.then(|| String::from_utf8_lossy(&b).into_owned())));
+    });
+    loop {
+        match deadline.map_or_else(|| rx.recv().ok(), |d| rx.recv_timeout(d.saturating_duration_since(Instant::now())).ok()) {
+            Some(Ev::Line(Some(t))) => return Ok(t),
+            Some(Ev::Line(None)) => return Err(Outcome::error("config", "the task on stdin is over 1 MiB or unreadable")),
+            Some(Ev::Signal(_)) => return Err(Outcome::Interrupted),
+            None => return Err(Outcome::Budget),
+            Some(_) => {}
+        }
+    }
+}
+
+/// An end before any session exists: the `--json` result with `session: null`, or plain text on stderr.
+fn refuse(out: &Out, o: &Outcome, t0: Instant) {
+    out.record(&rec::result(o, "", Usage::default(), None, 0, ms(t0)));
+    match o {
+        Outcome::Error { message, .. } => out.note(message),
+        o => out.line(&outcome_line(o)),
+    }
+}
+
+/// The plain-mode line for an end other than `ok`: `(gave up: stuck)`, `(error auth: MSG)`, `(budget)`.
+fn outcome_line(o: &Outcome) -> String {
+    match o {
+        Outcome::GaveUp(r) => format!("(gave up: {r})"),
+        Outcome::Error { kind, message } => format!("(error {kind}: {message})"),
+        Outcome::NeedsApproval(c) => format!("(needs approval: {})", c.name),
+        o => format!("({})", o.status().replace('_', " ")),
+    }
+}
+
+/// The bounded flush, then the exit code: 141 when stdout closed before a run that finished got its `result` out.
+fn code(out: Out, o: &Outcome, deadline: Option<Instant>) -> u8 {
+    let until = deadline.map_or_else(|| Instant::now() + Duration::from_secs(5), |d| d + Duration::from_millis(950));
+    let closed = out.flush(until);
+    if closed && matches!(o, Outcome::Ok | Outcome::GaveUp(_) | Outcome::NeedsApproval(_)) { 141 } else { o.exit() as u8 }
+}
+
+fn ms(t0: Instant) -> u64 {
+    t0.elapsed().as_millis() as u64
 }
