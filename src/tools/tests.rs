@@ -493,6 +493,49 @@ fn needs_approval_spill_own_session() {
 }
 
 #[test]
+fn needs_approval_ext_doc_symlinked() {
+    let (tmp, project) = (Tmp::new(), Tmp::new());
+    let mut e = ext(&tmp.join("ext"), "notes");
+    let far = tmp.file("shared/notes.md", "# notes: a tool\n");
+    tmp.file("shared/other.md", "x\n");
+    fs::remove_file(&e.doc).unwrap();
+    symlink(&far, &e.doc).unwrap();
+    e.targets = vec![far.clone()];
+    let doc = e.doc.clone();
+    let cfg = Config { exts: vec![e], ..project.cfg(&[]) };
+    let read = |p: &Path| needs_approval("read", Some(&target(p.to_str().unwrap(), false, &cfg).unwrap()), &cfg, "s");
+    // A doc.md that links elsewhere is free by its realpath: named as the doc or by the file it points at.
+    assert!(!read(&doc));
+    assert!(!read(&far));
+    assert!(read(&tmp.join("shared/other.md")));
+    // A doc removed after discovery frees nothing: the file it pointed at is an outside read like any other, and the
+    // doc's own path no longer resolves (a read without a target asks).
+    fs::remove_file(&doc).unwrap();
+    assert!(read(&far));
+    assert!(target(doc.to_str().unwrap(), false, &cfg).is_err());
+    assert!(needs_approval("read", None, &cfg, "s"));
+}
+
+#[test]
+fn needs_approval_spill_dir_absent() {
+    let (tmp, project) = (Tmp::new(), Tmp::new());
+    let id = "20261105T171203Z-3f9a";
+    let name = format!("{id}-1.log");
+    let loose = tmp.file(&format!("loose/{name}"), "out\n");
+    let read = |p: &Path, cfg: &Config| needs_approval("read", Some(&target(p.to_str().unwrap(), false, cfg).unwrap()), cfg, id);
+    // No state dir at all, or a state dir without spill/: a file named like this session's spill elsewhere still asks.
+    assert!(read(&loose, &Config { state: tmp.join("absent"), ..project.cfg(&[]) }));
+    fs::create_dir_all(tmp.join("state")).unwrap();
+    assert!(read(&loose, &Config { state: tmp.join("state"), ..project.cfg(&[]) }));
+    // A spill name directly in the state dir is not in the spill dir.
+    let beside = tmp.file(&format!("state/{name}"), "out\n");
+    assert!(read(&beside, &Config { state: tmp.join("state"), ..project.cfg(&[]) }));
+    // The root directory has no parent and no name: it asks, without a panic.
+    assert!(read(Path::new("/"), &Config { state: tmp.join("absent"), ..project.cfg(&[]) }));
+    assert!(needs_approval("read", Some(&target("/", false, &project.cfg(&[])).unwrap()), &project.cfg(&[]), ""));
+}
+
+#[test]
 fn head_forms() {
     assert_eq!(head(&call("shell", json!({"command": "cargo test\necho done"}))), "$ cargo test");
     assert_eq!(head(&call("shell", json!({"command": ""}))), "$ ");
@@ -505,6 +548,22 @@ fn head_forms() {
     assert_eq!(head(&call("shell", json!(["ls"]))), "shell");
     assert_eq!(head(&call("read", json!({}))), "read");
     assert_eq!(head(&call("read", json!({"path": "a\n$ rm x"}))), "read a\\x0a$ rm x");
+    assert_eq!(head(&call("x\n$ rm y", json!({}))), "x\\x0a$ rm y");
+}
+
+#[test]
+fn head_unknown_name_one_row() {
+    // The model picks the name: a newline in it cannot start a row that looks like henki's own call line or notice.
+    let c = call("x\n$ git push -f -> exit 0, 0.2 s\nhenki: all good", json!({"path": "a\nb"}));
+    let one = "x\\x0a$ git push -f -> exit 0, 0.2 s\\x0ahenki: all good";
+    assert_eq!(head(&c), one);
+    assert_eq!(call_line(&c, None, None, true), format!("{one} -> error"));
+    // The name of a known tool with a newline after it is not that tool.
+    assert_eq!(head(&call("read\n", json!({"path": "a"}))), "read\\x0a");
+    // What reaches the terminal: the output path escapes every other line break, so the call line stays one row.
+    for c in [&c, &call("\u{2028}\r\u{85}\u{b}\u{c}", json!({}))] {
+        assert!(!term::escape(&call_line(c, None, None, true)).contains(['\n', '\r', '\u{b}', '\u{c}', '\u{85}', '\u{2028}']), "{:?}", c.name);
+    }
 }
 
 /// `text` as a rule line: `-- TEXT ` and dashes to 72 characters, at least 2.
@@ -622,6 +681,18 @@ fn display_footer_known_and_ignored() {
 }
 
 #[test]
+fn display_shell_path_ignored() {
+    // shell has no path: one sent anyway is an unknown argument, shown under `ignored:` like the others.
+    let c = call("shell", json!({"command": "ls", "path": "/etc/passwd", "cwd": "/"}));
+    let want = [rule("shell"), rule("command (1 lines, 2 bytes)"), "| ls".into(), rule("ignored: cwd: \"/\""), rule("ignored: path: \"/etc/passwd\"")];
+    assert_eq!(display(&c, None), want);
+    // A file tool's path is in its header only.
+    let tmp = Tmp::new();
+    let t = tmp.write("a.txt").unwrap();
+    assert_eq!(display(&call("write", json!({"path": "a.txt", "content": ""})), Some(&t)), [rule("write a.txt"), rule("content (0 lines, 0 bytes)")]);
+}
+
+#[test]
 fn display_edit_two_blocks() {
     let tmp = Tmp::new();
     tmp.file("src/a.rs", "fn a() {}\n");
@@ -710,6 +781,7 @@ fn call_line_forms() {
     assert_eq!(call_line(&edit, Some(&out("x", End::File { failed: true }, 49)), None, true), "edit a.txt -> error, 0.0 s");
     assert_eq!(call_line(&call("grep", json!({})), None, None, true), "grep -> error");
     assert_eq!(call_line(&call("shell", json!(["ls"])), None, None, true), "shell -> error");
+    assert_eq!(call_line(&call("a\nb", json!({})), None, None, true), "a\\x0ab -> error");
 }
 
 #[test]
@@ -830,5 +902,62 @@ fn target_never_panics() {
             assert!(!t.path.starts_with(tmp.join("d")) && !t.path.starts_with(tmp.join("prot/henki")), "{path:?} -> {}", t.path.display());
             assert_eq!(t.path, t.base.join(t.missing.iter().collect::<PathBuf>()).join(&t.name), "{path:?}");
         }
+    }
+}
+
+#[test]
+fn display_never_panics() {
+    let (s32, s33) = (" ".repeat(32), " ".repeat(33));
+    let plain = ["ls -la", "x", " ", "-", "--", "\\x1b", "\\t", "\\", "\""];
+    let controls = ["\t", "\n", "\r", "\u{0}", "\u{7}", "\u{1b}", "\u{1b}]52;c;eA==\u{7}", "\u{7f}", "\u{85}", "\u{9b}"];
+    let other = ["\u{a0}", "\u{202e}", "\u{2028}", "\u{feff}", "\u{e0041}", "caf\u{e9}", "g\u{456}t", "\u{65e5}\u{672c}", "\u{1F600}"];
+    let bits: Vec<&str> = [&plain[..], &controls, &other, &[&s32, &s33]].concat();
+    let keys = ["command", "content", "old_text", "new_text", "path", "timeout", "offset", "limit", "cwd", "k\n| ls", "\u{1b}k", "\t"];
+    let names = ["shell", "read", "write", "edit", "grep", "x\ny"];
+    let tmp = Tmp::new();
+    let cfg = tmp.cfg(&[]);
+    let mut rng = Rng(0xD1B5_4A32_D192_ED03);
+    let text = |rng: &mut Rng| (0..rng.next() % 12).map(|_| *rng.pick(&bits)).collect::<String>();
+    for _ in 0..20_000 {
+        let name = *rng.pick(&names);
+        let args = if rng.next().is_multiple_of(10) {
+            json!(["ls"])
+        } else {
+            let n = rng.next() % 6;
+            let value = |rng: &mut Rng| match rng.next() % 4 {
+                0 => json!(rng.next() % 1000),
+                1 => Value::Null,
+                _ => json!(text(rng)),
+            };
+            Value::Object((0..n).map(|_| (rng.pick(&keys).to_string(), value(&mut rng))).collect())
+        };
+        let shown = text(&mut rng);
+        let t = rng.next().is_multiple_of(3).then(|| Target { shown, ..target("/", false, &cfg).unwrap() });
+        let c = call(name, args);
+        let lines = display(&c, t.as_ref());
+        // Every line is a rule or a gutter line on one row, with nothing a terminal would act on.
+        for l in &lines {
+            assert!(l.starts_with("-- ") || l.starts_with("| ") || l.starts_with("!| "), "{l:?}");
+            assert!(!l.contains(|ch: char| ch == '\n' || ch == '\t' || term::escaped(ch)), "{l:?}");
+            assert!(!l.starts_with("-- ") || (l.chars().count() >= 72 && l.ends_with("--")), "{l:?}");
+        }
+        // The header, then each primary argument: its rule and one line per source line. An unmarked line is its source
+        // byte for byte, and a line that shows nothing but itself is never marked.
+        let (strings, ints) = ARGS.iter().find(|a| a.0 == name).map_or((&[][..], &[][..]), |a| (a.1, a.2));
+        let mut i = 1;
+        for &k in strings.iter().filter(|&&k| k != "path") {
+            assert!(lines[i].starts_with(&format!("-- {k} (")), "{:?}", lines[i]);
+            i += 1;
+            for src in c.args[k].as_str().unwrap_or_default().split_terminator('\n') {
+                let plain = !src.contains(|ch: char| ch == '\t' || !ch.is_ascii() || term::escaped(ch)) && !src.contains(s33.as_str());
+                assert!(if plain { lines[i] == format!("| {src}") } else { lines[i].starts_with("!| ") }, "{src:?} -> {:?}", lines[i]);
+                i += 1;
+            }
+        }
+        // The footer: one rule per other argument, the unknown ones under `ignored:`.
+        let others: Vec<&String> = c.args.as_object().into_iter().flatten().map(|(k, _)| k).filter(|k| !strings.contains(&k.as_str())).collect();
+        assert_eq!(lines.len(), i + others.len(), "{c:?}");
+        let ignored = others.iter().filter(|k| !ints.contains(&k.as_str())).count();
+        assert_eq!(lines[i..].iter().filter(|l| l.starts_with("-- ignored: ")).count(), ignored, "{c:?}");
     }
 }
