@@ -289,7 +289,7 @@ fn now() -> i64 {
 
 /// The broken-down time of `secs`, local or UTC; all zero if the C library cannot represent it.
 fn tm(secs: i64, local: bool) -> libc::tm {
-    let t = secs as libc::time_t;
+    let t = secs as _; // the C library's time_t, inferred from the calls below
     // SAFETY: an all-zero tm is a valid value (its zone pointer, where present, is only written).
     let mut tm: libc::tm = unsafe { std::mem::zeroed() };
     // SAFETY: both pointers are to live locals; the reentrant forms write only into `tm`.
