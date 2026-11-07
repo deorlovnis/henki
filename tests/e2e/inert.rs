@@ -39,11 +39,19 @@ fn config_key_effect_base_url() {
 
 #[test]
 fn config_key_effect_dialect() {
-    let (d, _) = with_keys(&[("dialect", "\"openai\"")], vec![say("ok")], &["hi"]);
+    let (d, log) = with_keys(&[("dialect", "\"openai\"")], vec![say("ok")], &["hi"]);
     assert_eq!((d.code, d.of("session")[0]["dialect"].as_str()), (Some(0), Some("openai")), "{}", d.diag());
-    let (d, log) = with_keys(&[("dialect", "\"anthropic\"")], vec![say("ok")], &["hi"]);
+    assert_eq!(log[0].line, "POST /v1/chat/completions HTTP/1.1");
+    let m = Mock::start_api(Api::Anthropic, vec![say("ok")]);
+    let mut r = Run::new(&m.url());
+    r.set("dialect", "\"anthropic\"");
+    let d = r.json("hi");
+    d.finish();
+    assert_eq!((d.code, d.of("session")[0]["dialect"].as_str()), (Some(0), Some("anthropic")), "{}", d.diag());
+    assert_eq!((m.log()[0].line.as_str(), m.rejections().len()), ("POST /v1/messages HTTP/1.1", 0), "{:?}", m.rejections());
+    let (d, log) = with_keys(&[("dialect", "\"gemini\"")], vec![say("ok")], &["hi"]);
     assert_eq!((d.code, d.result()["error"]["kind"].as_str(), log.len()), (Some(2), Some("config"), 0), "{}", d.diag());
-    assert!(d.result()["error"]["message"].as_str().unwrap().contains("dialect anthropic is not supported by this build"));
+    assert!(d.result()["error"]["message"].as_str().unwrap().contains("unknown dialect gemini; fix: use dialect = \"openai\" or \"anthropic\""), "{}", d.result());
 }
 
 #[test]
@@ -82,17 +90,36 @@ fn config_key_effect_ext() {
     r.set("ext", &format!("[\"{}\"]", ext.display()));
     let d = r.json("hi");
     d.finish();
-    assert_eq!(d.code, Some(0), "an ext path with only dot entries is fine\n{}", d.diag());
-    std::fs::create_dir_all(ext.join("tool")).unwrap();
+    assert_eq!((d.code, &d.of("session")[0]["exts"]), (Some(0), &json!([])), "an ext path with only dot entries is fine\n{}", d.diag());
+    std::fs::create_dir_all(ext.join("notes")).unwrap();
+    std::fs::write(ext.join("notes/doc.md"), "# notes: keeps notes\n").unwrap();
     let d = r.json("hi");
     d.finish();
-    let e = &d.result()["error"];
-    assert_eq!((d.code, e["kind"].as_str()), (Some(2), Some("config")), "{}", d.diag());
-    assert!(e["message"].as_str().unwrap().contains(&format!("ext {}: tool: extensions are not supported by this build", ext.display())), "{e}");
+    assert_eq!((d.code, &d.of("session")[0]["exts"]), (Some(0), &json!(["notes"])), "{}", d.diag());
+    assert!(m.log()[1].system().contains(&format!("\n- notes: notes: keeps notes [{}]", ext.join("notes/doc.md").display())), "{}", m.log()[1].system());
     r.set("ext", &format!("[\"{}\"]", r.dir.join("missing").display()));
     let d = r.json("hi");
     d.finish();
-    assert_eq!((d.code, m.log().len()), (Some(2), 1), "a listed ext path must exist\n{}", d.diag());
+    assert_eq!((d.code, d.result()["error"]["kind"].as_str(), m.log().len()), (Some(2), Some("config"), 2), "a listed ext path must exist\n{}", d.diag());
+}
+
+#[test]
+fn config_key_effect_shadow() {
+    let m = Mock::start(vec![say("ok")]);
+    let mut r = Run::new(&m.url());
+    let ext = r.dir.join("ext-dir");
+    std::fs::create_dir_all(ext.join("wrap/bin")).unwrap();
+    std::fs::write(ext.join("wrap/doc.md"), "wraps ls\n").unwrap();
+    std::fs::write(ext.join("wrap/bin/ls"), "#!/bin/sh\necho wrapped\n").unwrap();
+    std::fs::set_permissions(ext.join("wrap/bin/ls"), std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+    r.set("ext", &format!("[\"{}\"]", ext.display()));
+    let d = r.json("hi");
+    d.finish();
+    assert_eq!((d.code, d.result()["error"]["kind"].as_str()), (Some(2), Some("config")), "a command that shadows one on PATH needs shadow\n{}", d.diag());
+    r.set("shadow", "[\"wrap/ls\"]");
+    let d = r.json("hi");
+    d.finish();
+    assert_eq!((d.code, m.log().len()), (Some(0), 1), "{}", d.diag());
 }
 
 #[test]

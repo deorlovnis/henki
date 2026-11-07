@@ -152,12 +152,6 @@ fn e2e_resume_after_answer_refused() {
     assert_eq!(m.log().len(), 1, "nothing was sent");
 }
 
-/// The spill path a tool result names.
-fn spill_of(content: &str, home: &std::path::Path) -> std::path::PathBuf {
-    let shown = content.split("full output: ").nth(1).and_then(|s| s.split(" ...]").next()).unwrap_or_else(|| panic!("no spill marker: {content}"));
-    shown.strip_prefix("~/").map_or_else(|| shown.into(), |rest| home.join(rest))
-}
-
 #[test]
 fn e2e_resume_spill_readable() {
     let big = "head -c 100000 /dev/zero | tr '\\0' z";
