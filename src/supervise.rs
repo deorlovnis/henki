@@ -1,7 +1,7 @@
 //! Tool processes: the child environment, the spawn recipe, bounded capture with spill, and the ledger of process groups
 //! that henki kills by group and, on Linux, by sweeping every descendant. Also the user's own `!cmd`, on the terminal.
-use crate::{config::Env, sys, term, types::End, types::Ev, types::ToolOutput};
-use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock, PoisonError, mpsc, mpsc::Sender};
+use crate::{config::Env, sys, term, types::End, types::Ev, types::ToolOutput, types::lock};
+use std::sync::{Arc, Condvar, Mutex, OnceLock, PoisonError, mpsc, mpsc::Sender};
 use std::{collections::VecDeque, ffi::OsString, fs::File, os::unix::process::ExitStatusExt, thread};
 use std::{io, io::Read, io::Write, path::Path, path::PathBuf, process::Child, process::Command, process::Stdio, time::Duration, time::Instant};
 
@@ -132,10 +132,6 @@ pub fn panic_kill() {
     // The panicking thread may hold the ledger itself; the sweep still finds every process through the process tree.
     let mut g = LEDGER.try_lock().map(|g| g.clone()).unwrap_or_default();
     _ = (0..5).all(|_| sweep(&mut g) > 0); // up to five passes, until one finds nothing
-}
-
-fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
-    m.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
 fn sweep(groups: &mut Vec<i32>) -> usize {

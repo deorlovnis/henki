@@ -1,10 +1,10 @@
 //! HTTP/1.1 to the model server: one POST per attempt, every resolved address, bounded heads, chunked and SSE bodies,
 //! socket timeouts, and the error classification shared by both wire formats.
-use crate::types::{ProviderError, Url};
+use crate::types::{ProviderError, Url, lock};
 use serde_json::Value;
 use std::io::{self, BufRead, BufReader, ErrorKind, Read, Write};
 use std::net::{Ipv4Addr, Shutdown, SocketAddr, TcpStream, ToSocketAddrs};
-use std::{sync::Arc, sync::Mutex, sync::PoisonError, time::Duration, time::Instant};
+use std::{sync::Arc, sync::Mutex, time::Duration, time::Instant};
 
 /// `request` is one whole attempt, enforced by MAIN (`turn`), not by this module. Tests shorten any of them.
 #[derive(Clone, Copy, Debug)]
@@ -34,7 +34,7 @@ pub type Slot = Arc<Mutex<(bool, Option<TcpStream>)>>;
 
 /// Marks the slot cancelled and shuts the stored socket down (both ways). A later connect sees the mark and shuts itself.
 pub fn cancel(slot: &Slot) {
-    let mut g = slot.lock().unwrap_or_else(PoisonError::into_inner);
+    let mut g = lock(slot);
     g.0 = true;
     g.1.iter().for_each(|s| drop(s.shutdown(Shutdown::Both)));
 }
@@ -78,7 +78,7 @@ pub fn post(url: &Url, suffix: &str, headers: &[(&'static str, String)], body: &
         let message = format!("{cause} ({n} address{}, {} s each)", if n == 1 { "" } else { "es" }, lim.connect.as_secs());
         return Err(ProviderError { kind: "provider", message, retry: Some(cause), retry_after: None });
     };
-    match &mut *slot.lock().unwrap_or_else(PoisonError::into_inner) {
+    match &mut *lock(slot) {
         (true, _) => return Err(perr("provider", "cancelled")), // dropping the only handle closes the socket
         (false, clone) => *clone = s.try_clone().ok(),
     }

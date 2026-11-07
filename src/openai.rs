@@ -1,6 +1,6 @@
 //! The OpenAI-compatible chat-completions wire format: the request body, the stream accumulator with its defensive
 //! call parser, and text calls for servers that leave tool markup in the content.
-use crate::types::{ARGS_MAX, CUT_ARGS, Call, Flow, Part, ProviderError, Reply, Usage, Wire};
+use crate::types::{ARGS_MAX, CUT_ARGS, Call, Flow, Part, ProviderError, Reply, Usage, Wire, call_name};
 use crate::{http::bad, http::error_object, http::perr};
 use serde_json::{Map, Value, json};
 
@@ -81,7 +81,7 @@ impl Wire for Acc {
     /// The after-stream rules; `complete` = `[DONE]`, or EOF/idle after a finish.
     fn finish(self, complete: bool) -> Result<Reply, ProviderError> {
         if !complete {
-            let names: Vec<&str> = self.slots.iter().map(|(_, c)| shown(&c.name)).collect();
+            let names: Vec<&str> = self.slots.iter().map(|(_, c)| call_name(&c.name)).collect();
             let dropped = if names.is_empty() { String::new() } else { format!("; dropped calls: {}", names.join(", ")) };
             return Err(perr("stream_incomplete", format!("stream ended early{dropped}")));
         }
@@ -161,7 +161,7 @@ impl Acc {
             a => *raw = a.to_string(),
         }
         if at.is_none() {
-            part(Part::Call(shown(&c.name).into()));
+            part(Part::Call(call_name(&c.name).into()));
         }
     }
 }
@@ -257,10 +257,6 @@ fn set_args(c: &mut Call) {
         Some(v) => c.args = v,
         None => (c.args, c.raw) = (json!({}), Some(a)),
     }
-}
-
-fn shown(name: &str) -> &str {
-    if name.is_empty() { "unknown" } else { name }
 }
 
 #[cfg(test)]

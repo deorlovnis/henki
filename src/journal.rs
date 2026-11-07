@@ -1,6 +1,6 @@
 //! The session journal: one JSON record per line, appended by the main thread alone, byte-counted and synced before the
 //! effect it explains; resume reads it back, repairs dangling calls by appending, and checks the call/result pairing.
-use crate::{config::Config, supervise::Spill, sys, term, tools, types::Outcome};
+use crate::{allow, config::Config, supervise::Spill, sys, term, tools, types::Outcome};
 use serde_json::Value;
 use std::path::{Path, PathBuf};
 use std::{collections::HashSet, fmt::Display, fs, fs::File, io::Read, io::Write, os::unix::ffi::OsStrExt, time::Duration, time::SystemTime};
@@ -141,8 +141,7 @@ impl Journal {
     pub fn spill(&mut self, home: &Path) -> Spill {
         self.n = self.n.saturating_add(1);
         let path = self.spill.join(format!("{}-{}.log", self.id, self.n));
-        let shown = path.strip_prefix(home).map_or_else(|_| path.display().to_string(), |rest| format!("~/{}", rest.display()));
-        Spill { path, shown }
+        Spill { shown: allow::shown(&path, home), path }
     }
 }
 

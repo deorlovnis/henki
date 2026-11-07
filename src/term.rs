@@ -1,6 +1,6 @@
 //! The only writer to stdout and stderr: one escape table for every path, a JSON line writer, and a writer thread so a
 //! reader that stops reading never blocks the main thread. Also the REPL's line reader.
-use crate::types::Ev;
+use crate::{types::Ev, types::lock};
 use serde_json::Value;
 use std::sync::{Arc, Condvar, Mutex, PoisonError, atomic::AtomicBool, atomic::Ordering::SeqCst, mpsc, mpsc::Receiver, mpsc::Sender};
 use std::{borrow::Cow, fmt::Write as _, io, io::BufRead, io::Read, io::Write, time::Duration, time::Instant};
@@ -253,10 +253,6 @@ impl Reader {
         *lock(&self.0.0) = tag;
         self.0.1.notify_one();
     }
-}
-
-fn lock(m: &Mutex<u32>) -> std::sync::MutexGuard<'_, u32> {
-    m.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
 /// The panic hook's line to fd 2: `henki: MSG`, escaped. A helper thread writes it and the hook waits at most 100 ms, so

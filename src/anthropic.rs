@@ -1,7 +1,7 @@
 //! The Anthropic Messages wire format, for boxes behind their model gateway: the request body rendered from journal
 //! records (a reply's content blocks replayed exactly as they came), and the stream accumulator.
 use crate::http::{bad, error_object, perr};
-use crate::types::{ARGS_MAX, CUT_ARGS, Call, Flow, Part, ProviderError, Reply, Usage, Wire};
+use crate::types::{ARGS_MAX, CUT_ARGS, Call, Flow, Part, ProviderError, Reply, Usage, Wire, call_name};
 use serde_json::{Value, json};
 use std::{collections::BTreeMap, time::Duration};
 
@@ -89,7 +89,7 @@ impl Wire for Acc {
                 let b = &v["content_block"];
                 let Some(i) = at.filter(|i| b.is_object() && !self.blocks.contains_key(i)) else { return Err(bad("a content block start without an object or a new index", data)) };
                 if b["type"] == "tool_use" {
-                    part(Part::Call(shown(b).into()));
+                    part(Part::Call(call_name(b["name"].as_str().unwrap_or_default()).into()));
                 }
                 self.blocks.insert(i, (b.clone(), String::new()));
             }
@@ -124,7 +124,7 @@ impl Wire for Acc {
     /// (`max_tokens`, or the context window full) runs none of its calls.
     fn finish(self, complete: bool) -> Result<Reply, ProviderError> {
         if !complete {
-            let names: Vec<&str> = self.blocks.values().filter(|(b, _)| b["type"] == "tool_use").map(|(b, _)| shown(b)).collect();
+            let names: Vec<&str> = self.blocks.values().filter(|(b, _)| b["type"] == "tool_use").map(|(b, _)| call_name(b["name"].as_str().unwrap_or_default())).collect();
             let dropped = if names.is_empty() { String::new() } else { format!("; dropped calls: {}", names.join(", ")) };
             return Err(perr("stream_incomplete", format!("stream ended early{dropped}")));
         }
@@ -172,10 +172,6 @@ fn append(b: &mut Value, k: &str, t: &str) -> String {
         _ => b[k] = t.into(),
     }
     t.into()
-}
-
-fn shown(b: &Value) -> &str {
-    b["name"].as_str().filter(|n| !n.is_empty()).unwrap_or("unknown")
 }
 
 #[cfg(test)]

@@ -1,6 +1,16 @@
 //! The data every module shares: events to MAIN, a parsed call, a model reply, a tool's output, and how a turn ends.
 use serde_json::Value;
-use std::time::Duration;
+use std::{sync::Mutex, sync::MutexGuard, sync::PoisonError, time::Duration};
+
+/// A lock that a thread which panicked while holding it does not poison for the others.
+pub fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// A call's name as notes and errors show it: `unknown` when the model sent none.
+pub fn call_name(name: &str) -> &str {
+    if name.is_empty() { "unknown" } else { name }
+}
 
 /// The built-in tools, in the order the model sees them.
 pub const TOOLS: [&str; 4] = ["shell", "read", "write", "edit"];
