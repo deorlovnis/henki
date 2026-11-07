@@ -63,7 +63,7 @@ pub struct Config {
     pub agents: Option<String>, // <config dir>/AGENTS.md, trailing newlines trimmed
     pub agents_hash: Option<String>,
     pub allow: allow::Allow,     // <config dir>/allow, read only in ask mode
-    pub protected: Vec<PathBuf>, // the config file and dir, the state dir, the ext paths and the link targets in them; each also as its realpath
+    pub protected: Vec<PathBuf>, // the config file and dir, AGENTS.md, the state dir, the ext paths and the link targets in them; each also as its realpath
     pub trust: Vec<PathBuf>,     // what the tripwire stamps, absent files included
     pub notices: Vec<String>,
 }
@@ -122,6 +122,11 @@ pub fn load(f: &Flags, env: &Env, cwd: &Path) -> Result<Config, String> {
         return Err(NO_CONFIG.into());
     }
     fs::metadata(&c.dir).map_or(Ok(()), |m| owner_mode(&c.dir, m.mode(), m.uid(), sys::euid(), true))?;
+    // The dir's AGENTS.md, extensions and allow file steer henki as the file does, so the rule holds without a file too.
+    if inside(&c.dir) {
+        let fix = "fix: run henki outside the project, or name a config file outside it with --config";
+        return Err(format!("{} is inside the project {} or named through it; {fix}", c.dir.display(), root.display()));
+    }
     let approve = f.approve.map(|a| Value::from(if a { "auto" } else { "ask" }));
     let late = [
         ("HENKI_MODEL", "model", env_model),
@@ -154,7 +159,11 @@ pub fn load(f: &Flags, env: &Env, cwd: &Path) -> Result<Config, String> {
     let listed = at("ext");
     let paths = listed.map_or_else(|| vec![c.dir.join("ext")], |l| l.2.as_array().into_iter().flatten().filter_map(Value::as_str).map(|p| expand(p, &home)).collect());
     let from = listed.map(|l| l.0.clone()).or_else(|| c.file.as_ref().map(|f| f.display().to_string()));
-    let at_ext = |e: String| from.as_ref().map_or_else(|| e.clone(), |at| format!("{at}: {e}"));
+    // A malformed `shadow` entry is that line's error; the rest of discovery's errors belong to the paths.
+    let at_ext = |e: String| {
+        let line = if e.starts_with("shadow ") { at("shadow").map(|l| &l.0) } else { from.as_ref() };
+        line.map_or_else(|| e.clone(), |at| format!("{at}: {e}"))
+    };
     if let Some(p) = paths.iter().find(|p| !p.is_absolute()) {
         return Err(at_ext(format!("ext path {} is relative; fix: use an absolute path or ~/", p.display())));
     }
@@ -187,7 +196,7 @@ pub fn load(f: &Flags, env: &Env, cwd: &Path) -> Result<Config, String> {
         c.window = 32_768;
         c.notices.push("context_window is unknown; using 32,768 tokens".into());
     }
-    let own = c.file.iter().chain([&c.dir, &c.state]).chain(&paths).chain(c.exts.iter().flat_map(|e| &e.targets));
+    let own = c.file.iter().chain([&c.dir, &agents, &c.state]).chain(&paths).chain(c.exts.iter().flat_map(|e| &e.targets));
     c.protected = own.flat_map(|p| [Some(p.clone()), fs::canonicalize(p).ok().filter(|r| r != p)]).flatten().collect();
     // Absent files too: creating one is a change.
     let exts = paths.into_iter().chain(c.exts.iter().flat_map(|e| e.paths.iter().cloned()));
