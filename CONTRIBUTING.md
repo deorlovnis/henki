@@ -15,7 +15,7 @@ cargo test              # the tests alone
 `./check.sh` runs, in order:
 
 1. **refs**: no private references in the tree. It reads patterns from `.git/info/private-patterns`, which is never committed; without that file it prints a `SKIPPED` warning and goes on.
-2. **dco**: every commit that no remote has yet carries a `Signed-off-by:` trailer (below). `./check.sh dco [RANGE]` runs it alone.
+2. **dco**: every commit that no remote has yet carries a `Signed-off-by:` trailer with its author's email (below). `./check.sh dco [RANGE]` runs it alone.
 3. **selftest**: every gate runs against fixtures it makes and must fail the bad ones with its own message. `./check.sh selftest` runs it alone.
 4. `cargo fmt --check` and `cargo clippy --all-targets -- -D warnings`.
 5. `cargo test`.
@@ -38,7 +38,7 @@ git rebase --signoff origin/main       # sign off every commit since origin/main
 git merge --signoff BRANCH             # merges are commits too
 ```
 
-The `dco` step of `./check.sh` refuses a commit without it. Only a trailer counts: the line must be in the last paragraph of the message, where `git commit -s` puts it.
+The `dco` step of `./check.sh` refuses a commit without it, and one whose sign-offs all name another email than the commit's author. Only a trailer counts: the line must be in the last paragraph of the message, where `git commit -s` puts it.
 
 ```
 Developer Certificate of Origin

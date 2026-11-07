@@ -28,7 +28,7 @@
 # commits add, so a reference added and later removed is still found. In a range a matched line
 # is shown as "COMMIT: +LINE", so a pattern anchored with ^ only matches in files.
 # `./check.sh dco [RANGE]` runs only the sign-off check: every commit in RANGE (default
-# `HEAD --not --remotes`, the commits no remote has yet) must carry a `Signed-off-by:` trailer, the
+# `HEAD --not --remotes`, the commits no remote has yet) must carry a `Signed-off-by:` trailer with its author's email, the
 # Developer Certificate of Origin sign-off of CONTRIBUTING.md. A range with no commits passes.
 # `./check.sh install-hook` makes every git push run the full check, then the reference and
 # sign-off checks on the commits it pushes; it refuses to install without the pattern file.
@@ -83,18 +83,20 @@ refs() {
 
 # The sign-off gate over RANGE (git log arguments, default the commits on no remote). Git's own trailer parser
 # decides, so only a trailer counts (the message's last paragraph, where `git commit -s` puts it), not the words
-# anywhere in a body. Merges too: a merge brings no code of its own, but the DCO is per commit, and
-# `git merge --signoff` costs nothing. Commits a remote already has are history, not this change.
+# anywhere in a body. The trailer must carry the commit author's email (CONTRIBUTING.md: "the email of the commit"),
+# as DCO checkers do: a sign-off is the author's own, not anyone's. Merges too: a merge brings no code of its own,
+# but the DCO is per commit, and `git merge --signoff` costs nothing. Commits a remote already has are history.
 dco() {
   local log bad
-  # %x01 marks a commit; the trailer lines, if any, follow it.
+  # %x01 marks a commit, then the author's email and the subject; the trailer lines, if any, follow it.
   # shellcheck disable=SC2086 # RANGE is several git arguments on purpose.
-  log="$(git log --no-color --format='%x01%h %s%n%(trailers:key=Signed-off-by)' ${1:-HEAD --not --remotes})" || return $?
-  bad="$(LC_ALL=C awk '/^\001/ { if (c != "" && !s) print c; c = substr($0, 2); s = 0; next } tolower($0) ~ /^signed-off-by: *[^ ]/ { s = 1 }
+  log="$(git log --no-color --format='%x01%h%x02%ae%x02%s%n%(trailers:key=Signed-off-by)' ${1:-HEAD --not --remotes})" || return $?
+  bad="$(LC_ALL=C awk -F '\002' '/^\001/ { if (c != "" && !s) print c; c = substr($1, 2) " " $3; ae = "<" tolower($2) ">"; s = 0; next }
+    tolower($0) ~ /^signed-off-by: *[^ ]/ && index(tolower($0), ae) { s = 1 }
     END { if (c != "" && !s) print c }' <<<"$log")"
   if [ -n "$bad" ]; then
     printf '%s\n' "$bad"
-    say "the commits above have no Signed-off-by: line; fix: git rebase --signoff BASE (or git commit --amend -s --no-edit for the last one), see CONTRIBUTING.md"
+    say "the commits above have no Signed-off-by: line with their author's email; fix: git rebase --signoff BASE (or git commit --amend -s --no-edit for the last one) as the author, see CONTRIBUTING.md"
     return 1
   fi
 }
@@ -366,6 +368,10 @@ selftest() {
     expect "dco HEAD~2..HEAD~1: only the signed commit" pass dco HEAD~2..HEAD~1 || rc=1
     commit --allow-empty -m $'mid-body\n\nSigned-off-by: a b <a@b.invalid>\n\nis not a trailer' || exit 1
     expect "dco: the words in a body, not a trailer" "no Signed-off-by: line" dco HEAD~1..HEAD || rc=1
+    commit --allow-empty -m $'signed by another\n\nSigned-off-by: Someone Else <else@example.invalid>' || exit 1
+    expect "dco: a sign-off that is not the author's" "no Signed-off-by: line with their author's email" dco HEAD~1..HEAD || rc=1
+    commit --allow-empty -m $'author in capitals, and a second sign-off\n\nSigned-off-by: Someone Else <else@example.invalid>\nSigned-off-by: Fixture <Fixture@Example.invalid>' || exit 1
+    expect "dco: the author's among several, any case" pass dco HEAD~1..HEAD || rc=1
     exit "$rc"
   ) || bad=1
 
