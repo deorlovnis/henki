@@ -119,8 +119,47 @@ fn render_no_empty_text() {
     let hist = vec![user("a"), asst("", json!([]), blocks), user("")];
     let m = messages(&hist);
     assert_eq!(m.len(), 2);
-    assert_eq!(m[1]["content"], json!([{"signature": "s", "thinking": "", "type": "thinking"}, {"text": " ", "type": "text"}]));
+    assert_eq!(m[1]["content"], json!([{"signature": "s", "thinking": "", "type": "thinking"}]));
     assert!(!render(&hist).contains(r#""text":"""#));
+}
+
+/// A text block of whitespace alone is refused by the API, so it is never sent: not from a reply's blocks, a partial
+/// reply or a user record. Text around other text keeps every byte of its whitespace.
+#[test]
+fn render_whitespace_text_dropped() {
+    let call = json!([{"args": {"command": "ls"}, "id": "t1", "name": "shell"}]);
+    let blocks = json!([{"text": "\n\n", "type": "text"}, {"id": "t1", "input": {"command": "ls"}, "name": "shell", "type": "tool_use"}, {"text": " \t\u{a0}", "type": "text"}]);
+    let partial = json!({"finish": "interrupted", "msg": {"content": " \n", "role": "assistant", "tool_calls": []}, "t": "assistant"});
+    let m = messages(&[user("a"), asst("\n\n", call, blocks), result("t1", "x"), user(" \n "), partial, user("\n next \n")]);
+    assert_eq!(
+        m,
+        [
+            json!({"content": [{"text": "a", "type": "text"}], "role": "user"}),
+            json!({"content": [{"id": "t1", "input": {"command": "ls"}, "name": "shell", "type": "tool_use"}], "role": "assistant"}),
+            json!({"content": [{"content": "x", "is_error": false, "tool_use_id": "t1", "type": "tool_result"}, {"text": "\n next \n", "type": "text"}], "role": "user"}),
+        ]
+    );
+}
+
+/// A dangling call repaired on resume answers its tool_use right after the replayed blocks, with the other results and
+/// before the next task, in one user message.
+#[test]
+fn render_repair_result_after_blocks() {
+    use crate::journal::rec;
+    let calls = [
+        Call { id: "t1".into(), name: "shell".into(), args: json!({"command": "a"}), ..Call::default() },
+        Call { id: "t2".into(), name: "read".into(), args: json!({"path": "b"}), ..Call::default() },
+    ];
+    let blocks = json!([{"signature": "c2ln", "thinking": "", "type": "thinking"}, {"id": "t1", "input": {"command": "a"}, "name": "shell", "type": "tool_use"},
+        {"id": "t2", "input": {"path": "b"}, "name": "read", "type": "tool_use"}]);
+    let reply = rec::assistant("", &calls, "tool_calls", Usage::default(), Some(&blocks));
+    let repair = rec::tool_result("t2", "read", crate::tools::REPAIR, true, 0, 0);
+    let m = messages(&[rec::user("go"), reply, rec::tool_result("t1", "shell", "A", false, 1, 1), repair, rec::user("next")]);
+    assert_eq!(m.len(), 3);
+    assert_eq!(m[1], json!({"content": blocks, "role": "assistant"}));
+    let want = json!([{"content": "A", "is_error": false, "tool_use_id": "t1", "type": "tool_result"},
+        {"content": "interrupted; the command may have partly run", "is_error": true, "tool_use_id": "t2", "type": "tool_result"}, {"text": "next", "type": "text"}]);
+    assert_eq!((&m[2]["content"], &m[2]["role"]), (&want, &json!("user")));
 }
 
 #[test]
@@ -293,6 +332,24 @@ fn parse_input_empty_is_object() {
     let r = reply(&[tool(0, "toolu_1", "shell"), stop("tool_use")]);
     assert_eq!(r.calls, [Call { id: "toolu_1".into(), name: "shell".into(), args: json!({}), ..Call::default() }]);
     assert_eq!(r.blocks.unwrap()[0]["input"], json!({}));
+    // A start block without an input, or with one that is not an object, gives `{}` as well.
+    for odd in [json!({"id": "t1", "name": "shell", "type": "tool_use"}), json!({"id": "t1", "input": "ls", "name": "shell", "type": "tool_use"})] {
+        let r = reply(&[start(0, odd), stop("tool_use")]);
+        assert_eq!((&r.calls[0].args, r.calls[0].raw.as_ref(), &r.blocks.unwrap()[0]["input"]), (&json!({}), None, &json!({})));
+    }
+}
+
+/// A proxy that streams a finished reply may send a tool_use input whole in its start block, with no deltas: the call
+/// gets it. Deltas, when they come, are the input.
+#[test]
+fn parse_input_in_start_kept() {
+    let whole = json!({"id": "t1", "input": {"command": "ls"}, "name": "shell", "type": "tool_use"});
+    let r = reply(&[start(0, whole.clone()), stop("tool_use")]);
+    assert_eq!(r.calls, [Call { id: "t1".into(), name: "shell".into(), args: json!({"command": "ls"}), ..Call::default() }]);
+    assert_eq!(r.blocks, Some(json!([whole])));
+    let placeholder = json!({"id": "t1", "input": {"command": "start"}, "name": "shell", "type": "tool_use"});
+    let r = reply(&[start(0, placeholder), input(0, r#"{"command": "delta"}"#), stop("tool_use")]);
+    assert_eq!((&r.calls[0].args, &r.blocks.unwrap()[0]["input"]), (&json!({"command": "delta"}), &json!({"command": "delta"})));
 }
 
 #[test]
@@ -333,13 +390,27 @@ fn parse_usage_cache_sum() {
 #[test]
 fn parse_message_delta_usage() {
     let begin = json!({"message": {"usage": {"cache_read_input_tokens": 100, "input_tokens": 10, "output_tokens": 1}}, "type": "message_start"}).to_string();
-    // The final counts in message_delta replace the first ones; a field it lacks keeps its value.
+    // The final counts in message_delta replace the first ones; each field it lacks keeps its value.
     let cumulative = json!({"delta": {"stop_reason": "end_turn"}, "type": "message_delta",
         "usage": {"cache_creation_input_tokens": 5, "cache_read_input_tokens": 100, "input_tokens": 20, "output_tokens": 300}});
     assert_eq!(reply(&[begin.clone(), cumulative.to_string()]).usage, Usage { input: 125, output: 300, cached: 100 });
     assert_eq!(reply(&[begin.clone(), stop("end_turn")]).usage, Usage { input: 110, output: 7, cached: 100 });
     let bare = json!({"delta": {"stop_reason": "end_turn"}, "type": "message_delta"});
     assert_eq!(reply(&[begin, bare.to_string()]).usage, Usage { input: 110, output: 1, cached: 100 });
+}
+
+/// A gateway that sends only some of the counts in message_delta keeps the cache counts message_start gave.
+#[test]
+fn parse_message_delta_usage_partial_cache_fields() {
+    let begin = json!({"message": {"usage": {"cache_creation_input_tokens": 3, "cache_read_input_tokens": 100, "input_tokens": 10}}, "type": "message_start"}).to_string();
+    let partial = json!({"delta": {"stop_reason": "end_turn"}, "type": "message_delta", "usage": {"input_tokens": 10, "output_tokens": 5}});
+    assert_eq!(reply(&[begin.clone(), partial.to_string()]).usage, Usage { input: 113, output: 5, cached: 100 });
+    // A null or negative count is no count: the one before stays.
+    let nulls = json!({"delta": {"stop_reason": "end_turn"}, "type": "message_delta",
+        "usage": {"cache_creation_input_tokens": null, "cache_read_input_tokens": -1, "input_tokens": 20, "output_tokens": 6}});
+    assert_eq!(reply(&[begin.clone(), nulls.to_string()]).usage, Usage { input: 123, output: 6, cached: 100 });
+    let only_cache = json!({"message": {"usage": {"cache_read_input_tokens": 50}}, "type": "message_start"}).to_string();
+    assert_eq!(reply(&[only_cache]).usage, Usage { input: 50, output: 0, cached: 50 });
 }
 
 #[test]
@@ -365,6 +436,19 @@ fn parse_stop_reasons() {
     assert_eq!(acc.finish(true).unwrap().finish, "stop");
 }
 
+/// A reply with calls that ends by message_stop alone (no message_delta, so no stop reason) runs its calls.
+#[test]
+fn parse_message_stop_without_delta_with_calls() {
+    let mut acc = Acc::new(&TOOLS);
+    for d in [text_block("Listing."), tool(1, "t1", "shell"), input(1, r#"{"command": "ls"}"#)] {
+        assert_eq!(acc.data(&d, &mut |_| {}).unwrap(), Flow::More);
+    }
+    assert_eq!(acc.data(MESSAGE_STOP, &mut |_| {}).unwrap(), Flow::Done);
+    let r = acc.finish(true).unwrap();
+    assert_eq!((r.finish.as_str(), r.text.as_str()), ("tool_calls", "Listing."));
+    assert_eq!(r.calls, [Call { id: "t1".into(), name: "shell".into(), args: json!({"command": "ls"}), ..Call::default() }]);
+}
+
 fn text_block(t: &str) -> String {
     start(0, json!({"text": t, "type": "text"}))
 }
@@ -386,12 +470,44 @@ fn parse_error_first_retryable() {
     assert_eq!((e.kind, e.retry), ("auth", None));
 }
 
+const OVERLOADED: &str = r#"{"type":"error","error":{"type":"overloaded_error","message":"Overloaded"}}"#;
+
+fn message_start() -> String {
+    json!({"message": {"usage": {"input_tokens": 1}}, "type": "message_start"}).to_string()
+}
+
+/// The error event after `events`: its retry cause.
+fn retry_after(events: &[String]) -> Option<String> {
+    let mut acc = Acc::new(&TOOLS);
+    for e in events {
+        acc.data(e, &mut |_| {}).unwrap();
+    }
+    let e = acc.data(OVERLOADED, &mut |_| {}).err().unwrap();
+    assert_eq!((e.kind, e.message.as_str()), ("provider", "Overloaded"));
+    e.retry
+}
+
+/// Once a part has streamed (text, reasoning, a call's name), a retry would show it twice: an error is fatal.
 #[test]
 fn parse_error_later_fatal() {
-    let mut acc = Acc::new(&TOOLS);
-    acc.data(&json!({"message": {"usage": {"input_tokens": 1}}, "type": "message_start"}).to_string(), &mut |_| {}).unwrap();
-    let e = acc.data(r#"{"type":"error","error":{"type":"overloaded_error","message":"Overloaded"}}"#, &mut |_| {}).err().unwrap();
-    assert_eq!((e.kind, e.message.as_str(), e.retry), ("provider", "Overloaded", None));
+    assert_eq!(retry_after(&[message_start(), start(0, json!({"text": "", "type": "text"})), text(0, "Hel")]), None);
+    assert_eq!(retry_after(&[message_start(), tool(0, "t1", "shell")]), None);
+    assert_eq!(retry_after(&[message_start(), start(0, json!({"thinking": "", "type": "thinking"})), delta(0, json!({"thinking": "hm", "type": "thinking_delta"}))]), None);
+    assert_eq!(retry_after(&[start(0, json!({"text": "", "type": "text"})), text(0, "x"), stop("end_turn"), PING.into()]), None);
+}
+
+/// The API always opens a stream with message_start (and may ping): an error after those, or after a thinking block that
+/// streams no text (display omitted), comes before anything was shown and is retryable.
+#[test]
+fn parse_error_after_ping_and_after_start() {
+    let retry = Some("overloaded_error".to_string());
+    assert_eq!(retry_after(&[PING.into()]), retry);
+    assert_eq!(retry_after(&[message_start()]), retry);
+    assert_eq!(retry_after(&[message_start(), PING.into()]), retry);
+    let thinking = start(0, json!({"signature": "", "thinking": "", "type": "thinking"}));
+    assert_eq!(retry_after(&[message_start(), thinking, delta(0, json!({"signature": "EqQB", "type": "signature_delta"})), PING.into()]), retry);
+    // A text block that started with its text whole (no delta) showed nothing either.
+    assert_eq!(retry_after(&[message_start(), text_block("unseen")]), retry);
 }
 
 #[test]
@@ -419,11 +535,70 @@ fn parse_delta_without_start() {
     assert!(Acc::new(&TOOLS).data(&no_index, &mut |_| {}).is_err());
     for bad_start in [json!({"content_block": {"type": "text"}, "type": "content_block_start"}), json!({"content_block": "text", "index": 0, "type": "content_block_start"})] {
         let e = Acc::new(&TOOLS).data(&bad_start.to_string(), &mut |_| {}).err().unwrap();
-        assert!(e.message.starts_with("a content block without an index: "), "{}", e.message);
+        assert!(e.message.starts_with("a content block start without an object or a new index: "), "{}", e.message);
     }
     // A payload that is not JSON is a provider error with its first 200 characters.
     let e = Acc::new(&TOOLS).data(&format!("{{not json{}", "x".repeat(300)), &mut |_| {}).err().unwrap();
     assert!(e.message.starts_with("stream data is not JSON (") && e.message.ends_with(&format!(": {{not json{}", "x".repeat(191))), "{}", e.message);
+}
+
+/// A delta of another block's type (a buggy gateway) changes nothing: no stray field in the replayed block, no stray
+/// part, no input from a text block.
+#[test]
+fn parse_delta_type_mismatch_ignored() {
+    let (r, parts) = run(&[tool(0, "t1", "shell"), text(0, "oops"), input(0, r#"{"command": "ls"}"#), stop("tool_use")]);
+    let r = r.unwrap();
+    assert_eq!((parts, r.text.as_str()), (vec![Part::Call("shell".into())], ""));
+    assert_eq!(r.blocks, Some(json!([{"id": "t1", "input": {"command": "ls"}, "name": "shell", "type": "tool_use"}])));
+    let (r, parts) = run(&[
+        text_block("hi"),
+        delta(0, json!({"signature": "abc", "type": "signature_delta"})),
+        delta(0, json!({"thinking": "t", "type": "thinking_delta"})),
+        input(0, r#"{"command": "ls"}"#),
+        start(1, json!({"thinking": "", "type": "thinking"})),
+        text(1, "not text"),
+        input(1, "{}"),
+        start(2, json!({"data": "d", "type": "redacted_thinking"})),
+        delta(2, json!({"signature": "s", "type": "signature_delta"})),
+        stop("end_turn"),
+    ]);
+    let r = r.unwrap();
+    assert!(parts.is_empty(), "{parts:?}");
+    assert_eq!((r.text.as_str(), r.reasoning.as_str(), r.calls.len()), ("hi", "", 0));
+    assert_eq!(r.blocks, Some(json!([{"text": "hi", "type": "text"}, {"thinking": "", "type": "thinking"}, {"data": "d", "type": "redacted_thinking"}])));
+}
+
+/// A second start on an index already open is a provider error; what streamed before stays streamed.
+#[test]
+fn parse_block_restarted_same_index() {
+    let mut acc = Acc::new(&TOOLS);
+    let mut parts = vec![];
+    for d in [start(0, json!({"text": "", "type": "text"})), text(0, "first")] {
+        acc.data(&d, &mut |p| parts.push(p)).unwrap();
+    }
+    for again in [start(0, json!({"text": "", "type": "text"})), tool(0, "t1", "shell")] {
+        let e = acc.data(&again, &mut |p| parts.push(p)).err().unwrap();
+        assert_eq!((e.kind, e.retry), ("provider", None));
+        assert!(e.message.starts_with("a content block start without an object or a new index: {"), "{}", e.message);
+    }
+    assert_eq!(parts, [Part::Text("first".into())]);
+}
+
+/// Whitespace alone streams and stays in the answer text, but its block is not kept for replay.
+#[test]
+fn parse_whitespace_text_block_dropped() {
+    let (r, parts) = run(&[
+        start(0, json!({"text": "", "type": "text"})),
+        text(0, "\n\n"),
+        tool(1, "t1", "shell"),
+        input(1, "{}"),
+        start(2, json!({"text": " Done. ", "type": "text"})),
+        stop("tool_use"),
+    ]);
+    let r = r.unwrap();
+    assert_eq!(parts, [Part::Text("\n\n".into()), Part::Call("shell".into())]);
+    assert_eq!(r.text, "\n\n Done. ");
+    assert_eq!(r.blocks, Some(json!([{"id": "t1", "input": {}, "name": "shell", "type": "tool_use"}, {"text": " Done. ", "type": "text"}])));
 }
 
 #[test]
@@ -532,7 +707,8 @@ fn acc_never_panics() {
                     let k = ["text", "thinking", "signature", "partial_json"][next(4)];
                     fields.push(format!("\"index\":{},\"delta\":{{\"type\":\"{d}\",\"{k}\":{}}}", next(2), values[next(values.len())]));
                 }
-                "content_block_start" => fields.push(format!("\"index\":{},\"content_block\":{}", next(2), values[15 + next(5)])),
+                // Mostly a new index (a repeated one is an error), which the deltas do not reach.
+                "content_block_start" => fields.push(format!("\"index\":{},\"content_block\":{}", 2 + next(40), values[15 + next(5)])),
                 "message_delta" => fields.push(format!("\"delta\":{{\"stop_reason\":{}}},\"usage\":{}", reasons[next(reasons.len())], values[next(values.len())])),
                 _ => {}
             }
