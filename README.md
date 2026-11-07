@@ -76,6 +76,10 @@ An extension is a directory that teaches the model a command-line tool: `NAME/do
 
 The official modules are extensions in this repository's `mods/`, off until you add one with `henki-mods add NAME` (from a checkout, `manager/henki-mods`), which shows what it installs and asks first. `halti` teaches the model halti's verbs, puts its card into `AGENTS.md`, and wraps `halti`, `pbpaste` and `security` so the calls cannot reach secret values through them (a seatbelt: a command named by its full path gets past it). On a Mac, where all three are on your PATH, henki starts with it on only once `config.toml` has `shadow = ["halti/halti", "halti/pbpaste", "halti/security"]`, as `profiles/config.mac.toml` does; the install screen prints that line when it is missing. `itse` is a doc only: itse's verbs and exit codes, run through its CLI.
 
+### Writing a module
+
+A module is an extension with an optional manifest, `.henki/module.toml`, that `henki-mods` shows on its install screen and checks first. The module template, `github.com/deorlovnis/henki-module-template` (to be published), is a working module with a guide from copying it to sharing your own. `henki-mods verify --dir DIR` checks a module as an install would, `henki-mods add ./DIR` installs it from a directory, and `henki-mods add URL[@REF]#DIR` from a git repository, which is how you share one: henki-mods pins the commit and runs nothing from the repository, and its install screen marks such a module unreviewed.
+
 ### In an isolated environment
 
 `profiles/config.box.toml` runs `henki run` with `dialect = "anthropic"`: the Anthropic Messages API through the environment's model gateway, with a stand-in key that the gateway replaces. An Anthropic session cannot be resumed after its system prompt (the global `AGENTS.md`, an extension's first doc line) or its tools changed, because the API refuses the replayed history; start a new session instead. When the model declines a request (`stop_reason` `refusal`), the run ends with `error provider`, and the text that streamed before the refusal is not kept in the session.
