@@ -592,6 +592,32 @@ fn journal_discard_fresh_only() {
     assert!(fs::metadata(&path).unwrap().len() > before);
 }
 
+/// A second discard reports the file gone again and removes nothing; a removal that fails is not tried again, and the
+/// session goes on being written.
+#[test]
+fn journal_discard_twice() {
+    let f = fx();
+    let mut j = Journal::create(&f.state, &f.cwd).unwrap();
+    j.write(rec::session(&f.cfg, j.id(), &f.cwd, None)).unwrap();
+    let path = j.path.clone();
+    assert!(j.discard());
+    fs::write(&path, "not henki's\n").unwrap();
+    assert!(j.discard());
+    assert_eq!(fs::read_to_string(&path).unwrap(), "not henki's\n");
+    fs::remove_file(&path).unwrap();
+    // Removed by someone else first: the unlink fails, so the journal is not gone and its writes still count.
+    let mut j = Journal::create(&f.state, &f.cwd).unwrap();
+    j.write(rec::session(&f.cfg, j.id(), &f.cwd, None)).unwrap();
+    let bytes = j.bytes();
+    fs::remove_file(&j.path).unwrap();
+    assert!(!j.discard());
+    j.write(rec::close(bytes)).unwrap();
+    assert!(j.bytes() > bytes);
+    fs::write(&j.path, "").unwrap();
+    assert!(!j.discard());
+    assert!(j.path.exists(), "one try only");
+}
+
 #[test]
 fn journal_resume_changes_noticed() {
     let f = fx();

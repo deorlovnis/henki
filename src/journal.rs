@@ -121,7 +121,8 @@ impl Journal {
     }
 
     /// The REPL ended before its first message: removes the session file this process created (never a resumed one).
-    /// True when it was removed.
+    /// True once the file is gone, also on a later call. One try: when the removal fails the file stays a complete
+    /// session, and later writes go on in it.
     pub fn discard(&mut self) -> bool {
         self.gone |= std::mem::take(&mut self.fresh) && fs::remove_file(&self.path).is_ok();
         self.gone

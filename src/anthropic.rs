@@ -19,8 +19,8 @@ pub fn headers(key: &str) -> Vec<(&'static str, String)> {
 
 /// The whole request body from journal records: compact JSON, keys sorted, old messages byte-identical every time.
 /// `tools` is in the OpenAI form; it is rendered as `{description, input_schema, name}`. Content is always a block
-/// list: empty text blocks and messages left empty are dropped, and adjacent messages of one role are merged, so tool
-/// results and the next task form one user message, results first.
+/// list: text blocks with no text but whitespace and messages left empty are dropped, and adjacent messages of one role
+/// are merged, so tool results and the next task form one user message, results first.
 pub fn body(model: &str, max_tokens: u64, system: &str, tools: &Value, hist: &[Value]) -> Vec<u8> {
     let mut msgs: Vec<(&str, Vec<Value>)> = Vec::new();
     for r in hist {
@@ -57,9 +57,9 @@ fn partial(r: &Value) -> Vec<Value> {
     std::iter::once(json!({"text": r["msg"]["content"], "type": "text"})).chain(uses).collect()
 }
 
-/// A text block without text: the API refuses it.
+/// A text block with no text but whitespace: the API refuses it, and ignores it when it compares a replayed history.
 fn empty_text(b: &Value) -> bool {
-    b["type"] == "text" && b["text"].as_str().is_none_or(str::is_empty)
+    b["type"] == "text" && b["text"].as_str().is_none_or(|t| t.trim().is_empty())
 }
 
 /// One reply as it arrives: every content block by its index, as started and grown by its deltas, with the input text
@@ -67,24 +67,27 @@ fn empty_text(b: &Value) -> bool {
 pub struct Acc {
     blocks: BTreeMap<u64, (Value, String)>,
     stop: Option<String>, // message_delta came: the reply is finished
-    usage: Usage,
-    seen: bool, // a data event came: an error now is not the first event
+    usage: Value,         // each count as last sent
+    seen: bool,           // a part streamed: an error now is not retried, as the retry would repeat it
 }
 
 impl Wire for Acc {
     fn new(_offered: &[&'static str]) -> Acc {
-        Acc { blocks: BTreeMap::new(), stop: None, usage: Usage::default(), seen: false }
+        Acc { blocks: BTreeMap::new(), stop: None, usage: Value::Null, seen: false }
     }
 
-    /// One SSE `data` payload, by its `type`; `ping`, `content_block_stop` and unknown types change nothing.
+    /// One SSE `data` payload, by its `type`; `ping`, `content_block_stop`, unknown types and a delta of another block's
+    /// type change nothing. An `error` is retryable only while no part has streamed.
     fn data(&mut self, data: &str, part: &mut dyn FnMut(Part)) -> Result<Flow, ProviderError> {
         let v: Value = serde_json::from_str(data).map_err(|e| bad(&format!("stream data is not JSON ({e})"), data))?;
-        let (first, at) = (!std::mem::replace(&mut self.seen, true), v["index"].as_u64());
+        let (first, at) = (!self.seen, v["index"].as_u64());
+        // A part reaches the user: from here on a retry would show it twice.
+        let part = &mut |p| self.seen = (part(p), true).1;
         match v["type"].as_str().unwrap_or_default() {
-            "message_start" => usage(&mut self.usage, &v["message"]["usage"]),
+            "message_start" => merge(&mut self.usage, &v["message"]["usage"]),
             "content_block_start" => {
                 let b = &v["content_block"];
-                let Some(i) = at.filter(|_| b.is_object()) else { return Err(bad("a content block without an index", data)) };
+                let Some(i) = at.filter(|i| b.is_object() && !self.blocks.contains_key(i)) else { return Err(bad("a content block start without an object or a new index", data)) };
                 if b["type"] == "tool_use" {
                     part(Part::Call(shown(b).into()));
                 }
@@ -94,16 +97,16 @@ impl Wire for Acc {
                 let Some((b, input)) = at.and_then(|i| self.blocks.get_mut(&i)) else { return Err(bad("a delta for a content block that never started", data)) };
                 let d = |k: &str| v["delta"][k].as_str().unwrap_or_default();
                 match d("type") {
-                    "text_delta" if !d("text").is_empty() => part(Part::Text(append(b, "text", d("text")))),
-                    "thinking_delta" if !d("thinking").is_empty() => part(Part::Reasoning(append(b, "thinking", d("thinking")))),
-                    "signature_delta" => _ = append(b, "signature", d("signature")),
-                    "input_json_delta" => input.push_str(d("partial_json")),
+                    "text_delta" if b["type"] == "text" && !d("text").is_empty() => part(Part::Text(append(b, "text", d("text")))),
+                    "thinking_delta" if b["type"] == "thinking" && !d("thinking").is_empty() => part(Part::Reasoning(append(b, "thinking", d("thinking")))),
+                    "signature_delta" if b["type"] == "thinking" => _ = append(b, "signature", d("signature")),
+                    "input_json_delta" if b["type"] == "tool_use" => input.push_str(d("partial_json")),
                     _ => {}
                 }
             }
             "message_delta" => {
                 self.stop = Some(v["delta"]["stop_reason"].as_str().unwrap_or_default().into());
-                usage(&mut self.usage, &v["usage"]);
+                merge(&mut self.usage, &v["usage"]);
             }
             "message_stop" => return Ok(Flow::Done),
             "error" => return Err(error_object(&v, first)),
@@ -130,21 +133,26 @@ impl Wire for Acc {
             return Err(perr("provider", REFUSAL));
         }
         let length = matches!(stop.as_str(), "max_tokens" | "model_context_window_exceeded");
-        let (mut r, mut blocks) = (Reply { usage: self.usage, ..Reply::default() }, Vec::new());
-        for (mut b, input) in self.blocks.into_values().filter(|(b, _)| !empty_text(b)) {
+        // Input counts every prompt token, cache reads and writes included; `cached` is the reads.
+        let n = |k: &str| self.usage[k].as_u64().unwrap_or(0);
+        let input = n("input_tokens").saturating_add(n("cache_read_input_tokens")).saturating_add(n("cache_creation_input_tokens"));
+        let usage = Usage { input, output: n("output_tokens"), cached: n("cache_read_input_tokens") };
+        let (mut r, mut blocks) = (Reply { usage, ..Reply::default() }, Vec::new());
+        for (mut b, input) in self.blocks.into_values() {
             match b["type"].as_str().unwrap_or_default() {
                 "text" => r.text += b["text"].as_str().unwrap_or_default(),
                 "thinking" => r.reasoning += b["thinking"].as_str().unwrap_or_default(),
                 "tool_use" => {
-                    // No input is `{}`; over 1 MiB or not JSON, the call gets `{}` and keeps the text for validation to quote.
-                    let args = (input.len() <= ARGS_MAX).then(|| serde_json::from_str::<Value>(if input.is_empty() { "{}" } else { &input }).ok()).flatten();
+                    // Without deltas, the input it started with; over 1 MiB or not JSON, `{}` and the text kept for validation to quote.
+                    let input = if input.is_empty() { b.get("input").filter(|i| i.is_object()).map_or_else(|| "{}".into(), Value::to_string) } else { input };
+                    let args = (input.len() <= ARGS_MAX).then(|| serde_json::from_str::<Value>(&input).ok()).flatten();
                     b["input"] = args.clone().filter(Value::is_object).unwrap_or_else(|| json!({}));
                     let (id, name) = (b["id"].as_str().unwrap_or_default().into(), b["name"].as_str().unwrap_or_default().into());
                     r.calls.push(Call { id, name, raw: args.is_none().then_some(input), args: args.unwrap_or_else(|| json!({})), error: length.then(|| CUT_ARGS.into()) });
                 }
                 _ => {}
             }
-            blocks.push(b);
+            blocks.extend((!empty_text(&b)).then_some(b));
         }
         r.finish = if length { "length".into() } else { (if r.calls.is_empty() { "stop" } else { "tool_calls" }).into() };
         r.blocks = Some(blocks.into());
@@ -152,14 +160,9 @@ impl Wire for Acc {
     }
 }
 
-/// A `usage` object: input counts every prompt token, cache reads and writes included; `cached` is the reads.
-fn usage(us: &mut Usage, u: &Value) {
-    let n = |k: &str| u[k].as_u64();
-    if let Some(i) = n("input_tokens") {
-        let read = n("cache_read_input_tokens").unwrap_or(0);
-        (us.input, us.cached) = (i.saturating_add(read).saturating_add(n("cache_creation_input_tokens").unwrap_or(0)), read);
-    }
-    us.output = n("output_tokens").unwrap_or(us.output);
+/// A `usage` object: each count it carries replaces the one before (`message_delta` sends the final ones).
+fn merge(us: &mut Value, u: &Value) {
+    u.as_object().into_iter().flatten().filter(|(_, n)| n.is_u64()).for_each(|(k, n)| us[k] = n.clone());
 }
 
 /// Appends `t` to the string field `k` of the block (an object) in place, a missing or other field becoming `t`; returns
