@@ -5,6 +5,7 @@
 #   bin/henki                    the static binary (musl on Linux)
 #   bin/henki-mods               the module manager; it finds the official modules at ../share/henki/official
 #   share/henki/official/NAME/   every module in mods/, as git tracks it (off until `henki-mods add NAME`)
+#   share/henki/config.*.toml    the config profiles in profiles/ (henki's no-config message names config.mac.toml)
 #   LICENSE README.md CONTRACTS.md
 #
 # Usage:
@@ -26,6 +27,9 @@
 # Bash 3.2 (macOS) compatible; POSIX tools plus git and cargo; GNU tar or bsdtar.
 set -euo pipefail
 export LC_ALL=C
+# macOS's tar packs extended attributes (com.apple.provenance, quarantine) as AppleDouble ._NAME members unless told
+# not to; this stops it for every tar, and pack passes --no-mac-metadata --no-xattrs to bsdtar on a Mac too.
+export COPYFILE_DISABLE=1
 cd "$(dirname "$0")/.."
 ROOT=$PWD
 export CARGO_BUILD_JOBS="${CARGO_BUILD_JOBS:-2}"
@@ -152,6 +156,8 @@ stage() {
   cp "$bin" "$dir/bin/henki" && chmod 755 "$dir/bin/henki"
   cp manager/henki-mods "$dir/bin/henki-mods" && chmod 755 "$dir/bin/henki-mods"
   for n in LICENSE README.md CONTRACTS.md; do cp "$n" "$dir/$n" && chmod 644 "$dir/$n"; done
+  # The profiles, where henki's no-config message sends a Homebrew user: $(brew --prefix)/share/henki/.
+  for n in $(git ls-files 'profiles/config.*.toml'); do cp "$n" "$dir/share/henki/${n#profiles/}" && chmod 644 "$dir/share/henki/${n#profiles/}"; done
   for m in mods/*/; do
     n=$(basename "$m")
     copy_mod "$n" "$dir/share/henki/official"
@@ -172,8 +178,10 @@ pack() {
     owner="--owner=0 --group=0 --numeric-owner"
   else
     owner="--uid 0 --gid 0 --numeric-owner"
+    # Apple's bsdtar: no AppleDouble members, no xattrs (the bytes would depend on where a file came from).
+    [ "$(uname -s)" != Darwin ] || owner="$owner --no-mac-metadata --no-xattrs"
   fi
-  # shellcheck disable=SC2086 # owner is two or three flags
+  # shellcheck disable=SC2086 # owner is several flags
   (cd "$stage" && find "$name" | sort | tar -c --format=ustar --no-recursion $owner -f - -T -) | gzip -n -9 >"$out.tmp"
   mv "$out.tmp" "$out"
 }
@@ -268,6 +276,8 @@ EOF
 
   def caveats
     <<~TEXT
+      henki reads ~/.config/henki/config.toml; start from a profile, then set model and base_url:
+        mkdir -p ~/.config/henki && cp #{HOMEBREW_PREFIX}/share/henki/config.mac.toml ~/.config/henki/config.toml
       The official modules (halti, itse) ship off. henki-mods manages modules:
         henki-mods list        what is added, on, and what each adds to the prompt
         henki-mods add halti   shows what it installs, then asks
@@ -322,13 +332,15 @@ selftest() {
   [ "$(cd "$DIST" && ls)" = SHA256SUMS$'\n'"$name.tar.gz" ] || { say "selftest: dist holds $(cd "$DIST" && ls | tr '\n' ' ')"; bad=1; }
   [ "$(awk '{ print $1 }' "$DIST/SHA256SUMS")" = "$(sha_of "$DIST/$name.tar.gz")" ] || { say "selftest: SHA256SUMS does not match"; bad=1; }
 
-  # The listing: one top dir, the binaries, the docs, every module in mods/ (as git tracks it), nothing else.
+  # The listing: one top dir, the binaries, the docs, the profiles, every module in mods/ (as git tracks it), nothing
+  # else.
   got=$(tar -tzf "$DIST/$name.tar.gz" | sed 's,/$,,' | sort)
   want=$(
     {
       for x in "" /bin /bin/henki /bin/henki-mods /share /share/henki /share/henki/official /LICENSE /README.md /CONTRACTS.md; do
         echo "$name$x"
       done
+      git ls-files 'profiles/config.*.toml' | sed "s,^profiles/,$name/share/henki/,"
       git ls-files mods | sed "s,^mods/,$name/share/henki/official/," | while read -r x; do
         while [ "$x" != "$name/share/henki/official" ]; do
           echo "$x"
@@ -345,6 +357,10 @@ selftest() {
   got=$(env -i HOME="$t/home" PATH=/usr/bin:/bin "$x/bin/henki" --version) || got="(exit $?)"
   want="henki $version ($commit, $(host_arch)-$(host_os))"
   [ "$got" = "$want" ] || { say "selftest: bin/henki --version said \"$got\", not \"$want\""; bad=1; }
+  # Without a config henki names a profile under $(brew --prefix)/share/henki/: the tarball's share/henki/ has it.
+  got=$(env -i HOME="$t/home" PATH=/usr/bin:/bin "$x/bin/henki" run hi 2>&1) && got="(exit 0) $got" || true
+  want=$(printf '%s\n' "$got" | sed -n 's,.*\$(brew --prefix)/\(share/henki/[^ ]*\).*,\1,p')
+  [ -n "$want" ] && [ -f "$x/$want" ] || { say "selftest: henki without a config said \"$got\", and the tarball has no ${want:-file it names}"; bad=1; }
   got=$(env -i HOME="$t/home" PATH=/usr/bin:/bin "$x/bin/henki-mods" --version 2>&1) || got="(exit $?)"
   [ "$got" = "henki-mods $version" ] || { say "selftest: bin/henki-mods --version said \"$got\""; bad=1; }
   # The official modules are found in the tarball's share/ (no HENKI_SHARE, no repo checkout next to it).

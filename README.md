@@ -5,7 +5,8 @@ henki is a small terminal agent in early development. It gives your task to a mo
 ## Usage
 
 ```sh
-mkdir -p ~/.config/henki && cp profiles/config.mac.toml ~/.config/henki/config.toml   # then set model and base_url
+mkdir -p ~/.config/henki && cp $(brew --prefix)/share/henki/config.mac.toml ~/.config/henki/config.toml   # then set model and base_url
+                                        # (from a tarball: share/henki/config.mac.toml; from a checkout: profiles/)
 henki-mods add halti                    # if you use halti: its doc, wrappers and card (1.1 KB into every request)
 henki                                   # the REPL
 henki run "why does the build fail?"    # one task, headless
