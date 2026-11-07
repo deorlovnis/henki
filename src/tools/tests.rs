@@ -624,7 +624,7 @@ fn display_header_target() {
     let c = call("write", json!({"path": "notes.md", "content": "export X=1\n"}));
     let t = target("notes.md", true, &tmp.cfg(&[])).unwrap();
     let lines = display(&c, Some(&t));
-    let header = format!("write notes.md -> {} (symlink, outside project)", far.display());
+    let header = format!("write notes.md -> {} (symlink, outside project) (replaces an existing file)", far.display());
     assert_eq!(lines[0], rule(&header));
     assert_eq!(lines[1..], [rule("content (1 lines, 11 bytes)"), "| export X=1".into()]);
     // read: the header and nothing for its path below it.
@@ -638,6 +638,14 @@ fn display_header_target() {
     // A newline or a tab in a path cannot start a row of its own.
     let t = tmp.write("x\n| ls\tz").unwrap();
     assert_eq!(display(&call("write", json!({"path": "x\n| ls\tz", "content": ""})), Some(&t))[0], rule("write x\\x0a| ls\\x09z"));
+    // Only a write over a file that exists says it replaces one: not a new file, not an edit.
+    tmp.file("kept.txt", "old\n");
+    let t = target("kept.txt", true, &tmp.cfg(&[])).unwrap();
+    assert_eq!(display(&call("write", json!({"path": "kept.txt", "content": ""})), Some(&t))[0], rule("write kept.txt (replaces an existing file)"));
+    let edit = call("edit", json!({"path": "kept.txt", "old_text": "old", "new_text": "new"}));
+    assert_eq!(display(&edit, Some(&t))[0], rule("edit kept.txt"));
+    let t = target("new.txt", true, &tmp.cfg(&[])).unwrap();
+    assert_eq!(display(&call("write", json!({"path": "new.txt", "content": ""})), Some(&t))[0], rule("write new.txt"));
 }
 
 #[test]
@@ -771,9 +779,12 @@ fn call_line_forms() {
     let shell = call("shell", json!({"command": "cargo test\necho done"}));
     let read = call("read", json!({"path": "src/main.rs"}));
     let edit = call("edit", json!({"path": "a.txt", "old_text": "x", "new_text": "y"}));
-    assert_eq!(call_line(&shell, Some(&out("", End::Exit(0), 300)), None, false), "$ cargo test -> exit 0, 0.3 s");
-    assert_eq!(call_line(&shell, Some(&out("", End::Exit(101), 12_345)), None, true), "$ cargo test -> exit 101, 12.3 s");
-    assert_eq!(call_line(&shell, Some(&out("", End::Signal(9), 1000)), None, true), "$ cargo test -> killed by signal 9, 1.0 s");
+    assert_eq!(call_line(&shell, Some(&out("ok\n", End::Exit(0), 300)), None, false), "$ cargo test -> exit 0, 0.3 s");
+    assert_eq!(call_line(&shell, Some(&out("e\n", End::Exit(101), 12_345)), None, true), "$ cargo test -> exit 101, 12.3 s");
+    assert_eq!(call_line(&shell, Some(&out("", End::Signal(9), 1000)), None, true), "$ cargo test -> killed by signal 9, 1.0 s, no output");
+    // Nothing printed: said, so a claim about the output can be checked; not for a killed call, whose output is lost.
+    assert_eq!(call_line(&shell, Some(&out("", End::Exit(0), 300)), None, false), "$ cargo test -> exit 0, 0.3 s, no output");
+    assert_eq!(call_line(&shell, Some(&out("", End::Signal(9), 300)), Some(&Killed::Timeout(5)), true), "$ cargo test -> timed out after 5 s");
     assert_eq!(call_line(&shell, None, Some(&Killed::Timeout(5)), true), "$ cargo test -> timed out after 5 s");
     assert_eq!(call_line(&shell, Some(&out("x", End::Signal(15), 900)), Some(&Killed::Interrupted), true), "$ cargo test -> interrupted");
     assert_eq!(call_line(&shell, None, None, true), "$ cargo test -> error");

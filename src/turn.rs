@@ -20,7 +20,8 @@ pub struct Session {
     /// The REPL reads it (the banner, the allow rules) and replaces `cfg.allow` after removing a rule.
     /// Its `snap` is what the tripwire compares with: the trust files as `config::load` found them.
     pub(crate) cfg: Config,
-    /// The signal that ended the last wait: INT and QUIT cancel a REPL turn, TERM and HUP end the REPL.
+    /// The signal that ended the last wait: INT and QUIT cancel a REPL turn, TERM and HUP end the REPL (and stay while
+    /// the turn finishes).
     pub(crate) sig: Option<i32>,
     j: Journal,
     out: Out,
@@ -219,6 +220,8 @@ impl Session {
         }
         loop {
             let mut r = self.request()?;
+            // A reply whose text came without deltas (a JSON completion, a whole text block): the REPL shows it now.
+            self.t.partial.is_empty().then(|| self.out.delta(&r.text));
             let calls = self.prepare(std::mem::take(&mut r.calls));
             // A renamed id goes into the replayed content too: each tool_use block is one call, in order.
             r.blocks.iter_mut().flat_map(Value::as_array_mut).flatten().filter(|b| b["type"] == "tool_use").zip(&calls).for_each(|(b, c)| b["id"] = c.id.as_str().into());
@@ -295,7 +298,9 @@ impl Session {
             let ev = if let Some(e) = until.into_iter().chain(deadline).min() { self.rx.recv_timeout(e - now).ok() } else { self.rx.recv().ok() };
             match ev {
                 Some(Ev::Signal(s)) => {
-                    (self.hurry, self.sig) = (self.hurry || self.finishing, Some(s));
+                    // While finishing, a Ctrl-C only hurries the kill: a TERM or HUP before it still ends the REPL.
+                    let kept = self.sig.filter(|&p| self.finishing && matches!(p, libc::SIGTERM | libc::SIGHUP));
+                    (self.hurry, self.sig) = (self.hurry || self.finishing, kept.or(Some(s)));
                     return Err(Stop::Signal(s));
                 }
                 Some(Ev::OutputClosed) if !self.finishing => return Err(Stop::Closed),
@@ -341,12 +346,13 @@ impl Session {
     }
 }
 
-/// The line for an end other than `ok`: `(gave up: stuck)`, `(error auth: MSG)`, `(needs approval: NAME)`, `(budget)`.
+/// The line for an end other than `ok`: `(gave up: stuck)`, `(error auth: MSG)`, `(needs approval: $ CMD; ...)` with the
+/// call's head and how to go on, `(budget)`.
 pub fn outcome_line(o: &Outcome) -> String {
     match o {
         Outcome::GaveUp(r) => format!("(gave up: {r})"),
         Outcome::Error { kind, message } => format!("(error {kind}: {message})"),
-        Outcome::NeedsApproval(c) => format!("(needs approval: {})", c.name),
+        Outcome::NeedsApproval(c) => format!("(needs approval: {}; henki --resume continues this session in the REPL)", tools::head(c)),
         o => format!("({})", o.status().replace('_', " ")),
     }
 }

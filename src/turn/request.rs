@@ -44,6 +44,8 @@ impl Session {
                     attempt += 1;
                 }
                 Err(e) if e.kind == "context_exceeded" && !elided && self.elide()? => elided = true,
+                // What streamed before a refusal is dropped: replayed, it would ask the model to go on with it.
+                Err(e) if e.message == anthropic::REFUSAL => return Err(self.gave_up(e, attempt)),
                 Err(e) => return Err(self.partial_reply("error", self.gave_up(e, attempt))),
             }
         }
@@ -81,8 +83,8 @@ impl Session {
         }
     }
 
-    /// A request that ends without a reply journals its streamed text, if any, as an assistant record without calls
-    /// (`finish` is `interrupted` or `error`); FINISHING names the calls it opened.
+    /// A request that ends without a reply (other than a refusal) journals its streamed text, if any, as an assistant
+    /// record without calls (`finish` is `interrupted` or `error`); FINISHING names the calls it opened.
     fn partial_reply(&mut self, finish: &str, o: Outcome) -> Outcome {
         let text = std::mem::take(&mut self.t.partial);
         if text.is_empty() {

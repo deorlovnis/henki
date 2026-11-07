@@ -16,12 +16,11 @@ pub struct Ext {
     pub targets: Vec<PathBuf>, // realpaths of the symlinks among `paths` (protected)
 }
 
-/// The extensions in ext path order (names sorted bytewise within a path), the user PATH (the inherited `path` without
-/// relative entries and without any extension's `bin/`), and notices.
+/// The extensions in ext path order (names sorted bytewise within a path), and the user PATH (the inherited `path`
+/// without relative entries and without any extension's `bin/`).
 pub struct Found {
     pub exts: Vec<Ext>,
     pub user_path: String,
-    pub notices: Vec<String>,
 }
 
 /// Every ext path in order. `optional`: the paths may be absent (the default path of the default config). Nothing is
@@ -60,7 +59,7 @@ pub fn discover(paths: &[PathBuf], optional: bool, shadow: &[String], path: &OsS
             x.shadows.push(found);
         }
     }
-    Ok(Found { exts, user_path: dirs.join(":"), notices: Vec::new() })
+    Ok(Found { exts, user_path: dirs.join(":") })
 }
 
 /// One extension directory: doc.md, an optional bin/, ignored names, nothing else.
@@ -87,9 +86,11 @@ fn one(dir: &Path, name: &str) -> Result<Ext, String> {
     let (mut paths, mut cmds) = (vec![dir.to_path_buf(), doc.clone()], Vec::new());
     if let Some(b) = &bin {
         paths.push(b.clone());
-        for c in names(b).map_err(|e| bad(b, e, "make bin a directory of commands"))? {
+        let runs = |p: &Path| fs::metadata(p).is_ok_and(|m| m.is_file() && m.mode() & 0o100 != 0);
+        // A dot file that cannot run is no command: Finder's .DS_Store, the ._NAME files a copy from a Mac leaves.
+        for c in names(b).map_err(|e| bad(b, e, "make bin a directory of commands"))?.into_iter().filter(|c| !c.as_bytes().starts_with(b".") || runs(&b.join(c))) {
             let p = b.join(&c);
-            if !c.to_str().is_some_and(cmd_name) || !fs::metadata(&p).is_ok_and(|m| m.is_file() && m.mode() & 0o100 != 0) {
+            if !c.to_str().is_some_and(cmd_name) || !runs(&p) {
                 return Err(bad(&p, "a command is a file you can run, named with A-Z, a-z, 0-9, ., _ and -", "rename it or chmod u+x it, or move it out of bin/"));
             }
             cmds.push(c.to_string_lossy().into_owned());

@@ -1,6 +1,6 @@
 //! The Anthropic Messages wire format, for boxes behind their model gateway: the request body rendered from journal
 //! records (a reply's content blocks replayed exactly as they came), and the stream accumulator.
-use crate::http::{error_object, perr};
+use crate::http::{bad, error_object, perr};
 use crate::types::{ARGS_MAX, CUT_ARGS, Call, Flow, Part, ProviderError, Reply, Usage, Wire};
 use serde_json::{Value, json};
 use std::{collections::BTreeMap, time::Duration};
@@ -141,7 +141,6 @@ impl Wire for Acc {
         for (mut b, input) in self.blocks.into_values() {
             match b["type"].as_str().unwrap_or_default() {
                 "text" => r.text += b["text"].as_str().unwrap_or_default(),
-                "thinking" => r.reasoning += b["thinking"].as_str().unwrap_or_default(),
                 "tool_use" => {
                     // Without deltas, the input it started with; over 1 MiB or not JSON, `{}` and the text kept for validation to quote.
                     let input = if input.is_empty() { b.get("input").filter(|i| i.is_object()).map_or_else(|| "{}".into(), Value::to_string) } else { input };
@@ -177,10 +176,6 @@ fn append(b: &mut Value, k: &str, t: &str) -> String {
 
 fn shown(b: &Value) -> &str {
     b["name"].as_str().filter(|n| !n.is_empty()).unwrap_or("unknown")
-}
-
-fn bad(what: &str, data: &str) -> ProviderError {
-    perr("provider", format!("{what}: {}", data.chars().take(200).collect::<String>()))
 }
 
 #[cfg(test)]

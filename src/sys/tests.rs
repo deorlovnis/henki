@@ -348,7 +348,7 @@ fn tty_save_not_a_tty() {
 fn flush_input_not_a_tty() {
     // No unit test saves terminal modes, so there is nothing to restore and nothing is flushed.
     assert!(TTY.get().is_none());
-    flush_input();
+    assert_eq!(flush_input(), 0, "nothing dropped");
     assert!(TTY.get().is_none());
 }
 
@@ -488,7 +488,8 @@ const PTY_CHILD: &str = "HENKI_TEST_PTY_CHILD";
 /// `tty_save` and `flush_input` on a terminal. They act on fd 0, so the test runs this same test again in a child
 /// process whose fd 0 is a fresh pty: the test process's own fd 0 is never touched. The parent leaves the pty
 /// non-blocking with a line typed ahead; the child checks that `tty_save` clears O_NONBLOCK and keeps the typed line,
-/// then that `flush_input` restores the modes it saved, drops what was typed ahead and clears O_NONBLOCK again.
+/// then that `flush_input` restores the modes it saved, drops what was typed ahead (and counts it) and clears O_NONBLOCK
+/// again.
 #[test]
 fn flush_input_restores_a_pty() {
     if std::env::var_os(PTY_CHILD).is_some() {
@@ -503,7 +504,7 @@ fn flush_input_restores_a_pty() {
         // SAFETY: `raw` is a live termios; tcsetattr only reads it.
         assert_eq!(unsafe { libc::tcsetattr(0, libc::TCSANOW, &raw) }, 0);
         set_fl(0, fl(0) | libc::O_NONBLOCK);
-        flush_input();
+        assert_eq!(flush_input(), "typed ahead\n".len(), "the bytes it dropped");
         let now = modes(0).unwrap();
         assert_eq!((now.c_lflag, now.c_iflag, now.c_oflag), (saved.c_lflag, saved.c_iflag, saved.c_oflag));
         assert_eq!(pending(0), 0, "the typed-ahead line is dropped");

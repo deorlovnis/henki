@@ -85,7 +85,6 @@ fn ext_discover_sorted() {
     assert_eq!((a.line.as_str(), &a.doc), ("x", &t.p("one/a/doc.md")));
     assert_eq!(a.paths, [t.p("one/a"), t.p("one/a/doc.md")]);
     assert!(a.bin.is_none() && a.cmds.is_empty() && a.shadows.is_empty() && a.targets.is_empty());
-    assert!(f.notices.is_empty());
 }
 
 #[test]
@@ -274,7 +273,7 @@ fn ext_shadow_entry_unused_ignored() {
     t.exe("e/a/bin/x");
     let usr = t.dir("usr");
     let f = find(&[t.p("e")], &["a/nope", "zz/x", "a/x"], usr.to_str().unwrap()).map_err(|e| panic!("{e}")).ok().unwrap();
-    assert!(f.notices.is_empty() && f.exts[0].shadows.is_empty());
+    assert!(f.exts[0].shadows.is_empty());
 }
 
 #[test]
@@ -424,14 +423,20 @@ fn ext_bin_dotfile() {
     let t = T::new();
     t.ext("e/a", "# a");
     t.exe("e/a/bin/x");
-    // Only NAME directories and the entries of NAME skip dot names; in bin/ every entry is a command.
-    for n in [".DS_Store", ".gitkeep"] {
-        let p = t.file(&format!("e/a/bin/{n}"), "");
-        assert_eq!(err(&[t.p("e")]), bin_refused(&p));
-        fs::remove_file(p).unwrap();
+    // A dot entry in bin/ that cannot run is no command (Finder's, or what a copy from a Mac leaves): ignored, not watched.
+    for n in [".DS_Store", ".gitkeep", "._x"] {
+        t.file(&format!("e/a/bin/{n}"), "");
     }
+    t.dir("e/a/bin/.git");
+    let f = ok(&[t.p("e")]);
+    assert_eq!((&f.exts[0].cmds, f.exts[0].paths.len()), (&vec!["x".to_string()], 4), "{:?}", f.exts[0].paths);
+    // One that can run is a command like any other: listed and watched.
     t.exe("e/a/bin/.x");
-    assert_eq!(ok(&[t.p("e")]).exts[0].cmds, [".x", "x"]);
+    let f = ok(&[t.p("e")]);
+    assert_eq!((&f.exts[0].cmds, f.exts[0].paths.len()), (&vec![".x".to_string(), "x".to_string()], 5));
+    // Without the dot, a file that cannot run is refused as before.
+    let p = t.file("e/a/bin/y", "");
+    assert_eq!(err(&[t.p("e")]), bin_refused(&p));
 }
 
 #[test]

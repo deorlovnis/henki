@@ -1,7 +1,7 @@
 //! The OpenAI-compatible chat-completions wire format: the request body, the stream accumulator with its defensive
 //! call parser, and text calls for servers that leave tool markup in the content.
 use crate::types::{ARGS_MAX, CUT_ARGS, Call, Flow, Part, ProviderError, Reply, Usage, Wire};
-use crate::{http::error_object, http::perr};
+use crate::{http::bad, http::error_object, http::perr};
 use serde_json::{Map, Value, json};
 
 pub const PATH: &str = "/chat/completions";
@@ -98,7 +98,7 @@ impl Wire for Acc {
                 calls = text_calls(&self.reasoning, &self.offered).0;
             }
         }
-        Ok(Reply { text, reasoning: self.reasoning, calls, finish: self.finish, usage: self.usage, blocks: None })
+        Ok(Reply { text, calls, finish: self.finish, usage: self.usage, blocks: None })
     }
 }
 
@@ -261,10 +261,6 @@ fn set_args(c: &mut Call) {
 
 fn shown(name: &str) -> &str {
     if name.is_empty() { "unknown" } else { name }
-}
-
-fn bad(what: &str, data: &str) -> ProviderError {
-    perr("provider", format!("{what}: {}", data.chars().take(200).collect::<String>()))
 }
 
 #[cfg(test)]

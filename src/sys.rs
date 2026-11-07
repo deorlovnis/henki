@@ -146,10 +146,13 @@ fn modes(fd: i32) -> Option<libc::termios> {
 
 /// tcsetattr(0, TCSAFLUSH, the saved modes): restores the modes `tty_save` kept and drops what was typed ahead, so a
 /// command that left the terminal raw or without echo cannot leave the line reader with it; then clears O_NONBLOCK.
-/// Nothing when no modes were saved (`run`, or fd 0 not a terminal).
-pub fn flush_input() {
-    // SAFETY: `t` is a termios tcgetattr filled, and tcsetattr only reads it.
-    let _ = TTY.get().map(|t| unsafe { libc::tcsetattr(0, libc::TCSAFLUSH, t) }).inspect(|_| blocking(0));
+/// Returns the bytes it dropped (FIONREAD; on a canonical terminal, of whole lines). Nothing, and 0, when no modes were
+/// saved (`run`, or fd 0 not a terminal).
+pub fn flush_input() -> usize {
+    let mut n: libc::c_int = 0;
+    // SAFETY: FIONREAD writes one int into `n`; `t` is a termios tcgetattr filled, and tcsetattr only reads it.
+    let _ = TTY.get().map(|t| unsafe { (libc::ioctl(0, libc::FIONREAD, &mut n), libc::tcsetattr(0, libc::TCSAFLUSH, t)) }).inspect(|_| blocking(0));
+    usize::try_from(n).unwrap_or(0)
 }
 
 /// Clears O_NONBLOCK on `fd`. A command that shares the terminal may set it on the open file and leave it set; reads

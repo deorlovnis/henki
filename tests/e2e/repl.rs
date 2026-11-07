@@ -175,18 +175,23 @@ fn pty_approval_no_denied() {
     assert!(!r.path("no.txt").exists() && m.log().len() == 2, "the turn goes on after a denial");
 }
 
+/// Ctrl-D at a question leaves: the turn ends at once (no answer is journaled, the call is not run, and no later question
+/// of the turn is answered for the user), then the REPL quits at its prompt.
 #[test]
-fn pty_approval_eof_no() {
-    let m = Mock::start(vec![shell("touch eof.txt"), say("nothing ran")]);
+fn pty_approval_eof_ends_turn() {
+    let m = Mock::start(vec![shell("touch eof.txt"), shell("touch eof2.txt"), say("never")]);
     let r = asking(&m);
     let p = start(&r, &[]);
     p.line("make the file");
     p.expect("run? [y/N/always] ", W);
     p.ctrl_d();
-    p.expect("nothing ran", W);
+    p.expect("(interrupted)\r\n", W);
+    let screen = String::from_utf8_lossy(&p.screen()).into_owned();
+    assert!(screen.contains("run? [y/N/always] \r\n(interrupted)\r\n"), "not on a row of its own:\n{screen:?}");
     let d = ended(p, 0); // at the next prompt
-    assert_eq!(verdicts(&d), [json!(["no", null])], "EOF is a no");
-    assert!(!r.path("eof.txt").exists());
+    assert_eq!((verdicts(&d), &d.results()[0]["content"]), (vec![], &json!("not run: interrupted")), "{}", d.diag());
+    assert_eq!((m.log().len(), d.of("ask").len()), (1, 1), "a later question answered for the user\n{}", d.diag());
+    assert!(!r.path("eof.txt").exists() && !r.path("eof2.txt").exists());
 }
 
 #[test]
@@ -702,11 +707,11 @@ fn pty_always_confirm_typeahead() {
     assert!(!r.allow().exists(), "a rule saved without a separate y");
 }
 
-/// Ctrl-C at the confirmation saves nothing and asks `run?` again; the end of input there saves nothing either, and
-/// then `run?` is a no.
+/// Ctrl-C at the confirmation saves nothing and asks `run?` again, on a row of its own; the end of input there saves
+/// nothing either and ends the turn, and then the REPL.
 #[test]
 fn pty_always_confirm_ctrl_c() {
-    let m = Mock::start(vec![shell("touch kept-out.txt"), say("nothing saved")]);
+    let m = Mock::start(vec![shell("touch kept-out.txt"), say("never")]);
     let r = asking(&m);
     let p = start(&r, &[]);
     p.line("go");
@@ -714,15 +719,16 @@ fn pty_always_confirm_ctrl_c() {
     p.line("always");
     p.expect(" ? [y/N] ", W);
     p.ctrl_c();
-    p.expect("run? [y/N/always] ", W);
+    p.expect("^C\r\nrun? [y/N/always] ", W);
     p.line("always");
     p.expect(" ? [y/N] ", W);
     p.ctrl_d();
-    p.expect("run? [y/N/always] ", W);
-    p.expect("nothing saved", W);
+    p.expect("(interrupted)\r\n", W);
+    let screen = String::from_utf8_lossy(&p.screen()).into_owned();
+    assert!(screen.contains(" ? [y/N] \r\n(interrupted)\r\n"), "not on a row of its own:\n{screen:?}");
     let d = ended(p, 0); // the end of input also ends the REPL at its next prompt
-    assert_eq!((verdicts(&d), &d.results()[0]["content"]), (vec![json!(["no", null])], &json!("denied by the user")), "{}", d.diag());
-    assert!(!r.allow().exists() && !r.path("kept-out.txt").exists());
+    assert_eq!((verdicts(&d), &d.results()[0]["content"]), (vec![], &json!("not run: interrupted")), "{}", d.diag());
+    assert!(!r.allow().exists() && !r.path("kept-out.txt").exists() && m.log().len() == 1);
 }
 
 /// Answers are trimmed and in any case: `YES` and ` Yes ` run the call and `Always` saves a rule; `a` is a no.
@@ -1020,4 +1026,132 @@ fn pty_typeahead_after_ctrl_c_at_question() {
     assert!(m.log().iter().all(|l| !l.text().contains("typed ahead")), "the typed-ahead line reached the model\n{}", d.diag());
     assert!(m.log()[2].contents("user").last().unwrap().ends_with("later"), "{:?}", m.log()[2].contents("user"));
     assert!(!r.path("q.txt").exists());
+}
+
+/// A block pasted at a question: its first line is the answer and the rest is dropped, so no pasted line becomes the next
+/// message or runs as a `!CMD`, whether the first line runs the call or not.
+#[test]
+fn pty_paste_at_question_one_line() {
+    for (first, verdict) in [("cd build", "no"), ("y", "yes")] {
+        let m = Mock::start(vec![shell("echo asked"), say("after the answer")]);
+        let r = asking(&m);
+        let pasted = r.path("PASTED");
+        let p = start(&r, &[]);
+        p.line("go");
+        p.expect("run? [y/N/always] ", W);
+        p.send(format!("{first}\n!touch {}\npasted-tail-line\n", pasted.display()).as_bytes());
+        p.expect("after the answer", W);
+        p.prompt(W);
+        let d = exit(p);
+        assert_eq!(verdicts(&d), [json!([verdict, null])], "{}", d.diag());
+        assert!(!pasted.exists(), "a pasted ! line ran\n{}", d.diag());
+        assert!(m.log().len() == 2 && m.log().iter().all(|l| !l.text().contains("pasted-tail-line")), "a pasted line became a message\n{}", d.diag());
+    }
+}
+
+/// `yes` confirms a rule as `y` does, in any case; and a block pasted at the confirmation is one answer, as at `run?`.
+#[test]
+fn pty_always_confirm_yes_and_paste() {
+    let m = Mock::start(vec![shell("echo confirmed"), say("saved it")]);
+    let r = asking(&m);
+    let (root, pasted) = (r.root(), r.path("PASTED"));
+    let p = start(&r, &[]);
+    p.line("go");
+    p.expect("run? [y/N/always] ", W);
+    p.line("always");
+    p.expect(" ? [y/N] ", W);
+    p.send(format!("YES\n!touch {}\npasted-tail-line\n", pasted.display()).as_bytes());
+    p.expect(&format!("added to ~/.config/henki/allow as rule 1 for {root}; /allow lists and removes rules\r\n"), W);
+    p.expect("saved it", W);
+    p.prompt(W);
+    let d = exit(p);
+    assert_eq!(verdicts(&d), [json!(["always", 1])], "{}", d.diag());
+    assert!(fs::read_to_string(r.allow()).unwrap().ends_with(&format!("{root}\techo confirmed\n")));
+    assert!(!pasted.exists(), "a pasted ! line ran\n{}", d.diag());
+    assert!(m.log().len() == 2 && m.log().iter().all(|l| !l.text().contains("pasted-tail-line")), "a pasted line became a message\n{}", d.diag());
+}
+
+/// An answer that comes without deltas (a server's JSON completion, an Anthropic text block sent whole) is shown all
+/// the same, before the next prompt.
+#[test]
+fn pty_answer_without_deltas_shown() {
+    let completion = json!({"id": "cmpl-1", "object": "chat.completion", "model": "mock-model",
+        "choices": [{"index": 0, "message": {"role": "assistant", "content": "json-answer-words"}, "finish_reason": "stop"}],
+        "usage": {"prompt_tokens": 50, "completion_tokens": 3, "total_tokens": 53}});
+    let m = Mock::start(vec![Step::Json(completion)]);
+    let r = asking(&m);
+    let p = start(&r, &[]);
+    p.line("no streaming");
+    p.expect("no streaming\r\njson-answer-words\r\n> ", W);
+    let d = exit(p);
+    assert_eq!(d.of("assistant")[0]["msg"]["content"], "json-answer-words");
+    let msg = json!({"id": "msg_whole", "type": "message", "role": "assistant", "content": [], "model": "mock-model", "stop_reason": null, "stop_sequence": null,
+        "usage": {"input_tokens": 10, "output_tokens": 1}});
+    let events = [
+        ("message_start", json!({"type": "message_start", "message": msg})),
+        ("content_block_start", json!({"type": "content_block_start", "index": 0, "content_block": {"type": "text", "text": "whole-text-block"}})),
+        ("content_block_stop", json!({"type": "content_block_stop", "index": 0})),
+        ("message_delta", json!({"type": "message_delta", "delta": {"stop_reason": "end_turn", "stop_sequence": null}, "usage": {"output_tokens": 3}})),
+        ("message_stop", json!({"type": "message_stop"})),
+    ];
+    let m = Mock::start_api(Api::Anthropic, vec![Step::Events(events.into_iter().map(|(n, v)| (n.to_string(), v)).collect())]);
+    let mut r = asking(&m);
+    r.set("dialect", "\"anthropic\"");
+    let p = start(&r, &[]);
+    p.line("hi");
+    p.expect("hi\r\nwhole-text-block\r\n> ", W);
+    let d = exit(p);
+    assert_eq!(d.of("assistant")[0]["msg"]["content"], "whole-text-block");
+}
+
+/// SIGTERM cancels a busy turn and ends the REPL. A Ctrl-C that comes while the turn's processes are being stopped only
+/// hurries the kill: henki still exits 130 instead of going back to the prompt.
+#[test]
+fn pty_term_then_ctrl_c_while_finishing_130() {
+    let mut r = Run::new("");
+    let cmd = format!("trap 'echo term >> term.txt' TERM; echo ready > ready.txt; while :; do sleep 0.05; done # {}", r.marker);
+    let m = Mock::start(vec![shell(&cmd), say("never")]);
+    r.at(&m.url());
+    let p = start(&r, &[]);
+    p.line("run it");
+    assert!(poll(W, || r.path("ready.txt").exists()), "the call did not start");
+    p.signal(libc::SIGTERM);
+    // The call got henki's SIGTERM and lives on through the grace henki gives it: henki is finishing the turn now.
+    assert!(poll(W, || r.path("term.txt").exists()), "the call never got SIGTERM");
+    p.signal(libc::SIGINT);
+    let d = p.wait(W);
+    d.finish();
+    assert_eq!(d.code, Some(130), "{}", d.diag());
+    assert_eq!(d.of("turn_end")[0]["status"], "interrupted", "{}", d.diag());
+}
+
+/// The REPL's own flags take effect: `--nested` (needed inside another henki), `--model` and `--approve auto` in the
+/// banner, and `--config` names the file it read.
+#[test]
+fn pty_flags_take_effect() {
+    let m = Mock::start(vec![]);
+    let mut r = asking(&m);
+    let alt = r.dir.join("alt");
+    fs::create_dir_all(alt.join("ext")).unwrap();
+    fs::set_permissions(&alt, fs::Permissions::from_mode(0o700)).unwrap();
+    let file = alt.join("henki.toml");
+    fs::write(&file, format!("model = \"alt-model\"\nbase_url = \"{}\"\napprove = \"ask\"\ncontext_window = 32768\n", m.url())).unwrap();
+    fs::set_permissions(&file, fs::Permissions::from_mode(0o600)).unwrap();
+    r.env("HENKI_DEPTH", "1");
+    let d = Pty::spawn(&r, &[], 24, 80).wait(W);
+    d.finish();
+    assert_eq!(d.code, Some(2), "{}", d.diag());
+    assert!(d.out().contains("refusing to start inside henki (HENKI_DEPTH=1); pass --nested if this is intended"), "{}", d.diag());
+    let p = Pty::spawn(&r, &["--nested", "--config", file.to_str().unwrap()], 24, 80);
+    p.expect(&format!("henki {VERSION} · alt-model · {} (openai)", m.url()), W);
+    p.expect("approval: ask\r\n", W);
+    p.expect(&format!("config: {}\r\n", file.display()), W);
+    p.prompt(W);
+    exit(p);
+    let p = Pty::spawn(&r, &["--nested", "--model", "flag-model", "--approve", "auto"], 24, 80);
+    p.expect(&format!("henki {VERSION} · flag-model · "), W);
+    p.expect("approval: AUTO (from --approve)\r\n", W);
+    p.expect("config: ~/.config/henki/config.toml\r\n", W);
+    p.prompt(W);
+    exit(p);
 }

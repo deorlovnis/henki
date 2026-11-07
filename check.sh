@@ -233,6 +233,18 @@ spread() {
   done
 }
 
+# An inline #[cfg(test)] item (nested braces, a brace in a string) put in the middle of FILE: the counter must skip
+# its lines and count every line after it.
+mid_test() {
+  local n
+  n="$(wc -l <"$1")"
+  {
+    head -n $((n / 2)) "$1"
+    printf '#[cfg(test)]\nfn t() {\n    let s = "}";\n    if s.is_empty() {}\n}\n'
+    tail -n +$((n / 2 + 1)) "$1"
+  } >"$1.tmp" && mv "$1.tmp" "$1"
+}
+
 # N package lines, as cargo tree prints them.
 packages() {
   awk -v n="$1" 'BEGIN { for (i = 1; i <= n; i++) print "p" i " v1.0.0" }'
@@ -251,10 +263,13 @@ selftest() {
   code "$t/ok/x.rs" "$max_file_lines"
   printf '// a comment\n\n  /* a block\n     comment */\n#[cfg(test)]\nmod tests;\n' >>"$t/ok/x.rs"
   code "$t/ok/x/tests.rs" 500
+  # Lines after an inline test item still count (else `over` would pass), and its own lines do not (else `ok` would fail).
+  mid_test "$t/over/f0.rs"
+  mid_test "$t/ok/x.rs"
   expect "lines: $((max_lines + 1)) in files of at most $max_file_lines" "over $max_lines" gate_lines "$t/over" || bad=1
   expect "lines: exactly $max_lines in files of at most $max_file_lines" pass gate_lines "$t/full" || bad=1
   expect "lines: a file of $((max_file_lines + 1))" "files over $max_file_lines" gate_lines "$t/big" || bad=1
-  expect "lines: $max_file_lines, comments, blank lines and a test module" pass gate_lines "$t/ok" || bad=1
+  expect "lines: $max_file_lines, comments, blank lines, an inline test item and a test module" pass gate_lines "$t/ok" || bad=1
 
   clean=$'[[package]]\nname = "henki"\nversion = "0.1.0"'
   expect "crates: $((max_crates + 1)) packages" "over $max_crates" gate_crates "$(packages $((max_crates + 1)))" "$clean" || bad=1

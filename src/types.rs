@@ -61,7 +61,6 @@ pub struct Call {
 #[derive(Debug, Default, PartialEq)]
 pub struct Reply {
     pub text: String,
-    pub reasoning: String,
     pub calls: Vec<Call>,
     pub finish: String,
     pub usage: Usage,

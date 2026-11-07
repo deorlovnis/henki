@@ -807,7 +807,7 @@ fn outcome_line_forms() {
     assert_eq!(outcome_line(&Outcome::GaveUp("stuck")), "(gave up: stuck)");
     assert_eq!(outcome_line(&Outcome::error("auth", "bad key")), "(error auth: bad key)");
     assert_eq!(outcome_line(&Outcome::error("changed", "trust file changed: /c")), "(error changed: trust file changed: /c)");
-    assert_eq!(outcome_line(&Outcome::NeedsApproval(shell_call("h1"))), "(needs approval: shell)");
+    assert_eq!(outcome_line(&Outcome::NeedsApproval(shell_call("h1"))), "(needs approval: $ ls; henki --resume continues this session in the REPL)");
     assert_eq!(outcome_line(&Outcome::Budget), "(budget)");
     assert_eq!(outcome_line(&Outcome::Interrupted), "(interrupted)");
     assert_eq!(outcome_line(&Outcome::OutputClosed), "(output closed)");

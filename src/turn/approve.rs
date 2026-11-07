@@ -7,7 +7,7 @@ pub const DENIED: &str = "denied by the user";
 
 impl Session {
     /// Shows `c`, asks until there is an answer, journals `ask` before and `approval` after; true to run the call.
-    /// INT and QUIT are a no; TERM, HUP and a closed stdout end the turn; a tripwire found before an append ends it
+    /// INT and QUIT are a no; EOF, TERM, HUP and a closed stdout end the turn; a tripwire found before an append ends it
     /// `Error changed`.
     pub(super) fn ask(&mut self, c: &Call, t: Option<&Target>) -> Result<bool, Outcome> {
         self.record(rec::ask(c, t.map(|t| t.shown.as_str())))?;
@@ -35,11 +35,10 @@ impl Session {
                 }
                 _ => return self.verdict(c, "no", None),
             }
-            sys::flush_input();
             self.out.reset();
             self.out.line(&format!("a rule allows whatever this command does in {root}, including the files and config it reads"));
             self.out.prompt(&format!("save rule for {root}: {cmd} ? [y/N] "));
-            if self.typed()? != "y" {
+            if !matches!(self.typed()?.as_str(), "y" | "yes") {
                 continue;
             }
             self.tripwire()?;
@@ -57,11 +56,14 @@ impl Session {
         }
     }
 
-    /// An answer, trimmed and in lower case; EOF, INT and QUIT give "".
+    /// An answer, trimmed and in lower case; INT and QUIT give "". One line is the answer, as at the prompt: the rest of
+    /// a pasted block, or of what was typed ahead, is dropped. EOF (Ctrl-D) ends the turn, and the REPL then quits. After
+    /// Ctrl-D or Ctrl-C, which leave the cursor after the question, what follows starts on its own row.
     fn typed(&mut self) -> Result<String, Outcome> {
         match self.line() {
-            Ok(a) => Ok(a.unwrap_or_default().trim().to_ascii_lowercase()),
-            Err(Stop::Signal(libc::SIGINT | libc::SIGQUIT)) => Ok(String::new()),
+            Ok(Some(a)) => Ok(a.trim().to_ascii_lowercase()).inspect(|_| _ = sys::flush_input()),
+            Ok(None) => Err(Outcome::Interrupted).inspect_err(|_| self.out.line("")),
+            Err(Stop::Signal(libc::SIGINT | libc::SIGQUIT)) => Ok(String::new()).inspect(|_| self.out.line("")),
             Err(s) => Err(s.into()),
         }
     }

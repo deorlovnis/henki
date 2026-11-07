@@ -280,6 +280,11 @@ pub fn perr(kind: &'static str, message: impl Into<String>) -> ProviderError {
     ProviderError { kind, message: message.into(), retry: None, retry_after: None }
 }
 
+/// A reply the wire format cannot read: `WHAT: ` and the first 200 characters of what came.
+pub fn bad(what: &str, data: &str) -> ProviderError {
+    perr("provider", format!("{what}: {}", data.chars().take(200).collect::<String>()))
+}
+
 /// `localhost`, a dotted quad in 127.0.0.0/8 (no trailing dot, no other IPv4 forms), or `::1`.
 pub fn loopback_literal(host: &str) -> bool {
     matches!(host, "localhost" | "::1") || host.parse::<Ipv4Addr>().is_ok_and(|a| a.is_loopback())

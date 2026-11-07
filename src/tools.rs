@@ -147,10 +147,10 @@ pub fn needs_approval(name: &str, t: Option<&Target>, cfg: &Config, session: &st
     !cfg.auto && (name != "read" || !t.is_some_and(free))
 }
 
-/// The approval display, without the reset and the question: a header rule (the tool, and a file tool's target), every
-/// line of each primary argument under its own rule, never truncated, then the other arguments as rules, sorted by key.
-/// A line is marked `!| ` instead of `| ` when it shows anything other than itself: an escaped or non-ASCII code point, a
-/// tab (as `\t`) or a run of more than 32 spaces (as `[N spaces]`).
+/// The approval display, without the reset and the question: a header rule (the tool, a file tool's target, and for a
+/// write whether it replaces a file), every line of each primary argument under its own rule, never truncated, then the
+/// other arguments as rules, sorted by key. A line is marked `!| ` instead of `| ` when it shows anything other than
+/// itself: an escaped or non-ASCII code point, a tab (as `\t`) or a run of more than 32 spaces (as `[N spaces]`).
 pub fn display(c: &Call, t: Option<&Target>) -> Vec<String> {
     // One row each, so a newline or a tab in a path or a key is escaped too.
     let rule = |text: &str| {
@@ -158,7 +158,9 @@ pub fn display(c: &Call, t: Option<&Target>) -> Vec<String> {
         format!("-- {text} {}", "-".repeat(72usize.saturating_sub(text.chars().count() + 4).max(2)))
     };
     let (strings, ints) = ARGS.iter().find(|a| a.0 == c.name).map_or((&[][..], &[][..]), |a| (a.1, a.2));
-    let mut lines = vec![rule(&t.map_or_else(|| c.name.clone(), |t| format!("{} {}", c.name, t.shown)))];
+    // A write over a file that exists says so: whatever the new content leaves out is gone.
+    let over = if c.name == "write" && t.is_some_and(|t| t.mode.is_some()) { " (replaces an existing file)" } else { "" };
+    let mut lines = vec![rule(&t.map_or_else(|| c.name.clone(), |t| format!("{} {}{over}", c.name, t.shown)))];
     for &k in strings.iter().filter(|&&k| k != "path") {
         let v = c.args[k].as_str().unwrap_or_default();
         let n = v.split_terminator('\n').count() as u64;
@@ -225,9 +227,11 @@ pub fn not_started(e: &io::Error) -> String {
     format!("[not started: {name} bash]")
 }
 
-/// The plain-mode stderr line: `$ FIRST_LINE -> exit 0, 0.3 s`, `read PATH -> ok, 0.0 s`, `edit PATH -> error, 0.0 s`.
+/// The plain-mode stderr line: `$ FIRST_LINE -> exit 0, 0.3 s`, `read PATH -> ok, 0.0 s`, `edit PATH -> error, 0.0 s`;
+/// a shell call that printed nothing adds `, no output`, so what the model says about its output can be checked.
 pub fn call_line(c: &Call, out: Option<&ToolOutput>, killed: Option<&Killed>, is_error: bool) -> String {
-    format!("{} -> {}", head(c), ended(out, killed, is_error))
+    let silent = if c.name == "shell" && killed.is_none() && out.is_some_and(|o| o.bytes == 0) { ", no output" } else { "" };
+    format!("{} -> {}{silent}", head(c), ended(out, killed, is_error))
 }
 
 /// A call's head: `$ FIRST_LINE` (shell), `read PATH`, `write PATH`, `edit PATH`, else the name. One row: a newline in a path

@@ -185,12 +185,12 @@ fn e2e_run_plain_outcome_line() {
     let d = r.cmd(&["hello"]).go();
     d.finish();
     assert_eq!(d.code, Some(3));
-    assert!(d.err().lines().any(|l| l == "(needs approval: shell)"), "{}", d.err());
+    assert!(d.err().lines().any(|l| l == "(needs approval: $ echo x; henki --resume continues this session in the REPL)"), "{}", d.err());
 }
 
 #[test]
 fn e2e_run_plain_call_line() {
-    let m = Mock::start(vec![shell("echo hi"), call("read", json!({"path": "notes.txt"})), say("It says hi.")]);
+    let m = Mock::start(vec![shell("echo hi"), shell("true"), call("read", json!({"path": "notes.txt"})), say("It says hi.")]);
     let r = Run::new(&m.url());
     std::fs::write(r.path("notes.txt"), "hi\n").unwrap();
     let d = r.cmd(&["what does it say"]).go();
@@ -200,6 +200,8 @@ fn e2e_run_plain_call_line() {
     let shell_line = err.lines().find(|l| l.starts_with("$ echo hi -> exit 0, ")).unwrap_or_else(|| panic!("no call line:\n{err}"));
     let secs = shell_line.strip_prefix("$ echo hi -> exit 0, ").unwrap().strip_suffix(" s").unwrap();
     assert!(secs.split_once('.').is_some_and(|(a, b)| a.parse::<u32>().is_ok() && b.len() == 1), "{shell_line}");
-    assert!(err.lines().any(|l| l.starts_with("read ") && l.contains("notes.txt -> ok, ")), "{err}");
+    assert!(err.lines().any(|l| l.starts_with("read ") && l.contains("notes.txt -> ok, ") && !l.contains("no output")), "{err}");
+    // A command that printed nothing says so, so a claim about its output can be checked.
+    assert!(err.lines().any(|l| l.starts_with("$ true -> exit 0, ") && l.ends_with(" s, no output")), "{err}");
     assert!(!err.contains("henki: $"), "call lines carry no prefix");
 }

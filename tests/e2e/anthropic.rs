@@ -151,6 +151,28 @@ fn e2e_anthropic_refusal() {
     assert_eq!(m.log().len(), 1);
 }
 
+/// What streamed before a refusal is not kept: no assistant record holds it, and a resumed session does not send it back
+/// to the model (which would ask it to go on with text it declined).
+#[test]
+fn e2e_anthropic_refusal_text_not_kept() {
+    let (mut r, m) = scripted(vec![Step::Refuse]);
+    let d = r.json("do something bad");
+    d.finish();
+    assert_eq!(error_of(&d), (Some(2), "provider".into(), "the model declined the request (refusal)".into()), "{}", d.diag());
+    assert!(d.of("assistant").is_empty() && !String::from_utf8_lossy(&d.journal_bytes).contains("I can't help"), "{}", d.diag());
+    clean(&m);
+    let m2 = Mock::start_api(Api::Anthropic, vec![say("something else then")]);
+    at(&mut r, &m2);
+    let d = r.cmd(&["--json", "--resume", "please continue"]).go();
+    d.finish();
+    assert_eq!(d.code, Some(0), "{}", d.diag());
+    clean(&m2);
+    let l = &m2.log()[0];
+    assert!(!l.text().contains("I can't help"), "the refused text was sent back: {}", l.text());
+    let msgs = l.messages();
+    assert_eq!((msgs.len(), &msgs[0]["role"], msgs[0]["content"].as_array().unwrap().len()), (1, &json!("user"), 2), "{msgs:?}");
+}
+
 #[test]
 fn e2e_anthropic_max_tokens_cuts_calls() {
     let (r, m) = scripted(vec![native("shell", &json!({"command": "touch cut-ran"}).to_string(), "length"), say("shorter now")]);
@@ -351,6 +373,9 @@ fn e2e_box_profile_run() {
     let l = &m.log()[0];
     assert_eq!((l.line.as_str(), l.header("x-api-key")), ("POST /model/v1/messages HTTP/1.1", Some("cred-managed")));
     assert!(l.system().ends_with(&format!("\n- itse: {line} [{}]", ext.join("itse/doc.md").display())), "{}", l.system());
+    // The key goes in the header only: never into the journal or the records on stdout.
+    let journal = String::from_utf8_lossy(&d.journal_bytes);
+    assert!(!journal.is_empty() && !journal.contains("cred-managed") && !d.out().contains("cred-managed"), "the key leaked\n{}", d.diag());
 }
 
 /// One POST to the mock; the status and the body (an SSE body as its `data:` payloads).

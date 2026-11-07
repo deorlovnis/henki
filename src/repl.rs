@@ -63,9 +63,10 @@ fn lines(s: &mut Session) -> u8 {
             Err(e) => return Outcome::from(e).exit() as u8, // a closed stdout, or TERM or HUP
         };
         let t = line.trim();
-        // One line per prompt: the rest of a pasted block, or of what was typed ahead, is dropped, so that no pasted line
-        // runs as a `!cmd`. What follows a `!cmd` line is the command's to read.
-        (!t.starts_with('!')).then(sys::flush_input);
+        // One line per prompt: the rest of a pasted block, or of what was typed ahead, is dropped with a note, so that no
+        // pasted line runs as a `!cmd`. What follows a `!cmd` line is the command's to read.
+        let dropped = if t.starts_with('!') { 0 } else { sys::flush_input() };
+        (dropped > 0).then(|| s.out().note(&format!("dropped {} bytes after that line: one line is one message; save longer text to a file", term::num(dropped as u64))));
         let rm = t.strip_prefix("/allow rm ").and_then(|n| n.trim().parse().ok());
         match (t, rm, t.strip_prefix('!')) {
             ("" | "!", ..) => {}
@@ -100,7 +101,7 @@ fn lines(s: &mut Session) -> u8 {
                     // stdout went away (only a turn writes to it), also when the turn did not end on it: a finishing turn
                     // drops that event.
                     _ if s.out().closed() => return 141,
-                    Outcome::Interrupted => sys::flush_input(), // what was typed during the turn is no answer
+                    Outcome::Interrupted => _ = sys::flush_input(), // what was typed during the turn is no answer
                     Outcome::Error { kind: "journal" | "tampered", .. } => return 2,
                     Outcome::Error { kind: "changed", .. } => {
                         s.out().note(TRIPPED);

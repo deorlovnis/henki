@@ -174,7 +174,7 @@ fn parse_content_and_reasoning() {
         finish_chunk("stop"),
     ]);
     assert_eq!(parts, vec![Part::Reasoning("think".into()), Part::Reasoning(" more".into()), Part::Text("Hel".into()), Part::Text("lo".into())]);
-    assert_eq!((r.text.as_str(), r.reasoning.as_str(), r.finish.as_str()), ("Hello", "think more", "stop"));
+    assert_eq!((r.text.as_str(), r.finish.as_str()), ("Hello", "stop"));
     assert!(r.calls.is_empty());
 }
 
@@ -475,11 +475,11 @@ fn after_scan_content_then_reasoning() {
     // Calls in the content: those run, their markup leaves the text, the reasoning is not scanned.
     let (r, _) = run(&[chunk(json!({"reasoning_content": hermes("from reasoning")})), chunk(json!({"content": format!("I will list.\n{}", hermes("ls"))})), finish_chunk("stop")]);
     assert_eq!(r.calls.iter().map(|c| &c.args).collect::<Vec<_>>(), [&json!({"command": "ls"})]);
-    assert_eq!((r.text.as_str(), r.reasoning.as_str()), ("I will list.", hermes("from reasoning").as_str()));
+    assert_eq!(r.text, "I will list.");
     // None in the content: the reasoning's calls run, and neither text changes.
     let (r, _) = run(&[chunk(json!({"reasoning_content": hermes("pwd")})), chunk(json!({"content": "Checking."})), finish_chunk("stop")]);
     assert_eq!(r.calls.iter().map(|c| &c.args).collect::<Vec<_>>(), [&json!({"command": "pwd"})]);
-    assert_eq!((r.text.as_str(), r.reasoning.as_str()), ("Checking.", hermes("pwd").as_str()));
+    assert_eq!(r.text, "Checking.");
     // Native calls win: no scan at all.
     let (r, _) = run(&[chunk(json!({"content": hermes("ls")})), calls_chunk(vec![tc(Some(0), Some("n"), Some("read"), Some(r#"{"path":"a"}"#))])]);
     assert_eq!((names(&r), r.text.as_str()), (vec!["read"], hermes("ls").as_str()));
@@ -733,10 +733,7 @@ fn json_completion() {
     let b = json!({"choices": [{"finish_reason": "stop", "index": 0, "message": {"content": "All done.", "reasoning_content": "hmm", "role": "assistant"}}],
         "object": "chat.completion", "usage": {"completion_tokens": 3, "prompt_tokens": 50, "prompt_tokens_details": {"cached_tokens": 40}}});
     let r = Acc::new(&OFFERED).json(b.to_string().as_bytes()).unwrap();
-    assert_eq!(
-        r,
-        Reply { text: "All done.".into(), reasoning: "hmm".into(), calls: vec![], finish: "stop".into(), usage: Usage { input: 50, output: 3, cached: 40 }, blocks: None }
-    );
+    assert_eq!(r, Reply { text: "All done.".into(), calls: vec![], finish: "stop".into(), usage: Usage { input: 50, output: 3, cached: 40 }, blocks: None });
     // Text calls in a completion are found as in a stream.
     let b = json!({"choices": [{"finish_reason": "stop", "message": {"content": "<function=read><parameter=path>a</parameter></function>"}}]});
     assert_eq!(names(&Acc::new(&OFFERED).json(b.to_string().as_bytes()).unwrap()), ["read"]);

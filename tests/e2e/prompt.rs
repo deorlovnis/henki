@@ -1,10 +1,10 @@
 #![allow(clippy::disallowed_methods, clippy::print_stdout, clippy::print_stderr, clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::string_slice, unsafe_code)]
 //! The REPL at its prompt: a pasted block and a line typed ahead, a bare `!`, Ctrl-\, what a `!cmd` is blamed for, and
-//! the ends that come from outside: the terminal closing (at the prompt and during a `!cmd`), TERM during a compound
-//! `!cmd`, and a stdout nobody reads.
+//! the ends that come from outside: the terminal closing (at the prompt, at a question and during a `!cmd`), TERM
+//! during a compound `!cmd`, and a stdout nobody reads.
 use crate::harness::*;
 use crate::mock::*;
-use crate::pty::{Pty, shown};
+use crate::pty::{Pty, RESET, shown};
 use std::cell::Cell;
 use std::collections::HashMap;
 use std::fs::{self, File};
@@ -45,15 +45,17 @@ fn exit(p: Pty<'_>) -> Done {
     d
 }
 
-/// A block pasted at the prompt: its first line is the message and the rest is dropped, so a pasted `!` line never
-/// runs and no pasted line becomes a message of its own.
+/// A block pasted at the prompt: its first line is the message and the rest is dropped, with a note that says so, so a
+/// pasted `!` line never runs and no pasted line becomes a message of its own.
 #[test]
 fn pty_paste_bang_line_not_run() {
     let m = Mock::start(vec![say("first answer streams here"), say("second answer")]);
     let r = asking(&m);
     let pwned = r.path("PWNED");
     let p = start(&r);
-    p.send(format!("please explain this log:\nERROR something failed\n!touch {}\n", pwned.display()).as_bytes());
+    let rest = format!("ERROR something failed\n!touch {}\n", pwned.display());
+    p.send(format!("please explain this log:\n{rest}").as_bytes());
+    p.expect(&format!("henki: dropped {} bytes after that line: one line is one message; save longer text to a file\r\n", rest.len()), W);
     p.expect("first answer streams here", W);
     p.prompt(W);
     let d = exit(p);
@@ -73,8 +75,10 @@ fn pty_typed_ahead_line_is_next_message() {
     let p = start(&r);
     p.line("first");
     p.expect("working on it", W);
-    p.send(format!("and then this\n!touch {}\n", ran.display()).as_bytes());
+    let rest = format!("!touch {}\n", ran.display());
+    p.send(format!("and then this\n{rest}").as_bytes());
     m.open_gate();
+    p.expect(&format!("henki: dropped {} bytes after that line: one line is one message; save longer text to a file\r\n", rest.len()), W);
     p.expect("second reply", W);
     p.prompt(W);
     let d = exit(p);
@@ -167,6 +171,25 @@ fn pty_hangup_at_prompt_130() {
         let d = t.hang_up();
         assert_eq!(d.code, Some(130), "round {round}: {}", d.diag());
         assert!(d.journal.is_none(), "round {round}: a session without a message");
+    }
+}
+
+/// The terminal closing while a question waits: exit 130, the question is not answered (no `approval` record), and no
+/// later call of the turn runs or is asked; several rounds, since the end of input and SIGHUP reach henki in either order.
+#[test]
+fn pty_hangup_at_question_130() {
+    for round in 0..3 {
+        let m = Mock::start(vec![shell("touch hup.txt"), shell("touch hup2.txt"), say("never")]);
+        let r = asking(&m);
+        let t = Term::spawn(&r, false);
+        t.expect("\n> ", W);
+        t.line("make the files");
+        t.expect("run? [y/N/always] ", W);
+        let d = t.hang_up();
+        assert_eq!(d.code, Some(130), "round {round}: {}", d.diag());
+        assert_eq!((d.of("ask").len(), d.of("approval").len(), m.log().len()), (1, 0, 1), "round {round}: {}", d.diag());
+        assert_eq!(d.results()[0]["content"], "not run: interrupted", "round {round}: {}", d.diag());
+        assert!(!r.path("hup.txt").exists() && !r.path("hup2.txt").exists());
     }
 }
 
@@ -308,7 +331,8 @@ impl<'a> Term<'a> {
         d
     }
 
-    /// The exit within `within` (a timeout kills henki and fails the test).
+    /// The exit within `within` (a timeout kills henki and fails the test). `stdout` is the screen with the reset and
+    /// "\r" of "\r\n" taken out, as `Pty::wait` has it.
     fn wait(mut self, within: Duration) -> Done {
         let end = Instant::now() + within;
         let status = loop {
@@ -327,7 +351,7 @@ impl<'a> Term<'a> {
         Done {
             code: status.code(),
             signal: status.signal(),
-            stdout: String::from_utf8_lossy(&self.screen()).replace("\r\n", "\n").into_bytes(),
+            stdout: String::from_utf8_lossy(&self.screen()).replace(RESET, "").replace("\r\n", "\n").into_bytes(),
             stderr: Vec::new(),
             elapsed: exited - self.started,
             exited,

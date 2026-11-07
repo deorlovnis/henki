@@ -280,7 +280,7 @@ fn parse_thinking_signature() {
         text(2, "Done."),
         stop("end_turn"),
     ]);
-    assert_eq!((r.reasoning.as_str(), r.text.as_str()), ("Let me think", "Done."));
+    assert_eq!(r.text, "Done.");
     let want = json!([{"signature": "EqQBCkYI", "thinking": "Let me think", "type": "thinking"}, {"signature": "c2ln", "thinking": "", "type": "thinking"}, {"text": "Done.", "type": "text"}]);
     assert_eq!(r.blocks, Some(want));
 }
@@ -289,7 +289,7 @@ fn parse_thinking_signature() {
 fn parse_redacted_kept() {
     let r = reply(&[start(0, json!({"data": "EmwKAhgBEgy3va3pzix", "type": "redacted_thinking"})), start(1, json!({"text": "hi", "type": "text"})), stop("end_turn")]);
     assert_eq!(r.blocks, Some(json!([{"data": "EmwKAhgBEgy3va3pzix", "type": "redacted_thinking"}, {"text": "hi", "type": "text"}])));
-    assert_eq!((r.text.as_str(), r.reasoning.as_str()), ("hi", ""));
+    assert_eq!(r.text, "hi");
 }
 
 #[test]
@@ -564,7 +564,7 @@ fn parse_delta_type_mismatch_ignored() {
     ]);
     let r = r.unwrap();
     assert!(parts.is_empty(), "{parts:?}");
-    assert_eq!((r.text.as_str(), r.reasoning.as_str(), r.calls.len()), ("hi", "", 0));
+    assert_eq!((r.text.as_str(), r.calls.len()), ("hi", 0));
     assert_eq!(r.blocks, Some(json!([{"text": "hi", "type": "text"}, {"thinking": "", "type": "thinking"}, {"data": "d", "type": "redacted_thinking"}])));
 }
 

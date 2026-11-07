@@ -188,3 +188,37 @@ fn e2e_ext_symlinked_dir_protected() {
     assert_eq!((d.code, e["kind"].as_str(), e["message"].as_str()), (Some(2), Some("changed"), Some(says.as_str())), "{}", d.diag());
     assert_eq!((fs::read_to_string(real.join("doc.md")).unwrap().as_str(), m.log().len()), ("a kit\nmore\n", 2));
 }
+
+/// What a copy from a Mac leaves in `bin/` (Finder's `.DS_Store`, AppleDouble `._NAME` files, neither one runnable) does
+/// not stop henki: the extension loads with its real command only.
+#[test]
+fn e2e_ext_bin_mac_dot_files_ignored() {
+    let m = Mock::start(vec![shell("xmac"), say("ok")]);
+    let r = Run::new(&m.url());
+    let x = ext(&r, None, "mac", "copied from a Mac\n", &[("xmac", "mac-ran")]);
+    fs::write(x.join("bin/.DS_Store"), b"\0\0\0\x01Bud1").unwrap();
+    fs::write(x.join("bin/._xmac"), b"\0\x05\x16\x07").unwrap();
+    fs::write(x.join(".DS_Store"), b"\0\0\0\x01Bud1").unwrap();
+    let d = r.json("hi");
+    d.finish();
+    assert_eq!(d.code, Some(0), "{}", d.diag());
+    assert_eq!(d.of("session")[0]["exts"], json!(["mac"]), "{}", d.diag());
+    assert!(content(&d, 0).starts_with("mac-ran"), "{}", content(&d, 0));
+}
+
+/// henki does not check who may write the extension files (a documented limit): an extension whose directories and files
+/// anyone may write still loads and runs. Pinned, so that changing it is a decision and not an accident.
+#[test]
+fn e2e_ext_writable_by_others_loads() {
+    let m = Mock::start(vec![shell("xopen"), say("ok")]);
+    let r = Run::new(&m.url());
+    let x = ext(&r, None, "open", "an open extension\n", &[("xopen", "open-ran")]);
+    for (p, mode) in [(x.parent().unwrap().to_path_buf(), 0o777), (x.clone(), 0o777), (x.join("bin"), 0o777), (x.join("doc.md"), 0o666), (x.join("bin/xopen"), 0o777)] {
+        fs::set_permissions(&p, fs::Permissions::from_mode(mode)).unwrap();
+    }
+    let d = r.json("hi");
+    d.finish();
+    assert_eq!(d.code, Some(0), "{}", d.diag());
+    assert_eq!(d.of("session")[0]["exts"], json!(["open"]), "{}", d.diag());
+    assert!(content(&d, 0).starts_with("open-ran"), "{}", content(&d, 0));
+}

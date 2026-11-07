@@ -172,7 +172,6 @@ pub fn load(f: &Flags, env: &Env, cwd: &Path) -> Result<Config, String> {
     // The default ext path may be absent only for the default config file.
     let found = ext::discover(&paths, listed.is_none() && !explicit, &c.shadow, env.get("PATH").unwrap_or_default()).map_err(at_ext)?;
     (c.exts, c.user_path) = (found.exts, found.user_path);
-    c.notices.extend(found.notices);
     // Looked up on the user PATH, so no extension's bin/ supplies the shell henki runs.
     let exe = |b: &PathBuf| fs::metadata(b).is_ok_and(|m| m.is_file() && m.mode() & 0o111 != 0);
     let dirs = std::env::split_paths(&c.user_path).filter(|d| d.is_absolute());
