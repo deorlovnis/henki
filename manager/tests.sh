@@ -736,13 +736,13 @@ t_shadow() {
 t_official() {
   case_ "official modules, --version"
   local share="$W/share" bin="$W/bin"
-  mkmod "$share/mods/halti"
-  mkmod "$share/mods/itse"
+  mkmod "$share/official/halti"
+  mkmod "$share/official/itse"
   HENKI_SHARE="$share" run list
   out_has "official, not added: halti itse"
   HENKI_SHARE="$share" run add halti --yes
   rc_is 0
-  out_has "source   official ($share/mods/halti)"
+  out_has "source   official ($share/official/halti)"
   check "KIND official, SOURCE the name" [ "$(field halti 5):$(field halti 6)" = official:halti ]
   HENKI_SHARE="$share" run list
   out_has "official, not added: itse"
@@ -751,7 +751,7 @@ t_official() {
   # Shipped next to a henki: its version, and the tarball's share/ dir without HENKI_SHARE.
   mkdir -p "$bin/bin" "$bin/share/henki"
   cp "$MODS" "$bin/bin/henki-mods"
-  cp -R "$share/mods" "$bin/share/henki/mods"
+  cp -R "$share/official" "$bin/share/henki/official"
   printf '#!/bin/sh\necho "henki 0.1.0 (abc, x86_64-linux)"\n' >"$bin/bin/henki"
   chmod 755 "$bin/bin/henki"
   RC=0

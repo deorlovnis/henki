@@ -13,7 +13,7 @@
 # before bash 4.4), no associative arrays, mapfile, ${x,,}, declare -n or |&. POSIX tools plus git; LC_ALL=C, so
 # sorting, ${#x} and patterns work on bytes.
 #
-# Environment: HOME (required), XDG_DATA_HOME, HENKI_SHARE (the dir holding mods/NAME for official modules),
+# Environment: HOME (required), XDG_DATA_HOME, HENKI_SHARE (the dir holding official/NAME, the official modules),
 # HENKI_MODS_TTY (the terminal the question is asked on; default /dev/tty).
 set -u
 export LC_ALL=C
@@ -628,7 +628,7 @@ EOF
 # The official module dir for NAME, or nothing.
 official_dir() {
   local d
-  for d in ${HENKI_SHARE:+"$HENKI_SHARE/mods"} "$SELF/../share/henki/mods" "$SELF/../mods"; do
+  for d in ${HENKI_SHARE:+"$HENKI_SHARE/official"} "$SELF/../share/henki/official" "$SELF/../mods"; do
     if [ -f "$d/$1/doc.md" ]; then
       (cd -P "$d/$1" && pwd)
       return 0
@@ -1229,7 +1229,7 @@ cmd_list() {
   done
   [ "$mods" != 0 ] || say "no modules; henki-mods add NAME | ./DIR | URL adds one, off until you say yes"
   off_names=""
-  for d in ${HENKI_SHARE:+"$HENKI_SHARE/mods"} "$SELF/../share/henki/mods" "$SELF/../mods"; do
+  for d in ${HENKI_SHARE:+"$HENKI_SHARE/official"} "$SELF/../share/henki/official" "$SELF/../mods"; do
     [ -d "$d" ] || continue
     for n in $(cd "$d" && for x in *; do [ -f "$x/doc.md" ] && echo "$x"; done); do
       lock_get "$n" || off_names="$off_names $n"
