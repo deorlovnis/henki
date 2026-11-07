@@ -184,7 +184,7 @@ fn journal_layout_modes() {
 #[test]
 fn journal_state_dir_tightened() {
     let tmp = Tmp::new();
-    let (xdg, home) = (tmp.0.join("xdg"), tmp.0.join("home"));
+    let xdg = tmp.0.join("xdg");
     fs::create_dir_all(xdg.join("henki/sessions")).unwrap();
     for d in [xdg.join("henki"), xdg.join("henki/sessions")] {
         fs::set_permissions(&d, fs::Permissions::from_mode(0o755)).unwrap();
@@ -194,9 +194,6 @@ fn journal_state_dir_tightened() {
     for d in [state.clone(), state.join("sessions"), state.join("spill")] {
         assert_eq!(mode(&d), 0o700, "{}", d.display());
     }
-    // A missing state dir is created with its ancestors.
-    state_dir(&home.join(".local/state/henki")).unwrap();
-    assert_eq!(mode(&home.join(".local/state/henki/spill")), 0o700);
     // A symlink in place of the state dir is refused, with the fix.
     let (planted, target) = (tmp.0.join("planted"), tmp.0.join("target"));
     fs::create_dir_all(&planted).unwrap();
@@ -318,6 +315,49 @@ fn journal_record_shapes() {
 }
 
 #[test]
+fn journal_session_record_fields() {
+    let mut cfg = Config::test(Path::new("/d"));
+    let ext = |name: &str| crate::ext::Ext {
+        name: name.into(),
+        line: "a CLI".into(),
+        doc: PathBuf::from(format!("/e/{name}/doc.md")),
+        bin: None,
+        cmds: vec![],
+        shadows: vec![],
+        paths: vec![],
+        targets: vec![],
+    };
+    (cfg.dialect, cfg.exts, cfg.allow.hash) = ("anthropic", vec![ext("halti"), ext("itse")], Some("5d0c9e1f2a3b4c6d".into()));
+    let r = rec::session(&cfg, "x", Path::new("/p"), None);
+    assert_eq!((&r["dialect"], &r["exts"], &r["allow_hash"]), (&json!("anthropic"), &json!(["halti", "itse"]), &json!("5d0c9e1f2a3b4c6d")));
+    assert_eq!(r["project_agents_hash"], Value::Null);
+    // No rules read (an absent file, or auto mode): null, as in journal_record_shapes.
+    assert_eq!(rec::session(&Config::test(Path::new("/d")), "x", Path::new("/p"), None)["allow_hash"], Value::Null);
+}
+
+#[test]
+fn journal_assistant_blocks() {
+    let s = |v: Value| serde_json::to_string(&v).unwrap();
+    let blocks = json!([{"signature": "EqQB", "thinking": "", "type": "thinking"}, {"id": "toolu_1", "input": {"command": "ls"}, "name": "shell", "type": "tool_use"}]);
+    let c = [call("toolu_1")];
+    assert_eq!(
+        s(rec::assistant("", &c, "tool_calls", Usage::default(), Some(&blocks))),
+        r#"{"blocks":[{"signature":"EqQB","thinking":"","type":"thinking"},{"id":"toolu_1","input":{"command":"ls"},"name":"shell","type":"tool_use"}],"finish":"tool_calls","msg":{"content":"","role":"assistant","tool_calls":[{"args":{"command":"ls"},"id":"toolu_1","name":"shell"}]},"t":"assistant","usage":{"cached":0,"in":0,"out":0}}"#
+    );
+    assert!(rec::assistant("", &c, "tool_calls", Usage::default(), None).get("blocks").is_none());
+}
+
+#[test]
+fn journal_approval_rule() {
+    let s = |v: Value| serde_json::to_string(&v).unwrap();
+    assert_eq!(s(rec::approval("call_7", "rule", Some(3))), r#"{"id":"call_7","rule":3,"t":"approval","verdict":"rule"}"#);
+    assert_eq!(s(rec::approval("h1", "always", Some(1))), r#"{"id":"h1","rule":1,"t":"approval","verdict":"always"}"#);
+    for v in ["yes", "no", "auto"] {
+        assert_eq!(s(rec::approval("h1", v, None)), format!(r#"{{"id":"h1","t":"approval","verdict":"{v}"}}"#));
+    }
+}
+
+#[test]
 fn journal_sync_table() {
     let f = fx();
     let mut j = Journal::create(&f.state, &f.cwd).unwrap();
@@ -375,7 +415,7 @@ fn journal_write_fail() {
     let f = fx();
     let path = f.tmp.0.join("read-only.jsonl");
     fs::write(&path, "").unwrap();
-    let mut j = Journal { file: File::open(&path).unwrap(), path: path.clone(), bytes: 0, id: "x".into(), spill: f.state.join("spill"), n: 0 };
+    let mut j = Journal { file: File::open(&path).unwrap(), path: path.clone(), bytes: 0, id: "x".into(), spill: f.state.join("spill"), n: 0, fresh: false, gone: false };
     match j.write(rec::user("a")) {
         Err(Outcome::Error { kind: "journal", message }) => assert!(message.starts_with(&format!("cannot write {}: ", path.display())), "{message}"),
         other => panic!("{other:?}"),
@@ -480,23 +520,102 @@ fn journal_no_close_notice() {
 }
 
 #[test]
-fn journal_resume_dialect_mismatch() {
+fn journal_resume_dialect_mismatch_both_ways() {
     let f = fx();
-    let open = rec::session(&f.cfg, "d", &f.cwd, None);
-    let mut other = open.clone();
-    other["dialect"] = "anthropic".into();
+    let mut anthropic = Config::test(&f.tmp.0);
+    (anthropic.cwd, anthropic.dialect) = (f.cwd.clone(), "anthropic");
+    let (open, other) = (rec::session(&f.cfg, "d", &f.cwd, None), rec::session(&anthropic, "d", &f.cwd, None));
+    assert_eq!((&open["dialect"], &other["dialect"]), (&json!("openai"), &json!("anthropic")));
     let path = f.plant("d", &[other.clone(), rec::user("a")]);
-    let e = journal_err("journal", f.resume(None));
-    assert_eq!(e, format!("{}: the session's dialect is \"anthropic\", not openai", path.display()));
+    assert_eq!(journal_err("journal", f.resume(None)), format!("{}: the session's dialect is anthropic, not openai", path.display()));
+    assert!(resume_at(&f.state, &f.cwd, None, &anthropic).is_ok());
+    f.plant("d", &[open.clone(), rec::user("a")]);
+    let e = journal_err("journal", resume_at(&f.state, &f.cwd, None, &anthropic));
+    assert_eq!(e, format!("{}: the session's dialect is openai, not anthropic", path.display()));
+    assert!(f.resume(None).is_ok());
     // The last session record decides.
-    f.plant("d", &[open.clone(), rec::user("a"), other]);
+    f.plant("d", &[open.clone(), rec::user("a"), other.clone()]);
     journal_err("journal", f.resume(None));
+    assert!(resume_at(&f.state, &f.cwd, None, &anthropic).is_ok());
+    f.plant("d", &[other, rec::user("a"), open.clone()]);
+    assert!(f.resume(None).is_ok());
+    journal_err("journal", resume_at(&f.state, &f.cwd, None, &anthropic));
+    // A session record without a dialect matches neither.
+    let mut none = open;
+    none.as_object_mut().unwrap().remove("dialect");
+    f.plant("d", &[none, rec::user("a")]);
+    assert_eq!(journal_err("journal", f.resume(None)), format!("{}: the session's dialect is unknown, not openai", path.display()));
     let path = f.plant("d", &[rec::user("a")]);
     assert_eq!(journal_err("journal", f.resume(None)), format!("{}: no session record", path.display()));
-    let mut first = open.clone();
-    first["dialect"] = "anthropic".into();
-    f.plant("d", &[first, rec::user("a"), open]);
-    assert!(f.resume(None).is_ok());
+}
+
+/// A session of the Anthropic dialect replays its blocks exactly: the request body after a resume is the live one.
+#[test]
+fn journal_resume_keeps_blocks() {
+    let mut f = fx();
+    f.cfg.dialect = "anthropic";
+    let blocks = json!([{"signature": "EqQBCkYI", "thinking": "", "type": "thinking"}, {"data": "ZGF0YQ==", "type": "redacted_thinking"},
+        {"text": "\u{e9} \u{2713} \u{1b}[0m \u{202e}", "type": "text"}, {"id": "toolu_1", "input": {"command": "ls", "n": 1.5, "z": [true, null]}, "name": "shell", "type": "tool_use"}]);
+    let c = Call { id: "toolu_1".into(), args: blocks[3]["input"].clone(), ..call("x") };
+    let mut j = Journal::create(&f.state, &f.cwd).unwrap();
+    let id = j.id().to_string();
+    j.write(rec::session(&f.cfg, &id, &f.cwd, None)).unwrap();
+    let text = blocks[2]["text"].as_str().unwrap();
+    let recs = [rec::user("go"), rec::assistant(text, &[c], "tool_calls", Usage::default(), Some(&blocks)), rec::tool_result("toolu_1", "shell", "ok", false, 1, 2)];
+    let live: Vec<Value> = recs.into_iter().map(|r| j.write(r).unwrap()).collect();
+    drop(j);
+    let r = f.resume(Some(&id)).unwrap();
+    assert_eq!(r.hist, live);
+    assert_eq!(r.hist[1]["blocks"], blocks);
+    let body = |h: &[Value]| crate::anthropic::body("m", 1, "SYS", &json!([]), h);
+    assert_eq!(body(&r.hist), body(&live));
+}
+
+/// Only the session file this process created is removed; after that nothing more is written. A resumed one stays.
+#[test]
+fn journal_discard_fresh_only() {
+    let f = fx();
+    let mut j = Journal::create(&f.state, &f.cwd).unwrap();
+    let id = j.id().to_string();
+    j.write(rec::session(&f.cfg, &id, &f.cwd, None)).unwrap();
+    let (path, bytes) = (j.path.clone(), j.bytes());
+    assert!(j.discard());
+    assert!(!path.exists());
+    assert_eq!(without_ts(&j.write(rec::close(bytes)).unwrap()), rec::close(bytes));
+    assert_eq!((path.exists(), j.bytes()), (false, bytes));
+    assert_eq!(journal_err("journal", f.resume(None)), format!("no session to resume in {}", f.cwd.display()));
+    let (id, path) = f.session(&[rec::user("a")]);
+    let mut r = f.resume(Some(&id)).unwrap();
+    assert!(!r.journal.discard());
+    let before = fs::metadata(&path).unwrap().len();
+    r.journal.write(rec::notice("still written")).unwrap();
+    assert!(fs::metadata(&path).unwrap().len() > before);
+}
+
+/// A second discard reports the file gone again and removes nothing; a removal that fails is not tried again, and the
+/// session goes on being written.
+#[test]
+fn journal_discard_twice() {
+    let f = fx();
+    let mut j = Journal::create(&f.state, &f.cwd).unwrap();
+    j.write(rec::session(&f.cfg, j.id(), &f.cwd, None)).unwrap();
+    let path = j.path.clone();
+    assert!(j.discard());
+    fs::write(&path, "not henki's\n").unwrap();
+    assert!(j.discard());
+    assert_eq!(fs::read_to_string(&path).unwrap(), "not henki's\n");
+    fs::remove_file(&path).unwrap();
+    // Removed by someone else first: the unlink fails, so the journal is not gone and its writes still count.
+    let mut j = Journal::create(&f.state, &f.cwd).unwrap();
+    j.write(rec::session(&f.cfg, j.id(), &f.cwd, None)).unwrap();
+    let bytes = j.bytes();
+    fs::remove_file(&j.path).unwrap();
+    assert!(!j.discard());
+    j.write(rec::close(bytes)).unwrap();
+    assert!(j.bytes() > bytes);
+    fs::write(&j.path, "").unwrap();
+    assert!(!j.discard());
+    assert!(j.path.exists(), "one try only");
 }
 
 #[test]
@@ -852,18 +971,20 @@ fn spill_counter_after_sweep() {
 }
 
 #[test]
-fn spill_sweep_24h() {
+fn state_dir_creates_and_sweeps() {
     let tmp = Tmp::new();
-    let state = tmp.0.join("henki");
+    let state = tmp.0.join("a/b/henki");
     state_dir(&state).unwrap();
-    let (old, new) = (state.join("spill/a-1.log"), state.join("spill/b-1.log"));
-    fs::write(&old, "x").unwrap();
-    fs::write(&new, "y").unwrap();
-    set_mtime(&old, 25 * 3600);
-    set_mtime(&new, 23 * 3600);
+    for d in [tmp.0.join("a"), tmp.0.join("a/b"), state.clone(), state.join("sessions"), state.join("spill")] {
+        assert_eq!(mode(&d), 0o700, "{}", d.display());
+    }
+    let (old, new, session) = (state.join("spill/a-1.log"), state.join("spill/b-1.log"), state.join("sessions/s.jsonl"));
+    for (p, age) in [(&old, 25), (&new, 23), (&session, 25)] {
+        fs::write(p, "x").unwrap();
+        set_mtime(p, age * 3600);
+    }
     state_dir(&state).unwrap();
-    assert!(!old.exists());
-    assert!(new.exists());
+    assert_eq!((old.exists(), new.exists(), session.exists()), (false, true, true), "only spill files older than 24 h go");
 }
 
 /// Random journals of records and record-like lines (wrong types, missing fields, duplicate ids, junk bytes) never panic

@@ -56,7 +56,7 @@ impl Wire for Acc {
         Acc { text: String::new(), reasoning: String::new(), slots: vec![], finish: String::new(), usage: Usage::default(), offered: offered.to_vec(), seen: false }
     }
 
-    /// One SSE `data` payload; streamed pieces go to `part`. Finished: a finish_reason came; Done: `[DONE]`.
+    /// One SSE `data` payload: `[DONE]` ends it, an empty one is a keep-alive.
     fn data(&mut self, data: &str, part: &mut dyn FnMut(Part)) -> Result<Flow, ProviderError> {
         match data.trim() {
             "[DONE]" => return Ok(Flow::Done),
