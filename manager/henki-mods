@@ -19,6 +19,16 @@ set -u
 export LC_ALL=C
 umask 022
 unset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE GIT_OBJECT_DIRECTORY GIT_COMMON_DIR GIT_ALTERNATE_OBJECT_DIRECTORIES GIT_NAMESPACE
+# Config and transport policy injected through the environment: GIT_CONFIG_COUNT (git reads GIT_CONFIG_KEY_N and
+# _VALUE_N only under it) and GIT_CONFIG_PARAMETERS (what `git -c` hands its children) could turn a remote helper
+# back on; GIT_ALLOW_PROTOCOL is set per clone below. GIT_SSH_COMMAND, GIT_SSH and GIT_PROXY_COMMAND stay, like
+# ~/.gitconfig: they are how this user reaches an allowed transport (keys, jump hosts, credential helpers), and no
+# config can allow a transport past GIT_ALLOW_PROTOCOL.
+unset GIT_CONFIG_COUNT GIT_CONFIG_PARAMETERS GIT_ALLOW_PROTOCOL GIT_PROTOCOL_FROM_USER GIT_EXTERNAL_DIFF
+# The transports a git source may use. Anything else is refused before git runs, and git is held to these too: a
+# remote helper (ext::CMD, fd::N, or SCHEME:// of an unknown scheme) runs a program at clone time, before the install
+# screen is shown or the question asked.
+GIT_TRANSPORTS='https http ssh git file'
 
 tab=$(printf '\t')
 nl='
@@ -30,6 +40,9 @@ CONTRACTS_KNOWN='journal/1 json/1 wire/1 ext/1 module/1 lock/1 hd1'
 AGENTS_MAX=4096 # henki refuses to start with a bigger AGENTS.md
 CARDS_BEGIN='# >>> mods cards'
 CARDS_END='# <<< mods cards'
+# Data reaches awk through ENVIRON, never -v: -v expands backslash escapes (a path with \t in it would name another
+# file), and the awk of macOS refuses a -v value holding a newline, then runs nothing ("newline in string").
+export HM_B="$CARDS_BEGIN" HM_E="$CARDS_END"
 RESTART='restart henki (or /exit and start again) to load the change'
 LICENSE_BAD='*[!A-Za-z0-9.+ ()-]*' # an SPDX expression: ids, AND/OR/WITH, parentheses
 NAME_RULE='a name is 1 to 32 of a-z, 0-9, _ and -, starting with a-z or 0-9'
@@ -167,17 +180,19 @@ invisible_check() {
 }
 
 # Each line of a .gitattributes file that sets an attribute changing what a checkout or archive holds against the
-# raw blobs (the copy is made from raw blobs, so a reviewer of a checkout could see other bytes).
+# raw blobs (the copy is made from raw blobs, so a reviewer of a checkout could see other bytes). crlf is the old
+# name of text and eol (git still honours it); working-tree-encoding re-encodes on checkout.
 attrs_bad() {
   command grep -v '^[[:space:]]*#' "$1" | sed 's/^[[:space:]]*[^[:space:]]*//' |
-    command grep -E '(^|[[:space:]])[-!]?(export-subst|export-ignore|ident|filter|text|eol)([=[:space:]]|$)' >/dev/null
+    command grep -E '(^|[[:space:]])[-!]?(export-subst|export-ignore|ident|filter|text|eol|crlf|working-tree-encoding)([=[:space:]]|$)' >/dev/null
 }
 
 # The values of henki's config grammar, one record per assignment: KEY<TAB>TYPE[<TAB>VALUE...]; TYPE S (string),
 # I (integer), B (bool) or A (array of strings, one item per field). ONLY: parse just that key's line. Strings
 # without escapes (a backslash is refused, so no record can hold a tab or newline). Err on stdout: "LINE: PROBLEM".
 toml() {
-  awk -v only="${1:-}" '
+  HM_ONLY="${1:-}" awk '
+    BEGIN { only = ENVIRON["HM_ONLY"] }
     function fail(m) { print NR ": " m; bad = 1; exit 1 }
     function lws(s) { sub(/^[ \t]+/, "", s); return s }
     # A string at the start of s: sets STR and REST; 0 if none.
@@ -285,22 +300,26 @@ hd1() {
   done <"$STAGE_LIST" | sha | sed 's/^/hd1:/'
 }
 
-# A symlink at PATH (relative to the module root) to TARGET stays inside the module: relative, and no `..` climbs
-# above the root. Checked on the words alone, before anything follows the link.
-inside() {
-  local depth=0 rest part
-  case "$2" in /* | '') return 1 ;; esac
-  rest=${1//[!\/]/}
-  depth=${#rest}
-  rest="$2/"
+# A symlink at PATH in module DIR to TARGET stays inside the module: TARGET is relative, walked from PATH's
+# directory no `..` climbs above the root, and no name on the way (all but the last) is itself a link. The words
+# alone are not enough: with x -> ., x/x/../.. counts as one level down but is two up. A link as the last name is
+# fine, as that link is checked too. Nothing is followed.
+inside() { # DIR PATH TARGET
+  local at rest part
+  case "$3" in /* | '') return 1 ;; esac
+  case "$2" in */*) at=${2%/*} ;; *) at="" ;; esac
+  rest=$3
   while [ -n "$rest" ]; do
-    part=${rest%%/*}
-    rest=${rest#*/}
+    case "$rest" in */*) part=${rest%%/*} rest=${rest#*/} ;; *) part=$rest rest="" ;; esac
     case "$part" in
-      '' | .) ;;
-      ..) depth=$((depth - 1)) && [ "$depth" -ge 0 ] || return 1 ;;
-      *) depth=$((depth + 1)) ;;
+      '' | .) continue ;;
+      ..)
+        [ -n "$at" ] || return 1
+        case "$at" in */*) at=${at%/*} ;; *) at="" ;; esac
+        ;;
+      *) at="${at:+$at/}$part" ;;
     esac
+    [ -z "$rest" ] || [ ! -L "$1/$at" ] || return 1
   done
 }
 
@@ -462,7 +481,8 @@ is_cmd() {
 # HAVE >= WANT for dotted numbers; "dev" (a build from the repository) has every version.
 version_ge() {
   [ "$1" = dev ] && return 0
-  awk -v a="$1" -v b="$2" 'BEGIN {
+  HM_V1="$1" HM_V2="$2" awk 'BEGIN {
+    a = ENVIRON["HM_V1"]; b = ENVIRON["HM_V2"]
     na = split(a, x, "."); nb = split(b, y, "."); n = na > nb ? na : nb
     for (i = 1; i <= n; i++) { p = x[i] + 0; q = y[i] + 0; if (p > q) exit 0; if (p < q) exit 1 }
     exit 0 }'
@@ -534,8 +554,8 @@ EOF
     if [ "$kind" = link ]; then
       I_links=$((I_links + 1))
       x=$(target "$dir/$p")
-      if ! inside "$p" "$x"; then
-        ERR="$dir/$p: a symlink to $x, which is absolute or leaves the module; fix: make it a relative link inside the module, or a file"
+      if ! inside "$dir" "$p" "$x"; then
+        ERR="$dir/$p: a symlink to $x, which is absolute, leaves the module or goes through another link; fix: make it a relative link to a file or directory inside the module, or a file"
         return 1
       fi
     fi
@@ -584,7 +604,7 @@ EOF
     esac
     case "$p" in .gitattributes | */.gitattributes)
       if [ "$kind" != link ] && attrs_bad "$dir/$p"; then
-        ERR="$dir/$p: sets export-subst, export-ignore, ident, filter, text or eol, so a checkout or an archive holds other bytes than the commit; fix: remove those attributes"
+        ERR="$dir/$p: sets export-subst, export-ignore, ident, filter, text, eol, crlf or working-tree-encoding, so a checkout or an archive holds other bytes than the commit; fix: remove those attributes"
         return 1
       fi
       ;;
@@ -639,25 +659,92 @@ official_dir() {
 
 # Copies module SRC (a directory) into DST as it stands: files with mode 644 or 755, links as links.
 copy_dir() {
-  local src="$1" dst="$2" p kind
+  local src="$1" dst="$2" p kind pass
   listing "$src" || die "$ERR"
+  cut -f 1 "$STAGE_LIST" >"$STAGE/paths"
+  p=$(clash "$STAGE/paths")
+  [ -z "$p" ] || die "$src: $p are one name where case does not count (as on a Mac); fix: rename one of them"
   mkdir -p "$dst"
-  while IFS= read -r p; do
-    kind=${p##*"$tab"}
-    p=${p%"$tab"*}
-    mkdir -p "$(dirname "$dst/$p")" || die "cannot copy into $dst; fix: make $STORE writable"
-    case "$kind" in
-      link) ln -s -- "$(target "$src/$p")" "$dst/$p" ;;
-      *) cat <"$src/$p" >"$dst/$p" && chmod "$kind" "$dst/$p" ;;
-    esac || die "cannot copy $src/$p; fix: make it readable"
-  done <"$STAGE_LIST"
+  # Files first, then links (see fresh).
+  for pass in file link; do
+    while IFS= read -r p; do
+      kind=${p##*"$tab"}
+      p=${p%"$tab"*}
+      case "$pass:$kind" in file:link | link:644 | link:755) continue ;; esac
+      fresh "$dst" "$p" "$src"
+      case "$kind" in
+        link) ln -s -- "$(target "$src/$p")" "$dst/$p" ;;
+        *) cat <"$src/$p" >"$dst/$p" && chmod "$kind" "$dst/$p" ;;
+      esac || die "cannot copy $src/$p; fix: make it readable"
+    done <"$STAGE_LIST"
+  done
+}
+
+# Before DST/PATH is written: no directory on the way there is a link, and nothing has the name yet; then the
+# directories are made. Links are made after every file, so a file is never written through one. Without this, on a
+# filesystem that folds case (macOS's), a link README and a file readme/x in one git tree are one name: the file
+# would be written where the link points, outside the copy, before the install screen. FROM names the source.
+fresh() { # DST PATH FROM
+  local at="$1" rest="$2"
+  while :; do
+    case "$rest" in */*) ;; *) break ;; esac
+    at="$at/${rest%%/*}"
+    rest=${rest#*/}
+    [ ! -L "$at" ] || die "$3: $2 is under ${at#"$1"/}, a link (on this filesystem two names are one); fix: rename one of them"
+  done
+  if [ -e "$at/$rest" ] || [ -L "$at/$rest" ]; then
+    die "$3: $2 and another entry are one name on this filesystem (case or Unicode form differs only); fix: rename one of them"
+  fi
+  mkdir -p "$at" || die "cannot copy into $1; fix: make $STORE writable"
+}
+
+# The first two paths of FILE (one per line) that are one name where ASCII case does not count, the directories on
+# the way included: "A and B", or nothing. A tree with them would copy differently on a Mac (and hash differently).
+clash() {
+  awk '{ p = $0; print p; while (sub(/\/[^\/]*$/, "", p)) print p }' "$1" | sort -u |
+    awk '{ k = tolower($0) } k in s { print s[k] " and " $0; exit } { s[k] = $0 }'
+}
+
+# Exit 1 with ERR unless URL names one of GIT_TRANSPORTS: SCHEME://HOST/... or scp's USER@HOST:PATH (ssh). git's own
+# rule for a remote helper is a run of scheme characters and then "::", so that is refused whatever follows; a
+# host starting with - would be an ssh option.
+git_url() {
+  local s="$1" scheme rest
+  scheme=${s%%[!A-Za-z0-9+.-]*}
+  rest=${s#"$scheme"}
+  case "$rest" in
+    ::*) ERR="$s: a git remote helper ($scheme::) runs a program of its choosing when cloned" ;;
+    ://*)
+      rest=${rest#://}
+      rest=${rest#*@}
+      case " $GIT_TRANSPORTS " in
+        *" $scheme "*) case "$rest" in -*) ERR="$s: the host starts with -" ;; *) return 0 ;; esac ;;
+        *) ERR="$s: $scheme:// is not a transport henki-mods clones over" ;;
+      esac
+      ;;
+    *)
+      # USER@HOST before the first colon: one @, both sides of [A-Za-z0-9._-], HOST not starting with -.
+      rest=${s%%:*}
+      case "$rest" in
+        *@*@* | *[!A-Za-z0-9@._-]* | @* | *@ | *@-*) ;;
+        *@*) [ "$rest" = "$s" ] || return 0 ;;
+      esac
+      ERR="$s: not a URL, nor USER@HOST:PATH"
+      ;;
+  esac
+  ERR="$ERR; fix: use an https, http, ssh, git or file URL (or USER@HOST:PATH)"
+  return 1
 }
 
 # A git source: clone without a checkout, pin REF to a commit, copy the raw blobs of SUBDIR with the tree's modes.
-# Sets COMMIT. Nothing from the repository runs: no checkout (so no hooks, no filters), hooks off anyway.
+# Sets COMMIT. Nothing from the repository runs: no checkout (so no hooks, no filters), hooks off anyway, and git
+# held to GIT_TRANSPORTS (GIT_ALLOW_PROTOCOL wins over any config, so an insteadOf rewrite into ext:: fails too).
 copy_git() {
   local url="$1" ref="$2" sub="$3" dst="$4" g="$STAGE/git" cand rec meta path mode oid d rest t
-  git -c core.hooksPath=/dev/null -c transfer.fsckObjects=true clone --quiet --no-checkout -- "$url" "$g" >&2 ||
+  git_url "$url" || die "$ERR"
+  GIT_ALLOW_PROTOCOL=$(printf '%s' "$GIT_TRANSPORTS" | tr ' ' ':') git -c core.hooksPath=/dev/null -c transfer.fsckObjects=true \
+    -c protocol.allow=never -c protocol.https.allow=always -c protocol.http.allow=always -c protocol.ssh.allow=always \
+    -c protocol.git.allow=always -c protocol.file.allow=always clone --quiet --no-checkout -- "$url" "$g" >&2 ||
     die "git clone $url failed (above); fix: check the URL and that you can read the repository"
   COMMIT=""
   if [ -z "$ref" ]; then
@@ -677,7 +764,7 @@ copy_git() {
   while :; do
     if [ "$(git -C "$g" cat-file -t "$COMMIT:${d}.gitattributes" 2>/dev/null)" = blob ]; then
       git -C "$g" cat-file blob "$COMMIT:${d}.gitattributes" >"$STAGE/attrs"
-      attrs_bad "$STAGE/attrs" && die "$url: ${d}.gitattributes sets export-subst, export-ignore, ident, filter, text or eol, so a checkout or an archive holds other bytes than the commit; fix: remove those attributes"
+      attrs_bad "$STAGE/attrs" && die "$url: ${d}.gitattributes sets export-subst, export-ignore, ident, filter, text, eol, crlf or working-tree-encoding, so a checkout or an archive holds other bytes than the commit; fix: remove those attributes"
     fi
     [ -n "$sub" ] && [ "$d" != "$sub/" ] || break
     rest=${sub#"$d"}
@@ -688,26 +775,44 @@ copy_git() {
   else
     git -C "$g" ls-tree -r -z "$COMMIT" >"$STAGE/tree"
   fi || die "git ls-tree failed in $url; fix: check the repository"
-  mkdir -p "$dst"
+  # Names and modes first, all of them, so nothing is written from a tree that is refused.
+  : >"$STAGE/paths"
   while IFS= read -r -d '' rec; do
     meta=${rec%%"$tab"*}
     path=${rec#*"$tab"}
     mode=${meta%% *}
-    oid=${meta##* }
     [ -z "$sub" ] || path=${path#"$sub/"}
     case "$path" in *[[:cntrl:]]*) die "$url: a file name holds a control character; fix: rename it" ;; esac
-    mkdir -p "$(dirname "$dst/$path")"
     case "$mode" in
-      100644) git -C "$g" cat-file blob "$oid" >"$dst/$path" && chmod 644 "$dst/$path" ;;
-      100755) git -C "$g" cat-file blob "$oid" >"$dst/$path" && chmod 755 "$dst/$path" ;;
-      120000)
-        # The x keeps a trailing newline of the target through $(...).
-        t=$(git -C "$g" cat-file blob "$oid" && echo x) && ln -s -- "${t%x}" "$dst/$path"
-        ;;
+      100644 | 100755 | 120000) ;;
       160000) die "$url: ${sub:+$sub/}$path is a submodule; fix: put its files in the module" ;;
       *) die "$url: ${sub:+$sub/}$path has git mode $mode; fix: make it a file or a link" ;;
-    esac || die "cannot copy ${sub:+$sub/}$path out of $url; fix: check the disk"
+    esac
+    printf '%s\n' "$path" >>"$STAGE/paths"
   done <"$STAGE/tree"
+  path=$(clash "$STAGE/paths")
+  [ -z "$path" ] || die "$url: $path are one name where case does not count (as on a Mac); fix: rename one of them"
+  mkdir -p "$dst"
+  # Files first, then links (see fresh).
+  for d in 100 120000; do
+    while IFS= read -r -d '' rec; do
+      meta=${rec%%"$tab"*}
+      path=${rec#*"$tab"}
+      mode=${meta%% *}
+      oid=${meta##* }
+      [ -z "$sub" ] || path=${path#"$sub/"}
+      case "$d:$mode" in 100:100644 | 100:100755 | 120000:120000) ;; *) continue ;; esac
+      fresh "$dst" "$path" "$url"
+      case "$mode" in
+        100644) git -C "$g" cat-file blob "$oid" >"$dst/$path" && chmod 644 "$dst/$path" ;;
+        100755) git -C "$g" cat-file blob "$oid" >"$dst/$path" && chmod 755 "$dst/$path" ;;
+        *)
+          # The x keeps a trailing newline of the target through $(...).
+          t=$(git -C "$g" cat-file blob "$oid" && echo x) && ln -s -- "${t%x}" "$dst/$path"
+          ;;
+      esac || die "cannot copy ${sub:+$sub/}$path out of $url; fix: check the disk"
+    done <"$STAGE/tree"
+  done
 }
 
 # --- the lock ----------------------------------------------------------------------------------------------------------
@@ -715,7 +820,8 @@ copy_git() {
 # Validates the lock; exit 1 on a line this version cannot read.
 lock_check() {
   [ -f "$LOCK" ] || return 0
-  awk -F '\t' -v f="$LOCK" '
+  HM_F="$LOCK" awk -F '\t' '
+    BEGIN { f = ENVIRON["HM_F"] }
     $1 != "lock/1" { printf "henki-mods: %s:%d: this lock is newer than this henki-mods; fix: upgrade henki\n", f, NR; exit 1 }
     NF != 11 || $2 !~ /^[a-z0-9][a-z0-9_-]*$/ || ($3 != "on" && $3 != "off") || $5 !~ /^(official|path|url)$/ {
       printf "henki-mods: %s:%d: not a lock/1 line; fix: henki-mods rm the module named on it, or remove the line\n", f, NR; exit 1 }
@@ -727,7 +833,7 @@ lock_get() {
   local line
   L_name="" L_state="" L_version="" L_kind="" L_source="" L_commit="" L_hd1="" L_added="" L_how=""
   [ -f "$LOCK" ] || return 1
-  line=$(awk -F '\t' -v n="$1" '$2 == n { print; exit }' "$LOCK")
+  line=$(HM_N="$1" awk -F '\t' '$2 == ENVIRON["HM_N"] { print; exit }' "$LOCK")
   [ -n "$line" ] || return 1
   # No field but the last (MASK, empty) is ever empty, so read's collapsing of tabs changes nothing.
   IFS="$tab" read -r _ L_name L_state L_version L_kind L_source L_commit L_hd1 L_added L_how _ <<EOF
@@ -746,7 +852,7 @@ store_of() {
 lock_put() {
   local name="$1" line="$2" tmp="$LOCK.tmp.$$"
   {
-    [ ! -f "$LOCK" ] || awk -F '\t' -v n="$name" '$2 != n' "$LOCK"
+    [ ! -f "$LOCK" ] || HM_N="$name" awk -F '\t' '$2 != ENVIRON["HM_N"]' "$LOCK"
     [ -z "$line" ] || printf '%s\n' "$line"
   } | sort -t "$tab" -k2,2 >"$tmp" && mv -f "$tmp" "$LOCK" || {
     rm -f "$tmp"
@@ -815,7 +921,8 @@ splice() {
     cp "$AGENTS" "$out"
     return 0
   fi
-  ERR=$(awk -v b="$CARDS_BEGIN" -v e="$CARDS_END" -v bf="$block" -v f="$AGENTS" '
+  ERR=$(HM_BF="$block" HM_F="$AGENTS" awk '
+    BEGIN { b = ENVIRON["HM_B"]; e = ENVIRON["HM_E"]; bf = ENVIRON["HM_BF"]; f = ENVIRON["HM_F"] }
     function emit(   l) { while ((getline l < bf) > 0) print l; close(bf) }
     function bad(n, m) { print f ":" n ": " m > "/dev/stderr"; err = 1; exit 1 }
     { line[NR] = $0 }
@@ -838,7 +945,7 @@ splice() {
 # The cards block AGENTS.md holds now (marker lines included), into OUT; empty without one.
 block_now() {
   : >"$1"
-  [ ! -f "$AGENTS" ] || awk -v b="$CARDS_BEGIN" -v e="$CARDS_END" '$0 == b { on = 1 } on { print } $0 == e { on = 0 }' "$AGENTS" >"$1"
+  [ ! -f "$AGENTS" ] || awk '$0 == ENVIRON["HM_B"] { on = 1 } on { print } $0 == ENVIRON["HM_E"] { on = 0 }' "$AGENTS" >"$1"
 }
 
 # Before a change: AGENTS.md's block can be written again (else the change would stop half way).
@@ -922,7 +1029,7 @@ config_shadow() {
 shadow_line() {
   local have missing
   have=$(config_shadow)
-  missing=$(printf '%s\n' "$1" | awk -v have="$have" 'BEGIN { n = split(have, h, "\n"); for (i = 1; i <= n; i++) s[h[i]] = 1 } NF && !($0 in s)')
+  missing=$(printf '%s\n' "$1" | HM_HAVE="$have" awk 'BEGIN { n = split(ENVIRON["HM_HAVE"], h, "\n"); for (i = 1; i <= n; i++) s[h[i]] = 1 } NF && !($0 in s)')
   [ -n "$missing" ] || return 0
   printf '%s\n%s\n' "$have" "$missing" | awk 'NF && !seen[$0]++ { o = o (o == "" ? "" : ", ") "\"" $0 "\"" } END { print "shadow = [" o "]" }'
 }
@@ -994,7 +1101,7 @@ cmd_add() {
       fallback=${dir##*/}
       copy_dir "$dir" "$STAGE/m"
       ;;
-    *://* | *@*:*)
+    *::* | *://* | *@*:*)
       kind=url
       url=$src
       case "$url" in *'#'*) sub=${url##*#} && url=${url%#*} ;; esac

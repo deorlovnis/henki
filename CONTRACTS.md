@@ -329,7 +329,7 @@ henki_module = 1                 # required
 name = "halti"                   # required, the directory name: [a-z0-9][a-z0-9_-]{0,31}
 version = "0.1.0"                # required, a label; the pin is the commit and the hd1
 summary = "..."                  # optional, at most 160 bytes; defaults to doc.md line 1
-license = "Apache-2.0"           # required, an SPDX id
+license = "Apache-2.0"           # required, an SPDX id or expression
 requires = ["henki >= 0.1"]      # optional
 contracts = ["ext/1"]            # optional; refused when this henki's index lacks one
 os = ["macos", "linux"]          # optional; refused on another OS
@@ -344,6 +344,13 @@ A module without a manifest is unmanaged (allowed for path and URL installs, and
 `cmd/`, `ctx/`, `on/` and `port/` are reserved for later layouts: henki-mods refuses them unless `requires` names a
 henki that has them (`needs henki >= X`).
 
+A git source (`URL[@REF][#SUBDIR]`) is cloned only over `https`, `http`, `ssh`, `git` or `file` URLs, or scp's
+`USER@HOST:PATH`; a remote helper (`ext::`, `fd::`, any other `SCHEME::` or unknown `SCHEME://`) is refused before
+git runs. The module is copied from the commit's raw blobs, and refused when a `.gitattributes` in it or in a
+directory above it sets `export-subst`, `export-ignore`, `ident`, `filter`, `text`, `eol`, `crlf` or
+`working-tree-encoding` (a checkout would hold other bytes), or when two of its paths differ only in ASCII case (one
+name on a Mac).
+
 ## lock/1
 
 Owned by henki-mods. `CONFIG_DIR/mods.lock` holds one line per module, fields separated by tabs, lines sorted by name,
@@ -353,9 +360,9 @@ written atomically (a temp file, then a rename):
 lock/1 NAME STATE VERSION SOURCE_KIND SOURCE COMMIT HD1 ADDED HOW MASK
 ```
 
-- STATE `on` or `off`; SOURCE_KIND `official`, `path` or `url`; SOURCE the path, or `URL#SUBDIR`; COMMIT 40 hex digits
-  or `-`; HD1 the module's `hd1:` hash; ADDED the UTC time, `YYYY-MM-DDTHH:MMZ`; HOW `tty` (answered on the terminal)
-  or `yes` (`--yes`); MASK empty in this version.
+- STATE `on` or `off`; SOURCE_KIND `official`, `path` or `url`; SOURCE the module's name (official), the path, or
+  `URL` or `URL#SUBDIR`; COMMIT 40 hex digits or `-`; HD1 the module's `hd1:` hash; ADDED the UTC time,
+  `YYYY-MM-DDTHH:MMZ`; HOW `tty` (answered on the terminal) or `yes` (`--yes`); MASK empty in this version.
 - A line whose first field is not `lock/1` is refused: `this lock is newer than this henki-mods; upgrade henki`.
 - On means the link `CONFIG_DIR/ext/NAME` points at the module's store copy; off means no link.
 
@@ -366,5 +373,5 @@ symbolic link, `MODE SHA256 PATH\n`, sorted bytewise (`LC_ALL=C`) by PATH:
 
 - MODE is `644`, `755` (any execute bit set) or `link`; SHA256 is the hex SHA-256 of the file's bytes, or of a link's
   target string; PATH is relative to the module root, with `/`.
-- Directories are not listed. `.git` is left out. A link whose target is absolute or leaves the module is refused when
-  the module is added.
+- Directories are not listed. `.git` is left out. A link whose target is absolute, leaves the module, or goes through
+  another link (a link as any name of the target but the last) is refused when the module is added.

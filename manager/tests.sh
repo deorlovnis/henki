@@ -116,6 +116,10 @@ static_bash32() {
   # Arrays: an empty one is "unbound" under set -u before bash 4.4, so the manager has none.
   hits=$(command grep -nE '^[^#]*([[:alnum:]_]+=\(|\$\{[[:alnum:]_]+\[)' "$MODS" || true)
   [ -z "$hits" ] || fail "henki-mods uses an array:$(printf '\n%s' "$hits")"
+  # awk -v: macOS's awk refuses a value holding a newline and then runs nothing ("newline in string"), and every
+  # awk expands backslash escapes in it; mawk and gawk here take both, so only a look at the text finds one.
+  hits=$(command grep -nE '^[^#]*(^|[^[:alnum:]_])awk([[:space:]]+-F[[:space:]]*[^[:space:]]+)*[[:space:]]+-v' "$MODS" || true)
+  [ -z "$hits" ] || fail "henki-mods passes data to awk with -v (use ENVIRON):$(printf '\n%s' "$hits")"
   bash -n "$MODS" || fail "bash -n henki-mods"
 }
 
@@ -372,11 +376,29 @@ t_refusals() {
   refused "leaves the module"
   rm "$m/bin/escape" && ln -s /bin/sh "$m/bin/escape"
   run add "$m" --yes
-  refused "is absolute or leaves the module"
+  refused "is absolute, leaves the module"
   rm "$m/bin/escape" && ln -s ../bin/../../m/doc.md "$m/README.x"
   run add "$m" --yes
   refused "leaves the module"
-  rm "$m/README.x"
+  # A link to . makes the words lie: README.x/README.x/../.. counts as one level down, and is one up.
+  local down="" up="" i
+  for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30; do down="${down}README.x/" up="${up}../"; done
+  rm "$m/README.x" && ln -s . "$m/README.x" && ln -s "$down${up}etc/hostname" "$m/README.host"
+  check "the fixture reaches out" [ "$(cat "$m/README.host")" = "$(cat /etc/hostname)" ]
+  run verify --dir "$m"
+  refused "README.host: a symlink to README.x/README.x/"
+  err_has "goes through another link"
+  run add "$m" --yes
+  refused "goes through another link"
+  check "nothing installed" [ ! -e "$CONF/mods.lock" ]
+  # Links to links, and through real directories, are fine.
+  rm "$m/README.host" && ln -s README.x "$m/README.y" && ln -s bin/../doc.md "$m/README.z" && ln -s README.y/doc.md "$m/README.w"
+  run verify --dir "$m"
+  refused "README.w: a symlink to README.y/doc.md"
+  rm "$m/README.w"
+  run verify --dir "$m"
+  rc_is 0
+  rm "$m/README.x" "$m/README.y" "$m/README.z"
 
   printf 'not runnable\n' >"$m/bin/data"
   run add "$m" --yes
@@ -472,13 +494,14 @@ t_gitattributes() {
   run add "file://$r#tool" --yes
   refused "tool/.gitattributes sets export-subst"
   check "nothing installed" [ ! -e "$CONF/mods.lock" ]
-  for a in 'bin/* filter=lfs' '*.md text eol=lf' '# export-subst only in a comment' 'tool/x ident' '[attr]mine export-ignore'; do
+  for a in 'bin/* filter=lfs' '*.md text eol=lf' '# export-subst only in a comment' 'tool/x ident' '[attr]mine export-ignore' \
+    '*.md crlf' '*.md -crlf' '*.md crlf=input' '*.md working-tree-encoding=UTF-16'; do
     printf '%s\n' "$a" >"$r/tool/.gitattributes"
     commit "$r" "attrs: $a"
     run add "file://$r#tool" --yes
     case "$a" in
       '#'*) rc_is 0 && run rm tool ;;
-      *) refused "sets export-subst, export-ignore, ident, filter, text or eol" ;;
+      *) refused "sets export-subst, export-ignore, ident, filter, text, eol, crlf or working-tree-encoding" ;;
     esac
   done
   # Attributes of a directory above the module apply to it.
@@ -487,6 +510,88 @@ t_gitattributes() {
   commit "$r" "root attrs"
   run add "file://$r#tool" --yes
   refused ".gitattributes sets export-subst"
+}
+
+# Only https, http, ssh, git and file reach git; a remote helper (ext::CMD runs CMD at clone time, before the screen
+# and the question) is refused by the parser, and git is held to the list too, whatever the config says.
+t_transport() {
+  case_ "git transports: a remote helper never runs"
+  local pw="$W/pwned" u r="$W/repo"
+  # ext enabled every way the environment can: the parser must refuse before git sees it.
+  for u in "ext::sh -c touch% $pw;% :% a@b:c" "ext::sh -c touch% $pw" "fd::7" "EXT::sh -c touch% $pw" "testing::x@y:z"; do
+    GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=protocol.ext.allow GIT_CONFIG_VALUE_0=always run add "$u" --yes
+    refused "a git remote helper"
+    check "$u ran nothing" [ ! -e "$pw" ]
+  done
+  for u in "foo://h/x" "HTTPS://h/x" "ftp://h/x" "ssh://-oProxyCommand=touch% $pw/x" "ssh://u@-oProxyCommand=x/y" "a@-oProxyCommand=x:y" "a@b@c:d" "a b@c:d"; do
+    run add "$u" --yes
+    refused "fix: use an https, http, ssh, git or file URL"
+  done
+  check "nothing ran" [ ! -e "$pw" ]
+  # Past the parser, git is pinned: an insteadOf rewrite of an https URL into ext:: fails, with ext allowed in
+  # ~/.gitconfig, in GIT_CONFIG_COUNT and in GIT_CONFIG_PARAMETERS, and GIT_ALLOW_PROTOCOL naming ext.
+  git config --global protocol.ext.allow always
+  git config --global url."ext::sh -c touch% $pw% #".insteadOf "https://mods.invalid/"
+  GIT_ALLOW_PROTOCOL=ext:https GIT_CONFIG_PARAMETERS="'protocol.ext.allow'='always'" \
+    GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=protocol.ext.allow GIT_CONFIG_VALUE_0=always run add "https://mods.invalid/x" --yes
+  refused "git clone https://mods.invalid/x failed"
+  err_has "transport 'ext' not allowed"
+  check "the rewritten helper ran nothing" [ ! -e "$pw" ]
+  # The allowed ones still work: file:// here, and USER@HOST:PATH goes to ssh (the user's GIT_SSH_COMMAND, kept).
+  git config --global --unset-all url."ext::sh -c touch% $pw% #".insteadOf
+  mkmod "$r/hello"
+  mkrepo "$r"
+  run add "file://$r#hello" --yes
+  rc_is 0
+  GIT_SSH_COMMAND="touch $W/ssh-ran; false" run add "git@mods.invalid:o/r.git" --yes
+  refused "git clone git@mods.invalid:o/r.git failed"
+  check "scp form goes to ssh" [ -e "$W/ssh-ran" ]
+}
+
+# A tree whose names are one name where case does not count. On a Mac a link README and a directory readme/ in one
+# tree put readme/x where the link points, outside the copy; refused before anything is written.
+t_case_clash() {
+  case_ "git trees with names that differ only in case"
+  local r="$W/repo" blob link sub tree out="$W/outside"
+  mkdir -p "$out" "$r"
+  git init -q "$r"
+  blob=$(printf '# m: case\n' | git -C "$r" hash-object -w --stdin)
+  link=$(printf '%s' "$out" | git -C "$r" hash-object -w --stdin)
+  sub=$(printf '100644 blob %s\tREADME.x\n' "$blob" | git -C "$r" mktree)
+  tree=$(printf '120000 blob %s\tREADME\n100644 blob %s\tdoc.md\n040000 tree %s\treadme\n' "$link" "$blob" "$sub" | git -C "$r" mktree)
+  git -C "$r" update-ref refs/heads/main "$(git -C "$r" commit-tree -m clash "$tree")"
+  git -C "$r" symbolic-ref HEAD refs/heads/main
+  check "git itself takes the tree" git -C "$r" fsck --strict --no-progress
+  run add "file://$r" --yes
+  refused "README and readme are one name where case does not count"
+  check "nothing written outside" [ -z "$(ls -A "$out")" ]
+  check "nothing installed" [ ! -e "$CONF/mods.lock" ]
+  # Two files, and a directory against a directory.
+  tree=$(printf '100644 blob %s\tDoc.md\n100644 blob %s\tdoc.md\n' "$blob" "$blob" | git -C "$r" mktree)
+  git -C "$r" update-ref refs/heads/main "$(git -C "$r" commit-tree -m files "$tree")"
+  run add "file://$r" --yes
+  refused "Doc.md and doc.md are one name"
+  tree=$(printf '100644 blob %s\tdoc.md\n040000 tree %s\tREADME.d\n040000 tree %s\treadme.D\n' "$blob" "$sub" "$sub" | git -C "$r" mktree)
+  git -C "$r" update-ref refs/heads/main "$(git -C "$r" commit-tree -m dirs "$tree")"
+  run add "file://$r" --yes
+  refused "README.d and readme.D are one name"
+}
+
+# Data with a backslash reaches awk intact (ENVIRON, not -v): a data dir named with \t in it. (A newline in a -v
+# value, which macOS's awk refuses, is caught by the static check: the awks here take it.)
+t_awk_data() {
+  case_ "awk data: backslashes and newlines"
+  export XDG_DATA_HOME="$XDG_DATA_HOME/back\\tslash"
+  STORE="$XDG_DATA_HOME/henki/mods"
+  mkdir -p "$CONF"
+  printf '# mine\n' >"$CONF/AGENTS.md"
+  mkmod "$W/carded"
+  printf 'The card.\n' >"$W/carded/.henki/card.md"
+  run add "$W/carded" --yes
+  rc_is 0
+  check "the card is written through a path with a backslash" command grep -qx 'The card.' "$CONF/AGENTS.md"
+  run verify
+  rc_is 0
 }
 
 t_lock_newer() {
@@ -735,10 +840,22 @@ t_shadow() {
   PATH="$bin:$PATH" run verify
   rc_is 0
   err_has 'warning: wrap: henki does not start until ~/.config/henki/config.toml has: shadow = ['
+  # Several entries, one still missing, under an awk that refuses a newline in a -v value as macOS's does.
+  local shim="$W/bwk" awk_bin
+  awk_bin=$(command -v awk)
+  mkdir -p "$shim"
+  printf '#!/bin/sh\nfor a in "$@"; do case "$a" in *"\n"*) [ "$v" = 1 ] && echo "awk: newline in string" >&2 && exit 2 ;; esac; v=0; [ "$a" = -v ] && v=1; done\nexec %s "$@"\n' "$awk_bin" >"$shim/awk"
+  chmod 755 "$shim/awk"
+  printf 'model = "m"\nshadow = ["halti/halti", "wrap/other"]\n' >"$CONF/config.toml"
+  PATH="$shim:$bin:$PATH" run verify
+  rc_is 0
+  err_has 'warning: wrap: henki does not start until ~/.config/henki/config.toml has: shadow = ["halti/halti", "wrap/other", "wrap/pbtool"]'
+  err_lacks "newline in string"
   printf 'model = "m"\nshadow = ["halti/halti", "wrap/other", "wrap/pbtool"]\n' >"$CONF/config.toml"
-  PATH="$bin:$PATH" run verify
+  PATH="$shim:$bin:$PATH" run verify
   rc_is 0
   err_lacks "warning"
+  err_lacks "newline in string"
   printf 'ext = ["/somewhere/else"]\n' >>"$CONF/config.toml"
   run list
   err_has "sets ext without ~/.config/henki/ext"
@@ -1001,6 +1118,9 @@ all() {
   t_hd1
   t_refusals
   t_gitattributes
+  t_transport
+  t_case_clash
+  t_awk_data
   t_lock_newer
   t_onoff
   t_verify
