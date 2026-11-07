@@ -94,28 +94,41 @@ fn before_last_answer(d: &Done) -> Vec<serde_json::Value> {
     all[..i].to_vec()
 }
 
-/// The plain-answer request of a fresh session with the built-in tools only: its size against the 2,048-byte gate.
-fn first_request(r: &Run, m: &Mock) -> Result<(), String> {
+/// The plain-answer request of a fresh session with the built-in tools only: its size against a gate in bytes.
+fn first_request(r: &Run, m: &Mock, gate: usize) -> Result<(), String> {
     let d = r.json("Reply with the single word ready.");
     d.finish();
     let l = m.log().pop().unwrap();
     let (system, tools) = (l.contents("system")[0].len(), l.json["tools"].to_string().len());
     println!("first request {} bytes: system {system}, tools {tools}, user {}", l.bytes, l.contents("user")[0].len());
-    if l.bytes <= 2048 { Ok(()) } else { Err(format!("the first request is {} bytes, over the 2,048-byte gate", l.bytes)) }
+    if l.bytes <= gate { Ok(()) } else { Err(format!("the first request is {} bytes, over the {gate}-byte gate", l.bytes)) }
+}
+
+/// A fresh session whose global AGENTS.md is `text`.
+fn with_agents_md(m: &Mock, text: &str) -> Run {
+    let r = Run::new(&m.url());
+    std::fs::create_dir_all(r.config_dir()).unwrap();
+    std::fs::write(r.config_dir().join("AGENTS.md"), text).unwrap();
+    r
 }
 
 #[test]
 fn first_request_le_2048() {
     let m = Mock::start(vec![say("ready")]);
-    first_request(&Run::new(&m.url()), &m).unwrap();
+    first_request(&Run::new(&m.url()), &m, 2048).unwrap();
 }
 
 #[test]
 fn first_request_gate_fires() {
     let m = Mock::start(vec![say("ready")]);
-    let r = Run::new(&m.url());
-    std::fs::create_dir_all(r.config_dir()).unwrap();
-    std::fs::write(r.config_dir().join("AGENTS.md"), "Keep answers short.\n".repeat(80)).unwrap();
-    let e = first_request(&r, &m).unwrap_err();
-    assert!(e.ends_with("bytes, over the 2,048-byte gate"), "{e}");
+    let e = first_request(&with_agents_md(&m, &"Keep answers short.\n".repeat(80)), &m, 2048).unwrap_err();
+    assert!(e.ends_with("bytes, over the 2048-byte gate"), "{e}");
+}
+
+/// The halti card (`profiles/halti-card.md`) as the global AGENTS.md, as the README sets it up: it goes into every
+/// request, so the first one stays within 3,200 bytes.
+#[test]
+fn first_request_halti_card_le_3200() {
+    let m = Mock::start(vec![say("ready")]);
+    first_request(&with_agents_md(&m, include_str!("../../profiles/halti-card.md")), &m, 3200).unwrap();
 }

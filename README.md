@@ -6,6 +6,7 @@ henki is a small terminal agent in early development. It gives your task to a mo
 
 ```sh
 mkdir -p ~/.config/henki && cp profiles/config.mac.toml ~/.config/henki/config.toml   # then set model and base_url
+cp profiles/halti-card.md ~/.config/henki/AGENTS.md   # if you use halti: its card goes into every request (1.1 KB)
 henki                                   # the REPL
 henki run "why does the build fail?"    # one task, headless
 henki run --json --approve auto --max-seconds 600 "fix the failing test"
