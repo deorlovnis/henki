@@ -84,6 +84,7 @@ An extension is a directory that teaches the model a command-line tool: `NAME/do
 - Every session is journaled under `~/.local/state/henki`; `--resume[=ID]` continues one. A REPL that quits before its first message leaves no session.
 - When a session ends, every process it started is stopped (on macOS, except a `!CMD &` job or a process that started a session of its own).
 - Exit codes: 0 answered (or the REPL quit), 1 gave up (step limit, stuck, empty answer), 2 error, 3 needs approval, 124 out of time, 130 interrupted (or TERM, HUP or the terminal closing), 141 stdout closed or not read in time.
+- The journal, the `--json` records, what henki sends to a model server and the extension layout are specified, with their versions and the stability rule, in [CONTRACTS.md](CONTRACTS.md).
 
 ## Build and check
 
