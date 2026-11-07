@@ -16,8 +16,8 @@ const ALLOW: &str = "HOME USER LOGNAME SHELL TERM LANG LC_ALL LC_CTYPE LC_MESSAG
 
 /// The process groups of calls that may still have members, by leader pid; a group leaves when a signal gives ESRCH.
 static LEDGER: Mutex<Vec<i32>> = Mutex::new(Vec::new());
-/// The children henki had before its first call, such as a launcher's background job that came along through exec.
-/// henki did not start them, so the count and the sweep leave them and their descendants alone.
+/// The children henki had before its first call or `!cmd`, such as a launcher's background job that came along through
+/// exec. henki did not start them, so the count and the sweep leave them and their descendants alone.
 static INHERITED: OnceLock<Vec<i32>> = OnceLock::new();
 
 /// Where a call's full output goes once it passes the cap; `shown` is the path as the marker prints it (`$HOME` as `~`).
@@ -76,8 +76,9 @@ pub fn spawn(bash: &Path, cmd: &str, cwd: &Path, env: &[(OsString, OsString)], c
 }
 
 /// MAIN thread only. The user's `!cmd`: `bash --noprofile --norc -c CMD` in henki's own process group on the terminal
-/// (stdin, stdout and stderr inherited), exactly `env`; not in the ledger. A waiter thread reaps it and sends one
-/// `Ev::BangDone { tag, code }` (128 + N when signal N ended it). Returns the pid.
+/// (stdin, stdout and stderr inherited), exactly `env`; not in the ledger, though a `!cmd &` job it leaves is counted and
+/// swept like a call's. A waiter thread reaps it and sends one `Ev::BangDone { tag, code }` (128 + N when signal N ended
+/// it). Returns the pid.
 pub fn bang(bash: &Path, cmd: &str, cwd: &Path, env: &[(OsString, OsString)], tag: u32, tx: &Sender<Ev>) -> io::Result<i32> {
     let (tx, (give, take)) = (tx.clone(), mpsc::channel::<Child>());
     // The waiter starts before the fork, so nothing can fail once the command runs.
@@ -88,6 +89,8 @@ pub fn bang(bash: &Path, cmd: &str, cwd: &Path, env: &[(OsString, OsString)], ta
     let mut c = Command::new(bash);
     c.args(["--noprofile", "--norc", "-c", cmd]).current_dir(cwd).env_clear().envs(env.iter().map(|(k, v)| (k, v)));
     sys::bang_setup(&mut c);
+    // As before a call: the children henki had before it started anything are fixed first, so the job is not one of them.
+    INHERITED.get_or_init(|| children(&sys::procs()));
     #[allow(clippy::disallowed_methods)] // the user's own command, typed at the prompt
     let child = c.spawn()?;
     let pid = child.id() as i32;

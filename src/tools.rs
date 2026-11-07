@@ -165,7 +165,7 @@ pub fn display(c: &Call, t: Option<&Target>) -> Vec<String> {
         lines.push(rule(&format!("{k} ({} lines, {} bytes)", term::num(n), term::num(v.len() as u64))));
         lines.extend(v.split_terminator('\n').map(gutter));
     }
-    for (k, v) in c.args.as_object().into_iter().flatten().filter(|(k, _)| *k != "path" && !strings.contains(&k.as_str())) {
+    for (k, v) in c.args.as_object().into_iter().flatten().filter(|(k, _)| !strings.contains(&k.as_str())) {
         let ignored = if ints.contains(&k.as_str()) { "" } else { "ignored: " };
         lines.push(rule(&format!("{ignored}{k}: {}", term::json_line(v))));
     }
@@ -230,13 +230,15 @@ pub fn call_line(c: &Call, out: Option<&ToolOutput>, killed: Option<&Killed>, is
     format!("{} -> {}", head(c), ended(out, killed, is_error))
 }
 
-/// A call's head, one row: `$ FIRST_LINE` (shell), `read PATH`, `write PATH`, `edit PATH`, else the name.
+/// A call's head: `$ FIRST_LINE` (shell), `read PATH`, `write PATH`, `edit PATH`, else the name. One row: a newline in a path
+/// or in a name the model chose shows as `\x0a`, so neither can start a row that looks like henki's own.
 pub fn head(c: &Call) -> String {
-    match (c.name.as_str(), c.args["command"].as_str(), c.args["path"].as_str()) {
+    let head = match (c.name.as_str(), c.args["command"].as_str(), c.args["path"].as_str()) {
         ("shell", Some(cmd), _) => format!("$ {}", cmd.lines().next().unwrap_or_default()),
-        (name @ ("read" | "write" | "edit"), _, Some(p)) => format!("{name} {}", p.replace('\n', "\\x0a")),
+        (name @ ("read" | "write" | "edit"), _, Some(p)) => format!("{name} {p}"),
         (name, ..) => name.to_string(),
-    }
+    };
+    head.replace('\n', "\\x0a")
 }
 
 /// min(output_cap, window / 2) bytes.
