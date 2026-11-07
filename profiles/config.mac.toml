@@ -1,0 +1,8 @@
+# henki on a Mac with a local model server. Copy it to ~/.config/henki/config.toml, then set model and base_url to what
+# your server serves.
+model = "qwen-27b"                      # the model name your server serves
+base_url = "http://127.0.0.1:8080/v1"   # llama-server's port varies by version (8080, 9931); Ollama :11434/v1
+approve = "ask"                         # shell, write and edit ask first; henki run ends with exit 3 instead
+context_window = 32768                  # match the server (llama-server -c 32768; Ollama OLLAMA_CONTEXT_LENGTH=32768)
+max_steps = 12                          # model requests per turn; small local models rarely finish a task after more
+shadow = ["halti/halti", "halti/pbpaste", "halti/security"]  # the halti extension wraps these commands; ignored when it is not installed
