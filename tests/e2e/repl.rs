@@ -374,7 +374,8 @@ fn pty_ctrl_c_call_sigint_first() {
     let p = start(&r, &[]);
     p.line("run it");
     p.expect(&format!("$ trap 'echo got-int > int.txt; exit 0' INT; sleep {} & wait\r\n", r.marker), W);
-    assert!(poll(W, || !marked(&r.marker).is_empty()), "the call did not start");
+    // The sleep, not bash (whose command line holds the marker too): bash forks it only after the trap is set.
+    assert!(poll(W, || marked(&r.marker).iter().any(|(_, c)| c.starts_with("sleep "))), "the call did not start");
     p.ctrl_c();
     p.expect("(interrupted)\r\n", W);
     p.prompt(W);
