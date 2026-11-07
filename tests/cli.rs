@@ -207,6 +207,76 @@ fn allow_ignores_nested() {
     assert_eq!((out.status.code(), text(&out.stdout)), (Some(0), format!("{}\n1  /src/app  git status\n", h.allow().display()).as_str()), "{}", text(&out.stderr));
 }
 
+/// A relative `--config` is taken from the working directory.
+#[test]
+fn allow_config_flag_relative() {
+    let h = Home::new();
+    fs::create_dir_all(h.0.join("alt")).unwrap();
+    write(&h.0.join("alt/allow"), "/src/app\techo alt\n", 0o600);
+    let out = h.run(&["allow", "--config", "alt/henki.toml"], &[]);
+    assert_eq!((out.status.code(), text(&out.stdout)), (Some(0), format!("{}\n1  /src/app  echo alt\n", h.0.join("alt/allow").display()).as_str()), "{}", text(&out.stderr));
+}
+
+/// N is a rule number: anything else is a usage error, and nothing is removed.
+#[test]
+fn allow_rm_not_a_number() {
+    let h = Home::new();
+    write(&h.allow(), "/src/app\tgit status\n", 0o600);
+    for n in ["x", "-1", "18446744073709551616", ""] {
+        let out = h.run(&["allow", "rm", n], &[]);
+        assert_eq!((out.status.code(), text(&out.stdout)), (Some(2), ""), "rm {n:?}");
+        assert!(text(&out.stderr).starts_with("henki: ") && text(&out.stderr).ends_with(USAGE), "rm {n:?}: {}", text(&out.stderr));
+    }
+    assert_eq!(fs::read_to_string(h.allow()).unwrap(), "/src/app\tgit status\n");
+}
+
+/// Without an absolute HOME there is no allow file to name: the config's own refusal, exit 2, nothing read or written
+/// below the working directory.
+#[test]
+fn allow_home_unset_refused() {
+    let h = Home::new();
+    fs::create_dir_all(h.0.join("rel/.config/henki")).unwrap();
+    write(&h.0.join("rel/.config/henki/allow"), "/x\tls\n", 0o600);
+    write(&h.0.join(".config/henki/allow"), "/x\tls\n", 0o600);
+    for home in [None, Some("rel"), Some("")] {
+        let mut c = Command::new(env!("CARGO_BIN_EXE_henki"));
+        c.args(["allow", "rm", "1"]).current_dir(&h.0).env_clear().env("PATH", "/usr/bin:/bin").stdin(Stdio::null());
+        home.iter().for_each(|v| _ = c.env("HOME", v));
+        let out = c.output().unwrap();
+        assert_eq!((out.status.code(), text(&out.stdout)), (Some(2), ""), "HOME {home:?}");
+        assert_eq!(text(&out.stderr), "henki: HOME is not set; fix: set HOME to your home directory\n", "HOME {home:?}");
+    }
+    for f in [h.0.join("rel/.config/henki/allow"), h.0.join(".config/henki/allow")] {
+        assert_eq!(fs::read_to_string(&f).unwrap(), "/x\tls\n", "{}", f.display());
+    }
+}
+
+/// An allow file that is a FIFO is neither opened for reading nor waited on: the list names the problem, `rm` fails.
+#[test]
+fn allow_fifo_not_blocking() {
+    let h = Home::new();
+    assert!(Command::new("mkfifo").arg(h.allow()).status().unwrap().success());
+    let run = |args: &[&str]| {
+        let mut c = Command::new(env!("CARGO_BIN_EXE_henki"));
+        c.args(args).current_dir(&h.0).env_clear().env("HOME", &h.0).env("PATH", "/usr/bin:/bin").stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
+        let mut child = c.spawn().unwrap();
+        let end = Instant::now() + Duration::from_secs(10);
+        while child.try_wait().unwrap().is_none() {
+            if Instant::now() > end {
+                let _ = child.kill();
+                panic!("henki {args:?} waits on the FIFO");
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        child.wait_with_output().unwrap()
+    };
+    let out = run(&["allow"]);
+    assert_eq!((out.status.code(), text(&out.stdout)), (Some(0), format!("{}\ncannot read it: not a regular file\n", h.allow().display()).as_str()));
+    let out = run(&["allow", "rm", "1"]);
+    assert_eq!((out.status.code(), text(&out.stdout)), (Some(2), ""));
+    assert_eq!(text(&out.stderr), format!("henki: {}: not a regular file\n", h.allow().display()));
+}
+
 #[test]
 #[ignore = "release gate"]
 fn version_le_10ms() {
