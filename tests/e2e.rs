@@ -19,6 +19,8 @@ mod journal;
 mod outcomes;
 #[path = "e2e/processes.rs"]
 mod processes;
+#[path = "e2e/prompt.rs"]
+mod prompt;
 #[path = "e2e/protocol.rs"]
 mod protocol;
 #[path = "e2e/pty.rs"]

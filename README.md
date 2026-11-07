@@ -16,11 +16,11 @@ echo "a long task" | henki run -
 
 `henki` starts a line REPL on the terminal it was started from (without a terminal on stdin it refuses: use `henki run`). Its banner names the model, the server and its dialect, the approval mode, the config file, the extensions, any notices, and every allow rule for this project. Each line you type at the `> ` prompt is one message. The answer streams to stdout; the banner, the prompt, questions, call lines and notices go to stderr, so `henki > answers.txt` keeps only the answers.
 
-- One line is one message. For longer text, such as a pasted log, save it to a file and name the file in your message, or use `henki run -`.
+- One line is one message, and henki takes one line at each prompt: the rest of a pasted block, or of what you typed ahead, is dropped. So a pasted line that starts with `!` runs only when it is the first line of the paste. For longer text, such as a log, save it to a file and name the file in your message, or use `henki run -`.
 - `/exit` or Ctrl-D quits. `/help` lists the commands, `/allow` lists the allow rules and `/allow rm N` removes rule N. Any other line that starts with `/` is an unknown command and never reaches the model.
-- `!CMD` runs CMD yourself with bash on this terminal, so an editor or a pager works, and what you type goes to the command. Your next message starts with `[the user ran in their terminal: CMD (exit N)]`. Afterwards henki restores the terminal modes it started with, so a change made with `!stty` does not last.
+- `!CMD` runs CMD yourself with bash on this terminal, so an editor or a pager works, and what you type (also right after the `!CMD` line) goes to the command. Your next message starts with `[the user ran in their terminal: CMD (exit N)]`. Afterwards henki restores the terminal modes it started with, so a change made with `!stty` does not last.
 - Ctrl-C while the model answers or a call runs cancels the turn: the calls get SIGINT, then SIGTERM, then SIGKILL, and the text so far stays on the screen. At a question Ctrl-C answers no; during `!CMD` it goes to the command; at the prompt it does not quit, it prints a hint.
-- A process a call starts in the background keeps running between turns, and so does a `!CMD &` job; a cancel and the end of the session stop them all.
+- A process a call starts in the background keeps running between turns, and so does a `!CMD &` job. On Linux a cancel and the end of the session stop them all. On macOS henki stops what stays in a call's process group, but it cannot see a `!CMD &` job or a process that started a session of its own: such a process keeps running after henki exits (stop it yourself), and a `!CMD &` job does not hold back `always`.
 - `max_steps` (model requests) bounds a turn. `--max-seconds` and `max_seconds` apply to `henki run` only.
 - There is no line editor and no key binding beyond Ctrl-C and Ctrl-D; `rlwrap henki` adds editing and history.
 
@@ -29,11 +29,11 @@ echo "a long task" | henki run -
 With `approve = "ask"` (the default), `shell`, `write` and `edit` calls ask first, and so does a `read` outside the project (the nearest directory above the working directory that holds `.git`). The REPL shows the whole call first: every line of the command or the content, never cut, with control and invisible characters escaped and such lines marked `!| `; when the display is taller than the screen, its last line says so. Then it asks `run? [y/N]`:
 
 - `y` or `yes` runs the call once. Anything else, an empty line or Ctrl-C answers no, and the model is told `denied by the user`.
-- `always` saves an allow rule for the command, after a second question, and runs it. It is offered (`run? [y/N/always]`) only for a `shell` command that is one line of printable ASCII of at most 200 bytes, and only while no background process of the session runs.
+- `always` saves an allow rule for the command, after a second question, and runs it. It is offered (`run? [y/N/always]`) only for a `shell` command that is one line of printable ASCII of at most 200 bytes, and only while no background process of the session runs (on macOS a `!CMD &` job does not count).
 
 What you type while henki works never answers a question: input typed ahead is dropped before each one.
 
-`henki run` never asks. In ask mode the first call that needs approval ends it with exit 3, naming the call; `henki --resume=ID` continues that session in the REPL, which asks. `--approve auto` runs every call without asking.
+`henki run` never asks. In ask mode the first call that needs approval ends it with exit 3, naming the call; `henki --resume=ID` continues that session in the REPL: tell the model to go on, and it asks before the call runs. `--approve auto` runs every call without asking.
 
 ### Allow rules
 
@@ -68,8 +68,8 @@ An extension is a directory that teaches the model a command-line tool: `NAME/do
 
 - `henki run` prints the answer on stdout and one line per call and notice on stderr. `--json` prints one JSON record per line instead, ending with a `result` record.
 - Every session is journaled under `~/.local/state/henki`; `--resume[=ID]` continues one. A REPL that quits before its first message leaves no session.
-- When a session ends, every process it started is stopped.
-- Exit codes: 0 answered (or the REPL quit), 1 gave up (step limit, stuck, empty answer), 2 error, 3 needs approval, 124 out of time, 130 interrupted (or TERM or HUP), 141 stdout closed or not read in time.
+- When a session ends, every process it started is stopped (on macOS, except a `!CMD &` job or a process that started a session of its own).
+- Exit codes: 0 answered (or the REPL quit), 1 gave up (step limit, stuck, empty answer), 2 error, 3 needs approval, 124 out of time, 130 interrupted (or TERM, HUP or the terminal closing), 141 stdout closed or not read in time.
 
 ## Build and check
 
