@@ -773,31 +773,147 @@ t_official() {
   rc_is 0
 }
 
-# The live check: the system prompt of real henki requests, without modules and with them, sent to a stub that
-# records its length in bytes.
-t_live() {
-  case_ "list's bytes are what henki really adds (henki run --json)"
-  if [ -z "$HENKI_BIN" ]; then
-    echo "tests.sh: the live prompt check was SKIPPED (set MODS_TEST_HENKI to a henki binary)" >&2
-    return
-  fi
-  command -v python3 >/dev/null 2>&1 || {
-    fail "python3 is not on PATH, and the live check needs it for its stub server"
-    return
+# The official halti module from this checkout: its install screen, its card, and its wrappers, which refuse what
+# hands out secret values and run the user's own command for the rest. USER holds stand-ins for halti, pbpaste and
+# security, as on a Mac.
+t_halti() {
+  case_ "the official halti module and its wrappers"
+  local user="$W/user" b="$CONF/ext/halti/bin" v line card
+  mkdir -p "$user"
+  for v in halti pbpaste security; do
+    printf '#!/bin/sh\necho "real %s: $*"\n' "$v" >"$user/$v"
+    chmod 755 "$user/$v"
+  done
+  line='shadow = ["halti/halti", "halti/pbpaste", "halti/security"]'
+  PATH="$user:$PATH" run add halti --yes
+  rc_is 0
+  out_has "source   official ($(cd "$HERE/../mods/halti" && pwd -P))"
+  out_has "license  Apache-2.0"
+  out_has "bin/halti (sh, "
+  out_has "bin/pbpaste (sh, "
+  out_has "bin/security (sh, "
+  out_has "needs    halti (found)"
+  out_has "config   henki starts only once ~/.config/henki/config.toml has: $line"
+  out_has "add to ~/.config/henki/config.toml: $line"
+  card="$HERE/../mods/halti/.henki/card.md"
+  out_has "card     +$(num "$(wc -c <"$card" | tr -d ' ')") B"
+  check "AGENTS.md is the card in its block" [ "$(cat "$CONF/AGENTS.md")" = "$(printf '# >>> mods cards\n%s\n# <<< mods cards' "$(cat "$card")")" ]
+  run verify
+  rc_is 0
+  err_has "$line"
+  # The wrappers, with HENKI_USER_PATH as henki sets it for a call.
+  wrap() {
+    RC=0
+    OUT=$(HENKI_USER_PATH="$user:/usr/bin:/bin" PATH="$b:$user:/usr/bin:/bin" "$@" 2>"$SCRATCH/err") || RC=$?
+    ERR=$(cat "$SCRATCH/err")
   }
-  local d="$W/stub" port i base with work="$W/work"
-  mkdir -p "$d" "$work" "$CONF"
+  for v in set with copy update rotate; do
+    wrap halti "$v" own/github
+    rc_is 126
+    err_has "fix: ask the user to run !halti $v"
+  done
+  wrap halti --version
+  check "halti --version runs the real halti" [ "$OUT" = "real halti: --version" ]
+  wrap halti
+  check "bare halti runs the real halti" [ "$OUT" = "real halti: " ]
+  wrap halti ls own
+  check "halti ls runs the real halti" [ "$OUT" = "real halti: ls own" ]
+  for v in "-s github" "--secret github" "-sgithub" "--secret=github"; do
+    # shellcheck disable=SC2086 # two words on purpose
+    wrap halti run $v -- gh api user
+    rc_is 126
+    err_has "'halti run -s' puts secret values"
+  done
+  wrap halti sh own -- grep -s x
+  check "-s after -- is the command's" [ "$OUT" = "real halti: sh own -- grep -s x" ]
+  wrap halti run own -- echo -s
+  check "-s after -- in halti run is the command's" [ "$OUT" = "real halti: run own -- echo -s" ]
+  wrap pbpaste
+  rc_is 126
+  err_has "pbpaste reads the clipboard"
+  for v in "find-generic-password -s x -w" "-q find-internet-password -s x" "-p prompt dump-keychain -d" "export -k login" \
+    "set-key-partition-list -S apple:" "add-generic-password -a a -s s -w pw" "unlock-keychain -p pw" "-i" "-qi" ""; do
+    # shellcheck disable=SC2086 # words on purpose
+    wrap security $v
+    rc_is 126
+    err_has "henki: "
+    check "security $v runs nothing" [ -z "$OUT" ]
+  done
+  wrap security -p find-generic-password list-keychains
+  check "-p takes the next word" [ "$OUT" = "real security: -p find-generic-password list-keychains" ]
+  wrap security -h
+  check "security -h runs the real one" [ "$OUT" = "real security: -h" ]
+  wrap security find-certificate -a -c name
+  check "find-certificate runs the real one" [ "$OUT" = "real security: find-certificate -a -c name" ]
+  # henki sets HENKI_USER_PATH even when empty: then there is no real command, and the wrapper says so.
+  RC=0
+  ERR=$(HENKI_USER_PATH="" PATH="$b:$user:/usr/bin:/bin" halti ls 2>&1 >/dev/null) || RC=$?
+  rc_is 127
+  err_has "halti is not installed on the user's PATH"
+  # Run outside henki: the PATH without the wrapper's own dir, by the link and by the store copy alike.
+  for v in "$b" "$(cd "$b" && pwd -P)"; do
+    RC=0
+    OUT=$(env -u HENKI_USER_PATH PATH="$v:$user:/usr/bin:/bin" halti ls 2>&1) || RC=$?
+    check "outside henki, $v: the real halti" [ "$OUT" = "real halti: ls" ]
+    OUT=$(env -u HENKI_USER_PATH PATH="$v:/usr/bin:/bin" halti ls 2>&1) || RC=$?
+    rc_is 127
+  done
+}
+
+# A real henki with the halti module on and a fresh HOME: it refuses to start without the shadow line the install
+# screen prints, and starts with the Mac profile, which has it; the doc line and the card reach the model.
+t_halti_live() {
+  case_ "henki starts with the official halti module (henki run --json)"
+  live_ok || return
+  local d="$W/stub" user="$W/user" work="$W/work" v
+  mkdir -p "$user" "$work" "$CONF"
+  for v in halti pbpaste security; do
+    printf '#!/bin/sh\necho "real %s: $*"\n' "$v" >"$user/$v"
+    chmod 755 "$user/$v"
+  done
+  stub_up "$d" || return
+  printf 'model = "m"\nbase_url = "http://127.0.0.1:%s/v1"\n' "$STUB_PORT" >"$CONF/config.toml"
+  chmod 600 "$CONF/config.toml"
+  PATH="$user:$PATH" run add halti --yes
+  rc_is 0
+  henki_run() { (cd "$work" && PATH="$user:$PATH" env -u XDG_CONFIG_HOME "$HENKI_BIN" run --json hi >"$d/run.out" 2>&1); }
+  RC=0
+  henki_run || RC=$?
+  check "henki refuses without the shadow line" [ "$RC" != 0 ]
+  check "henki says what shadows what: $(cat "$d/run.out")" command grep -qF 'bin/halti shadows' "$d/run.out"
+  check "henki says which line to add" command grep -qF 'fix: add shadow = [' "$d/run.out"
+  check "no request without it" [ ! -e "$d/system" ]
+  sed "s|^base_url = .*|base_url = \"http://127.0.0.1:$STUB_PORT/v1\"|" "$HERE/../profiles/config.mac.toml" >"$CONF/config.toml"
+  chmod 600 "$CONF/config.toml"
+  henki_run || fail "henki run with the Mac profile failed: $(cat "$d/run.out")"
+  check "the doc line reaches the model" command grep -qF -e "- halti: $(sed -n '1s/^# //p' "$HERE/../mods/halti/doc.md") [~/.config/henki/ext/halti/doc.md]" "$d/system"
+  check "the card reaches the model" command grep -qF -e "$(sed -n 1p "$HERE/../mods/halti/.henki/card.md")" "$d/system"
+  run verify
+  rc_is 0
+  err_lacks "shadow"
+  kill "$STUB_PID" 2>/dev/null
+  wait "$STUB_PID" 2>/dev/null
+}
+
+# A stub model server for the live checks in D: it answers every request "ok" and appends the system prompt's length
+# in bytes to D/sizes, and writes the prompt itself to D/system. Sets STUB_PORT and STUB_PID; exit 1 when it does not
+# start.
+stub_up() {
+  local d="$1" i=0
+  mkdir -p "$d"
   cat >"$d/stub.py" <<'PY'
-import http.server, json, socketserver, sys
-out, portfile = sys.argv[1], sys.argv[2]
+import http.server, json, os, socketserver, sys
+d = sys.argv[1]
 def chunk(delta, finish=None):
     return "data: " + json.dumps({"choices": [{"index": 0, "delta": delta, "finish_reason": finish}], "object": "chat.completion.chunk"}) + "\n\n"
 class H(http.server.BaseHTTPRequestHandler):
     def do_POST(self):
         body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
         system = [m["content"] for m in body["messages"] if m["role"] == "system"][0]
-        with open(out, "a") as f:
+        with open(os.path.join(d, "sizes"), "a") as f:
             f.write("%d\n" % len(system.encode()))
+        with open(os.path.join(d, "system"), "w") as f:
+            f.write(system)
         sse = (chunk({"role": "assistant", "content": "ok"}) + chunk({}, "stop") + "data: [DONE]\n\n").encode()
         self.send_response(200)
         self.send_header("Content-Type", "text/event-stream")
@@ -807,23 +923,42 @@ class H(http.server.BaseHTTPRequestHandler):
     def log_message(self, *a):
         pass
 s = socketserver.TCPServer(("127.0.0.1", 0), H)
-open(portfile, "w").write(str(s.server_address[1]))
+open(os.path.join(d, "port"), "w").write(str(s.server_address[1]))
 s.serve_forever()
 PY
-  python3 -I "$d/stub.py" "$d/sizes" "$d/port" &
-  local pid=$!
-  i=0
+  python3 -I "$d/stub.py" "$d" &
+  STUB_PID=$!
   while [ ! -s "$d/port" ] && [ $i -lt 100 ]; do
     sleep 0.1 2>/dev/null || sleep 1
     i=$((i + 1))
   done
-  port=$(cat "$d/port" 2>/dev/null)
-  if [ -z "$port" ]; then
-    kill "$pid" 2>/dev/null
-    fail "the stub server did not start"
-    return
+  STUB_PORT=$(cat "$d/port" 2>/dev/null)
+  [ -n "$STUB_PORT" ] && return 0
+  kill "$STUB_PID" 2>/dev/null
+  fail "the stub server did not start"
+  return 1
+}
+
+# Whether the live checks can run; says why not.
+live_ok() {
+  if [ -z "$HENKI_BIN" ]; then
+    echo "tests.sh: the live check \"$CASE\" was SKIPPED (set MODS_TEST_HENKI to a henki binary)" >&2
+    return 1
   fi
-  printf 'model = "m"\nbase_url = "http://127.0.0.1:%s/v1"\n' "$port" >"$CONF/config.toml"
+  command -v python3 >/dev/null 2>&1 && return 0
+  fail "python3 is not on PATH, and the live check needs it for its stub server"
+  return 1
+}
+
+# The live check: the system prompt of real henki requests, without modules and with them, sent to a stub that
+# records its length in bytes.
+t_live() {
+  case_ "list's bytes are what henki really adds (henki run --json)"
+  live_ok || return
+  local d="$W/stub" base with work="$W/work"
+  mkdir -p "$work" "$CONF"
+  stub_up "$d" || return
+  printf 'model = "m"\nbase_url = "http://127.0.0.1:%s/v1"\n' "$STUB_PORT" >"$CONF/config.toml"
   chmod 600 "$CONF/config.toml"
   live_run() { (cd "$work" && env -u XDG_CONFIG_HOME "$HENKI_BIN" run --json hi >"$d/run.out" 2>&1) || fail "henki run failed: $(cat "$d/run.out")"; }
   live_run
@@ -843,8 +978,8 @@ PY
   live_run
   with=$(tail -n 1 "$d/sizes")
   out_has "on: $(num $((with - base))) B of prompt"
-  kill "$pid" 2>/dev/null
-  wait "$pid" 2>/dev/null
+  kill "$STUB_PID" 2>/dev/null
+  wait "$STUB_PID" 2>/dev/null
 }
 
 all() {
@@ -862,12 +997,14 @@ all() {
   t_cards
   t_shadow
   t_official
+  t_halti
 }
 
 static_bash32
 RUN=bash
 all
 t_live
+t_halti_live
 # POSIX mode turns off some bash behaviour a script may lean on without knowing; the manager must not.
 RUN="bash --posix"
 all
