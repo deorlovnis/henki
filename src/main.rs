@@ -1,6 +1,10 @@
 //! henki: a small terminal agent. `henki run [--json] TASK` drives a model through a shell and three file tools.
+#![allow(dead_code)]
 
+mod allow;
+mod anthropic;
 mod config;
+mod ext;
 mod files;
 mod http;
 mod journal;
@@ -136,7 +140,8 @@ fn start(a: Args, tx: &Sender<Ev>, rx: &Receiver<Ev>, t0: Instant, early: io::Re
     let cwd = std::env::current_dir().map_err(|e| bad(format!("cannot read the working directory: {e}")))?;
     let mut cfg = config::load(&a.flags, &env, &cwd).map_err(bad)?;
     *deadline = (cfg.max_seconds > 0).then(|| t0 + Duration::from_secs(cfg.max_seconds));
-    let state = journal::state_dir(&cfg.env, &cfg.home).map_err(bad)?;
+    journal::state_dir(&cfg.state).map_err(bad)?;
+    let state = cfg.state.clone();
     cfg.protected.extend([Some(state.clone()), state.canonicalize().ok()].into_iter().flatten());
     let task = if a.task.as_deref() == Some("-") { Some(stdin_task(tx, rx, *deadline)?) } else { a.task };
     if task.as_deref().is_some_and(|t| t.trim().is_empty()) {

@@ -1,5 +1,6 @@
 #![allow(clippy::disallowed_methods, clippy::print_stdout, clippy::print_stderr, clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::string_slice)]
 use super::*;
+use crate::types::Wire;
 use std::time::Instant;
 
 const OFFERED: [&str; 4] = ["shell", "read", "write", "edit"];
@@ -732,7 +733,10 @@ fn json_completion() {
     let b = json!({"choices": [{"finish_reason": "stop", "index": 0, "message": {"content": "All done.", "reasoning_content": "hmm", "role": "assistant"}}],
         "object": "chat.completion", "usage": {"completion_tokens": 3, "prompt_tokens": 50, "prompt_tokens_details": {"cached_tokens": 40}}});
     let r = Acc::new(&OFFERED).json(b.to_string().as_bytes()).unwrap();
-    assert_eq!(r, Reply { text: "All done.".into(), reasoning: "hmm".into(), calls: vec![], finish: "stop".into(), usage: Usage { input: 50, output: 3, cached: 40 } });
+    assert_eq!(
+        r,
+        Reply { text: "All done.".into(), reasoning: "hmm".into(), calls: vec![], finish: "stop".into(), usage: Usage { input: 50, output: 3, cached: 40 }, blocks: None }
+    );
     // Text calls in a completion are found as in a stream.
     let b = json!({"choices": [{"finish_reason": "stop", "message": {"content": "<function=read><parameter=path>a</parameter></function>"}}]});
     assert_eq!(names(&Acc::new(&OFFERED).json(b.to_string().as_bytes()).unwrap()), ["read"]);

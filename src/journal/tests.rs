@@ -3,7 +3,6 @@ use super::*;
 use crate::types::{Call, Usage};
 use serde_json::json;
 use std::cell::Cell;
-use std::ffi::OsString;
 use std::os::unix::fs::{MetadataExt, PermissionsExt, symlink};
 use std::process::Command;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -140,7 +139,7 @@ fn call(id: &str) -> Call {
 
 fn asst(ids: &[&str]) -> Value {
     let calls: Vec<Call> = ids.iter().map(|i| call(i)).collect();
-    rec::assistant("", &calls, if ids.is_empty() { "stop" } else { "tool_calls" }, Usage::default())
+    rec::assistant("", &calls, if ids.is_empty() { "stop" } else { "tool_calls" }, Usage::default(), None)
 }
 
 fn res(id: &str) -> Value {
@@ -160,8 +159,8 @@ fn journal_layout_modes() {
     let tmp = Tmp::new();
     let home = tmp.0.join("home");
     fs::create_dir(&home).unwrap();
-    let state = state_dir(&Env(Vec::new()), &home).unwrap();
-    assert_eq!(state, home.join(".local/state/henki"));
+    let state = home.join(".local/state/henki");
+    state_dir(&state).unwrap();
     for d in [home.join(".local"), home.join(".local/state"), state.clone(), state.join("sessions"), state.join("spill")] {
         assert_eq!(mode(&d), 0o700, "{}", d.display());
     }
@@ -185,25 +184,22 @@ fn journal_layout_modes() {
 #[test]
 fn journal_state_dir_tightened() {
     let tmp = Tmp::new();
-    let (xdg, home) = (tmp.0.join("xdg"), tmp.0.join("home"));
+    let xdg = tmp.0.join("xdg");
     fs::create_dir_all(xdg.join("henki/sessions")).unwrap();
     for d in [xdg.join("henki"), xdg.join("henki/sessions")] {
         fs::set_permissions(&d, fs::Permissions::from_mode(0o755)).unwrap();
     }
-    let env = |v: &Path| Env(vec![(OsString::from("XDG_STATE_HOME"), v.as_os_str().to_owned())]);
-    let state = state_dir(&env(&xdg), &home).unwrap();
-    assert_eq!(state, xdg.join("henki"));
+    let state = xdg.join("henki");
+    state_dir(&state).unwrap();
     for d in [state.clone(), state.join("sessions"), state.join("spill")] {
         assert_eq!(mode(&d), 0o700, "{}", d.display());
     }
-    // A relative XDG_STATE_HOME is not used.
-    assert_eq!(state_dir(&env(Path::new("rel")), &home).unwrap(), home.join(".local/state/henki"));
     // A symlink in place of the state dir is refused, with the fix.
     let (planted, target) = (tmp.0.join("planted"), tmp.0.join("target"));
     fs::create_dir_all(&planted).unwrap();
     fs::create_dir_all(&target).unwrap();
     symlink(&target, planted.join("henki")).unwrap();
-    let e = state_dir(&env(&planted), &home).unwrap_err();
+    let e = state_dir(&planted.join("henki")).unwrap_err();
     assert!(e.starts_with(&format!("state dir {}: ", planted.join("henki").display())) && e.contains("; fix: "), "{e}");
     assert!(fs::read_dir(&target).unwrap().next().is_none());
 }
@@ -276,16 +272,16 @@ fn journal_record_shapes() {
     let calls = [call("h1"), Call { id: "h2".into(), name: "edit".into(), args: json!({}), raw: Some("{bad".into()), error: Some("x".into()) }];
     let u = Usage { input: 1840, output: 22, cached: 1664 };
     assert_eq!(
-        s(rec::assistant("x", &calls, "tool_calls", u)),
+        s(rec::assistant("x", &calls, "tool_calls", u, None)),
         r#"{"finish":"tool_calls","msg":{"content":"x","role":"assistant","tool_calls":[{"args":{"command":"ls"},"id":"h1","name":"shell"},{"args":{},"id":"h2","name":"edit","raw":"{bad"}]},"t":"assistant","usage":{"cached":1664,"in":1840,"out":22}}"#
     );
     assert_eq!(
-        s(rec::assistant("done", &[], "interrupted", Usage::default())),
+        s(rec::assistant("done", &[], "interrupted", Usage::default(), None)),
         r#"{"finish":"interrupted","msg":{"content":"done","role":"assistant","tool_calls":[]},"t":"assistant","usage":{"cached":0,"in":0,"out":0}}"#
     );
     assert_eq!(s(rec::ask(&call("h1"), None)), r#"{"args":{"command":"ls"},"id":"h1","name":"shell","t":"ask"}"#);
     assert_eq!(s(rec::ask(&call("h1"), Some("/p/a"))), r#"{"args":{"command":"ls"},"id":"h1","name":"shell","t":"ask","target":"/p/a"}"#);
-    assert_eq!(s(rec::approval("h1", "auto")), r#"{"id":"h1","t":"approval","verdict":"auto"}"#);
+    assert_eq!(s(rec::approval("h1", "auto", None)), r#"{"id":"h1","t":"approval","verdict":"auto"}"#);
     assert_eq!(
         s(rec::tool_result("call_7", "shell", "ws1 open\n[exit 0, 0.3 s]", false, 312, 402)),
         r#"{"bytes":402,"content":"ws1 open\n[exit 0, 0.3 s]","id":"call_7","is_error":false,"ms":312,"name":"shell","t":"tool_result"}"#
@@ -328,7 +324,7 @@ fn journal_sync_table() {
         (rec::user("u"), true),
         (asst(&["h1"]), true),
         (rec::ask(&c, None), false),
-        (rec::approval("h1", "auto"), false),
+        (rec::approval("h1", "auto", None), false),
         (res("h1"), true),
         (rec::notice("n"), false),
         (rec::elide(&["h1".into()]), true),
@@ -573,9 +569,9 @@ fn record_hist_kinds() {
     let c = call("h1");
     let recs = [
         rec::user("u"),
-        rec::assistant("", std::slice::from_ref(&c), "tool_calls", Usage::default()),
+        rec::assistant("", std::slice::from_ref(&c), "tool_calls", Usage::default(), None),
         rec::ask(&c, Some("/x")),
-        rec::approval("h1", "auto"),
+        rec::approval("h1", "auto", None),
         rec::notice("n"),
         res("h1"),
         rec::elide(&[]),
@@ -748,7 +744,7 @@ fn pairing_ignores_non_message_kinds() {
         rec::user("u"),
         asst(&["h1"]),
         rec::ask(&c, None),
-        rec::approval("h1", "auto"),
+        rec::approval("h1", "auto", None),
         rec::notice("n"),
         res("h1"),
         rec::elide(&["h1".into()]),
@@ -855,14 +851,14 @@ fn spill_counter_after_sweep() {
 #[test]
 fn spill_sweep_24h() {
     let tmp = Tmp::new();
-    let env = Env(vec![(OsString::from("XDG_STATE_HOME"), tmp.0.as_os_str().to_owned())]);
-    let state = state_dir(&env, &tmp.0).unwrap();
+    let state = tmp.0.join("henki");
+    state_dir(&state).unwrap();
     let (old, new) = (state.join("spill/a-1.log"), state.join("spill/b-1.log"));
     fs::write(&old, "x").unwrap();
     fs::write(&new, "y").unwrap();
     set_mtime(&old, 25 * 3600);
     set_mtime(&new, 23 * 3600);
-    state_dir(&env, &tmp.0).unwrap();
+    state_dir(&state).unwrap();
     assert!(!old.exists());
     assert!(new.exists());
 }

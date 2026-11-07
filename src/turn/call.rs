@@ -49,7 +49,7 @@ impl Session {
             self.record(rec::ask(c, t.as_ref().map(|t| t.shown.as_str())))?;
             return Err(Outcome::NeedsApproval(c.clone()));
         }
-        self.record(rec::approval(&c.id, "auto"))?;
+        self.record(rec::approval(&c.id, "auto", None))?;
         self.call(c, t)
     }
 

@@ -2,6 +2,13 @@
 use serde_json::Value;
 use std::time::Duration;
 
+/// The built-in tools, in the order the model sees them.
+pub const TOOLS: [&str; 4] = ["shell", "read", "write", "edit"];
+/// The most a call's arguments may hold.
+pub const ARGS_MAX: usize = 1 << 20;
+/// The result of every call of a reply that was cut at max_tokens.
+pub const CUT_ARGS: &str = "arguments cut at max_tokens; not run. Send a shorter call.";
+
 /// Everything that wakes MAIN. A tagged event carries the tag MAIN gave its worker (one per model attempt, one per tool
 /// call); MAIN drops a tagged event whose tag is not the one it is waiting for.
 #[derive(Debug)]
@@ -55,6 +62,29 @@ pub struct Reply {
     pub calls: Vec<Call>,
     pub finish: String,
     pub usage: Usage,
+    /// Anthropic: the reply's content blocks as received (thinking with its signature, text, tool_use with its parsed
+    /// input), empty text blocks dropped. None for OpenAI.
+    pub blocks: Option<Value>,
+}
+
+/// How far a streamed reply got: more to come; its finish came (EOF or 2 s of silence now completes it); its end
+/// marker came.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Flow {
+    More,
+    Finished,
+    Done,
+}
+
+/// One wire format's reply as it arrives (OpenAI chat completions, Anthropic Messages); one loop drives either.
+pub trait Wire: Sized {
+    fn new(offered: &[&'static str]) -> Self;
+    /// One SSE `data` payload; streamed pieces go to `part`.
+    fn data(&mut self, data: &str, part: &mut dyn FnMut(Part)) -> Result<Flow, ProviderError>;
+    /// A 200 `application/json` completion.
+    fn json(self, body: &[u8]) -> Result<Reply, ProviderError>;
+    /// The after-stream rules; `complete` = the end marker came, or EOF or idle after the finish.
+    fn finish(self, complete: bool) -> Result<Reply, ProviderError>;
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq)]

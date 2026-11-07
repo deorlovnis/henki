@@ -1,6 +1,6 @@
 //! The configuration: one TOML-subset file, two environment variables and the flags, checked so that anything wrong
 //! stops henki with the file, the line and the fix.
-use crate::{http, sys, term, tools::ALL as TOOLS, types::Url};
+use crate::{allow, ext, http, sys, term, tools::ALL as TOOLS, types::Url};
 use serde_json::Value;
 use std::path::{Component, Path, PathBuf};
 use std::{ffi::OsStr, ffi::OsString, fs, io::ErrorKind, io::Read, net::Ipv6Addr, os::unix::ffi::OsStrExt, os::unix::fs::MetadataExt};
@@ -57,6 +57,10 @@ pub struct Config {
     pub agents_hash: Option<String>,
     pub protected: Vec<PathBuf>, // the config file and dir, each also as its realpath (main adds the state dir)
     pub notices: Vec<String>,
+    pub dialect: &'static str,
+    pub state: PathBuf,
+    pub exts: Vec<ext::Ext>,
+    pub allow: allow::Allow,
 }
 
 /// The HENKI_* variables henki reads or sets for its children; any other gives a notice.
@@ -81,11 +85,13 @@ pub fn load(f: &Flags, env: &Env, cwd: &Path) -> Result<Config, String> {
     let base = cwd.ancestors().nth(up).unwrap_or(Path::new("/"));
     let file = f.config.as_ref().map_or_else(|| home.join(".config/henki/config.toml"), |p| base.join(p.components().skip(up).collect::<PathBuf>()));
     let (dir, explicit, root) = (file.parent().unwrap_or(&home).to_path_buf(), f.config.is_some(), project_root(cwd, &real(&home)));
+    let state = env.get("XDG_STATE_HOME").map(Path::new).filter(|p| p.is_absolute()).map_or_else(|| home.join(".local/state"), Path::to_path_buf).join("henki");
     #[rustfmt::skip]
     let mut c = Config { model: String::new(), url: Url { host: String::new(), port: 80, path: String::new() }, url_from: "config", api_key: String::new(),
         auto: false, approve_from: "default".into(), tools: TOOLS.to_vec(), pass_env: Vec::new(), max_steps: 50, max_seconds: 0, tool_timeout_s: 120,
         output_cap: 16_384, window: 0, max_tokens: 4_096, file: None, dir, explicit, hash: None, home, cwd: cwd.to_path_buf(), env: env.clone(), root,
-        user_path: String::new(), bash: PathBuf::new(), agents: None, agents_hash: None, protected: Vec::new(), notices: Vec::new() };
+        user_path: String::new(), bash: PathBuf::new(), agents: None, agents_hash: None, protected: Vec::new(), notices: Vec::new(),
+        dialect: "openai", state, exts: Vec::new(), allow: allow::Allow::default() };
     // Each layer is (where, key, value): the file's lines, then the two variables, then the flags; the last one wins.
     let mut layers: Vec<(String, String, Value)> = Vec::new();
     if explicit || file.exists() {
@@ -387,6 +393,10 @@ impl Config {
             agents_hash: None,
             protected: Vec::new(),
             notices: Vec::new(),
+            dialect: "openai",
+            state: dir.join("state"),
+            exts: Vec::new(),
+            allow: allow::Allow { file: dir.join("allow"), ..Default::default() },
         }
     }
 }

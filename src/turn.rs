@@ -138,7 +138,7 @@ impl Session {
         loop {
             let mut r = self.request()?;
             let calls = self.prepare(std::mem::take(&mut r.calls));
-            self.record(rec::assistant(&r.text, &calls, &r.finish, r.usage))?;
+            self.record(rec::assistant(&r.text, &calls, &r.finish, r.usage, r.blocks.as_ref()))?;
             (self.steps, self.text) = (self.steps + 1, r.text);
             self.usage_turn.add(r.usage);
             self.usage_proc.add(r.usage);
