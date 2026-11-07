@@ -265,10 +265,10 @@ struct Term<'a> {
 impl<'a> Term<'a> {
     fn spawn(r: &'a Run, closed_stdout: bool) -> Term<'a> {
         let (mut m, mut s) = (0, 0);
-        let ws = libc::winsize { ws_row: 24, ws_col: 80, ws_xpixel: 0, ws_ypixel: 0 };
+        let mut ws = libc::winsize { ws_row: 24, ws_col: 80, ws_xpixel: 0, ws_ypixel: 0 };
         // SAFETY: openpty writes two descriptors into the out-pointers; the name and termios pointers may be null and
-        // the window size is read only.
-        assert_eq!(unsafe { libc::openpty(&mut m, &mut s, std::ptr::null_mut(), std::ptr::null(), &ws) }, 0, "openpty");
+        // the window size is only read (macOS declares the termios and window size pointers mutable).
+        assert_eq!(unsafe { libc::openpty(&mut m, &mut s, std::ptr::null_mut(), std::ptr::null_mut(), &raw mut ws) }, 0, "openpty");
         // SAFETY: openpty just returned both descriptors, and nothing else owns them.
         let (master, slave) = unsafe { (OwnedFd::from_raw_fd(m), OwnedFd::from_raw_fd(s)) };
         for fd in [&master, &slave] {

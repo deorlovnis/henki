@@ -74,6 +74,7 @@ fn until(what: &str, f: impl Fn() -> bool) {
     }
 }
 
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))] // only the Linux tests use it
 fn alive(pid: i32) -> bool {
     sys::procs().iter().any(|p| p.pid == pid && !p.zombie)
 }
@@ -418,6 +419,7 @@ fn capture_stdin_null() {
 /// that process (marked by `HENKI_TEST_ALONE`) it returns true and the test runs its body there. Code that changes the
 /// whole process (the subreaper flag, the ledger, the sweep) is tested only this way, so it never meets another test's
 /// children.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))] // only the Linux tests use it
 fn alone(name: &str) -> bool {
     if std::env::var_os("HENKI_TEST_ALONE").is_some() {
         return true;

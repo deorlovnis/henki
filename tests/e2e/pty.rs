@@ -66,10 +66,10 @@ impl<'a> Pty<'a> {
     /// The same, with henki's stdout and stderr to the files given (the pty stays its stdin).
     pub fn spawn_io(r: &'a Run, args: &[&str], rows: u16, cols: u16, stdout: Option<File>, stderr: Option<File>) -> Pty<'a> {
         let (mut m, mut s) = (0, 0);
-        let ws = libc::winsize { ws_row: rows, ws_col: cols, ws_xpixel: 0, ws_ypixel: 0 };
+        let mut ws = libc::winsize { ws_row: rows, ws_col: cols, ws_xpixel: 0, ws_ypixel: 0 };
         // SAFETY: openpty writes two descriptors into the out-pointers; the name and termios pointers may be null and
-        // the window size is read only.
-        let rc = unsafe { libc::openpty(&mut m, &mut s, std::ptr::null_mut(), std::ptr::null(), &ws) };
+        // the window size is only read (macOS declares the termios and window size pointers mutable).
+        let rc = unsafe { libc::openpty(&mut m, &mut s, std::ptr::null_mut(), std::ptr::null_mut(), &raw mut ws) };
         assert_eq!(rc, 0, "openpty: {}", std::io::Error::last_os_error());
         // SAFETY: openpty just returned both descriptors, and nothing else owns them.
         let (master, slave) = unsafe { (OwnedFd::from_raw_fd(m), OwnedFd::from_raw_fd(s)) };
@@ -207,6 +207,7 @@ impl<'a> Pty<'a> {
         unsafe { libc::kill(self.child.id() as i32, sig) };
     }
 
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))] // only a Linux test uses it
     pub fn pid(&self) -> i32 {
         self.child.id() as i32
     }
