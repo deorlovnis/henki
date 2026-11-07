@@ -1,9 +1,10 @@
 #![allow(clippy::disallowed_methods, clippy::print_stdout, clippy::print_stderr, clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::string_slice, unsafe_code)]
 //! The end-to-end harness: a `Run` is one throwaway HOME, XDG dirs, a git working directory and a config file; each
-//! `Cmd` starts `henki run` there; `Done::finish` checks what must hold after every run: no process with the run's
-//! marker survives, nothing that must be escaped reaches an output raw, the journal pairs every call with one result,
-//! the records end `turn_end`, the final stop's notices, `result`, `close` with the right byte count, the exit code is
-//! the one of the `result` status, and `--json` stdout mirrors the journal.
+//! `Cmd` starts `henki run` there (a `Pty` starts the REPL); `Done::finish` checks what must hold after every run: no
+//! process with the run's marker survives, nothing that must be escaped reaches an output raw, the journal pairs every
+//! call with one result, the records end `turn_end`, the final stop's notices, `result`, `close` with the right byte
+//! count (a REPL session: its turns, notices, `close`, no `result`), the exit code is the one of the `result` status,
+//! and `--json` stdout mirrors the journal.
 use crate::mock::{Mock, Step, shell};
 use serde_json::Value;
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -138,6 +139,22 @@ impl Run {
         journals_in(&self.state())
     }
 
+    /// Writes the config, then gives `c` this run's working directory and exactly this run's environment.
+    pub fn prepare(&self, c: &mut Command) {
+        self.write_config();
+        c.current_dir(&self.cwd).env_clear();
+        for (k, v) in &self.env {
+            if let Some(v) = v {
+                c.env(k, v);
+            }
+        }
+    }
+
+    /// The journals and their sizes now: `changed_journal` finds the one a later process wrote.
+    pub fn sizes(&self) -> HashMap<PathBuf, u64> {
+        self.journals().into_iter().map(|p| (p.clone(), fs::metadata(&p).map(|m| m.len()).unwrap_or(0))).collect()
+    }
+
     fn write_config(&self) {
         let text = match &self.raw {
             Some(t) => t.clone(),
@@ -179,6 +196,29 @@ impl Run {
 
     pub fn path(&self, rel: &str) -> PathBuf {
         self.cwd.join(rel)
+    }
+
+    /// The project root henki computes for the working directory (its realpath), as allow rules name it.
+    pub fn root(&self) -> String {
+        fs::canonicalize(&self.cwd).unwrap().display().to_string()
+    }
+
+    /// `~/.config/henki/`: the config dir of the default config file.
+    pub fn config_dir(&self) -> PathBuf {
+        self.config_path.parent().unwrap().to_path_buf()
+    }
+
+    /// The allow file next to the default config file.
+    pub fn allow(&self) -> PathBuf {
+        self.config_dir().join("allow")
+    }
+
+    /// The allow file holds exactly `text`, mode 0600, in a 0700 config dir.
+    pub fn write_allow(&self, text: &str) {
+        fs::create_dir_all(self.config_dir()).unwrap();
+        fs::set_permissions(self.config_dir(), fs::Permissions::from_mode(0o700)).unwrap();
+        fs::write(self.allow(), text).unwrap();
+        fs::set_permissions(self.allow(), fs::Permissions::from_mode(0o600)).unwrap();
     }
 }
 
@@ -264,8 +304,7 @@ impl<'a> Cmd<'a> {
 
     pub fn spawn(self) -> Live {
         let r = self.run;
-        r.write_config();
-        let before: HashMap<PathBuf, u64> = r.journals().into_iter().map(|p| (p.clone(), fs::metadata(&p).map(|m| m.len()).unwrap_or(0))).collect();
+        let before = r.sizes();
         let mut c = match &self.launch {
             Some(prefix) => {
                 let mut c = Command::new("/bin/sh");
@@ -278,12 +317,8 @@ impl<'a> Cmd<'a> {
                 c
             }
         };
-        c.args(&self.args).current_dir(self.cwd.as_deref().unwrap_or(&r.cwd)).env_clear();
-        for (k, v) in &r.env {
-            if let Some(v) = v {
-                c.env(k, v);
-            }
-        }
+        r.prepare(&mut c);
+        c.args(&self.args).current_dir(self.cwd.as_deref().unwrap_or(&r.cwd));
         let (stdio, file, bytes) = match self.stdin {
             In::Null => (Stdio::null(), None, None),
             In::File(f) => (Stdio::from(f.try_clone().unwrap()), Some(f), None),
@@ -553,11 +588,8 @@ impl Live {
         pid
     }
 
-    /// The journal this run writes: a new file, or one that grew since the start.
     fn journal(&self) -> Option<PathBuf> {
-        let mut changed: Vec<PathBuf> = journals_in(&self.state).into_iter().filter(|p| self.before.get(p) != fs::metadata(p).ok().map(|m| m.len()).as_ref()).collect();
-        assert!(changed.len() <= 1, "more than one journal changed: {changed:?}");
-        changed.pop()
+        changed_journal(&self.state, &self.before)
     }
 
     /// The complete records this run appended so far.
@@ -616,6 +648,7 @@ impl Live {
             stdout_complete,
             marker: self.marker.clone(),
             stdin_file: self.stdin_file.take(),
+            repl: false,
         }
     }
 }
@@ -628,6 +661,13 @@ impl Drop for Live {
             let _ = self.child.wait();
         }
     }
+}
+
+/// The journal a process wrote: a new file, or one that grew since `before` was taken.
+pub fn changed_journal(state: &Path, before: &HashMap<PathBuf, u64>) -> Option<PathBuf> {
+    let mut changed: Vec<PathBuf> = journals_in(state).into_iter().filter(|p| before.get(p) != fs::metadata(p).ok().map(|m| m.len()).as_ref()).collect();
+    assert!(changed.len() <= 1, "more than one journal changed: {changed:?}");
+    changed.pop()
 }
 
 fn journals_in(state: &Path) -> Vec<PathBuf> {
@@ -661,11 +701,13 @@ pub struct Done {
     pub journal: Option<PathBuf>,
     /// The journal file as the run left it.
     pub journal_bytes: Vec<u8>,
-    killed: bool,
-    closed_stdout: bool,
-    stdout_complete: bool,
-    marker: String,
+    pub killed: bool,
+    pub closed_stdout: bool,
+    pub stdout_complete: bool,
+    pub marker: String,
     pub stdin_file: Option<fs::File>,
+    /// A REPL session over a pty: `stdout` is the screen, and the journal has turns and no `result`.
+    pub repl: bool,
 }
 
 impl Done {
@@ -769,7 +811,14 @@ impl Done {
             }
             let kinds = self.kinds();
             self.check(kinds.first().map(String::as_str) == Some("session"), "the run's records do not start with session");
-            if !self.killed {
+            if self.repl {
+                // A REPL session: one `turn_end` per message, then the session end's notices and `close`; never a `result`.
+                let last = kinds.iter().rposition(|k| k == "turn_end").unwrap_or(0);
+                let tail = &kinds[last + 1..];
+                let order = tail.last().map(String::as_str) == Some("close") && tail[..tail.len() - 1].iter().all(|k| k == "notice");
+                self.check(self.killed || order, &format!("the session's records do not end turn_end, notices, close: {kinds:?}"));
+                self.check(!kinds.contains(&"result".to_string()), "a REPL session has a result record");
+            } else if !self.killed {
                 // The session end: `turn_end`, notices of the final stop (`stopped N background processes at exit`), then
                 // `result` and `close`.
                 self.check(kinds.iter().filter(|k| *k == "turn_end").count() == 1, "not exactly one turn_end");
@@ -782,6 +831,10 @@ impl Done {
             return;
         }
         let code = self.code.unwrap();
+        if self.repl {
+            self.check([0, 2, 130, 141].contains(&code), &format!("the REPL exited {code}"));
+            return;
+        }
         let has_result = self.journal.is_some() || self.json && !self.closed_stdout;
         if has_result {
             let r = self.result();
@@ -994,6 +1047,12 @@ pub fn num(n: usize) -> String {
         out.push(c);
     }
     out
+}
+
+/// The spill path a tool result names (`~/` expanded with `home`).
+pub fn spill_of(content: &str, home: &Path) -> PathBuf {
+    let shown = content.split("full output: ").nth(1).and_then(|s| s.split(" ...]").next()).unwrap_or_else(|| panic!("no spill marker: {content}"));
+    shown.strip_prefix("~/").map_or_else(|| shown.into(), |rest| home.join(rest))
 }
 
 /// Waits for `cond` up to `within`; false on timeout.

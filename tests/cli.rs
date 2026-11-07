@@ -1,10 +1,16 @@
 #![allow(clippy::disallowed_methods, clippy::print_stdout, clippy::print_stderr, clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::string_slice)]
-//! The command line: `--version`, `--help`, refused arguments, and the argument errors of `run`, all before any
-//! config is read.
-use std::process::{Command, Output};
+//! The command line: `--version`, `--help`, refused arguments, the argument errors of `run`, the REPL's refusal
+//! without a terminal, and `henki allow`, which lists and removes allow rules without reading a config.
+use std::fs;
+use std::os::unix::fs::PermissionsExt;
+use std::path::{Path, PathBuf};
+use std::process::{Command, Output, Stdio};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
-const USAGE: &str = "usage: henki run [--json] [--max-steps N] [--max-seconds N] [--approve ask|auto] [--config FILE] [--model NAME] [--resume[=ID]] [--nested] [TASK | -]
+const USAGE: &str = "usage: henki [--config FILE] [--approve ask|auto] [--model NAME] [--resume[=ID]] [--nested]
+       henki run [--json] [--max-steps N] [--max-seconds N] [--approve ask|auto] [--config FILE] [--model NAME] [--resume[=ID]] [--nested] [TASK | -]
+       henki allow [--config FILE] [rm N]
        henki --version | --help
 ";
 
@@ -15,6 +21,46 @@ fn henki(args: &[&str]) -> Output {
 
 fn text(bytes: &[u8]) -> &str {
     std::str::from_utf8(bytes).expect("utf-8 output")
+}
+
+/// A throwaway HOME (removed on drop) with a 0700 `~/.config/henki/`.
+struct Home(PathBuf);
+
+impl Home {
+    fn new() -> Home {
+        static N: AtomicUsize = AtomicUsize::new(0);
+        let h = PathBuf::from(format!("/tmp/henki-cli-{}-{}", std::process::id(), N.fetch_add(1, Ordering::SeqCst)));
+        let _ = fs::remove_dir_all(&h);
+        fs::create_dir_all(h.join(".config/henki")).unwrap();
+        fs::set_permissions(h.join(".config/henki"), fs::Permissions::from_mode(0o700)).unwrap();
+        Home(h)
+    }
+
+    fn allow(&self) -> PathBuf {
+        self.0.join(".config/henki/allow")
+    }
+
+    /// henki in this HOME (also its cwd), stdin at /dev/null, with `env` added.
+    fn run(&self, args: &[&str], env: &[(&str, &str)]) -> Output {
+        let mut c = Command::new(env!("CARGO_BIN_EXE_henki"));
+        c.args(args).current_dir(&self.0).env_clear().env("HOME", &self.0).env("PATH", "/usr/bin:/bin").env("XDG_STATE_HOME", self.0.join("state"));
+        c.envs(env.iter().copied()).stdin(Stdio::null()).output().expect("run henki")
+    }
+}
+
+impl Drop for Home {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.0);
+    }
+}
+
+fn write(path: &Path, text: &str, mode: u32) {
+    fs::write(path, text).unwrap();
+    fs::set_permissions(path, fs::Permissions::from_mode(mode)).unwrap();
+}
+
+fn mode(p: &Path) -> u32 {
+    fs::metadata(p).unwrap().permissions().mode() & 0o777
 }
 
 #[test]
@@ -36,7 +82,7 @@ fn help() {
 
 #[test]
 fn unknown_argument() {
-    let cases = [(&[][..], ""), (&["--bogus"][..], "--bogus"), (&["--project-agents"][..], "--project-agents"), (&["--version", "extra"][..], "extra"), (&["repl"][..], "repl")];
+    let cases = [(&["--bogus"][..], "--bogus"), (&["--project-agents"][..], "--project-agents"), (&["--version", "extra"][..], "extra"), (&["repl"][..], "repl")];
     for (args, says) in cases {
         let out = henki(args);
         assert_eq!(out.status.code(), Some(2), "{args:?}");
@@ -77,6 +123,88 @@ fn run_flags() {
         assert_eq!((out.status.code(), text(&out.stdout)), (Some(2), ""), "{args:?}: no result before --json is known");
         assert!(text(&out.stderr).starts_with("henki: "), "{args:?}");
     }
+}
+
+#[test]
+fn repl_needs_terminal() {
+    let h = Home::new();
+    let out = h.run(&[], &[("HENKI_BASE_URL", "http://127.0.0.1:9/v1"), ("HENKI_MODEL", "m")]);
+    assert_eq!((out.status.code(), text(&out.stdout)), (Some(2), ""), "{}", text(&out.stderr));
+    assert_eq!(text(&out.stderr), "henki: the REPL needs a terminal; use henki run\n");
+    let sessions = h.0.join("state/henki/sessions");
+    let files: Vec<_> = fs::read_dir(&sessions).into_iter().flatten().flatten().flat_map(|d| fs::read_dir(d.path()).into_iter().flatten().flatten()).collect();
+    assert!(files.is_empty(), "a session file: {files:?}");
+}
+
+#[test]
+fn allow_list_and_rm() {
+    let h = Home::new();
+    let (file, mine) = (h.allow(), h.0.join("proj"));
+    write(&file, &format!("# my rules\n/src/app\tgit status\n\n/src/app\tmake test\n{}\tls -la\n", mine.display()), 0o600);
+    let out = h.run(&["allow"], &[]);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+    assert_eq!(text(&out.stdout), format!("{}\n1  /src/app  git status\n2  /src/app  make test\n3  ~/proj  ls -la\n", file.display()));
+    let out = h.run(&["allow", "rm", "1"], &[]);
+    assert_eq!((out.status.code(), text(&out.stdout), text(&out.stderr)), (Some(0), "removed rule 1: /src/app  git status\n", ""));
+    assert_eq!(fs::read_to_string(&file).unwrap(), format!("# my rules\n\n/src/app\tmake test\n{}\tls -la\n", mine.display()), "everything else byte for byte");
+    assert_eq!(mode(&file), 0o600);
+    let out = h.run(&["allow"], &[]);
+    assert_eq!(text(&out.stdout), format!("{}\n1  /src/app  make test\n2  ~/proj  ls -la\n", file.display()));
+    fs::remove_file(&file).unwrap();
+    assert_eq!(text(&h.run(&["allow"], &[]).stdout), format!("{}\n", file.display()), "no file: the path alone");
+}
+
+#[test]
+fn allow_config_flag() {
+    let h = Home::new();
+    let alt = h.0.join("alt");
+    fs::create_dir_all(&alt).unwrap();
+    write(&alt.join("allow"), "/src/app\techo alt\n", 0o600);
+    write(&h.allow(), "/src/app\techo home\n", 0o600);
+    let conf = alt.join("henki.toml");
+    let out = h.run(&["allow", "--config", conf.to_str().unwrap()], &[]);
+    assert_eq!((out.status.code(), text(&out.stdout)), (Some(0), format!("{}\n1  /src/app  echo alt\n", alt.join("allow").display()).as_str()));
+    let out = h.run(&["allow", "--config", conf.to_str().unwrap(), "rm", "1"], &[]);
+    assert_eq!((out.status.code(), text(&out.stdout)), (Some(0), "removed rule 1: /src/app  echo alt\n"), "{}", text(&out.stderr));
+    assert_eq!(fs::read_to_string(alt.join("allow")).unwrap(), "");
+    assert_eq!(fs::read_to_string(h.allow()).unwrap(), "/src/app\techo home\n", "the default file is untouched");
+}
+
+/// Listing and removing never fail closed: an invalid line and a mode others can write are shown, and `rm` works.
+#[test]
+fn allow_broken_file_lists() {
+    let h = Home::new();
+    write(&h.allow(), "/src/app\tgit status\nno tab here\n", 0o666);
+    let out = h.run(&["allow"], &[]);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+    assert_eq!(text(&out.stdout), format!("{}\n1  /src/app  git status\n2  !no tab here  (invalid: no TAB between ROOT and COMMAND)\n", h.allow().display()));
+    let out = h.run(&["allow", "rm", "2"], &[]);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+    assert!(text(&out.stdout).starts_with("removed rule 2: "), "{}", text(&out.stdout));
+    assert_eq!((fs::read_to_string(h.allow()).unwrap().as_str(), mode(&h.allow())), ("/src/app\tgit status\n", 0o600));
+}
+
+#[test]
+fn allow_rm_missing_exit2() {
+    let h = Home::new();
+    write(&h.allow(), "/src/app\tgit status\n", 0o600);
+    let out = h.run(&["allow", "rm", "9"], &[]);
+    assert_eq!((out.status.code(), text(&out.stdout)), (Some(2), ""));
+    assert_eq!(text(&out.stderr), format!("henki: no rule 9 in {}\n", h.allow().display()));
+    for args in [&["allow", "rm", "x"][..], &["allow", "rm"][..], &["allow", "clear"][..]] {
+        let out = h.run(args, &[]);
+        assert_eq!((out.status.code(), text(&out.stdout)), (Some(2), ""), "{args:?}");
+        assert!(text(&out.stderr).starts_with("henki: ") && text(&out.stderr).ends_with(USAGE), "{args:?}: {}", text(&out.stderr));
+    }
+    assert_eq!(fs::read_to_string(h.allow()).unwrap(), "/src/app\tgit status\n");
+}
+
+#[test]
+fn allow_ignores_nested() {
+    let h = Home::new();
+    write(&h.allow(), "/src/app\tgit status\n", 0o600);
+    let out = h.run(&["allow"], &[("HENKI_DEPTH", "1")]);
+    assert_eq!((out.status.code(), text(&out.stdout)), (Some(0), format!("{}\n1  /src/app  git status\n", h.allow().display()).as_str()), "{}", text(&out.stderr));
 }
 
 #[test]
