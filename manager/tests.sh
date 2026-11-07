@@ -119,6 +119,17 @@ static_bash32() {
   bash -n "$MODS" || fail "bash -n henki-mods"
 }
 
+# The contracts henki-mods accepts in a manifest are the rows of CONTRACTS.md's index, no more and no fewer: a
+# contract added there and not here would refuse every module that names it.
+static_contracts() {
+  case_ "static: CONTRACTS_KNOWN is the CONTRACTS.md index"
+  local doc known
+  doc=$(awk '/^## Index$/ { p = 1; next } /^## / { p = 0 } p && /^\| `/ { split($0, c, "`"); print c[2] }' "$HERE/../CONTRACTS.md" | sort)
+  known=$(sed -n "s/^CONTRACTS_KNOWN='\(.*\)'$/\1/p" "$MODS" | tr ' ' '\n' | sort)
+  [ -n "$doc" ] || fail "CONTRACTS.md has no index rows"
+  [ "$doc" = "$known" ] || fail "henki-mods knows [$(echo $known)], CONTRACTS.md's index lists [$(echo $doc)]"
+}
+
 # --- the cases ----------------------------------------------------------------------------------------------------------
 
 t_add_path() {
@@ -1001,6 +1012,7 @@ all() {
 }
 
 static_bash32
+static_contracts
 RUN=bash
 all
 t_live
