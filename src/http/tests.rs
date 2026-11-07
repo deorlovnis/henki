@@ -496,6 +496,40 @@ fn http_idle_after_finish_completes() {
     assert!(t.elapsed() >= lim.idle_done && t.elapsed() < Duration::from_secs(5), "{:?}", t.elapsed());
 }
 
+/// An Anthropic event stream (event lines, a ping, the final message_delta, then silence or message_stop), read the way a
+/// model attempt reads it, gives the whole reply.
+#[test]
+fn sse_anthropic_stream() {
+    use crate::{anthropic::Acc, types::Flow, types::Wire};
+    let lim = Limits { stall: Duration::from_secs(20), ..LIM };
+    let events = [
+        json!({"message": {"usage": {"input_tokens": 3}}, "type": "message_start"}),
+        json!({"content_block": {"text": "", "type": "text"}, "index": 0, "type": "content_block_start"}),
+        json!({"type": "ping"}),
+        json!({"delta": {"text": "hi", "type": "text_delta"}, "index": 0, "type": "content_block_delta"}),
+        json!({"index": 0, "type": "content_block_stop"}),
+        json!({"delta": {"stop_reason": "end_turn"}, "type": "message_delta", "usage": {"output_tokens": 2}}),
+    ];
+    let stream: String = events.iter().map(|d| format!("event: {}\ndata: {d}\n\n", d["type"].as_str().unwrap())).collect();
+    for end in ["", "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n"] {
+        let (url, _rx) = fake(vec![(0, format!("{SSE}{stream}{end}").into_bytes())], true);
+        let (mut r, mut acc, mut flow) = (go(&url, &lim).unwrap(), Acc::new(&[]), Flow::More);
+        let t = Instant::now();
+        let reply = loop {
+            match r.event(flow == Flow::Finished, &lim).unwrap() {
+                None => break acc.finish(flow == Flow::Finished),
+                Some((_, data)) => flow = acc.data(&data, &mut |_| {}).unwrap(),
+            }
+            if flow == Flow::Done {
+                break acc.finish(true);
+            }
+        };
+        let reply = reply.unwrap();
+        assert_eq!((reply.text.as_str(), reply.finish.as_str(), reply.usage.input, reply.usage.output), ("hi", "stop", 3, 2));
+        assert!(t.elapsed() < Duration::from_secs(5), "{:?}", t.elapsed());
+    }
+}
+
 #[test]
 fn http_cancel_shuts_socket() {
     let (url, rx) = fake(vec![(0, SSE.as_bytes().to_vec())], true);
