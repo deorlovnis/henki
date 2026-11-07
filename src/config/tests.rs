@@ -69,6 +69,15 @@ impl T {
 
 impl Drop for T {
     fn drop(&mut self) {
+        // A test that failed while a directory was mode 000 left it unreadable; open every one again, or nothing in it
+        // could be removed.
+        fn open(p: &Path) {
+            if fs::symlink_metadata(p).is_ok_and(|m| m.is_dir()) {
+                let _ = fs::set_permissions(p, fs::Permissions::from_mode(0o700));
+                fs::read_dir(p).into_iter().flatten().flatten().for_each(|e| open(&e.path()));
+            }
+        }
+        open(&self.dir);
         let _ = fs::remove_dir_all(&self.dir);
     }
 }
@@ -81,23 +90,9 @@ fn flags() -> Flags {
 fn add_ext(path: &Path, name: &str, cmds: &[&str]) {
     let dir = path.join(name);
     fs::create_dir_all(dir.join(if cmds.is_empty() { "" } else { "bin" })).unwrap();
-    put(
-        &dir.join("doc.md"),
-        &format!(
-            "# {name}: a test tool
-
-How to use it.
-"
-        ),
-        0o644,
-    );
+    put(&dir.join("doc.md"), &format!("# {name}: a test tool\n\nHow to use it.\n"), 0o644);
     for c in cmds {
-        put(
-            &dir.join("bin").join(c),
-            "#!/bin/sh
-",
-            0o755,
-        );
+        put(&dir.join("bin").join(c), "#!/bin/sh\n", 0o755);
     }
 }
 
@@ -480,7 +475,7 @@ fn config_env_only_start() {
     assert_eq!((c.model.as_str(), c.url.port, c.url_from), ("qwen", 8080, "HENKI_BASE_URL"));
     assert_eq!((c.file, c.hash, c.explicit, c.auto), (None, None, false, false));
     assert_eq!(c.dir, t.cfg_dir());
-    assert_eq!(c.protected, [t.cfg_dir(), t.home.join(".local/state/henki"), t.cfg_dir().join("ext")]);
+    assert_eq!(c.protected, [t.cfg_dir(), t.cfg_dir().join("AGENTS.md"), t.home.join(".local/state/henki"), t.cfg_dir().join("ext")]);
 }
 
 #[test]
@@ -680,6 +675,34 @@ fn config_ext_relative_refused() {
 }
 
 #[test]
+fn config_ext_empty_list() {
+    let t = T::new();
+    // The default path holds what discovery refuses; an empty list names no path, so nothing is discovered.
+    let ext = t.cfg_dir().join("ext");
+    fs::create_dir_all(&ext).unwrap();
+    put(&ext.join("notes.txt"), "", 0o600);
+    assert!(t.load(BASE).is_err());
+    let c = t.load(&format!("{BASE}ext = []\n")).unwrap();
+    assert!(c.exts.is_empty());
+    assert!(!c.protected.contains(&ext), "{:?}", c.protected);
+    let d = t.cfg_dir();
+    assert_eq!(c.trust, [t.cfg(), d.join("allow"), d.join("AGENTS.md"), t.bin.join("bash")]);
+}
+
+#[test]
+fn config_ext_error_env_only_unprefixed() {
+    let t = T::new();
+    let ext = t.cfg_dir().join("ext");
+    fs::create_dir_all(&ext).unwrap();
+    put(&ext.join("notes.txt"), "", 0o600);
+    // No config file to name: discovery's own error, as it is.
+    let env = t.env(&[("HENKI_MODEL", "m"), ("HENKI_BASE_URL", "http://127.0.0.1:1/v1")]);
+    let e = load(&flags(), &env, &t.cwd).err().unwrap();
+    assert!(e.starts_with(&format!("ext {}: ", ext.join("notes.txt").display())) && e.contains("; fix: "), "{e}");
+    assert_eq!(Err(e), ext::discover(&[ext], true, &[], t.bin.as_os_str()).map(|_| ()));
+}
+
+#[test]
 fn config_user_path_drops_ext_bins() {
     let t = T::new();
     let ext = t.cfg_dir().join("ext");
@@ -728,6 +751,25 @@ fn config_shadow_not_list() {
     has(&t.err(&format!("{BASE}shadow = \"halti/halti\"\n")), ":3: shadow must be a list; fix: write shadow = [\"...\"]");
     has(&t.err(&format!("{BASE}shadow = true\n")), ":3: shadow must be a list");
     assert!(t.load(&format!("{BASE}shadow = []\n")).unwrap().shadow.is_empty());
+}
+
+#[test]
+fn config_shadow_entry_invalid_line() {
+    let t = T::new();
+    let exts = t.home.join("exts");
+    fs::create_dir_all(&exts).unwrap();
+    let want = |line: usize| format!("{}:{line}: shadow entry \"bad\" is not EXT/COMMAND; fix: ", t.cfg().display());
+    // The entry's own line, not the ext line above it.
+    let e = t.err(&format!("{BASE}ext = [\"~/exts\"]\ncontext_window = 8192\nshadow = [\"bad\"]\n"));
+    assert!(e.starts_with(&want(5)), "{e}");
+    // Without an ext line: still its line, not just the file.
+    let e = t.err(&format!("{BASE}context_window = 8192\nshadow = [\"halti/ok\", \"bad\"]\n"));
+    assert!(e.starts_with(&want(4)), "{e}");
+    // A command that needs a shadow entry is the extension's error, at the ext line.
+    add_ext(&exts, "halti", &["tool"]);
+    put(&t.bin.join("tool"), "#!/bin/sh\n", 0o755);
+    let e = t.err(&format!("{BASE}ext = [\"~/exts\"]\ncontext_window = 8192\nshadow = [\"other/x\"]\n"));
+    assert!(e.starts_with(&format!("{}:3: ext halti: bin/tool shadows ", t.cfg().display())), "{e}");
 }
 
 #[test]
@@ -872,18 +914,37 @@ fn config_allow_inside_project() {
     put(&t.cwd.join("rules"), "*\tls\n", 0o600);
     symlink(t.cwd.join("rules"), &allow).unwrap();
     assert_eq!(t.err(BASE), format!("{} is inside the project {} or named through it; fix: use a config dir outside the project", allow.display(), t.cwd.display()));
-    // No config file, and the default config dir in a repository at ~/.config.
-    fs::remove_file(&allow).unwrap();
-    fs::remove_file(t.cfg()).unwrap();
+    assert!(t.load(&format!("{BASE}approve = \"auto\"\n")).is_ok(), "auto never reads it");
+}
+
+#[test]
+fn config_dir_inside_project() {
+    let t = T::new();
+    let env = t.env(&[("HENKI_MODEL", "m"), ("HENKI_BASE_URL", "http://127.0.0.1:1/v1")]);
+    // No config file, and the default config dir in a repository at ~/.config: its AGENTS.md, extensions and allow file
+    // would come from the project, and an `always` would write into it.
     let root = t.home.join(".config");
     fs::create_dir_all(root.join(".git")).unwrap();
     fs::create_dir_all(root.join("sub")).unwrap();
-    let env = t.env(&[("HENKI_MODEL", "m"), ("HENKI_BASE_URL", "http://127.0.0.1:1/v1")]);
-    assert!(load(&flags(), &env, &root.join("sub")).is_ok(), "absent, it holds no rules");
-    put(&allow, "*\tls\n", 0o600);
-    let e = load(&flags(), &env, &root.join("sub")).err().unwrap();
-    assert_eq!(e, format!("{} is inside the project {} or named through it; fix: use a config dir outside the project", allow.display(), root.display()));
-    assert!(load(&Flags { approve: Some(true), ..flags() }, &env, &root.join("sub")).is_ok(), "auto never reads it");
+    let fix = "fix: run henki outside the project, or name a config file outside it with --config";
+    let want = format!("{} is inside the project {} or named through it; {fix}", t.cfg_dir().display(), root.display());
+    for approve in [None, Some(true)] {
+        assert_eq!(load(&Flags { approve, ..flags() }, &env, &root.join("sub")).err().unwrap(), want, "empty, in either mode");
+    }
+    put(&t.cfg_dir().join("AGENTS.md"), "from the project\n", 0o600);
+    add_ext(&t.cfg_dir().join("ext"), "proj", &[]);
+    assert_eq!(load(&flags(), &env, &root.join("sub")).err().unwrap(), want);
+    // From another project the same dir is the user's own.
+    assert_eq!(load(&flags(), &env, &t.cwd).unwrap().exts[0].name, "proj");
+    // A config file outside the project, named through a directory link into it.
+    let (sub, link) = (t.cwd.join("sub"), t.dir.join("cfglink"));
+    fs::create_dir_all(sub.join("ext")).unwrap();
+    chmod(&sub, 0o700);
+    put(&t.dir.join("safe.toml"), BASE, 0o600);
+    symlink(t.dir.join("safe.toml"), sub.join("config.toml")).unwrap();
+    symlink(&sub, &link).unwrap();
+    let e = load(&Flags { config: Some(link.join("config.toml")), ..flags() }, &t.env(&[]), &t.cwd).err().unwrap();
+    assert_eq!(e, format!("{} is inside the project {} or named through it; {fix}", link.display(), t.cwd.display()));
 }
 
 #[test]
@@ -900,6 +961,29 @@ fn config_allow_notice() {
     put(&allow, "*\tls\n", 0o600);
     assert_eq!(t.load(&text).unwrap().notices, ["allow: 1 rules apply to this root (~/.config/henki/allow; /allow lists them)"]);
     assert!(t.load(&format!("{text}approve = \"auto\"\n")).unwrap().notices.is_empty());
+}
+
+#[test]
+fn config_allow_notice_num() {
+    let t = T::new();
+    let rules: String = (0..1_500).map(|i| format!("*\techo {i}\n")).collect();
+    put(&t.cfg_dir().join("allow"), &rules, 0o600);
+    let c = t.load(&format!("{BASE}context_window = 8192\n")).unwrap();
+    assert_eq!(c.allow.rules.len(), 1_500);
+    assert_eq!(c.notices, ["allow: 1,500 rules apply to this root (~/.config/henki/allow; /allow lists them)"]);
+}
+
+#[test]
+fn config_notices_order() {
+    let t = T::new();
+    put(&t.cfg_dir().join("allow"), "*\tls\n", 0o600);
+    let c = t.load_env(BASE, &[("HENKI_COLOR", "1")]).unwrap();
+    let want = [
+        "ignoring HENKI_COLOR: henki does not read it",
+        "allow: 1 rules apply to this root (~/.config/henki/allow; /allow lists them)",
+        "context_window is unknown; using 32,768 tokens",
+    ];
+    assert_eq!(c.notices, want);
 }
 
 #[test]
@@ -921,6 +1005,31 @@ fn config_trust_paths() {
     let c = t.explicit(&format!("{BASE}ext = [\"~/exts\"]\n")).unwrap();
     let cfg = t.dir.join("cfg");
     assert_eq!(c.trust, [cfg.join("config.toml"), cfg.join("allow"), cfg.join("AGENTS.md"), t.bin.join("bash"), t.home.join("exts")]);
+}
+
+#[test]
+fn config_trust_paths_symlinked_ext() {
+    let t = T::new();
+    let ext = t.cfg_dir().join("ext");
+    fs::create_dir_all(&ext).unwrap();
+    // The NAME dir is a link to a checkout, and its one command a link to a file elsewhere.
+    let (src, tool) = (t.dir.join("src/checkout"), t.dir.join("tool-real"));
+    add_ext(&t.dir.join("src"), "checkout", &[]);
+    fs::create_dir_all(src.join("bin")).unwrap();
+    put(&tool, "#!/bin/sh\n", 0o755);
+    symlink(&tool, src.join("bin/tool")).unwrap();
+    symlink(&src, ext.join("halti")).unwrap();
+    let c = t.load(BASE).unwrap();
+    // The tripwire stamps the names discovery used, through the links; write and edit refuse what the links reach.
+    let dir = ext.join("halti");
+    let through = [dir.clone(), dir.join("doc.md"), dir.join("bin"), dir.join("bin/tool")];
+    assert_eq!(c.exts[0].paths, through);
+    let d = t.cfg_dir();
+    let want: Vec<_> = [t.cfg(), d.join("allow"), d.join("AGENTS.md"), t.bin.join("bash"), ext.clone()].into_iter().chain(through).collect();
+    assert_eq!(c.trust, want);
+    for p in [src, tool] {
+        assert!(c.protected.contains(&p) && !c.trust.contains(&p), "{p:?}: {:?}", c.protected);
+    }
 }
 
 #[test]
@@ -1026,7 +1135,8 @@ fn config_protected_realpaths() {
     symlink(&real, t.cfg_dir()).unwrap();
     let c = t.load(BASE).unwrap();
     let real = fs::canonicalize(&real).unwrap();
-    assert_eq!(c.protected, [t.cfg(), real.join("config.toml"), t.cfg_dir(), real, t.home.join(".local/state/henki"), t.cfg_dir().join("ext")]);
+    let want = [t.cfg(), real.join("config.toml"), t.cfg_dir(), real.clone(), t.cfg_dir().join("AGENTS.md"), t.home.join(".local/state/henki"), t.cfg_dir().join("ext")];
+    assert_eq!(c.protected, want);
     assert_eq!((c.file, c.dir), (Some(t.cfg()), t.cfg_dir()));
 }
 
@@ -1129,6 +1239,29 @@ fn config_agents_mode() {
     has(&t.err(BASE), "AGENTS.md is group- or world-writable");
     put(&p, "be brief\n", 0o644);
     assert_eq!(t.load(BASE).unwrap().agents.as_deref(), Some("be brief"));
+}
+
+#[test]
+fn config_agents_symlink_target_protected() {
+    let t = T::new();
+    // AGENTS.md and the config file are links into a dotfiles checkout outside the config dir.
+    let dots = t.dir.join("dots");
+    fs::create_dir_all(&dots).unwrap();
+    put(&dots.join("AGENTS.md"), "be brief\n", 0o644);
+    put(&dots.join("config.toml"), BASE, 0o600);
+    put(&dots.join("notes.md"), "", 0o644);
+    let agents = t.cfg_dir().join("AGENTS.md");
+    symlink(dots.join("AGENTS.md"), &agents).unwrap();
+    symlink(dots.join("config.toml"), t.cfg()).unwrap();
+    let c = load(&flags(), &t.env(&[]), &t.cwd).unwrap();
+    assert_eq!(c.agents.as_deref(), Some("be brief"));
+    // write and edit refuse both by either name: what they hold steers henki.
+    for p in [agents, dots.join("AGENTS.md"), t.cfg(), dots.join("config.toml")] {
+        assert!(c.protected.contains(&p), "{p:?} not in {:?}", c.protected);
+        has(&crate::tools::target(p.to_str().unwrap(), true, &c).err().expect("a refusal"), "protected: ");
+    }
+    // The rest of the checkout is not henki's.
+    assert!(crate::tools::target(dots.join("notes.md").to_str().unwrap(), true, &c).is_ok());
 }
 
 #[test]
