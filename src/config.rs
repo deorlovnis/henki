@@ -65,6 +65,8 @@ pub struct Config {
     pub allow: allow::Allow,     // <config dir>/allow, read only in ask mode
     pub protected: Vec<PathBuf>, // the config file and dir, AGENTS.md, the state dir, the ext paths and the link targets in them; each also as its realpath
     pub trust: Vec<PathBuf>,     // what the tripwire stamps, absent files included
+    /// The stamps of `trust` as `load` found them: what the tripwire compares with.
+    pub snap: Vec<(PathBuf, (sys::Stamp, sys::Stamp))>,
     pub notices: Vec<String>,
 }
 
@@ -201,6 +203,9 @@ pub fn load(f: &Flags, env: &Env, cwd: &Path) -> Result<Config, String> {
     // Absent files too: creating one is a change.
     let exts = paths.into_iter().chain(c.exts.iter().flat_map(|e| e.paths.iter().cloned()));
     c.trust = [file, allow, agents, c.bash.clone()].into_iter().chain(exts).collect();
+    // Taken here, before startup waits for anything (a task on stdin, the journal), so that no change made meanwhile is
+    // taken for the state henki read.
+    c.snap = c.trust.iter().map(|p| (p.clone(), sys::stamp(p))).collect();
     Ok(c)
 }
 

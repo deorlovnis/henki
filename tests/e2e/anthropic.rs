@@ -453,3 +453,55 @@ fn e2e_anthropic_whitespace_text_dropped() {
     assert_eq!((&replayed["role"], replayed["content"].as_array().map(Vec::len)), (&json!("assistant"), Some(1)), "{replayed}");
     assert_eq!((&replayed["content"][0]["type"], &replayed["content"][0]["input"]), (&json!("tool_use"), &json!({"command": "echo ws"})), "{replayed}");
 }
+
+/// A reply of `shell` calls, one tool_use block per (id, command), the ids as a gateway sent them: empty, or one already
+/// used.
+fn tool_uses(calls: &[(&str, &str)]) -> Step {
+    let msg = json!({"id": "msg_ids", "type": "message", "role": "assistant", "content": [], "model": "mock-model", "stop_reason": null, "stop_sequence": null, "usage": {"input_tokens": 10, "output_tokens": 1}});
+    let mut events = vec![("message_start".to_string(), json!({"type": "message_start", "message": msg}))];
+    for (i, (id, cmd)) in calls.iter().enumerate() {
+        let input = json!({"command": cmd}).to_string();
+        events.push((
+            "content_block_start".into(),
+            json!({"type": "content_block_start", "index": i, "content_block": {"type": "tool_use", "id": id, "name": "shell", "input": {}}}),
+        ));
+        events.push(("content_block_delta".into(), json!({"type": "content_block_delta", "index": i, "delta": {"type": "input_json_delta", "partial_json": input}})));
+        events.push(("content_block_stop".into(), json!({"type": "content_block_stop", "index": i})));
+    }
+    events.push(("message_delta".into(), json!({"type": "message_delta", "delta": {"stop_reason": "tool_use", "stop_sequence": null}, "usage": {"output_tokens": 5}})));
+    events.push(("message_stop".into(), json!({"type": "message_stop"})));
+    Step::Events(events)
+}
+
+/// The tool_use ids and the tool_result ids of a request, in order.
+fn paired_ids(l: &Logged) -> (Vec<String>, Vec<String>) {
+    let blocks: Vec<Value> = l.messages().iter().flat_map(|m| m["content"].as_array().unwrap().clone()).collect();
+    let ids = |ty: &str, k: &str| blocks.iter().filter(|b| b["type"] == ty).map(|b| b[k].as_str().unwrap().to_string()).collect();
+    (ids("tool_use", "id"), ids("tool_result", "tool_use_id"))
+}
+
+/// Empty tool_use ids, and an id a later reply uses again: henki names those calls itself, and the replayed tool_use
+/// blocks carry the same names as the tool_results, so the API (which refuses unpaired ids) takes every request, and a
+/// resumed session's too.
+#[test]
+fn e2e_anthropic_duplicate_tool_use_ids() {
+    // The mock keeps what it sent by id across tests; an id of this test's own.
+    let reused = format!("toolu_reused_{}", std::process::id());
+    let again = tool_uses(&[(&reused, "echo three")]);
+    let (mut r, m) = scripted(vec![tool_uses(&[("", "echo one"), ("", "echo two")]), again.clone(), again, say("all paired")]);
+    let d = r.json("run them");
+    d.finish();
+    assert_eq!((d.code, d.result()["text"].as_str()), (Some(0), Some("all paired")), "{}", d.diag());
+    clean(&m);
+    let (uses, results) = paired_ids(&m.log()[3]);
+    assert_eq!(uses, results, "every tool_use answered by a tool_result of its id");
+    let distinct: std::collections::HashSet<&String> = uses.iter().collect();
+    assert_eq!((uses.len(), distinct.len(), uses[2] == reused, uses.iter().all(|u| !u.is_empty())), (4, 4, true, true), "{uses:?}");
+    let m2 = Mock::start_api(Api::Anthropic, vec![say("resumed")]);
+    at(&mut r, &m2);
+    let d = r.cmd(&["--json", "--resume", "go on"]).go();
+    d.finish();
+    assert_eq!(d.code, Some(0), "{}", d.diag());
+    clean(&m2);
+    assert_eq!(paired_ids(&m2.log()[0]).0, uses, "the journal replays the same ids");
+}

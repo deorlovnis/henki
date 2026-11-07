@@ -172,6 +172,10 @@ impl<'a> Pty<'a> {
         unsafe { libc::kill(self.child.id() as i32, sig) };
     }
 
+    pub fn pid(&self) -> i32 {
+        self.child.id() as i32
+    }
+
     /// The exit within `within` (a timeout kills henki and fails the test), then the screen until the terminal
     /// closes (at most 1 s more). `stdout` is the screen with the reset and "\r" of "\r\n" taken out.
     pub fn wait(mut self, within: Duration) -> Done {

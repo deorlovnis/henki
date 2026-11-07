@@ -904,3 +904,120 @@ fn pty_hangup_during_call() {
     assert_eq!(d.code, Some(130), "{}", d.diag());
     assert_eq!((d.of("turn_end").len(), m.log().len()), (1, 1), "{}", d.diag());
 }
+
+/// A trust file that changes while the question waits (here the extension command the call runs) is found when the user
+/// answers: `y` ends the turn `error changed` and the changed command never runs.
+#[test]
+fn pty_trust_change_during_question_not_run() {
+    let m = Mock::start(vec![shell("xtool"), say("never")]);
+    let r = asking(&m);
+    let x = r.config_dir().join("ext/tools");
+    fs::create_dir_all(x.join("bin")).unwrap();
+    fs::write(x.join("doc.md"), "runs xtool\n").unwrap();
+    let xtool = x.join("bin/xtool");
+    fs::write(&xtool, "#!/bin/sh\necho vetted\n").unwrap();
+    fs::set_permissions(&xtool, fs::Permissions::from_mode(0o755)).unwrap();
+    let says = format!("trust file changed: {}", xtool.display());
+    let p = start(&r, &[]);
+    p.line("use the tool");
+    p.expect("run? [y/N/always] ", W);
+    fs::write(&xtool, "#!/bin/sh\necho SWAPPED\n").unwrap();
+    p.line("y");
+    p.expect(&format!("henki: {says}\r\n"), W);
+    p.expect(&format!("(error changed: {says})\r\n"), W);
+    p.prompt(W);
+    p.line("go on");
+    p.expect(REFUSED, W);
+    p.prompt(W);
+    let d = exit(p);
+    assert_eq!(verdicts(&d), [json!(["yes", null])]);
+    assert_eq!(d.results()[0]["content"], "not run: trust file changed", "{}", d.diag());
+    assert!(!d.out().contains("SWAPPED") && m.log().len() == 1, "{}", d.diag());
+}
+
+/// A Ctrl-C at a question leaves the turn going, and SIGINT as the last signal; when a closed stdout later stops the turn,
+/// its processes get SIGTERM first, as for any stop that is not the user's cancel.
+#[test]
+fn pty_ctrl_c_at_question_then_epipe_sigterm_first() {
+    let mut r = Run::new("");
+    let handlers = r#"$SIG{INT} = sub { open(my $f, ">>", "sigs.txt"); print $f "int\n"; close $f }; $SIG{TERM} = sub { open(my $f, ">>", "sigs.txt"); print $f "term\n"; close $f; exit 0 }; open(my $f, ">", "ready.txt"); close $f; sleep 1 while 1"#;
+    let bg = format!("perl -e '{handlers}' {} >/dev/null 2>&1 & for i in $(seq 200); do [ -f ready.txt ] && break; sleep 0.05; done; echo started", r.marker);
+    let pause = Step::Stall { before_first_byte: false, after_words: 0, for_ms: 30_000 };
+    let words = Step::Stream { parts: vec![say("words for a closed stdout"), pause, say(" never")], finish: Some("stop".into()), done: true, hold_ms: 0 };
+    let m = Mock::start(vec![shell("touch first.txt"), shell(&bg), words]);
+    r.at(&m.url()).set("approve", "\"ask\"");
+    let (rd, wr) = std::io::pipe().unwrap();
+    drop(rd);
+    let p = Pty::spawn_to(&r, &[], 24, 80, Some(fs::File::from(std::os::fd::OwnedFd::from(wr))));
+    p.prompt(W);
+    p.line("start it");
+    p.expect("run? [y/N/always] ", W);
+    p.ctrl_c();
+    p.expect("run? [y/N] ", W); // the command is too long for a rule
+    p.line("y");
+    p.expect("(output closed)\r\n", W);
+    let d = p.wait(W);
+    m.open_gate();
+    d.finish();
+    assert_eq!(d.code, Some(141), "{}", d.diag());
+    assert!(poll(W, || r.path("sigs.txt").exists()), "the background process got no signal it could see");
+    assert_eq!(fs::read_to_string(r.path("sigs.txt")).unwrap(), "term\n", "SIGTERM first, and no SIGINT\n{}", d.diag());
+    assert_eq!(d.kinds().iter().filter(|k| *k == "approval").count(), 2, "{}", d.diag());
+}
+
+/// A `!cmd &` job is stopped when the REPL ends, and henki says so, also when no message was sent (and so no session
+/// file is left).
+#[cfg(target_os = "linux")]
+#[test]
+fn pty_bang_job_stopped_notice_without_message() {
+    let m = Mock::start(vec![]);
+    let r = asking(&m);
+    let p = start(&r, &[]);
+    p.line(&format!("!sleep {} &", r.marker));
+    p.prompt(W);
+    assert!(poll(W, || !marked(&r.marker).is_empty()), "the job did not start");
+    p.line("/exit");
+    p.expect("henki: stopped 1 background processes at exit\r\n", W);
+    let d = ended(p, 0);
+    assert!(d.journal.is_none() && r.journals().is_empty() && marked(&r.marker).is_empty(), "{}", d.diag());
+}
+
+/// The voluntary context switches of henki's line reader thread: each one is a time it blocked.
+#[cfg(target_os = "linux")]
+fn reader_blocks(pid: i32) -> u64 {
+    let tasks = fs::read_dir(format!("/proc/{pid}/task")).unwrap();
+    let input = tasks.flatten().map(|t| t.path()).find(|t| fs::read_to_string(t.join("comm")).is_ok_and(|c| c == "input\n")).expect("the input thread");
+    let status = fs::read_to_string(input.join("status")).unwrap();
+    status.lines().find_map(|l| l.strip_prefix("voluntary_ctxt_switches:")).unwrap().trim().parse().unwrap()
+}
+
+/// After a Ctrl-C at a question the reader still waits for that question's line. The first line typed before the turn
+/// ends completes that read and is dropped: it neither answers a later question nor becomes the next message. The next
+/// line typed at the prompt is the next message.
+#[cfg(target_os = "linux")]
+#[test]
+fn pty_typeahead_after_ctrl_c_at_question() {
+    let pause = Step::Stall { before_first_byte: false, after_words: 0, for_ms: 30_000 };
+    let busy = Step::Stream { parts: vec![say("still working"), pause, say(" done")], finish: Some("stop".into()), done: true, hold_ms: 0 };
+    let m = Mock::start(vec![shell("touch q.txt"), busy, say("got the later line")]);
+    let r = asking(&m);
+    let p = start(&r, &[]);
+    p.line("go");
+    p.expect("run? [y/N/always] ", W);
+    p.ctrl_c();
+    p.expect("still working", W);
+    let before = reader_blocks(p.pid());
+    p.line("typed ahead");
+    // Read and dropped: the reader blocked again, now waiting to be asked for a line.
+    assert!(poll(W, || reader_blocks(p.pid()) > before), "the reader did not take the line");
+    m.open_gate();
+    p.expect(" done", W);
+    p.prompt(W);
+    p.line("later");
+    p.expect("got the later line", W);
+    p.prompt(W);
+    let d = exit(p);
+    assert!(m.log().iter().all(|l| !l.text().contains("typed ahead")), "the typed-ahead line reached the model\n{}", d.diag());
+    assert!(m.log()[2].contents("user").last().unwrap().ends_with("later"), "{:?}", m.log()[2].contents("user"));
+    assert!(!r.path("q.txt").exists());
+}

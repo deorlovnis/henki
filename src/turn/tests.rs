@@ -39,8 +39,9 @@ fn cfg(d: &Path, port: u16) -> Config {
 }
 
 /// A session over `cfg` with no history, its stdout and stderr captured; a REPL session when `input` is given (the
-/// reader reads it).
-fn open(cfg: Config, mode: Mode, input: Option<Box<dyn Read + Send>>) -> (Session, Buf, Buf) {
+/// reader reads it). The trust files are stamped first, as `config::load` stamps them at its end.
+fn open(mut cfg: Config, mode: Mode, input: Option<Box<dyn Read + Send>>) -> (Session, Buf, Buf) {
+    cfg.snap = cfg.trust.iter().map(|p| (p.clone(), sys::stamp(p))).collect();
     journal::state_dir(&cfg.state).unwrap();
     let j = Journal::create(&cfg.state, &cfg.cwd).unwrap();
     let (tx, rx) = mpsc::channel();
@@ -118,7 +119,7 @@ fn key(name: &str, args: &str) -> String {
 }
 
 #[test]
-fn stuck_spec_rule() {
+fn stuck_three_identical_failures() {
     let mut s = Stuck::default();
     for run in 1..=3 {
         s.feed(key("read", r#"{"path":"x"}"#), true);
@@ -394,6 +395,18 @@ fn poll_between_calls() {
     std::fs::remove_dir_all(d).unwrap();
 }
 
+/// A Ctrl-C that lands between calls is kept in `sig` too, so the cancel it causes sends SIGINT first.
+#[test]
+fn poll_sets_sig() {
+    let d = dir("pollsig");
+    let (mut s, _) = session(&d, 9);
+    s.tx.send(Ev::Signal(libc::SIGINT)).unwrap();
+    assert_eq!((s.poll(), s.sig), (Err(Stop::Signal(libc::SIGINT)), Some(libc::SIGINT)));
+    s.tx.send(Ev::OutputClosed).unwrap();
+    assert_eq!((s.poll(), s.sig), (Err(Stop::Closed), Some(libc::SIGINT)), "a closed stdout leaves the last signal");
+    std::fs::remove_dir_all(d).unwrap();
+}
+
 /// A call to `read` a file that does not exist: an error result without running anything.
 fn read_missing(i: u32) -> Value {
     json!({"index": i, "id": format!("c{i}"), "type": "function", "function": {"name": "read", "arguments": "{\"path\":\"missing\"}"}})
@@ -626,9 +639,9 @@ fn line_stale_tag_dropped() {
     std::fs::remove_dir_all(d).unwrap();
 }
 
-/// A session whose trust files are `a` and `b` (both exist) and `c` (absent) in `d`.
+/// A session whose trust files are `a` and `allow` (both exist; `allow` is its allow file) and `c` (absent) in `d`.
 fn trusting(d: &Path) -> (Session, [PathBuf; 3]) {
-    let paths = ["a", "b", "c"].map(|n| d.join(n));
+    let paths = ["a", "allow", "c"].map(|n| d.join(n));
     paths[..2].iter().for_each(|p| std::fs::write(p, "1").unwrap());
     let mut c = Config::test(d);
     c.trust = paths.to_vec();
@@ -649,14 +662,46 @@ fn changed_lists_every_path() {
 #[test]
 fn rearm_clears() {
     let d = dir("rearm");
-    let (mut s, [a, _, c]) = trusting(&d);
-    std::fs::write(&a, "22").unwrap();
-    std::fs::write(&c, "new").unwrap();
-    assert_eq!(s.changed().len(), 2);
+    let (mut s, [_, allow, _]) = trusting(&d);
+    std::fs::write(&allow, "henki's own write").unwrap();
+    assert_eq!(s.changed(), std::slice::from_ref(&allow));
     s.rearm();
-    assert_eq!(s.changed(), Vec::<PathBuf>::new(), "a new snapshot");
-    std::fs::remove_file(&c).unwrap();
-    assert_eq!(s.changed(), [c], "a removed file is a change too");
+    assert_eq!(s.changed(), Vec::<PathBuf>::new(), "a new stamp of the allow file");
+    std::fs::remove_file(&allow).unwrap();
+    assert_eq!(s.changed(), [allow], "a removed file is a change too");
+    std::fs::remove_dir_all(d).unwrap();
+}
+
+/// henki's own write to the allow file never takes in a change to another trust file made meanwhile.
+#[test]
+fn rearm_keeps_other_changes() {
+    let d = dir("rearm2");
+    let (mut s, [a, allow, c]) = trusting(&d);
+    std::fs::write(&a, "an outside change").unwrap();
+    std::fs::write(&c, "created outside").unwrap();
+    std::fs::write(&allow, "henki's own write").unwrap();
+    s.rearm();
+    assert_eq!(s.changed(), [a, c], "only the allow file is stamped again");
+    std::fs::remove_dir_all(d).unwrap();
+}
+
+/// The snapshot is the one `config` took when it read the files: a change made after that and before the session
+/// starts (while `run -` reads its task from stdin, say) is found at the first check.
+#[test]
+fn snapshot_from_config() {
+    let d = dir("snapcfg");
+    let agents = d.join("AGENTS.md");
+    std::fs::write(&agents, "read at start\n").unwrap();
+    let mut c = Config::test(&d);
+    c.trust = vec![agents.clone()];
+    c.snap = vec![(agents.clone(), sys::stamp(&agents))];
+    std::fs::write(&agents, "changed before the session started\n").unwrap();
+    journal::state_dir(&c.state).unwrap();
+    let j = Journal::create(&c.state, &c.cwd).unwrap();
+    let (tx, rx) = mpsc::channel();
+    let o = Out::with(Mode::Json, tx.clone(), Box::new(Buf::default()), Box::new(Buf::default()), false);
+    let s = Session::new(c, j, Vec::new(), o, tx, rx, None, None);
+    assert_eq!(s.changed(), [agents]);
     std::fs::remove_dir_all(d).unwrap();
 }
 
@@ -788,6 +833,19 @@ fn discard_only_without_user() {
     [d, d2, d3].into_iter().for_each(|d| std::fs::remove_dir_all(d).unwrap());
 }
 
+/// A REPL session that got no message has no journal, but the processes the session end stopped are still named.
+#[test]
+fn discard_notes_stopped_processes() {
+    let d = dir("discard4");
+    let (mut s, out, err) = open(Config::test(&d), Mode::Repl, Some(Box::new(std::io::empty())));
+    let file = journal_file(&d);
+    s.end(2, None).unwrap();
+    s.into_out().flush(Instant::now() + Duration::from_secs(1));
+    assert!(!file.exists(), "no session file");
+    assert_eq!((text(&out), text(&err)), (String::new(), "henki: stopped 2 background processes at exit\n".to_string()));
+    std::fs::remove_dir_all(d).unwrap();
+}
+
 #[test]
 fn notices_repl_journaled_only() {
     let d = dir("notices");
@@ -829,5 +887,46 @@ fn turn_anthropic_seam() {
     let req = String::from_utf8_lossy(&log.lock().unwrap()[0]).to_ascii_lowercase();
     assert!(req.starts_with("post /model/v1/messages http/1.1\r\n"), "{req}");
     assert!(req.contains("\r\nanthropic-version: 2023-06-01\r\n") && req.contains("\r\nx-api-key: cred-managed\r\n"), "{req}");
+    std::fs::remove_dir_all(d).unwrap();
+}
+
+/// An Anthropic stream of `read` calls of missing files, one tool_use block per id (as sent: maybe empty or repeated).
+fn anthropic_reads(ids: &[&str]) -> String {
+    let mut events = vec![json!({"type": "message_start", "message": {"usage": {"input_tokens": 5, "output_tokens": 1}}})];
+    for (i, id) in ids.iter().enumerate() {
+        events.push(json!({"type": "content_block_start", "index": i, "content_block": {"type": "tool_use", "id": id, "name": "read", "input": {}}}));
+        events.push(json!({"type": "content_block_delta", "index": i, "delta": {"type": "input_json_delta", "partial_json": format!("{{\"path\":\"missing{i}\"}}")}}));
+        events.push(json!({"type": "content_block_stop", "index": i}));
+    }
+    events.push(json!({"type": "message_delta", "delta": {"stop_reason": "tool_use"}, "usage": {"output_tokens": 2}}));
+    events.push(json!({"type": "message_stop"}));
+    let body: String = events.iter().map(|e| format!("event: {}\ndata: {e}\n\n", e["type"].as_str().unwrap())).collect();
+    format!("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n\r\n{body}")
+}
+
+/// The tool_use ids and the tool_result ids of an Anthropic request body, in order.
+fn anthropic_ids(req: &[u8]) -> (Vec<String>, Vec<String>) {
+    let start = String::from_utf8_lossy(req).find("\r\n\r\n").unwrap() + 4;
+    let body: Value = serde_json::from_slice(&req[start..body_end(req)]).unwrap();
+    let blocks: Vec<Value> = body["messages"].as_array().unwrap().iter().flat_map(|m| m["content"].as_array().unwrap().clone()).collect();
+    let ids = |ty: &str, k: &str| blocks.iter().filter(|b| b["type"] == ty).map(|b| b[k].as_str().unwrap().to_string()).collect();
+    (ids("tool_use", "id"), ids("tool_result", "tool_use_id"))
+}
+
+/// A call id the reply left empty or used twice gets a new name, and the replayed tool_use blocks carry it, so every
+/// tool_result answers a tool_use of the same id (the API refuses a request where they differ).
+#[test]
+fn anthropic_renamed_ids_replayed() {
+    let d = dir("anthropic-ids");
+    let (port, log) = serve_at(vec![(None, anthropic_reads(&["dup", "dup", ""])), (None, anthropic_sse("done"))]);
+    let mut c = cfg(&d, port);
+    c.dialect = "anthropic";
+    let (mut s, _, _) = open(c, Mode::Json, None);
+    assert_eq!(s.turn(Some("read it".into())), Outcome::Ok);
+    let (uses, results) = anthropic_ids(&log.lock().unwrap()[1]);
+    assert_eq!(uses, results, "every tool_use id is answered by the tool_result after it");
+    assert_eq!((uses[0].as_str(), uses[1] != "dup" && !uses[2].is_empty() && uses[1] != uses[2]), ("dup", true), "{uses:?}");
+    let journaled: Vec<&str> = s.hist[1]["blocks"].as_array().unwrap().iter().map(|b| b["id"].as_str().unwrap()).collect();
+    assert_eq!(journaled, uses, "the journal replays the same ids after a resume");
     std::fs::remove_dir_all(d).unwrap();
 }

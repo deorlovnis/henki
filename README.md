@@ -31,7 +31,7 @@ With `approve = "ask"` (the default), `shell`, `write` and `edit` calls ask firs
 - `y` or `yes` runs the call once. Anything else, an empty line or Ctrl-C answers no, and the model is told `denied by the user`.
 - `always` saves an allow rule for the command, after a second question, and runs it. It is offered (`run? [y/N/always]`) only for a `shell` command that is one line of printable ASCII of at most 200 bytes, and only while no background process of the session runs (on macOS a `!CMD &` job does not count).
 
-What you type while henki works never answers a question: input typed ahead is dropped before each one.
+What you type while henki works never answers a question: input typed ahead is dropped before each one. After Ctrl-C at a question, henki is still reading the line it asked for, so the first line you type before the turn ends is dropped too, rather than kept as your next message.
 
 `henki run` never asks. In ask mode the first call that needs approval ends it with exit 3, naming the call; `henki --resume=ID` continues that session in the REPL: tell the model to go on, and it asks before the call runs. `--approve auto` runs every call without asking.
 
@@ -54,7 +54,7 @@ An allow rule lets one exact shell command run without asking in one project. Th
 
 ### Trust files
 
-The config file, the allow file, `AGENTS.md` in the config dir, the bash henki runs and every extension file are trust files. henki checks them before and after every call and before a turn ends. When one changed (a call edited it, a background process, another program), the turn ends with `error changed`: `henki run` exits 2, and the REPL takes no more messages until you restart henki; `henki --resume` continues the session with the files read again. Editing a trust file with `!CMD` stops the REPL the same way. henki's own writes to the allow file (`always`, `/allow rm`) do not count.
+The config file, the allow file, `AGENTS.md` in the config dir, the bash henki runs and every extension file are trust files. henki stamps them when it reads them at start, and checks them before every call (again right before it runs, after you answer a question), after it, and before a turn ends. When one changed (a call edited it, a background process, another program), the turn ends with `error changed`: `henki run` exits 2, and the REPL takes no more messages until you restart henki; `henki --resume` continues the session with the files read again. Editing a trust file with `!CMD` stops the REPL the same way. henki's own writes to the allow file (`always`, `/allow rm`) do not count.
 
 ### Extensions
 

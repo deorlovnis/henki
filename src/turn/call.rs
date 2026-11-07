@@ -36,7 +36,8 @@ impl Session {
     }
 
     /// One call of the step and its result: its error; else the tripwire, then who approves it (nobody needs to, an allow
-    /// rule for the project root, or the user: `run` ends the turn, the REPL asks), the run, and the tripwire again.
+    /// rule for the project root, or the user: `run` ends the turn, the REPL asks), the tripwire right before the run,
+    /// the run, and the tripwire again.
     pub(super) fn dispatch(&mut self, c: &Call) -> Result<(), Outcome> {
         if let Some(e) = &c.error {
             return self.answer(c, e, true, None, None);
@@ -60,6 +61,8 @@ impl Session {
         } else if !self.ask(c, t.as_ref())? {
             return self.answer(c, DENIED, true, None, None);
         }
+        // Again right before the call starts: the question can wait for as long as the user takes.
+        self.tripwire()?;
         self.call(c, t, rule.is_none())?;
         self.tripwire()
     }

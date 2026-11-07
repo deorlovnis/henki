@@ -443,8 +443,7 @@ fn reader(fd: OwnedFd, p: Arc<Pipe>, close_first: bool) {
 pub struct Live {
     pub pid: i32,
     child: Child,
-    /// Keeps a piped stdin open; only the Linux interrupt matrix writes to it.
-    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    /// Keeps a piped stdin open, for `write_stdin` and `close_stdin`.
     stdin: Option<ChildStdin>,
     out: Arc<Pipe>,
     err: Arc<Pipe>,
@@ -504,13 +503,11 @@ impl Live {
         }
     }
 
-    #[cfg_attr(not(target_os = "linux"), allow(dead_code))] // only the Linux interrupt matrix uses it
     pub fn write_stdin(&mut self, b: &[u8]) {
         use std::io::Write;
         let _ = self.stdin.as_mut().expect("stdin is open").write_all(b);
     }
 
-    #[cfg_attr(not(target_os = "linux"), allow(dead_code))] // only the Linux interrupt matrix uses it
     pub fn close_stdin(&mut self) {
         self.stdin = None;
     }

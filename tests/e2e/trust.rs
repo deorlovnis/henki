@@ -133,3 +133,25 @@ fn e2e_tripwire_allow_in_auto() {
     tripped(&d, &r.allow());
     assert_eq!((&d.of("session")[0]["allow_hash"], m.log().len()), (&serde_json::Value::Null, 1), "{}", d.diag());
 }
+
+/// The snapshot is taken when the config and the files it names are read, so a change made while `run -` still waits for
+/// its task (here a rule revoked from another terminal, as `henki allow rm 1` does) is found before the first call: the
+/// revoked rule never runs it.
+#[test]
+fn e2e_run_stdin_trust_change_trips() {
+    let m = Mock::start(vec![shell("echo ruled"), say("never")]);
+    let mut r = Run::new(&m.url());
+    r.set("approve", "\"ask\"");
+    r.write_allow(&format!("{}\techo ruled\n", r.root()));
+    let mut l = r.cmd(&["--json", "-"]).stdin(In::Open).spawn();
+    // The state dir is made right after the config is loaded, and before the task is read.
+    l.until("the state dir", 10 * SEC, |_| r.state().is_dir());
+    fs::write(r.allow(), "# no rules\n").unwrap();
+    l.write_stdin(b"run the rule");
+    l.close_stdin();
+    let d = l.wait();
+    d.finish();
+    tripped(&d, &r.allow());
+    assert_eq!((d.of("approval").len(), d.results()[0]["content"].as_str()), (0, Some("not run: trust file changed")), "{}", d.diag());
+    assert_eq!(m.log().len(), 1);
+}

@@ -1,5 +1,5 @@
 //! One session: the step loop of a turn, the only place the main thread waits, and the single way a turn and a session end.
-use crate::{anthropic, config::Config, ext, http, journal, journal::Journal, journal::rec, supervise, sys, sys::Stamp, term, term::Out, term::Reader};
+use crate::{anthropic, config::Config, ext, http, journal, journal::Journal, journal::rec, supervise, sys, term, term::Out, term::Reader};
 use crate::{tools, tools::Killed, types::*};
 use call::Stuck;
 use serde_json::Value;
@@ -18,6 +18,7 @@ pub const SLICE: Duration = Duration::from_millis(50); // how often a kill step 
 
 pub struct Session {
     /// The REPL reads it (the banner, the allow rules) and replaces `cfg.allow` after removing a rule.
+    /// Its `snap` is what the tripwire compares with: the trust files as `config::load` found them.
     pub(crate) cfg: Config,
     /// The signal that ended the last wait: INT and QUIT cancel a REPL turn, TERM and HUP end the REPL.
     pub(crate) sig: Option<i32>,
@@ -35,8 +36,6 @@ pub struct Session {
     tools: Value,
     /// The REPL's line reader: approvals are asked on the terminal. None in `run`, where they end the turn.
     reader: Option<Reader>,
-    /// The stamps of `cfg.trust` the tripwire compares with, in that order.
-    snap: Vec<(PathBuf, (Stamp, Stamp))>,
     next_h: u32,
     tag: u32,
     t: Turn,
@@ -76,7 +75,7 @@ impl Session {
         // The Anthropic API can be silent for minutes while it buffers a large tool input.
         let lim = http::Limits { stall: if cfg.dialect == "anthropic" { anthropic::STALL } else { http::LIMITS.stall }, ..http::LIMITS };
         let (tools, next_h) = (tools::schema(&cfg.tools), journal::next_h(&hist));
-        let mut s = Session {
+        Session {
             cfg,
             sig: None,
             j,
@@ -90,7 +89,6 @@ impl Session {
             system,
             tools,
             reader,
-            snap: Vec::new(),
             next_h,
             tag: 0,
             t: Turn::default(),
@@ -99,9 +97,7 @@ impl Session {
             bg: 0,
             finishing: false,
             hurry: false,
-        };
-        s.rearm();
-        s
+        }
     }
 
     /// One turn: the `user` record (none for `run --resume` without TASK), then steps until an outcome. Every call of the
@@ -123,15 +119,16 @@ impl Session {
 
     /// The last records: the kill notice, `result`, `close`; then the result on `--json` stdout, or in plain mode the
     /// answer of an `ok` run. After a failed write the stdout result is the given one when it is already an error (that
-    /// error stays the run's end), else one for the failure. A REPL session that got no message leaves no file.
+    /// error stays the run's end), else one for the failure. A REPL session that got no message leaves no file, and its
+    /// kill notice goes to the terminal only.
     fn end(&mut self, killed: usize, result: Option<Value>) -> Result<(), Outcome> {
+        let stopped = (killed > 0).then(|| format!("stopped {} background processes at exit", term::num(killed as u64)));
         if self.reader.is_some() && !self.hist.iter().any(|r| r["t"] == "user") && self.j.discard() {
+            stopped.iter().for_each(|m| self.out.note(m)); // no journal to write it to
             return Ok(());
         }
         let written = (|| {
-            if killed > 0 {
-                self.notice(&format!("stopped {} background processes at exit", term::num(killed as u64)))?;
-            }
+            stopped.iter().try_for_each(|m| self.notice(m))?;
             let r = result.clone().map(|r| self.j.write(r)).transpose()?;
             self.j.write(rec::close(self.j.bytes())).map(|_| r)
         })();
@@ -192,13 +189,13 @@ impl Session {
 
     /// Every trust file whose stamps differ from the snapshot, in `cfg.trust` order.
     pub fn changed(&self) -> Vec<PathBuf> {
-        self.snap.iter().filter(|(p, s)| sys::stamp(p) != *s).map(|(p, _)| p.clone()).collect()
+        self.cfg.snap.iter().filter(|(p, s)| sys::stamp(p) != *s).map(|(p, _)| p.clone()).collect()
     }
 
-    /// A new snapshot of `cfg.trust`. Only right after a `changed()` that was empty, around henki's own write to the allow
-    /// file, so that no outside change is ever absorbed.
+    /// A new stamp of the allow file, after henki's own write to it (`always`, `/allow rm`) and right after a `changed()`
+    /// that was empty. Every other trust file keeps its stamp, so no outside change is ever absorbed.
     pub fn rearm(&mut self) {
-        self.snap = self.cfg.trust.iter().map(|p| (p.clone(), sys::stamp(p))).collect();
+        self.cfg.snap.iter_mut().filter(|(p, _)| *p == self.cfg.allow.file).for_each(|(p, s)| *s = sys::stamp(p));
     }
 
     /// Requests and calls until an outcome; `Err` is the only way out.
@@ -223,6 +220,8 @@ impl Session {
         loop {
             let mut r = self.request()?;
             let calls = self.prepare(std::mem::take(&mut r.calls));
+            // A renamed id goes into the replayed content too: each tool_use block is one call, in order.
+            r.blocks.iter_mut().flat_map(Value::as_array_mut).flatten().filter(|b| b["type"] == "tool_use").zip(&calls).for_each(|(b, c)| b["id"] = c.id.as_str().into());
             self.record(rec::assistant(&r.text, &calls, &r.finish, r.usage, r.blocks.as_ref()))?;
             (self.t.steps, self.t.text) = (self.t.steps + 1, r.text);
             self.t.usage.add(r.usage);
