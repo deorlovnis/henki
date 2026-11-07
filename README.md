@@ -47,7 +47,7 @@ An allow rule lets one exact shell command run without asking in one project. Th
 
 - ROOT is the project's root directory, or `*` for every project. COMMAND must equal the call's command byte for byte: `git status` never matches `git status --short`, `git status && x` or `git status; rm -rf ~`.
 - A rule fixes the bytes of a command, not what it does: `git status` runs what the repository's `.git/config` names, and `make` runs the Makefile. That is why a rule holds only in its own project.
-- henki adds a rule only after a confirmed `always`; a `*` rule comes only from your editor. The model's `write` and `edit` refuse the file.
+- henki adds a rule only after a confirmed `always`; a `*` rule comes only from your editor. The model's `write` and `edit` refuse the file. `always` does not create the config dir: without it (no config file, only `HENKI_MODEL` and `HENKI_BASE_URL`) the call runs once and no rule is saved.
 - `/allow` and `henki allow [--config FILE]` list the rules with their numbers; `/allow rm N` and `henki allow [--config FILE] rm N` remove one. N counts every rule line from 1, invalid ones included.
 - At every start in ask mode a notice counts the rules for this project (`allow: N rules apply to this root ...`), and the REPL lists each of them. In `auto` mode the file is not read.
 - henki does not start when the file is a symlink, writable by others, owned by another user, over 64 KiB, or holds an invalid line; `henki allow` still lists and removes, and the error names the fix.
@@ -58,7 +58,7 @@ The config file, the allow file, `AGENTS.md` in the config dir, the bash henki r
 
 ### Extensions
 
-An extension is a directory that teaches the model a command-line tool: `NAME/doc.md`, whose first line goes into the system prompt (the model reads the rest of it when it needs to, without asking), and an optional `NAME/bin/`, whose executables come first on the PATH of the calls. Besides those it may hold only `README*`, `LICENSE*`, `CHANGELOG*` and dot files. Extensions live in `~/.config/henki/ext`, or in the directories the `ext` key lists. An extension command with the name of a command on your PATH loads only when the `shadow` key lists it as `EXT/NAME`; the calls see your own PATH in `HENKI_USER_PATH`.
+An extension is a directory that teaches the model a command-line tool: `NAME/doc.md`, whose first line goes into the system prompt (the model reads the rest of it when it needs to, without asking), and an optional `NAME/bin/`, whose executables come first on the PATH of the calls. Besides those it may hold only `README*`, `LICENSE*`, `CHANGELOG*` and dot files. Extensions live in `~/.config/henki/ext`, or in the directories the `ext` key lists. An extension command with the name of a command on your PATH loads only when the `shadow` key lists it as `EXT/NAME`; the calls see your own PATH in `HENKI_USER_PATH`. Every entry of `bin/`, a dot file such as `.DS_Store` too, must be a file you can run, or henki does not start. henki does not check who owns the extension files or who may write them, so keep them writable only by you.
 
 ### In an isolated environment
 
