@@ -12,6 +12,8 @@ pub struct Journal {
     id: String,
     spill: PathBuf,
     n: usize,
+    fresh: bool, // created by this process, so `discard` may remove it
+    gone: bool,  // discarded: nothing more is written
 }
 
 pub struct Resumed {
@@ -25,8 +27,8 @@ pub struct Resumed {
 
 const ELIDED: &str = "[output elided: ";
 
-/// Creates `dir` (the state dir `config` computed), `dir/sessions` and `dir/spill` with `sys::private_dir`; deletes spill
-/// files older than 24 h.
+/// Creates the state dir `dir` with `sessions/` and `spill/` through `sys::private_dir`, and deletes spill files older
+/// than 24 h.
 pub fn state_dir(dir: &Path) -> Result<(), String> {
     for d in [dir.to_path_buf(), dir.join("sessions"), dir.join("spill")] {
         sys::private_dir(&d).map_err(|e| format!("state dir {}: {e}; fix: make it a directory you own, or set XDG_STATE_HOME", d.display()))?;
@@ -62,7 +64,7 @@ impl Journal {
     fn start(path: PathBuf, id: String, state: &Path) -> Result<Journal, Outcome> {
         let file = sys::create_excl(&path, 0o600, true).map_err(|e| jerr(&path, e))?;
         file.try_lock().map_err(|e| jerr(&path, e))?;
-        Ok(Journal { file, path, bytes: 0, id, spill: state.join("spill"), n: 0 })
+        Ok(Journal { file, path, bytes: 0, id, spill: state.join("spill"), n: 0, fresh: true, gone: false })
     }
 
     /// Resume through one `sys::open_append` fd: pick, open, lock, read, truncate a torn tail (`set_len`), parse, check,
@@ -85,7 +87,7 @@ impl Journal {
         let names = fs::read_dir(&spill).into_iter().flatten().flatten().map(|e| e.file_name());
         // A name whose file the 24 h sweep removed may still be named in the history: each call took at most one name.
         let n = names.filter_map(|f| f.to_str()?.strip_prefix(&prefix)?.strip_suffix(".log")?.parse().ok()).max().unwrap_or(0).max(calls(&hist).count());
-        let mut journal = Journal { file, path, bytes: keep as u64, id, spill, n };
+        let mut journal = Journal { file, path, bytes: keep as u64, id, spill, n, fresh: false, gone: false };
         let repairs = dangling(&hist).into_iter().map(|(id, name)| journal.write(rec::tool_result(&id, &name, tools::REPAIR, true, 0, 0)));
         let repairs = repairs.collect::<Result<Vec<_>, _>>()?;
         hist.extend(repairs.iter().cloned());
@@ -93,9 +95,13 @@ impl Journal {
     }
 
     /// Adds `ts`; checks fstat size = bytes written (else `tampered`); appends `term::json_line` + "\n" on the O_APPEND
-    /// fd; fdatasync unless the kind is `ask`, `approval` or `notice`. Returns the record as written.
+    /// fd; fdatasync unless the kind is `ask`, `approval` or `notice`. Returns the record as written (after `discard`,
+    /// as it would have been).
     pub fn write(&mut self, mut rec: Value) -> Result<Value, Outcome> {
         rec.as_object_mut().map(|o| o.insert("ts".into(), sys::utc().0.into()));
+        if self.gone {
+            return Ok(rec);
+        }
         let line = term::json_line(&rec) + "\n";
         let fail = |e: std::io::Error| Outcome::error("journal", format!("cannot write {}: {e}", self.path.display()));
         if self.file.metadata().map_err(fail)?.len() != self.bytes {
@@ -114,17 +120,19 @@ impl Journal {
         Ok(rec)
     }
 
+    /// The REPL ended before its first message: removes the session file this process created (never a resumed one).
+    /// True when it was removed.
+    pub fn discard(&mut self) -> bool {
+        self.gone |= std::mem::take(&mut self.fresh) && fs::remove_file(&self.path).is_ok();
+        self.gone
+    }
+
     pub fn id(&self) -> &str {
         &self.id
     }
 
     pub fn bytes(&self) -> u64 {
         self.bytes
-    }
-
-    /// The REPL ended before its first message: removes this process's session file. Never a resumed one. True when removed.
-    pub fn discard(&mut self) -> bool {
-        todo!()
     }
 
     /// The next spill name, `<id>-<n>.log` (n from the counter, never from a model string). One per tool call at most:
@@ -182,8 +190,9 @@ fn replay(buf: &[u8], path: &Path, cfg: &Config, cwd: &Path, notices: &mut Vec<S
         Some(_) => return Err(tampered(path)),
     }
     let s = &recs[last].1;
-    if s["dialect"] != "openai" {
-        return Err(Outcome::error("journal", format!("{}: the session's dialect is {}, not openai", path.display(), s["dialect"])));
+    if s["dialect"] != cfg.dialect {
+        let was = s["dialect"].as_str().unwrap_or("unknown");
+        return Err(Outcome::error("journal", format!("{}: the session's dialect is {was}, not {}", path.display(), cfg.dialect)));
     }
     for (k, now) in [("model", cfg.model.as_str().into()), ("tools", Value::from(cfg.tools.clone())), ("cwd", cwd.to_string_lossy().into())] {
         if s[k] != now {
@@ -255,9 +264,7 @@ pub fn next_h(hist: &[Value]) -> u32 {
     calls(hist).filter_map(|c| c["id"].as_str()?.strip_prefix('h')?.parse::<u32>().ok()).max().map_or(1, |n| n.saturating_add(1))
 }
 
-/// One builder per record kind; each sets "t"; `write` adds "ts". Laid out by hand, one line per short builder, so the
-/// module reads as the record table.
-#[rustfmt::skip]
+/// One builder per record kind, so the module reads as the record table; each sets "t"; `write` adds "ts".
 pub mod rec {
     use crate::{config::Config, types::Call, types::Outcome, types::Usage};
     use serde_json::{Value, json};
@@ -266,32 +273,40 @@ pub mod rec {
     pub fn session(cfg: &Config, id: &str, cwd: &Path, resumed: Option<u64>) -> Value {
         let u = &cfg.url;
         json!({"t": "session", "v": 1, "henki": env!("CARGO_PKG_VERSION"), "id": id, "cwd": cwd.to_string_lossy(), "model": cfg.model,
-            "dialect": "openai", "base_url": format!("http://{}{}", crate::http::host_port(u), u.path), "base_url_from": cfg.url_from,
+            "dialect": cfg.dialect, "base_url": format!("http://{}{}", crate::http::host_port(u), u.path), "base_url_from": cfg.url_from,
             "approve": if cfg.auto { "auto" } else { "ask" }, "approve_from": cfg.approve_from, "config": cfg.file.as_ref().map(|f| f.to_string_lossy()),
-            "tools": cfg.tools, "shell": cfg.bash.to_string_lossy(), "exts": [], "pass_env": cfg.pass_env, "ctx": cfg.window,
-            "config_hash": cfg.hash, "allow_hash": null, "agents_hash": cfg.agents_hash, "project_agents_hash": null,
+            "tools": cfg.tools, "shell": cfg.bash.to_string_lossy(), "exts": cfg.exts.iter().map(|e| &e.name).collect::<Vec<_>>(), "pass_env": cfg.pass_env, "ctx": cfg.window,
+            "config_hash": cfg.hash, "allow_hash": cfg.allow.hash, "agents_hash": cfg.agents_hash, "project_agents_hash": null,
             "resumed": resumed.map(|b| json!({"from_bytes": b}))})
     }
-    pub fn user(content: &str) -> Value { json!({"t": "user", "msg": {"content": content, "role": "user"}}) }
+    pub fn user(content: &str) -> Value {
+        json!({"t": "user", "msg": {"content": content, "role": "user"}})
+    }
     /// "text" | "reasoning"; stdout only.
-    pub fn delta(reasoning: bool, text: &str) -> Value { json!({"t": if reasoning { "reasoning" } else { "text" }, "delta": text}) }
+    pub fn delta(reasoning: bool, text: &str) -> Value {
+        json!({"t": if reasoning { "reasoning" } else { "text" }, "delta": text})
+    }
+    /// `blocks`: the reply's content blocks as received (Anthropic), replayed as they are.
     pub fn assistant(text: &str, calls: &[Call], finish: &str, u: Usage, blocks: Option<&Value>) -> Value {
         let calls: Vec<Value> = calls.iter().map(|c| with(json!({"args": c.args, "id": c.id, "name": c.name}), "raw", c.raw.as_deref())).collect();
-        let mut v = json!({"t": "assistant", "msg": {"content": text, "role": "assistant", "tool_calls": calls}, "finish": finish, "usage": usage(u)});
-        if let Some(b) = blocks { v["blocks"] = b.clone() }
-        v
+        with(json!({"t": "assistant", "msg": {"content": text, "role": "assistant", "tool_calls": calls}, "finish": finish, "usage": usage(u)}), "blocks", blocks.cloned())
     }
-    pub fn ask(c: &Call, target: Option<&str>) -> Value { with(json!({"t": "ask", "id": c.id, "name": c.name, "args": c.args}), "target", target) }
+    pub fn ask(c: &Call, target: Option<&str>) -> Value {
+        with(json!({"t": "ask", "id": c.id, "name": c.name, "args": c.args}), "target", target)
+    }
+    /// `verdict`: yes, no, always, rule or auto; `rule`: the allow rule's number.
     pub fn approval(id: &str, verdict: &str, rule: Option<usize>) -> Value {
-        let mut v = json!({"t": "approval", "id": id, "verdict": verdict});
-        if let Some(n) = rule { v["rule"] = n.into() }
-        v
+        with(json!({"t": "approval", "id": id, "verdict": verdict}), "rule", rule)
     }
     pub fn tool_result(id: &str, name: &str, content: &str, is_error: bool, ms: u64, bytes: u64) -> Value {
         json!({"t": "tool_result", "id": id, "name": name, "content": content, "is_error": is_error, "ms": ms, "bytes": bytes})
     }
-    pub fn notice(text: &str) -> Value { json!({"t": "notice", "text": text}) }
-    pub fn elide(ids: &[String]) -> Value { json!({"t": "elide", "ids": ids}) }
+    pub fn notice(text: &str) -> Value {
+        json!({"t": "notice", "text": text})
+    }
+    pub fn elide(ids: &[String]) -> Value {
+        json!({"t": "elide", "ids": ids})
+    }
     pub fn turn_end(o: &Outcome, steps: u32, u: Usage) -> Value {
         with(json!({"t": "turn_end", "status": o.status(), "steps": steps, "usage": usage(u)}), "reason", o.reason())
     }
@@ -306,12 +321,18 @@ pub mod rec {
         }
         v
     }
-    pub fn close(bytes: u64) -> Value { json!({"t": "close", "bytes": bytes}) }
+    pub fn close(bytes: u64) -> Value {
+        json!({"t": "close", "bytes": bytes})
+    }
 
-    fn usage(u: Usage) -> Value { json!({"cached": u.cached, "in": u.input, "out": u.output}) }
+    fn usage(u: Usage) -> Value {
+        json!({"cached": u.cached, "in": u.input, "out": u.output})
+    }
     /// `v` with the optional field `k` when it is given.
-    fn with(mut v: Value, k: &str, x: Option<&str>) -> Value {
-        if let Some(x) = x { v[k] = x.into() }
+    fn with(mut v: Value, k: &str, x: Option<impl Into<Value>>) -> Value {
+        if let Some(x) = x {
+            v[k] = x.into();
+        }
         v
     }
 }

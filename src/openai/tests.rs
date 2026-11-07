@@ -1,5 +1,6 @@
 #![allow(clippy::disallowed_methods, clippy::print_stdout, clippy::print_stderr, clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::string_slice)]
 use super::*;
+use crate::types::Wire;
 use std::time::Instant;
 
 const OFFERED: [&str; 4] = ["shell", "read", "write", "edit"];
