@@ -1,0 +1,1350 @@
+#!/usr/bin/env bash
+# henki-mods: henki's module manager. A module is an extension directory (NAME/doc.md, an optional NAME/bin/, an
+# optional NAME/.henki/module.toml and .henki/card.md); this program copies one into a read-only store, pins it by
+# commit and tree hash in a lock, and turns it on and off by a symlink in the ext dir henki reads. It never runs code
+# from a module: no checkout, no hooks, no build step, no install script.
+#
+#   ~/.config/henki/ext/NAME -> ${XDG_DATA_HOME:-~/.local/share}/henki/mods/NAME/ID/   on = the link exists
+#   ~/.config/henki/mods.lock                                                          lock/1, one line per module
+#   ~/.config/henki/AGENTS.md                         only its "# >>> mods cards" block is written here
+#
+# The config dir is ~/.config/henki whatever XDG_CONFIG_HOME says, because that is the dir henki reads (it takes
+# no XDG variable for it). Bash 3.2 (macOS) compatible: no arrays at all (an empty one is "unbound" under set -u
+# before bash 4.4), no associative arrays, mapfile, ${x,,}, declare -n or |&. POSIX tools plus git; LC_ALL=C, so
+# sorting, ${#x} and patterns work on bytes.
+#
+# Environment: HOME (required), XDG_DATA_HOME, HENKI_SHARE (the dir holding mods/NAME for official modules),
+# HENKI_MODS_TTY (the terminal the question is asked on; default /dev/tty).
+set -u
+export LC_ALL=C
+umask 022
+unset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE GIT_OBJECT_DIRECTORY GIT_COMMON_DIR GIT_ALTERNATE_OBJECT_DIRECTORIES GIT_NAMESPACE
+
+tab=$(printf '\t')
+nl='
+'
+# ext::prompt's header line; henki joins it to the rest of the system prompt with a blank line ("\n\n").
+HEADER='Extensions are commands on PATH; read the doc in brackets before first use.'
+# The named formats this henki ships (CONTRACTS.md); a module's `contracts` must all be here.
+CONTRACTS_KNOWN='journal/1 json/1 wire/1 ext/1 module/1 lock/1 hd1'
+AGENTS_MAX=4096 # henki refuses to start with a bigger AGENTS.md
+CARDS_BEGIN='# >>> mods cards'
+CARDS_END='# <<< mods cards'
+RESTART='restart henki (or /exit and start again) to load the change'
+LICENSE_BAD='*[!A-Za-z0-9.+ ()-]*' # an SPDX expression: ids, AND/OR/WITH, parentheses
+NAME_RULE='a name is 1 to 32 of a-z, 0-9, _ and -, starting with a-z or 0-9'
+
+die() {
+  printf 'henki-mods: %s\n' "$*" >&2
+  exit 1
+}
+warn() { printf 'henki-mods: warning: %s\n' "$*" >&2; }
+say() { printf '%s\n' "$*"; }
+usage() {
+  cat >&2 <<'EOF'
+usage: henki-mods [list]              modules: state, version, source, prompt bytes
+       henki-mods add SRC [--yes]     SRC: NAME (official), /DIR or ./DIR [#SUBDIR], URL[@REF][#SUBDIR]
+       henki-mods on NAME | off NAME | rm NAME
+       henki-mods lock                print the lock
+       henki-mods verify [NAME]       store copies against the lock, the links, the layout
+       henki-mods verify --dir DIR    one module directory: layout and manifest
+       henki-mods help | --version
+EOF
+  exit 2
+}
+
+# 4096 -> 4,096, as henki writes numbers.
+num() { printf '%s\n' "$1" | awk '{ s = $0; o = ""; while (length(s) > 3) { o = "," substr(s, length(s) - 2) o; s = substr(s, 1, length(s) - 3) } print s o }'; }
+
+# A path as henki shows it (allow::shown): under HOME it starts with ~/.
+shown() {
+  case "$1" in
+    "$HOME") printf '~\n' ;;
+    "$HOME"/*) printf '~/%s\n' "${1#"$HOME"/}" ;;
+    *) printf '%s\n' "$1" ;;
+  esac
+}
+
+if command -v sha256sum >/dev/null 2>&1; then
+  sha() { sha256sum | awk '{ print $1 }'; }
+elif command -v shasum >/dev/null 2>&1; then
+  sha() { shasum -a 256 | awk '{ print $1 }'; }
+else
+  die "neither sha256sum nor shasum is on PATH; fix: install one of them (coreutils or perl)"
+fi
+
+# The directory this program is in, through any symlinks to it (Homebrew links bin/henki-mods into its prefix).
+self_dir() {
+  local p="$0" t
+  while [ -L "$p" ]; do
+    t=$(readlink "$p") || break
+    case "$t" in /*) p="$t" ;; *) p="$(dirname "$p")/$t" ;; esac
+  done
+  (cd -P "$(dirname "$p")" && pwd)
+}
+SELF=$(self_dir)
+
+# The version of the henki this ships with (bin/henki next to it), or "dev".
+henki_version() {
+  local v
+  if [ -x "$SELF/henki" ] && v=$("$SELF/henki" --version 2>/dev/null); then
+    v=${v#henki }
+    v=${v%% *}
+    case "$v" in [0-9]*) printf '%s\n' "$v" && return ;; esac
+  fi
+  printf 'dev\n'
+}
+
+setup() {
+  case "${HOME:-}" in /*) ;; *) die "HOME is not set; fix: set HOME to your home directory" ;; esac
+  while [ "$HOME" != / ] && [ "${HOME%/}" != "$HOME" ]; do HOME=${HOME%/}; done
+  CONF="$HOME/.config/henki"
+  EXT="$CONF/ext"
+  LOCK="$CONF/mods.lock"
+  AGENTS="$CONF/AGENTS.md"
+  local data="${XDG_DATA_HOME:-}"
+  case "$data" in /*) ;; *) data="$HOME/.local/share" ;; esac
+  STORE="$data/henki/mods"
+  case "$(uname -s)" in Darwin) OS=macos ;; Linux) OS=linux ;; *) OS=$(uname -s | tr 'A-Z' 'a-z') ;; esac
+}
+
+# --- cleanup and the one-at-a-time guard ------------------------------------------------------------------------------
+STAGE=""
+BUSY=""
+cleanup() {
+  if [ -n "$STAGE" ]; then
+    chmod -R u+w "$STAGE" 2>/dev/null
+    rm -rf "$STAGE"
+  fi
+  [ -z "$BUSY" ] || rmdir "$BUSY" 2>/dev/null
+}
+trap cleanup EXIT
+trap 'exit 1' INT TERM HUP
+
+# Two runs at once would each write the lock from what it read; mkdir is atomic on every filesystem.
+busy() {
+  mkdir -p "$CONF" || die "cannot make $CONF; fix: make it a directory you own"
+  mkdir "$CONF/mods.busy" 2>/dev/null || die "another henki-mods is running ($CONF/mods.busy exists); fix: wait for it, or rmdir $CONF/mods.busy if none runs"
+  BUSY="$CONF/mods.busy"
+}
+
+# A scratch dir next to the store, so the finished copy moves into place with one rename.
+stage() {
+  mkdir -p "$STORE" || die "cannot make $STORE; fix: make it a directory you own"
+  STAGE=$(mktemp -d "$STORE/.add.XXXXXX") || die "cannot make a scratch dir in $STORE; fix: make it writable"
+}
+
+# --- text checks -------------------------------------------------------------------------------------------------------
+
+# Exit 0 when FILE is UTF-8 without a code point henki escapes (term::ESCAPE: controls other than tab and newline,
+# C1, invisible and bidi format characters); else 1 with "U+XXXX" or "not UTF-8" on stdout. Without iconv, only the
+# ASCII controls are checked.
+invisible_check() {
+  if ! command -v iconv >/dev/null 2>&1; then
+    if tr -d '\t\n' <"$1" | LC_ALL=C command grep -q '[[:cntrl:]]'; then echo "a control character" && return 1; fi
+    return 0
+  fi
+  local hex
+  hex=$(iconv -f UTF-8 -t UTF-32BE <"$1" 2>/dev/null | od -An -v -tx1) || {
+    echo "not UTF-8"
+    return 1
+  }
+  printf '%s\n' "$hex" | awk '
+    BEGIN {
+      split("0 8 11 31 127 159 160 160 173 173 847 847 1536 1541 1564 1564 1757 1757 1807 1807 2192 2193 2274 2274 " \
+        "4447 4448 5760 5760 6068 6069 6155 6159 8192 8207 8232 8239 8287 8303 12288 12288 12644 12644 " \
+        "65024 65039 65279 65279 65440 65440 65520 65531 69821 69821 69837 69837 78896 78911 113824 113827 " \
+        "119155 119162 917504 921599", r, " ")
+      for (i = 0; i < 16; i++) h[substr("0123456789abcdef", i + 1, 1)] = i
+    }
+    { for (i = 1; i <= NF; i++) { b[n++] = h[substr($i, 1, 1)] * 16 + h[substr($i, 2, 1)] } }
+    END {
+      for (i = 0; i + 3 < n; i += 4) {
+        c = ((b[i] * 256 + b[i + 1]) * 256 + b[i + 2]) * 256 + b[i + 3]
+        for (j = 1; j in r; j += 2) if (c >= r[j] + 0 && c <= r[j + 1] + 0) { printf "U+%04X\n", c; exit 1 }
+      }
+    }'
+}
+
+# Each line of a .gitattributes file that sets an attribute changing what a checkout or archive holds against the
+# raw blobs (the copy is made from raw blobs, so a reviewer of a checkout could see other bytes).
+attrs_bad() {
+  command grep -v '^[[:space:]]*#' "$1" | sed 's/^[[:space:]]*[^[:space:]]*//' |
+    command grep -E '(^|[[:space:]])[-!]?(export-subst|export-ignore|ident|filter|text|eol)([=[:space:]]|$)' >/dev/null
+}
+
+# The values of henki's config grammar, one record per assignment: KEY<TAB>TYPE[<TAB>VALUE...]; TYPE S (string),
+# I (integer), B (bool) or A (array of strings, one item per field). ONLY: parse just that key's line. Strings
+# without escapes (a backslash is refused, so no record can hold a tab or newline). Err on stdout: "LINE: PROBLEM".
+toml() {
+  awk -v only="${1:-}" '
+    function fail(m) { print NR ": " m; bad = 1; exit 1 }
+    function lws(s) { sub(/^[ \t]+/, "", s); return s }
+    # A string at the start of s: sets STR and REST; 0 if none.
+    function str(s,   e) {
+      if (substr(s, 1, 1) != "\"") return 0
+      e = index(substr(s, 2), "\"")
+      if (!e) return 0
+      STR = substr(s, 2, e - 1); REST = substr(s, e + 2)
+      if (index(STR, "\\")) fail("a \\ escape; fix: write the text without escapes")
+      if (index(STR, "\t")) fail("a tab in a string; fix: remove it")
+      return 1
+    }
+    {
+      line = $0
+      if (NR == 1) sub(/^\357\273\277/, "", line)
+      sub(/\r$/, "", line)
+      if (line ~ /[\001-\010\012-\037\177]/) fail("a raw control character; fix: remove it")
+      l = lws(line)
+      if (l == "" || substr(l, 1, 1) == "#") next
+      eq = index(l, "=")
+      if (!eq) fail("expected key = value; fix: write key = value (no tables, no multi-line values)")
+      k = substr(l, 1, eq - 1); sub(/[ \t]+$/, "", k)
+      if (only != "" && k != only) next
+      if (k !~ /^[a-z][a-z0-9_]*$/) fail("invalid key \"" k "\"; fix: keys use a-z, 0-9 and _")
+      if (k in seen) fail("duplicate key " k " (first on line " seen[k] "); fix: keep one of them")
+      seen[k] = NR
+      r = lws(substr(l, eq + 1)); out = ""
+      inv = "invalid value; fix: use \"text\", an integer, true, false or [\"a\", \"b\"] on one line"
+      if (substr(r, 1, 1) == "[") {
+        r = substr(r, 2); t = "A"
+        while (1) {
+          r = lws(r)
+          if (substr(r, 1, 1) == "]") { r = substr(r, 2); break }
+          if (!str(r)) fail(inv)
+          out = out "\t" STR; r = lws(REST)
+          if (substr(r, 1, 1) == ",") r = substr(r, 2)
+          else if (substr(r, 1, 1) != "]") fail(inv)
+        }
+      } else if (str(r)) {
+        t = "S"; out = "\t" STR; r = REST
+      } else {
+        h = index(r, "#"); v = h ? substr(r, 1, h - 1) : r; sub(/[ \t]+$/, "", v); r = h ? "#" : ""
+        if (v == "true" || v == "false") t = "B"
+        else if (v ~ /^(0|[1-9][0-9]*)$/ && length(v) <= 10 && v + 0 <= 2147483647) t = "I"
+        else fail(inv)
+        out = "\t" v
+      }
+      r = lws(r)
+      if (r != "" && substr(r, 1, 1) != "#") fail(inv)
+      recs = recs k "\t" t out "\n"
+    }
+    END { if (!bad) printf "%s", recs }'
+}
+
+# --- a module directory ------------------------------------------------------------------------------------------------
+
+# Every file and symlink under DIR (its top-level .git excluded) as "PATH<TAB>KIND", KIND 644, 755 (any x bit) or
+# link, sorted bytewise by PATH: a tab sorts below every byte a path may hold, so sorting the lines sorts the paths.
+# Refuses names with control characters and anything that is not a file, a link or a directory.
+listing() {
+  local dir="$1" p
+  ERR=""
+  if [ -n "$(cd "$dir" && find . -name "*$nl*" -print | head -n 1)" ]; then
+    ERR="$dir: a file name holds a newline; fix: rename it"
+    return 1
+  fi
+  p=$(cd "$dir" && find . -path ./.git -prune -o ! -type f ! -type l ! -type d -print | head -n 1)
+  if [ -n "$p" ]; then
+    ERR="$dir/${p#./}: not a file, a link or a directory; fix: remove it"
+    return 1
+  fi
+  {
+    (cd "$dir" && find . -path ./.git -prune -o -type l -print) | sed 's/$/	link/'
+    (cd "$dir" && find . -path ./.git -prune -o -type f \( -perm -100 -o -perm -010 -o -perm -001 \) -print) | sed 's/$/	755/'
+    (cd "$dir" && find . -path ./.git -prune -o -type f ! -perm -100 ! -perm -010 ! -perm -001 -print) | sed 's/$/	644/'
+  } | sed 's|^\./||' | sort >"$STAGE_LIST" || {
+    ERR="$dir: cannot list it; fix: make it readable"
+    return 1
+  }
+  while IFS= read -r p; do
+    case "${p%"$tab"*}" in *[[:cntrl:]]*)
+      ERR="$dir: a file name holds a control character; fix: rename it"
+      return 1
+      ;;
+    esac
+  done <"$STAGE_LIST"
+}
+
+# A symlink's target, exactly (a trailing newline in it survives).
+target() {
+  local t
+  t=$(readlink "$1" && echo x) || return 1
+  t=${t%x}
+  printf '%s' "${t%"$nl"}"
+}
+
+# hd1 of the listing in STAGE_LIST for DIR: sha256 of "MODE SHA256 PATH\n" per entry, in PATH order.
+hd1() {
+  local dir="$1" p kind h
+  while IFS= read -r p; do
+    kind=${p##*"$tab"}
+    p=${p%"$tab"*}
+    if [ "$kind" = link ]; then h=$(target "$dir/$p" | sha); else h=$(sha <"$dir/$p"); fi
+    printf '%s %s %s\n' "$kind" "$h" "$p"
+  done <"$STAGE_LIST" | sha | sed 's/^/hd1:/'
+}
+
+# A symlink at PATH (relative to the module root) to TARGET stays inside the module: relative, and no `..` climbs
+# above the root. Checked on the words alone, before anything follows the link.
+inside() {
+  local depth=0 rest part
+  case "$2" in /* | '') return 1 ;; esac
+  rest=${1//[!\/]/}
+  depth=${#rest}
+  rest="$2/"
+  while [ -n "$rest" ]; do
+    part=${rest%%/*}
+    rest=${rest#*/}
+    case "$part" in
+      '' | .) ;;
+      ..) depth=$((depth - 1)) && [ "$depth" -ge 0 ] || return 1 ;;
+      *) depth=$((depth + 1)) ;;
+    esac
+  done
+}
+
+# The manifest DIR/.henki/module.toml into M_* (arrays as newline-separated lists). HOST: also check what depends
+# on this machine (os, requires); needs is checked at the install screen, as a warning.
+manifest() {
+  local dir="$1" host="$2" f="$1/.henki/module.toml" out rec key rest type val x
+  M_module="" M_name="" M_version="" M_summary="" M_license="" M_requires="" M_contracts="" M_os="" M_needs=""
+  M_shadow="" M_caps="" M_maintainer="" M_ports="" M_has=0
+  [ -e "$f" ] || [ -L "$f" ] || return 0
+  M_has=1
+  if [ -L "$f" ] || [ ! -f "$f" ]; then
+    ERR="$f: not a regular file; fix: make it one"
+    return 1
+  fi
+  out=$(toml <"$f") || {
+    ERR="$f:$out"
+    return 1
+  }
+  while IFS= read -r rec; do
+    [ -n "$rec" ] || continue
+    key=${rec%%"$tab"*}
+    rest=${rec#*"$tab"}
+    type=${rest%%"$tab"*}
+    case "$rest" in *"$tab"*) val=${rest#*"$tab"} ;; *) val="" ;; esac
+    case "$key:$type" in
+      henki_module:I) M_module=$val ;;
+      name:S) M_name=$val ;;
+      version:S) M_version=$val ;;
+      summary:S) M_summary=$val ;;
+      license:S) M_license=$val ;;
+      caps_net:S) M_caps=$val ;;
+      maintainer:S) M_maintainer=$val ;;
+      requires:A | contracts:A | os:A | needs:A | shadow:A | ports:A)
+        val=$(printf '%s' "$val" | tr '\t' '\n')
+        case "$key" in
+          requires) M_requires=$val ;; contracts) M_contracts=$val ;; os) M_os=$val ;;
+          needs) M_needs=$val ;; shadow) M_shadow=$val ;; ports) M_ports=$val ;;
+        esac
+        ;;
+      henki_module:* | name:* | version:* | summary:* | license:* | caps_net:* | maintainer:* | requires:* | contracts:* | os:* | needs:* | shadow:* | ports:*)
+        ERR="$f: $key has the wrong type; fix: see the module/1 format in CONTRACTS.md"
+        return 1
+        ;;
+      *)
+        ERR="$f: unknown key $key; fix: remove it (module/1 keys: henki_module, name, version, summary, license, requires, contracts, os, needs, shadow, caps_net, maintainer, ports)"
+        return 1
+        ;;
+    esac
+  done <<EOF
+$out
+EOF
+  [ -n "$M_module" ] || {
+    ERR="$f: no henki_module; fix: add henki_module = 1"
+    return 1
+  }
+  # A later format: say which henki reads it rather than refusing its layout piece by piece.
+  if [ "$M_module" != 1 ]; then
+    x=$(printf '%s\n' "$M_requires" | sed -n 's/^henki >= *//p' | head -n 1)
+    ERR="$f: henki_module = $M_module needs henki >= ${x:-a version that reads module/$M_module}; fix: upgrade henki"
+    return 1
+  fi
+  for x in name version license; do
+    eval "val=\$M_$x"
+    [ -n "$val" ] || {
+      ERR="$f: no $x; fix: add $x = \"...\""
+      return 1
+    }
+  done
+  if ! is_name "$M_name"; then
+    ERR="$f: name: $NAME_RULE; fix: rename it"
+    return 1
+  fi
+  case "$M_version" in *[!A-Za-z0-9.+_-]* | ?????????????????????????????????*)
+    ERR="$f: version \"$M_version\" is not a label of 1 to 32 of A-Z, a-z, 0-9, . + _ -; fix: use one like 0.1.0"
+    return 1
+    ;;
+  esac
+  case "$M_license" in $LICENSE_BAD)
+    ERR="$f: license \"$M_license\" is not an SPDX expression; fix: use an SPDX id like Apache-2.0"
+    return 1
+    ;;
+  esac
+  if [ "${#M_summary}" -gt 160 ]; then
+    ERR="$f: summary is ${#M_summary} bytes, over 160; fix: shorten it"
+    return 1
+  fi
+  case "$M_caps" in '' | none | loopback | any) ;; *)
+    ERR="$f: caps_net \"$M_caps\" is not none, loopback or any; fix: use one of them"
+    return 1
+    ;;
+  esac
+  if [ -n "$M_ports" ]; then
+    ERR="$f: ports must be empty in module/1 (port bindings come with a later henki); fix: set ports = []"
+    return 1
+  fi
+  while IFS= read -r x; do
+    [ -n "$x" ] || continue
+    case " $CONTRACTS_KNOWN " in *" $x "*) ;; *)
+      ERR="$f: contract $x is not one this henki ships ($CONTRACTS_KNOWN); fix: upgrade henki, or drop it"
+      return 1
+      ;;
+    esac
+  done <<EOF
+$M_contracts
+EOF
+  while IFS= read -r x; do
+    [ -n "$x" ] || continue
+    case "$x" in */*) ;; *) x="-/" ;; esac
+    if ! is_name "${x%%/*}" || ! is_cmd "${x#*/}"; then
+      ERR="$f: a shadow entry is not EXT/COMMAND; fix: write them like \"halti/pbpaste\""
+      return 1
+    fi
+  done <<EOF
+$M_shadow
+EOF
+  while IFS= read -r x; do
+    [ -n "$x" ] || continue
+    case "$x" in macos | linux) ;; *)
+      ERR="$f: os \"$x\" is not macos or linux; fix: use those names"
+      return 1
+      ;;
+    esac
+  done <<EOF
+$M_os
+EOF
+  [ "$host" = 1 ] || return 0
+  if [ -n "$M_os" ] && ! printf '%s\n' "$M_os" | command grep -qx "$OS"; then
+    ERR="$M_name runs on $(printf '%s' "$M_os" | tr '\n' ' ' | sed 's/ $//;s/ / and /g') only, not on $OS; fix: install it on a machine it supports"
+    return 1
+  fi
+  while IFS= read -r x; do
+    [ -n "$x" ] || continue
+    case "$x" in "henki >= "[0-9]*) ;; *)
+      ERR="$f: requires \"$x\" is not \"henki >= VERSION\"; fix: write it that way (henki-mods checks nothing else)"
+      return 1
+      ;;
+    esac
+    if ! version_ge "$(henki_version)" "${x#henki >= }"; then
+      ERR="$M_name needs ${x}, and this henki is $(henki_version); fix: upgrade henki"
+      return 1
+    fi
+  done <<EOF
+$M_requires
+EOF
+}
+
+# [a-z0-9][a-z0-9_-]{0,31}, henki's extension name.
+is_name() {
+  case "$1" in [a-z0-9]*) ;; *) return 1 ;; esac
+  case "$1" in *[!a-z0-9_-]* | ?????????????????????????????????*) return 1 ;; esac
+}
+
+# [A-Za-z0-9._-]+, henki's command name.
+is_cmd() {
+  case "$1" in '' | *[!A-Za-z0-9._-]*) return 1 ;; esac
+}
+
+# HAVE >= WANT for dotted numbers; "dev" (a build from the repository) has every version.
+version_ge() {
+  [ "$1" = dev ] && return 0
+  awk -v a="$1" -v b="$2" 'BEGIN {
+    na = split(a, x, "."); nb = split(b, y, "."); n = na > nb ? na : nb
+    for (i = 1; i <= n; i++) { p = x[i] + 0; q = y[i] + 0; if (p > q) exit 0; if (p < q) exit 1 }
+    exit 0 }'
+}
+
+# doc.md's line 1 as henki reads it (ext::one): from the first 4 KiB, without a leading run of `#` and spaces, trimmed.
+docline() {
+  local l
+  l=$(head -c 4096 "$1" | sed -n 1p && echo x) || return 1
+  l=${l%x}
+  l=${l%"$nl"}
+  while :; do case "$l" in '#'* | ' '*) l=${l#?} ;; *) break ;; esac done
+  l="${l#"${l%%[![:space:]]*}"}"
+  l="${l%"${l##*[![:space:]]}"}"
+  printf '%s' "$l"
+}
+
+# A top-level NAME henki takes (anything but doc.md and bin, which inspect checks itself); else 1 with ERR.
+top_ok() {
+  case "$2" in
+    cmd | ctx | on | port)
+      ERR="$1/$2/: a later module layout (commands, context, observers, ports) that this henki does not load; fix: remove it, or set henki_module and requires for the henki that loads it"
+      return 1
+      ;;
+    README* | LICENSE* | CHANGELOG* | .*) ;;
+    *)
+      ERR="$1/$2: unknown entry; an extension holds doc.md, bin/, README*, LICENSE*, CHANGELOG* and dot files only; fix: move it out of the module"
+      return 1
+      ;;
+  esac
+}
+
+# Everything about module DIR into I_* and M_*: hd1, doc line, commands, links, card, manifest; NAME the default
+# name (the source dir's), HOST 1 to check this machine too. Exit 1 with ERR at the first problem.
+inspect() {
+  local dir="$1" fallback="$2" host="$3" p kind top rest x why
+  I_hd1="" I_line="" I_cmds="" I_links=0 I_files=0 I_card=0 I_name=""
+  listing "$dir" || return 1
+  [ -s "$STAGE_LIST" ] || {
+    ERR="$dir: empty; fix: a module holds doc.md"
+    return 1
+  }
+  manifest "$dir" "$host" || return 1
+  I_name=${M_name:-$fallback}
+  if ! is_name "$I_name"; then
+    ERR="$dir: the name \"$I_name\": $NAME_RULE; fix: rename the directory, or set name in .henki/module.toml"
+    return 1
+  fi
+  # Directories are not in the listing, and henki refuses an empty one as it does a full one.
+  while IFS= read -r p; do
+    [ -n "$p" ] || continue
+    p=${p#"$dir"/}
+    case "$p" in bin/.* | doc.md | bin) ;; bin/*) p="$p/x" ;; *) top_ok "$dir" "$p" || return 1 ;; esac
+    case "$p" in bin/*/x)
+      ERR="$dir/${p%/x}: a directory; fix: a command is a file you can run, so move it out of bin/"
+      return 1
+      ;;
+    esac
+  done <<EOF
+$(find "$dir" -mindepth 1 -maxdepth 1 -print; [ ! -d "$dir/bin" ] || [ -L "$dir/bin" ] || find "$dir/bin" -mindepth 1 -maxdepth 1 -type d -print)
+EOF
+  while IFS= read -r p; do
+    kind=${p##*"$tab"}
+    p=${p%"$tab"*}
+    top=${p%%/*}
+    rest=${p#"$top"}
+    rest=${rest#/}
+    I_files=$((I_files + 1))
+    if [ "$kind" = link ]; then
+      I_links=$((I_links + 1))
+      x=$(target "$dir/$p")
+      if ! inside "$p" "$x"; then
+        ERR="$dir/$p: a symlink to $x, which is absolute or leaves the module; fix: make it a relative link inside the module, or a file"
+        return 1
+      fi
+    fi
+    case "$top" in
+      doc.md)
+        if [ -n "$rest" ] || [ ! -f "$dir/doc.md" ]; then
+          ERR="$dir/doc.md: not a regular file; fix: make doc.md a file"
+          return 1
+        fi
+        ;;
+      bin)
+        case "$rest" in
+          '')
+            ERR="$dir/bin: not a directory; fix: make bin a directory of commands"
+            return 1
+            ;;
+          .*/*) ;; # a dot directory in bin/: henki skips it
+          */*)
+            ERR="$dir/bin/${rest%%/*}: a directory; fix: a command is a file you can run, so move it out of bin/"
+            return 1
+            ;;
+          *)
+            # henki's test: a regular file (through a link) with the owner's x bit, named [A-Za-z0-9._-]+; a dot
+            # file that cannot run is skipped.
+            x=0
+            [ -n "$(find -L "$dir/$p" -prune -type f -perm -100 -print 2>/dev/null)" ] && x=1
+            if [ "$x" = 1 ] && is_cmd "$rest"; then
+              I_cmds="$I_cmds$rest$nl"
+            elif [ "$x" = 1 ] || [ "${rest#.}" = "$rest" ]; then
+              ERR="$dir/$p: a command is a file you can run, named with A-Z, a-z, 0-9, ., _ and -; fix: rename it or chmod u+x it, or move it out of bin/"
+              return 1
+            fi
+            ;;
+        esac
+        ;;
+      .henki)
+        case "$rest:$kind" in
+          module.toml:644 | module.toml:755 | card.md:644 | card.md:755) ;;
+          *)
+            ERR="$dir/$p: .henki holds module.toml and card.md (regular files) only; fix: remove it"
+            return 1
+            ;;
+        esac
+        ;;
+      *) top_ok "$dir" "$top" || return 1 ;;
+    esac
+    case "$p" in .gitattributes | */.gitattributes)
+      if [ "$kind" != link ] && attrs_bad "$dir/$p"; then
+        ERR="$dir/$p: sets export-subst, export-ignore, ident, filter, text or eol, so a checkout or an archive holds other bytes than the commit; fix: remove those attributes"
+        return 1
+      fi
+      ;;
+    esac
+  done <"$STAGE_LIST"
+  [ -e "$dir/doc.md" ] || {
+    ERR="$dir: no doc.md; fix: write doc.md with a summary of the module on line 1"
+    return 1
+  }
+  I_line=$(docline "$dir/doc.md")
+  printf '%s' "$I_line" >"$STAGE_LIST.line"
+  why=$(invisible_check "$STAGE_LIST.line") || {
+    ERR="$dir/doc.md: line 1 holds $why, which a terminal does not show; fix: remove it"
+    return 1
+  }
+  if [ -z "$I_line" ] || [ "${#I_line}" -gt 160 ]; then
+    ERR="$dir/doc.md: line 1 must be a summary of 1 to 160 bytes (it is ${#I_line}); fix: write one"
+    return 1
+  fi
+  if [ -f "$dir/.henki/card.md" ]; then
+    I_card=$(wc -c <"$dir/.henki/card.md")
+    I_card=$((I_card))
+    why=$(invisible_check "$dir/.henki/card.md") || {
+      ERR="$dir/.henki/card.md: holds $why, which henki refuses in AGENTS.md; fix: remove it"
+      return 1
+    }
+    if command grep -qxF -e "$CARDS_BEGIN" -e "$CARDS_END" "$dir/.henki/card.md"; then
+      ERR="$dir/.henki/card.md: holds a mods cards marker line; fix: remove it"
+      return 1
+    fi
+    if [ "$I_card" -gt "$AGENTS_MAX" ]; then
+      ERR="$dir/.henki/card.md: $(num "$I_card") bytes, over henki's AGENTS.md limit of $(num $AGENTS_MAX); fix: shorten it"
+      return 1
+    fi
+  fi
+  I_hd1=$(hd1 "$dir")
+}
+
+# --- sources -----------------------------------------------------------------------------------------------------------
+
+# The official module dir for NAME, or nothing.
+official_dir() {
+  local d
+  for d in ${HENKI_SHARE:+"$HENKI_SHARE/mods"} "$SELF/../share/henki/mods" "$SELF/../mods"; do
+    if [ -f "$d/$1/doc.md" ]; then
+      (cd -P "$d/$1" && pwd)
+      return 0
+    fi
+  done
+  return 1
+}
+
+# Copies module SRC (a directory) into DST as it stands: files with mode 644 or 755, links as links.
+copy_dir() {
+  local src="$1" dst="$2" p kind
+  listing "$src" || die "$ERR"
+  mkdir -p "$dst"
+  while IFS= read -r p; do
+    kind=${p##*"$tab"}
+    p=${p%"$tab"*}
+    mkdir -p "$(dirname "$dst/$p")" || die "cannot copy into $dst; fix: make $STORE writable"
+    case "$kind" in
+      link) ln -s -- "$(target "$src/$p")" "$dst/$p" ;;
+      *) cat <"$src/$p" >"$dst/$p" && chmod "$kind" "$dst/$p" ;;
+    esac || die "cannot copy $src/$p; fix: make it readable"
+  done <"$STAGE_LIST"
+}
+
+# A git source: clone without a checkout, pin REF to a commit, copy the raw blobs of SUBDIR with the tree's modes.
+# Sets COMMIT. Nothing from the repository runs: no checkout (so no hooks, no filters), hooks off anyway.
+copy_git() {
+  local url="$1" ref="$2" sub="$3" dst="$4" g="$STAGE/git" cand rec meta path mode oid d rest t
+  git -c core.hooksPath=/dev/null -c transfer.fsckObjects=true clone --quiet --no-checkout -- "$url" "$g" >&2 ||
+    die "git clone $url failed (above); fix: check the URL and that you can read the repository"
+  COMMIT=""
+  if [ -z "$ref" ]; then
+    COMMIT=$(git -C "$g" rev-parse -q --verify 'HEAD^{commit}')
+  else
+    for cand in "refs/remotes/origin/$ref" "refs/tags/$ref" "$ref"; do
+      COMMIT=$(git -C "$g" rev-parse -q --verify "$cand^{commit}" 2>/dev/null) && break
+      COMMIT=""
+    done
+  fi
+  case "$COMMIT" in [0-9a-f]*) ;; *) die "$url has no ${ref:-default branch} to pin; fix: name a branch, tag or commit after @" ;; esac
+  if [ -n "$sub" ] && [ "$(git -C "$g" cat-file -t "$COMMIT:$sub" 2>/dev/null)" != tree ]; then
+    die "$url has no directory $sub at ${COMMIT%"${COMMIT#????????????}"}; fix: check the #SUBDIR"
+  fi
+  # The attributes of the dirs above the module apply to it too.
+  d=""
+  while :; do
+    if [ "$(git -C "$g" cat-file -t "$COMMIT:${d}.gitattributes" 2>/dev/null)" = blob ]; then
+      git -C "$g" cat-file blob "$COMMIT:${d}.gitattributes" >"$STAGE/attrs"
+      attrs_bad "$STAGE/attrs" && die "$url: ${d}.gitattributes sets export-subst, export-ignore, ident, filter, text or eol, so a checkout or an archive holds other bytes than the commit; fix: remove those attributes"
+    fi
+    [ -n "$sub" ] && [ "$d" != "$sub/" ] || break
+    rest=${sub#"$d"}
+    d="$d${rest%%/*}/"
+  done
+  if [ -n "$sub" ]; then
+    git -C "$g" ls-tree -r -z "$COMMIT" -- "$sub/" >"$STAGE/tree"
+  else
+    git -C "$g" ls-tree -r -z "$COMMIT" >"$STAGE/tree"
+  fi || die "git ls-tree failed in $url; fix: check the repository"
+  mkdir -p "$dst"
+  while IFS= read -r -d '' rec; do
+    meta=${rec%%"$tab"*}
+    path=${rec#*"$tab"}
+    mode=${meta%% *}
+    oid=${meta##* }
+    [ -z "$sub" ] || path=${path#"$sub/"}
+    case "$path" in *[[:cntrl:]]*) die "$url: a file name holds a control character; fix: rename it" ;; esac
+    mkdir -p "$(dirname "$dst/$path")"
+    case "$mode" in
+      100644) git -C "$g" cat-file blob "$oid" >"$dst/$path" && chmod 644 "$dst/$path" ;;
+      100755) git -C "$g" cat-file blob "$oid" >"$dst/$path" && chmod 755 "$dst/$path" ;;
+      120000)
+        # The x keeps a trailing newline of the target through $(...).
+        t=$(git -C "$g" cat-file blob "$oid" && echo x) && ln -s -- "${t%x}" "$dst/$path"
+        ;;
+      160000) die "$url: ${sub:+$sub/}$path is a submodule; fix: put its files in the module" ;;
+      *) die "$url: ${sub:+$sub/}$path has git mode $mode; fix: make it a file or a link" ;;
+    esac || die "cannot copy ${sub:+$sub/}$path out of $url; fix: check the disk"
+  done <"$STAGE/tree"
+}
+
+# --- the lock ----------------------------------------------------------------------------------------------------------
+
+# Validates the lock; exit 1 on a line this version cannot read.
+lock_check() {
+  [ -f "$LOCK" ] || return 0
+  awk -F '\t' -v f="$LOCK" '
+    $1 != "lock/1" { printf "henki-mods: %s:%d: this lock is newer than this henki-mods; fix: upgrade henki\n", f, NR; exit 1 }
+    NF != 11 || $2 !~ /^[a-z0-9][a-z0-9_-]*$/ || ($3 != "on" && $3 != "off") || $5 !~ /^(official|path|url)$/ {
+      printf "henki-mods: %s:%d: not a lock/1 line; fix: henki-mods rm the module named on it, or remove the line\n", f, NR; exit 1 }
+  ' "$LOCK" >&2 || exit 1
+}
+
+# The lock line of NAME into L_* (exit 1 when absent).
+lock_get() {
+  local line
+  L_name="" L_state="" L_version="" L_kind="" L_source="" L_commit="" L_hd1="" L_added="" L_how=""
+  [ -f "$LOCK" ] || return 1
+  line=$(awk -F '\t' -v n="$1" '$2 == n { print; exit }' "$LOCK")
+  [ -n "$line" ] || return 1
+  # No field but the last (MASK, empty) is ever empty, so read's collapsing of tabs changes nothing.
+  IFS="$tab" read -r _ L_name L_state L_version L_kind L_source L_commit L_hd1 L_added L_how _ <<EOF
+$line
+EOF
+}
+
+# The store copy a lock line names.
+store_of() {
+  local id
+  if [ "$L_commit" != - ]; then id=$L_commit; else id=${L_hd1#hd1:}; fi
+  printf '%s/%s/%s\n' "$STORE" "$L_name" "${id%"${id#????????????}"}"
+}
+
+# Replaces NAME's line by LINE (or drops it when LINE is empty), sorted by name, written atomically.
+lock_put() {
+  local name="$1" line="$2" tmp="$LOCK.tmp.$$"
+  {
+    [ ! -f "$LOCK" ] || awk -F '\t' -v n="$name" '$2 != n' "$LOCK"
+    [ -z "$line" ] || printf '%s\n' "$line"
+  } | sort -t "$tab" -k2,2 >"$tmp" && mv -f "$tmp" "$LOCK" || {
+    rm -f "$tmp"
+    die "cannot write $LOCK; fix: make $CONF writable"
+  }
+  [ -s "$LOCK" ] || rm -f "$LOCK"
+}
+
+lock_line() { # STATE (the rest from L_*)
+  printf 'lock/1\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t' "$L_name" "$1" "$L_version" "$L_kind" "$L_source" "$L_commit" "$L_hd1" "$L_added" "$L_how"
+}
+
+lock_names() { [ ! -f "$LOCK" ] || awk -F '\t' '{ print $2 }' "$LOCK"; }
+
+# --- prompt bytes and cards --------------------------------------------------------------------------------------------
+
+# What NAME's module adds to the system prompt (ext::prompt): "\n- NAME: LINE [DOC]", DOC as henki shows it.
+prompt_bytes() { # NAME DIR
+  local l
+  l=$(docline "$2/doc.md") || return 1
+  l="$nl- $1: $l [$(shown "$EXT/$1/doc.md")]"
+  printf '%s\n' "${#l}"
+}
+
+# The cards block for the modules on, plus EXTRA (NAME DIR) when given, into FILE (empty when there are no cards).
+cards_block() {
+  local out="$1" extra="${2:-}" extra_dir="${3:-}" n d any=0
+  : >"$out.cards"
+  for n in $( (
+    lock_names_on
+    [ -z "$extra" ] || echo "$extra"
+  ) | sort -u); do
+    # A subshell, so the caller's L_* stay as they are.
+    if [ "$n" = "$extra" ]; then d=$extra_dir; else d=$(lock_get "$n" && store_of); fi
+    [ -f "$d/.henki/card.md" ] || continue
+    [ "$any" = 0 ] || echo >>"$out.cards"
+    cat "$d/.henki/card.md" >>"$out.cards"
+    [ -z "$(tail -c 1 "$d/.henki/card.md")" ] || echo >>"$out.cards"
+    any=1
+  done
+  if [ "$any" = 1 ]; then
+    {
+      say "$CARDS_BEGIN"
+      cat "$out.cards"
+      say "$CARDS_END"
+    } >"$out"
+  else
+    : >"$out"
+  fi
+  rm -f "$out.cards"
+}
+
+lock_names_on() { [ ! -f "$LOCK" ] || awk -F '\t' '$3 == "on" { print $2 }' "$LOCK"; }
+
+# AGENTS.md with its cards block replaced by BLOCK (a file; empty removes the block), into OUT; the lines outside the
+# block stay as they are. A new block goes at the end after a blank line, and that blank line goes with it again.
+# Exit 1 with ERR on a broken block.
+splice() {
+  local block="$1" out="$2"
+  ERR=""
+  if [ ! -f "$AGENTS" ]; then
+    cp "$block" "$out"
+    return 0
+  fi
+  if [ ! -s "$block" ] && ! command grep -qxF -e "$CARDS_BEGIN" -e "$CARDS_END" "$AGENTS"; then
+    cp "$AGENTS" "$out"
+    return 0
+  fi
+  ERR=$(awk -v b="$CARDS_BEGIN" -v e="$CARDS_END" -v bf="$block" -v f="$AGENTS" '
+    function emit(   l) { while ((getline l < bf) > 0) print l; close(bf) }
+    function bad(n, m) { print f ":" n ": " m > "/dev/stderr"; err = 1; exit 1 }
+    { line[NR] = $0 }
+    $0 == b { if (at) bad(NR, "a second mods cards block; fix: remove one"); at = NR }
+    $0 == e { if (!at || end) bad(NR, "a mods cards end line without its start; fix: remove it"); end = NR }
+    END {
+      if (err) exit 1
+      if (at && !end) bad(at, "a mods cards block without its end line; fix: add \"" e "\" or remove the block")
+      some = (getline l < bf) > 0; close(bf)
+      if (!at) { for (i = 1; i <= NR; i++) print line[i]; if (NR > 0) print ""; emit(); exit 0 }
+      stop = at - 1
+      if (!some && end == NR && stop >= 1 && line[stop] == "") stop--
+      for (i = 1; i <= stop; i++) print line[i]
+      emit()
+      for (i = end + 1; i <= NR; i++) print line[i]
+    }
+  ' "$AGENTS" 2>&1 >"$out")
+}
+
+# The cards block AGENTS.md holds now (marker lines included), into OUT; empty without one.
+block_now() {
+  : >"$1"
+  [ ! -f "$AGENTS" ] || awk -v b="$CARDS_BEGIN" -v e="$CARDS_END" '$0 == b { on = 1 } on { print } $0 == e { on = 0 }' "$AGENTS" >"$1"
+}
+
+# Before a change: AGENTS.md's block can be written again (else the change would stop half way).
+cards_ok() {
+  : >"$STAGE/empty"
+  splice "$STAGE/empty" "$STAGE/spliced" || die "$ERR"
+}
+
+# The bytes AGENTS.md text puts into the system prompt: trailing newlines trimmed, plus the "\n\n" join when not empty.
+agents_bytes() {
+  local t
+  [ -f "$1" ] || {
+    echo 0
+    return
+  }
+  t=$(cat "$1")
+  if [ -n "$t" ]; then echo $((${#t} + 2)); else echo 0; fi
+}
+
+# Writes AGENTS.md for the modules on (plus EXTRA NAME DIR); DRY 1: only check the size. Exit 1 with ERR.
+cards_write() {
+  local dry="$1" t="$STAGE_LIST.agents" size
+  cards_block "$t.block" "${2:-}" "${3:-}"
+  splice "$t.block" "$t" || return 1
+  size=$(wc -c <"$t")
+  size=$((size))
+  if [ "$size" -gt "$AGENTS_MAX" ]; then
+    ERR="the cards would make $(shown "$AGENTS") $(num "$size") bytes, over henki's limit of $(num $AGENTS_MAX); fix: shorten AGENTS.md outside the mods cards block, or leave a module with a card off"
+    return 1
+  fi
+  [ "$dry" = 0 ] || return 0
+  if [ "$size" = 0 ]; then
+    rm -f "$AGENTS"
+  elif ! cmp -s "$t" "$AGENTS" 2>/dev/null; then
+    cp "$t" "$AGENTS.tmp.$$" && mv -f "$AGENTS.tmp.$$" "$AGENTS" || die "cannot write $AGENTS; fix: make $CONF writable"
+  fi
+}
+
+# --- shadows and the ext path ------------------------------------------------------------------------------------------
+
+# The shadow entries module NAME needs: its manifest's, plus each bin/ command found on PATH (henki refuses to
+# start when one shadows a command on the user PATH and `shadow` lacks it).
+shadows_needed() { # NAME CMDS DECLARED
+  local name="$1" c d
+  {
+    printf '%s\n' "$3"
+    while IFS= read -r c; do
+      [ -n "$c" ] || continue
+      d=$(path_lookup "$c") && [ -n "$d" ] && echo "$name/$c"
+    done <<EOF
+$2
+EOF
+  } | awk 'NF && !seen[$0]++'
+}
+
+# The first executable NAME on PATH outside the ext dir (the PATH henki inherits holds no ext bin/).
+path_lookup() {
+  local d rest="$PATH:"
+  while [ -n "$rest" ]; do
+    d=${rest%%:*}
+    rest=${rest#*:}
+    case "$d" in /*) ;; *) continue ;; esac
+    case "$d" in "$EXT"/* | "$STORE"/*) continue ;; esac
+    if [ -f "$d/$1" ] && [ -x "$d/$1" ]; then
+      printf '%s\n' "$d/$1"
+      return 0
+    fi
+  done
+  return 1
+}
+
+# The shadow entries config.toml has now (one per line).
+config_shadow() {
+  local out
+  [ -f "$CONF/config.toml" ] || return 0
+  out=$(toml shadow <"$CONF/config.toml") || return 0
+  printf '%s' "${out#shadow"$tab"A}" | tr '\t' '\n' | sed '/^$/d'
+}
+
+# NEEDED (lines) minus what config.toml lists; prints the `shadow = [...]` line to write, or nothing.
+shadow_line() {
+  local have missing
+  have=$(config_shadow)
+  missing=$(printf '%s\n' "$1" | awk -v have="$have" 'BEGIN { n = split(have, h, "\n"); for (i = 1; i <= n; i++) s[h[i]] = 1 } NF && !($0 in s)')
+  [ -n "$missing" ] || return 0
+  printf '%s\n%s\n' "$have" "$missing" | awk 'NF && !seen[$0]++ { o = o (o == "" ? "" : ", ") "\"" $0 "\"" } END { print "shadow = [" o "]" }'
+}
+
+# A warning when config.toml's `ext` leaves out the dir this program links into.
+ext_path_warning() {
+  local out
+  [ -f "$CONF/config.toml" ] || return 0
+  out=$(toml ext <"$CONF/config.toml") || return 0
+  [ -n "$out" ] || return 0
+  printf '%s\n' "$out" | tr '\t' '\n' | command grep -qxE "~/.config/henki/ext/?|$EXT/?" && return 0
+  warn "$(shown "$CONF/config.toml") sets ext without ~/.config/henki/ext, so henki does not load the modules turned on here; fix: add \"~/.config/henki/ext\" to ext"
+}
+
+# --- verbs -------------------------------------------------------------------------------------------------------------
+
+# A file's interpreter and line count, for the install screen: "sh, 12 lines" or "binary, 4,120 B".
+file_kind() {
+  local first size
+  size=$(wc -c <"$1")
+  if [ "$(tr -d '\000' <"$1" | wc -c)" != "$size" ]; then
+    printf 'binary, %s B' "$(num $((size)))"
+    return
+  fi
+  first=$(head -n 1 "$1")
+  case "$first" in
+    '#!'*)
+      first=${first#\#!}
+      first=${first#"${first%%[! ]*}"}
+      case "$first" in */env\ *) first=${first#*/env }; first=${first#-S } ;; esac
+      first=${first%% *}
+      first=${first##*/}
+      ;;
+    *) first="no #! line" ;;
+  esac
+  printf '%s, %s lines' "$first" "$(num $(($(wc -l <"$1"))))"
+}
+
+red() { if [ -t 1 ]; then printf '\033[1;31m%s\033[0m' "$1"; else printf '%s' "$1"; fi; }
+
+cmd_add() {
+  local src="" yes=0 a kind source fallback dir id store how answer ref sub url bytes total n d x tty need line
+  for a in "$@"; do
+    case "$a" in
+      --yes | -y) yes=1 ;;
+      -*) usage ;;
+      *) [ -z "$src" ] && src=$a || usage ;;
+    esac
+  done
+  [ -n "$src" ] || usage
+  case "$src" in *[[:cntrl:]]*) die "the source holds a control character; fix: name it without one" ;; esac
+  busy
+  lock_check
+  stage
+  STAGE_LIST="$STAGE/list"
+  COMMIT=-
+  ref="" sub=""
+  case "$src" in
+    /* | ./* | ../*)
+      kind=path
+      dir=$src
+      if [ ! -d "$dir" ]; then
+        case "$dir" in *'#'*) dir="${dir%#*}/${dir##*#}" ;; esac
+      fi
+      [ -d "$dir" ] || die "$src is not a directory; fix: name a module directory"
+      dir=$(cd -P "$dir" && pwd) || die "cannot enter $src; fix: make it readable"
+      source=$dir
+      case "$source" in *[[:cntrl:]]*) die "the path $source holds a control character; fix: rename it" ;; esac
+      fallback=${dir##*/}
+      copy_dir "$dir" "$STAGE/m"
+      ;;
+    *://* | *@*:*)
+      kind=url
+      url=$src
+      case "$url" in *'#'*) sub=${url##*#} && url=${url%#*} ;; esac
+      # @REF comes after the host: a user@ in front of the host, and scp's git@host:, are not refs.
+      case "$url" in
+        *://*/*@* | [!/]*@*:*@*)
+          ref=${url##*@}
+          url=${url%@*}
+          ;;
+      esac
+      while [ "${sub%/}" != "$sub" ]; do sub=${sub%/}; done
+      if [ -n "$sub" ]; then
+        case "/$sub/" in */../* | */./* | //*) die "#$sub is not a plain directory path; fix: name a directory of the repository like #mods/NAME" ;; esac
+      fi
+      case "$ref" in -*) die "@$ref is not a ref; fix: name a branch, tag or commit" ;; esac
+      source="$url${sub:+#$sub}"
+      x=${url%/}
+      x=${x##*/}
+      x=${x##*:}
+      fallback=${sub##*/}
+      fallback=${fallback:-${x%.git}}
+      copy_git "$url" "$ref" "$sub" "$STAGE/m"
+      ;;
+    *)
+      is_name "$src" || usage
+      kind=official
+      dir=$(official_dir "$src") || die "no official module $src; fix: henki-mods list shows the official ones, or name a path (./DIR) or a URL"
+      source=$src
+      fallback=$src
+      copy_dir "$dir" "$STAGE/m"
+      ;;
+  esac
+  inspect "$STAGE/m" "$fallback" 1 || die "$(printf '%s' "$ERR" | sed "s|$STAGE/m|$source|g")"
+  n=$I_name
+  if lock_get "$n"; then
+    die "$n is already added (from $L_source); fix: henki-mods rm $n first, or turn it on with henki-mods on $n"
+  fi
+  if [ -e "$EXT/$n" ] || [ -L "$EXT/$n" ]; then
+    die "$(shown "$EXT/$n") exists and henki-mods did not make it; fix: move it out of $(shown "$EXT") first"
+  fi
+  if [ "$COMMIT" != - ]; then id=$COMMIT; else id=${I_hd1#hd1:}; fi
+  store="$STORE/$n/${id%"${id#????????????}"}"
+  cards_write 1 "$n" "$STAGE/m" || die "$ERR"
+  # The screen.
+  bytes=$(prompt_bytes "$n" "$STAGE/m")
+  total=$(total_on)
+  x=""
+  if [ "$total" = 0 ]; then
+    x=" with the $((${#HEADER} + 2)) B header, as the first module on"
+    bytes=$((bytes + ${#HEADER} + 2))
+  fi
+  say "$n ${M_version:-(no version)}"
+  case "$kind" in
+    official) say "  source   official ($dir)" ;;
+    path) say "  source   $source (a directory on this machine)" ;;
+    url)
+      say "  source   $source @ $COMMIT"
+      say "  $(red "UNREVIEWED: in no index you use; nobody has read this code for you")"
+      ;;
+  esac
+  [ "$M_has" = 1 ] || say "  manifest none (unmanaged: no license, os or needs declared)"
+  [ -z "$M_license" ] || say "  license  $M_license"
+  [ -z "$M_maintainer" ] || say "  by       $M_maintainer"
+  say "  summary  ${M_summary:-$I_line}"
+  say "  prompt   +$(num "$bytes") B on every request$x (total on after: $(num $((total + bytes))) B)"
+  [ "$I_card" = 0 ] || say "  card     +$(num "$I_card") B into $(shown "$AGENTS") (henki's limit: $(num $AGENTS_MAX) B for the file)"
+  x=""
+  while IFS= read -r a; do
+    [ -n "$a" ] || continue
+    x="$x${x:+; }bin/$a ($(file_kind "$STAGE/m/bin/$a"))"
+  done <<EOF
+$I_cmds
+EOF
+  say "  files    $I_files ($I_links links)${x:+; runs as you, unsandboxed: $x}"
+  while IFS= read -r a; do
+    [ -n "$a" ] || continue
+    if command -v "$a" >/dev/null 2>&1; then say "  needs    $a (found)"; else say "  needs    $a: NOT on PATH; install it yourself (henki-mods installs nothing)"; fi
+  done <<EOF
+$M_needs
+EOF
+  need=$(shadows_needed "$n" "$I_cmds" "$M_shadow")
+  line=$(shadow_line "$need")
+  [ -z "$need" ] || say "  shadows  $(printf '%s' "$need" | tr '\n' ' ')"
+  [ -z "$line" ] || say "  config   henki starts only once $(shown "$CONF/config.toml") has: $line"
+  say "  network  ${M_caps:-not declared} (declared, NOT enforced)"
+  if [ "$COMMIT" != - ]; then say "  pin      commit $COMMIT, $I_hd1"; else say "  pin      $I_hd1"; fi
+  if [ "$yes" = 1 ]; then
+    how=yes
+  else
+    tty=${HENKI_MODS_TTY:-/dev/tty}
+    # A subshell tries the open: a failed redirection of `exec` would end a POSIX-mode shell on the spot.
+    (: <"$tty") 2>/dev/null || die "no terminal to ask on; fix: run it in a terminal, or add --yes once you have read the screen above"
+    if [ -c "$tty" ]; then printf 'install and turn on? [y/N] ' >"$tty"; else printf 'install and turn on? [y/N] \n' >&2; fi
+    read -r answer <"$tty" || answer=""
+    case "$answer" in y | Y | yes | YES) how=tty ;; *) die "not installed (the answer was no); fix: run add again and answer y" ;; esac
+  fi
+  # Install: the store copy (read-only, kept for rollback), the link, the lock line, the cards.
+  if [ -d "$store" ]; then
+    STAGE_LIST2=$STAGE_LIST
+    STAGE_LIST="$STAGE/list2"
+    listing "$store" || die "$ERR"
+    [ "$(hd1 "$store")" = "$I_hd1" ] || die "the store copy $store is not what its name says; fix: chmod -R u+w $store && rm -rf $store, then add again"
+    STAGE_LIST=$STAGE_LIST2
+  else
+    mkdir -p "$STORE/$n" && mv "$STAGE/m" "$store" || die "cannot move the copy into $store; fix: make $STORE writable"
+  fi
+  chmod -R a-w "$store"
+  mkdir -p "$EXT" && ln -s -- "$store" "$EXT/$n" || die "cannot link $(shown "$EXT/$n"); fix: make $(shown "$EXT") writable"
+  L_name=$n L_version=${M_version:--} L_kind=$kind L_source=$source L_commit=$COMMIT L_hd1=$I_hd1 L_how=$how
+  L_added=$(date -u +%Y-%m-%dT%H:%MZ)
+  lock_put "$n" "$(lock_line on)"
+  cards_write 0 || die "$ERR"
+  say "added $n: on, $(shown "$store")"
+  [ -z "$line" ] || say "add to $(shown "$CONF/config.toml"): $line"
+  ext_path_warning
+  say "$RESTART"
+}
+
+# The prompt bytes of everything on now: the header and each module in the ext dir (managed or not).
+total_on() {
+  local n t=0 b
+  for n in $(ext_names); do
+    b=$(prompt_bytes "$n" "$EXT/$n" 2>/dev/null) || continue
+    t=$((t + b))
+  done
+  [ "$t" = 0 ] || t=$((t + ${#HEADER} + 2))
+  echo "$t"
+}
+
+# The names henki loads from the ext dir: not starting with a dot, sorted bytewise.
+ext_names() { [ ! -d "$EXT" ] || (cd "$EXT" && for n in *; do [ -e "$n" ] && echo "$n"; done | sort); }
+
+cmd_onoff() { # on|off NAME
+  local verb="$1" n="${2:-}" store
+  [ -n "$n" ] && [ $# = 2 ] || usage
+  busy
+  lock_check
+  STAGE=$(mktemp -d "${TMPDIR:-/tmp}/henki-mods.XXXXXX") || die "cannot make a scratch dir; fix: check TMPDIR"
+  STAGE_LIST="$STAGE/list"
+  lock_get "$n" || die "$n is not added; fix: henki-mods add SRC first (henki-mods list shows what is)"
+  cards_ok
+  store=$(store_of)
+  if [ "$verb" = on ]; then
+    [ -d "$store" ] || die "the store copy $store is gone; fix: henki-mods rm $n, then add it again"
+    listing "$store" || die "$ERR"
+    [ "$(hd1 "$store")" = "$L_hd1" ] || die "the store copy $store does not match the lock (it changed); fix: chmod -R u+w $store && rm -rf $store, then henki-mods rm $n and add it again"
+    if [ -L "$EXT/$n" ] && [ "$(target "$EXT/$n")" = "$store" ]; then
+      [ "$L_state" = on ] && say "$n is already on" && return 0
+    elif [ -e "$EXT/$n" ] || [ -L "$EXT/$n" ]; then
+      die "$(shown "$EXT/$n") exists and is not the link to $store; fix: move it away, then turn $n on"
+    fi
+    cards_write 1 "$n" "$store" || die "$ERR"
+    [ -L "$EXT/$n" ] || { mkdir -p "$EXT" && ln -s -- "$store" "$EXT/$n"; } || die "cannot link $(shown "$EXT/$n"); fix: make $(shown "$EXT") writable"
+    lock_put "$n" "$(lock_line on)"
+  else
+    if [ -L "$EXT/$n" ]; then
+      rm -f "$EXT/$n" || die "cannot remove $(shown "$EXT/$n"); fix: make $(shown "$EXT") writable"
+    elif [ -e "$EXT/$n" ]; then
+      die "$(shown "$EXT/$n") is not a link; fix: move it out of $(shown "$EXT") yourself"
+    elif [ "$L_state" = off ]; then
+      say "$n is already off" && return 0
+    fi
+    lock_put "$n" "$(lock_line off)"
+  fi
+  cards_write 0 || die "$ERR"
+  say "$n: $verb"
+  [ "$verb" = off ] || ext_path_warning
+  say "$RESTART"
+}
+
+cmd_rm() {
+  local n="${1:-}" store
+  [ -n "$n" ] && [ $# = 1 ] || usage
+  busy
+  lock_check
+  STAGE=$(mktemp -d "${TMPDIR:-/tmp}/henki-mods.XXXXXX") || die "cannot make a scratch dir; fix: check TMPDIR"
+  STAGE_LIST="$STAGE/list"
+  lock_get "$n" || die "$n is not added; fix: henki-mods list shows what is"
+  cards_ok
+  store=$(store_of)
+  if [ -L "$EXT/$n" ]; then
+    rm -f "$EXT/$n" || die "cannot remove $(shown "$EXT/$n"); fix: make $(shown "$EXT") writable"
+  elif [ -e "$EXT/$n" ]; then
+    die "$(shown "$EXT/$n") is not a link; fix: move it out of $(shown "$EXT") yourself"
+  fi
+  lock_put "$n" ""
+  cards_write 0 || die "$ERR"
+  say "removed $n; its store copy stays in $(shown "$store") for a rollback"
+  say "$RESTART"
+}
+
+cmd_lock() {
+  [ $# = 0 ] || usage
+  lock_check
+  [ ! -f "$LOCK" ] || cat "$LOCK"
+}
+
+cmd_list() {
+  local n b on_b=0 cards=0 c src mods=0 off_names x d agents_now agents_none state
+  [ $# = 0 ] || usage
+  lock_check
+  STAGE=$(mktemp -d "${TMPDIR:-/tmp}/henki-mods.XXXXXX") || die "cannot make a scratch dir; fix: check TMPDIR"
+  STAGE_LIST="$STAGE/list"
+  for n in $( (
+    lock_names
+    ext_names
+  ) | sort -u); do
+    [ "$mods" != 0 ] || printf '%-16s %-5s %-10s %s  %s\n' NAME STATE VERSION PROMPT SOURCE
+    mods=$((mods + 1))
+    c=""
+    if lock_get "$n"; then
+      d=$(store_of)
+      case "$L_kind" in url) src="$L_source (UNREVIEWED)" ;; official) src="official" ;; *) src=$L_source ;; esac
+      [ -f "$d/.henki/module.toml" ] || src="$src (unmanaged)"
+      if [ -f "$d/.henki/card.md" ]; then
+        c=$(wc -c <"$d/.henki/card.md")
+        c=", card $(num $((c))) B"
+      fi
+      state=$L_state
+      [ "$state" = off ] || [ -L "$EXT/$n" ] || state="on (link missing)"
+      x=$L_version
+    else
+      d="$EXT/$n" state=on x=- src="not added by henki-mods ($(shown "$EXT/$n"))"
+    fi
+    if b=$(prompt_bytes "$n" "$d" 2>/dev/null); then
+      [ "$state" != on ] || on_b=$((on_b + b))
+      b="$(num "$b") B"
+    else
+      b="unreadable"
+    fi
+    printf '%-16s %-5s %-10s %s%s  %s\n' "$n" "$state" "$x" "$b" "$c" "$src"
+  done
+  [ "$mods" != 0 ] || say "no modules; henki-mods add NAME | ./DIR | URL adds one, off until you say yes"
+  off_names=""
+  for d in ${HENKI_SHARE:+"$HENKI_SHARE/mods"} "$SELF/../share/henki/mods" "$SELF/../mods"; do
+    [ -d "$d" ] || continue
+    for n in $(cd "$d" && for x in *; do [ -f "$x/doc.md" ] && echo "$x"; done); do
+      lock_get "$n" || off_names="$off_names $n"
+    done
+    break
+  done
+  [ -z "$off_names" ] || say "official, not added:$off_names (henki-mods add NAME)"
+  # The cards' share of the prompt: AGENTS.md as it is, against AGENTS.md without the block.
+  agents_now=$(agents_bytes "$AGENTS")
+  if [ -f "$AGENTS" ]; then
+    : >"$STAGE/empty"
+    splice "$STAGE/empty" "$STAGE/plain" 2>/dev/null || cp "$AGENTS" "$STAGE/plain"
+    agents_none=$(agents_bytes "$STAGE/plain")
+    cards=$((agents_now - agents_none))
+  fi
+  [ "$on_b" = 0 ] || on_b=$((on_b + ${#HEADER} + 2))
+  if [ "$on_b" = 0 ] && [ "$cards" = 0 ]; then
+    say "on: nothing (0 B of prompt)"
+  else
+    say "on: $(num $((on_b + cards))) B of prompt (extensions $(num "$on_b") B with the $((${#HEADER} + 2)) B header, cards $(num "$cards") B)"
+  fi
+  if [ -f "$AGENTS" ]; then
+    x=$(wc -c <"$AGENTS")
+    say "AGENTS.md: $(num $((x))) of $(num $AGENTS_MAX) B"
+  fi
+  ext_path_warning
+}
+
+# One problem found by verify: said, counted, and verify goes on.
+problem() {
+  printf 'henki-mods: %s\n' "$*" >&2
+  BAD=$((BAD + 1))
+}
+
+cmd_verify() {
+  local n names store want line need t
+  BAD=0
+  STAGE=$(mktemp -d "${TMPDIR:-/tmp}/henki-mods.XXXXXX") || die "cannot make a scratch dir; fix: check TMPDIR"
+  STAGE_LIST="$STAGE/list"
+  if [ "${1:-}" = --dir ]; then
+    [ $# = 2 ] || usage
+    [ -d "$2" ] || die "$2 is not a directory; fix: name a module directory"
+    t=$(cd -P "$2" && pwd)
+    inspect "$t" "${t##*/}" 0 || die "$ERR"
+    say "$2: ok: $I_name ${M_version:-(unmanaged)}, $(num "$(prompt_bytes "$I_name" "$t")") B of prompt, $I_hd1"
+    return 0
+  fi
+  [ $# -le 1 ] || usage
+  lock_check
+  if [ -n "${1:-}" ]; then
+    lock_get "$1" || die "$1 is not added; fix: henki-mods list shows what is"
+    names=$1
+  else
+    names=$(lock_names)
+  fi
+  for n in $names; do
+    lock_get "$n"
+    store=$(store_of)
+    if [ ! -d "$store" ]; then
+      problem "$n: the store copy $store is gone; fix: henki-mods rm $n, then add it again"
+      continue
+    fi
+    if ! inspect "$store" "$n" 0; then
+      problem "$n: $ERR"
+    elif [ "$I_hd1" != "$L_hd1" ]; then
+      problem "$n: the store copy $store changed: $I_hd1, the lock has $L_hd1; fix: chmod -R u+w $store && rm -rf $store, then henki-mods rm $n and add it again"
+    elif [ "$I_name" != "$n" ]; then
+      problem "$n: the store copy names itself $I_name; fix: henki-mods rm $n and add it again"
+    fi
+    [ -z "$(find "$store" ! -type l -perm -200 -print | head -n 1)" ] || warn "$n: $store is writable; fix: chmod -R a-w $store"
+    if [ "$L_state" = on ]; then
+      if [ ! -L "$EXT/$n" ]; then
+        problem "$n is on in the lock, but $(shown "$EXT/$n") is not a link; fix: henki-mods on $n"
+      elif [ "$(target "$EXT/$n")" != "$store" ]; then
+        problem "$n: $(shown "$EXT/$n") points at $(target "$EXT/$n"), not at the locked copy $store; fix: henki-mods off $n && henki-mods on $n"
+      else
+        need=$(shadows_needed "$n" "$I_cmds" "$M_shadow")
+        line=$(shadow_line "$need")
+        [ -z "$line" ] || warn "$n: henki does not start until $(shown "$CONF/config.toml") has: $line"
+      fi
+    elif [ -e "$EXT/$n" ] || [ -L "$EXT/$n" ]; then
+      problem "$n is off in the lock, but $(shown "$EXT/$n") exists; fix: henki-mods off $n"
+    fi
+  done
+  # The cards block must be the cards of the modules on.
+  if [ -z "${1:-}" ]; then
+    if cards_write 1; then
+      block_now "$STAGE/block"
+      if ! cmp -s "$STAGE_LIST.agents.block" "$STAGE/block"; then
+        problem "the mods cards block in $(shown "$AGENTS") is not the cards of the modules on; fix: henki-mods off and on one of them, which writes it again"
+      fi
+    else
+      problem "$ERR"
+    fi
+  fi
+  ext_path_warning
+  [ "$BAD" = 0 ] || die "verify: $BAD problems (above); fix: as each one says"
+  say "verify: ok ($(printf '%s\n' "$names" | awk 'NF' | wc -l | tr -d ' ') modules)"
+}
+
+setup
+case "${1:-list}" in
+  list) shift $(($# > 0 ? 1 : 0)) && cmd_list "$@" ;;
+  add) shift && cmd_add "$@" ;;
+  on | off) cmd_onoff "$@" ;;
+  rm) shift && cmd_rm "$@" ;;
+  lock) shift && cmd_lock "$@" ;;
+  verify) shift && cmd_verify "$@" ;;
+  help | -h | --help)
+    usage 2>&1 | sed 's/^usage: //;s/^       //'
+    exit 0
+    ;;
+  --version)
+    [ $# = 1 ] || usage
+    say "henki-mods $(henki_version)"
+    ;;
+  *) usage ;;
+esac
