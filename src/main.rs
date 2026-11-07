@@ -1,6 +1,4 @@
 //! henki: a small terminal agent. `henki run [--json] TASK` drives a model through a shell and three file tools.
-// Removed when the modules are wired: until then most of the crate has no caller, and the stubs' parameters are unused.
-#![allow(dead_code, unused_variables)]
 
 mod config;
 mod files;

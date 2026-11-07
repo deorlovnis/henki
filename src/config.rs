@@ -1,5 +1,6 @@
 //! The configuration: one TOML-subset file, two environment variables and the flags, checked so that anything wrong
 //! stops henki with the file, the line and the fix.
+use crate::tools::ALL as TOOLS;
 use crate::types::Url;
 use crate::{http, sys, term};
 use serde_json::Value;
@@ -62,7 +63,6 @@ pub struct Config {
     pub notices: Vec<String>,
 }
 
-const TOOLS: [&str; 4] = ["shell", "read", "write", "edit"];
 /// The HENKI_* variables henki reads or sets for its children; any other gives a notice.
 const KNOWN: [&str; 6] = ["HENKI_MODEL", "HENKI_BASE_URL", "HENKI_DEPTH", "HENKI_SESSION", "HENKI_USER_PATH", "HENKI_VERSION"];
 const KEYS: &str = "model, base_url, dialect, api_key, approve, tools, ext, pass_env, max_steps, max_seconds, tool_timeout_s, output_cap, context_window, max_tokens";
