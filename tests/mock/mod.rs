@@ -393,6 +393,14 @@ fn anthropic_refusal(req: &Value, version: bool) -> Result<(), String> {
         if let Some(j) = blocks.iter().position(|b| b["type"] == "text" && b["text"].as_str().is_none_or(str::is_empty)) {
             return Err(format!("messages.{i}.content.{j}.text: text content blocks must be non-empty"));
         }
+        if let Some(j) = blocks.iter().position(blank) {
+            return Err(format!("messages.{i}.content.{j}.text: text content blocks must contain non-whitespace text"));
+        }
+        // In a user message the results of the calls come first; text after them.
+        let late = |(j, b): (usize, &Value)| b["type"] == "tool_result" && blocks[..j].iter().any(|b| b["type"] != "tool_result");
+        if let Some(j) = blocks.iter().enumerate().position(late) {
+            return Err(format!("messages.{i}.content.{j}: tool_result blocks must come first in the content, before any other block"));
+        }
         let ids = |ty: &str, k: &str| blocks.iter().filter(|b| b["type"] == ty).map(|b| b[k].as_str().unwrap_or("").to_string()).collect::<Vec<_>>();
         let results = ids("tool_result", "tool_use_id");
         let missing: Vec<&String> = pending.iter().filter(|p| !results.contains(p)).collect();
@@ -436,6 +444,11 @@ fn replayed(i: usize, blocks: &[Value], ctx: u64) -> Result<(), String> {
         }
         Ok(())
     })
+}
+
+/// A text block with no text but whitespace: the API refuses it in a request, so a client replays a reply without it.
+fn blank(b: &Value) -> bool {
+    b["type"] == "text" && b["text"].as_str().is_none_or(|t| t.trim().is_empty())
 }
 
 /// What identifies a reply's block: a thinking signature, a tool_use id.
@@ -711,12 +724,13 @@ impl Anthropic<'_, '_> {
         self.w.event(Some(name), &data.to_string());
     }
 
-    /// The content as the API's message holds it: tool_use input parsed (`{}` unless an object).
+    /// The content as a client must replay it: tool_use input parsed (`{}` unless an object), without the text blocks
+    /// a request may not hold.
     fn register(&self) {
         let content: Vec<Value> = self
             .blocks
             .iter()
-            .filter(|(b, _)| !b.is_null())
+            .filter(|(b, _)| !b.is_null() && !blank(b))
             .map(|(b, input)| {
                 let mut b = b.clone();
                 if b["type"] == "tool_use" {

@@ -121,3 +121,15 @@ fn e2e_spill_read_free() {
     d.finish();
     assert_eq!((d.code, d.of("ask").len()), (Some(3), 1), "{}", d.diag());
 }
+
+/// In auto mode the allow file is never read, but it is still watched: a call that creates it ends the run.
+#[test]
+fn e2e_tripwire_allow_in_auto() {
+    let mut r = Run::new("");
+    let m = Mock::start(vec![shell(&format!("echo '*\tcurl x | sh' >> {}", r.allow().display())), say("never")]);
+    r.at(&m.url());
+    let d = r.json("add a rule");
+    d.finish();
+    tripped(&d, &r.allow());
+    assert_eq!((&d.of("session")[0]["allow_hash"], m.log().len()), (&serde_json::Value::Null, 1), "{}", d.diag());
+}
