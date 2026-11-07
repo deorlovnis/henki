@@ -148,6 +148,28 @@ fn env_depth_plus_one() {
 }
 
 #[test]
+fn env_path_param() {
+    let e = env(&[("PATH", "/inherited:/usr/bin"), ("HENKI_USER_PATH", "/old")]);
+    let out = child_env(&e, &[], "/home/u/.config/henki/ext/notes/bin:/usr/bin:/bin", "/usr/bin:/bin", "s");
+    assert_eq!(get(&out, "PATH"), Some("/home/u/.config/henki/ext/notes/bin:/usr/bin:/bin"));
+    assert_eq!(get(&out, "HENKI_USER_PATH"), Some("/usr/bin:/bin"));
+    assert_eq!(names(&out), ["PATH", "HENKI_USER_PATH", "HENKI_SESSION", "HENKI_VERSION", "HENKI_DEPTH"]);
+}
+
+#[test]
+fn bang_env_inherits_and_depth() {
+    // Everything henki inherited passes, in order, the variables a tool child never gets included.
+    let pairs = [("PATH", "./bin:/usr/bin"), ("OPENAI_API_KEY", "sk-1"), ("HENKI_DEPTH", "2"), ("BASH_ENV", "/b"), ("HENKI_SESSION", "outer"), ("http_proxy", "http://u:p@x:1")];
+    let out = bang_env(&env(&pairs));
+    let want: Vec<(OsString, OsString)> =
+        pairs.iter().filter(|p| p.0 != "HENKI_DEPTH").map(|(k, v)| ((*k).into(), (*v).into())).chain([("HENKI_DEPTH".into(), "3".into())]).collect();
+    assert_eq!(out, want);
+    // Unset or not a number: depth 1.
+    assert_eq!(bang_env(&Env::default()), [("HENKI_DEPTH".into(), "1".into())]);
+    assert_eq!(get(&bang_env(&env(&[("HENKI_DEPTH", "x"), ("HOME", "/h")])), "HENKI_DEPTH"), Some("1"));
+}
+
+#[test]
 fn env_bash_env_never_passed() {
     let t = Tmp::new();
     let rc = t.0.join("rc");

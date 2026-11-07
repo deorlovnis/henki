@@ -1,8 +1,8 @@
 //! What the model sees before its first call (the core prompt and the tool schemas), and what decides a call before it
-//! runs: validation, the target it would touch, and whether it needs a human.
+//! runs: validation, the target it would touch, whether it needs a human, and what that human is shown.
 use crate::{config, config::Config, sys, term, types::ARGS_MAX, types::Call, types::End, types::ToolOutput};
 use serde_json::{Value, json};
-use std::{ffi::OsString, fs, io, os::unix::fs::MetadataExt, path::Path, path::PathBuf};
+use std::{ffi::OsString, fmt::Write, fs, io, os::unix::fs::MetadataExt, path::Path, path::PathBuf};
 
 /// System part 1, byte-exact (563 B).
 pub const PART1: &str = include_str!("prompt.txt");
@@ -19,9 +19,10 @@ pub fn schema(enabled: &[&'static str]) -> Value {
     all.into_iter().filter(|t| t["function"]["name"].as_str().is_some_and(|n| enabled.contains(&n))).collect()
 }
 
-/// Part 1, then "\n\n" and part 3 when it is not empty; part 3 = the non-empty of [global AGENTS.md, EXTS] joined by "\n\n".
+/// Part 1, then "\n\n" and part 3 when it is not empty; part 3 = the non-empty of the global AGENTS.md and the
+/// extensions item (`exts`), joined by "\n\n".
 pub fn system(agents: Option<&str>, exts: &str) -> String {
-    [PART1, agents.unwrap_or_default(), exts].into_iter().filter(|p| !p.is_empty()).collect::<Vec<_>>().join("\n\n")
+    [PART1, agents.unwrap_or_default(), exts].into_iter().filter(|s| !s.is_empty()).collect::<Vec<_>>().join("\n\n")
 }
 
 /// Sets `c.error` to the first failing validation string; normalizes integer fields in `c.args`.
@@ -77,7 +78,8 @@ pub struct Target {
     pub outside: bool,          // outside the project root
 }
 
-/// Resolve a file tool's path before anything is shown or run (`cfg.cwd`, `cfg.root`, `cfg.home`, `cfg.protected`).
+/// Resolve a file tool's path before anything is shown or run: against `cfg.cwd`, with `~/` as `cfg.home`, refused under
+/// `cfg.protected` (write), `outside` of `cfg.root`.
 pub fn target(path: &str, write: bool, cfg: &Config) -> Result<Target, String> {
     let fail = io_error(path);
     if write && matches!(path.rsplit('/').next(), Some("" | "." | "..")) {
@@ -133,15 +135,54 @@ pub fn io_error(path: &str) -> impl Fn(io::Error) -> String + Copy + '_ {
     move |e| format!("{path}: {}", e.to_string().split(" (os error").next().unwrap_or_default())
 }
 
-/// `ask` mode: shell, write and edit always; read only outside the project root. `auto` (`cfg.auto`): never.
-pub fn needs_approval(name: &str, t: Option<&Target>, cfg: &Config, _session: &str) -> bool {
-    !cfg.auto && (name != "read" || t.is_none_or(|t| t.outside))
+/// `ask` mode: shell, write and edit always; read only outside the project root, except henki's own files the model is
+/// pointed at: an extension's `doc.md` and this session's spill files (`<state>/spill/<session>-N.log`). `auto`: never.
+pub fn needs_approval(name: &str, t: Option<&Target>, cfg: &Config, session: &str) -> bool {
+    let real = |p: &Path| fs::canonicalize(p).ok();
+    let spill = |t: &Target| {
+        let n = t.name.to_str().and_then(|n| n.strip_prefix(session)?.strip_prefix('-')?.strip_suffix(".log"));
+        n.is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit())) && t.path.parent() == real(&cfg.state.join("spill")).as_deref()
+    };
+    let free = |t: &Target| !t.outside || spill(t) || cfg.exts.iter().any(|e| real(&e.doc).as_ref() == Some(&t.path));
+    !cfg.auto && (name != "read" || !t.is_some_and(free))
 }
 
-/// The approval display as lines, without the reset and the question.
+/// The approval display, without the reset and the question: a header rule (the tool, and a file tool's target), every
+/// line of each primary argument under its own rule, never truncated, then the other arguments as rules, sorted by key.
+/// A line is marked `!| ` instead of `| ` when it shows anything other than itself: an escaped or non-ASCII code point, a
+/// tab (as `\t`) or a run of more than 32 spaces (as `[N spaces]`).
 pub fn display(c: &Call, t: Option<&Target>) -> Vec<String> {
-    let _ = (c, t);
-    todo!()
+    // One row each, so a newline or a tab in a path or a key is escaped too.
+    let rule = |text: &str| {
+        let text = term::escape(text).replace('\n', "\\x0a").replace('\t', "\\x09");
+        format!("-- {text} {}", "-".repeat(72usize.saturating_sub(text.chars().count() + 4).max(2)))
+    };
+    let (strings, ints) = ARGS.iter().find(|a| a.0 == c.name).map_or((&[][..], &[][..]), |a| (a.1, a.2));
+    let mut lines = vec![rule(&t.map_or_else(|| c.name.clone(), |t| format!("{} {}", c.name, t.shown)))];
+    for &k in strings.iter().filter(|&&k| k != "path") {
+        let v = c.args[k].as_str().unwrap_or_default();
+        let n = v.split_terminator('\n').count() as u64;
+        lines.push(rule(&format!("{k} ({} lines, {} bytes)", term::num(n), term::num(v.len() as u64))));
+        lines.extend(v.split_terminator('\n').map(gutter));
+    }
+    for (k, v) in c.args.as_object().into_iter().flatten().filter(|(k, _)| *k != "path" && !strings.contains(&k.as_str())) {
+        let ignored = if ints.contains(&k.as_str()) { "" } else { "ignored: " };
+        lines.push(rule(&format!("{ignored}{k}: {}", term::json_line(v))));
+    }
+    lines
+}
+
+/// One line of an argument with its gutter.
+fn gutter(line: &str) -> String {
+    let (mut o, mut rest, run) = (String::with_capacity(line.len()), line, " ".repeat(33));
+    while let Some((head, spaces)) = rest.find(&run).map(|i| rest.split_at(i)) {
+        rest = spaces.trim_start_matches(' ');
+        let _ = write!(o, "{head}[{} spaces]", term::num((spaces.len() - rest.len()) as u64));
+    }
+    o.push_str(rest);
+    // A collapsed run always shortens the line.
+    let mark = o != line || line.contains(|c: char| c == '\t' || !c.is_ascii() || term::escaped(c));
+    format!("{}{}", if mark { "!| " } else { "| " }, term::escape(&o.replace('\t', "\\t")))
 }
 
 pub enum Killed {
@@ -184,18 +225,18 @@ pub fn not_started(e: &io::Error) -> String {
     format!("[not started: {name} bash]")
 }
 
-/// A call's head: `$ FIRST_LINE` (shell), `read PATH`, `write PATH`, `edit PATH`, else the name.
+/// The plain-mode stderr line: `$ FIRST_LINE -> exit 0, 0.3 s`, `read PATH -> ok, 0.0 s`, `edit PATH -> error, 0.0 s`.
+pub fn call_line(c: &Call, out: Option<&ToolOutput>, killed: Option<&Killed>, is_error: bool) -> String {
+    format!("{} -> {}", head(c), ended(out, killed, is_error))
+}
+
+/// A call's head, one row: `$ FIRST_LINE` (shell), `read PATH`, `write PATH`, `edit PATH`, else the name.
 pub fn head(c: &Call) -> String {
     match (c.name.as_str(), c.args["command"].as_str(), c.args["path"].as_str()) {
         ("shell", Some(cmd), _) => format!("$ {}", cmd.lines().next().unwrap_or_default()),
-        (name, _, Some(p)) => format!("{name} {p}"),
+        (name @ ("read" | "write" | "edit"), _, Some(p)) => format!("{name} {}", p.replace('\n', "\\x0a")),
         (name, ..) => name.to_string(),
     }
-}
-
-/// The call line: `$ FIRST_LINE -> exit 0, 0.3 s`, `read PATH -> ok, 0.0 s`, `edit PATH -> error, 0.0 s`.
-pub fn call_line(c: &Call, out: Option<&ToolOutput>, killed: Option<&Killed>, is_error: bool) -> String {
-    format!("{} -> {}", head(c), ended(out, killed, is_error))
 }
 
 /// min(output_cap, window / 2) bytes.
