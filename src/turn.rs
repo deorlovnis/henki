@@ -315,9 +315,7 @@ impl Session {
         }
         let stop = |ev| if let Ev::Signal(s) = ev { Some(Stop::Signal(s)) } else { matches!(ev, Ev::OutputClosed).then_some(Stop::Closed) };
         let found = self.rx.try_iter().find_map(stop);
-        if let Some(Stop::Signal(s)) = found {
-            self.sig = Some(s);
-        }
+        self.sig = found.and_then(|f| if let Stop::Signal(s) = f { Some(s) } else { None }).or(self.sig);
         found.map_or(Ok(()), Err)
     }
 

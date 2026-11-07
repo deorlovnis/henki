@@ -21,12 +21,8 @@ impl Session {
         self.out.reset();
         lines.iter().for_each(|l| self.out.line(l));
         let n = term::rows(&lines, usize::from(cols)) + 1;
-        if n > usize::from(rows) {
-            self.out.line(&format!("{} rows: taller than the screen; scroll up or answer n", term::num(n as u64)));
-        }
-        if shell && bg > 0 {
-            self.notice(&format!("{} background processes still run; always is off until they end", term::num(bg as u64)))?;
-        }
+        (n > usize::from(rows)).then(|| self.out.line(&format!("{} rows: taller than the screen; scroll up or answer n", term::num(n as u64))));
+        (shell && bg > 0).then(|| self.notice(&format!("{} background processes still run; always is off until they end", term::num(bg as u64)))).transpose()?;
         let (root, file) = (allow::shown(&self.cfg.root, &self.cfg.home), allow::shown(&self.cfg.allow.file, &self.cfg.home));
         loop {
             self.out.prompt(if offer { "run? [y/N/always] " } else { "run? [y/N] " });
