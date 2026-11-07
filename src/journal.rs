@@ -1,6 +1,6 @@
 //! The session journal: one JSON record per line, appended by the main thread alone, byte-counted and synced before the
 //! effect it explains; resume reads it back, repairs dangling calls by appending, and checks the call/result pairing.
-use crate::{config::Config, config::Env, supervise::Spill, sys, term, tools, types::Outcome};
+use crate::{config::Config, supervise::Spill, sys, term, tools, types::Outcome};
 use serde_json::Value;
 use std::path::{Path, PathBuf};
 use std::{collections::HashSet, fmt::Display, fs, fs::File, io::Read, io::Write, os::unix::ffi::OsStrExt, time::Duration, time::SystemTime};
@@ -25,17 +25,15 @@ pub struct Resumed {
 
 const ELIDED: &str = "[output elided: ";
 
-/// `$XDG_STATE_HOME/henki` (default `~/.local/state/henki`), with `sessions/` and `spill/`: `sys::private_dir` for each;
-/// spill files older than 24 h are deleted.
-pub fn state_dir(env: &Env, home: &Path) -> Result<PathBuf, String> {
-    let xdg = env.get("XDG_STATE_HOME").map(Path::new).filter(|p| p.is_absolute());
-    let dir = xdg.map_or_else(|| home.join(".local/state"), Path::to_path_buf).join("henki");
-    for d in [dir.clone(), dir.join("sessions"), dir.join("spill")] {
+/// Creates `dir` (the state dir `config` computed), `dir/sessions` and `dir/spill` with `sys::private_dir`; deletes spill
+/// files older than 24 h.
+pub fn state_dir(dir: &Path) -> Result<(), String> {
+    for d in [dir.to_path_buf(), dir.join("sessions"), dir.join("spill")] {
         sys::private_dir(&d).map_err(|e| format!("state dir {}: {e}; fix: make it a directory you own, or set XDG_STATE_HOME", d.display()))?;
     }
     let old = |e: &fs::DirEntry| e.metadata().ok().and_then(|m| m.modified().ok()?.elapsed().ok()).is_some_and(|age| age > Duration::from_secs(86_400));
     fs::read_dir(dir.join("spill")).into_iter().flatten().flatten().filter(old).for_each(|e| _ = fs::remove_file(e.path()));
-    Ok(dir)
+    Ok(())
 }
 
 fn jerr(path: &Path, e: impl Display) -> Outcome {
@@ -122,6 +120,11 @@ impl Journal {
 
     pub fn bytes(&self) -> u64 {
         self.bytes
+    }
+
+    /// The REPL ended before its first message: removes this process's session file. Never a resumed one. True when removed.
+    pub fn discard(&mut self) -> bool {
+        todo!()
     }
 
     /// The next spill name, `<id>-<n>.log` (n from the counter, never from a model string). One per tool call at most:
@@ -272,12 +275,18 @@ pub mod rec {
     pub fn user(content: &str) -> Value { json!({"t": "user", "msg": {"content": content, "role": "user"}}) }
     /// "text" | "reasoning"; stdout only.
     pub fn delta(reasoning: bool, text: &str) -> Value { json!({"t": if reasoning { "reasoning" } else { "text" }, "delta": text}) }
-    pub fn assistant(text: &str, calls: &[Call], finish: &str, u: Usage) -> Value {
+    pub fn assistant(text: &str, calls: &[Call], finish: &str, u: Usage, blocks: Option<&Value>) -> Value {
         let calls: Vec<Value> = calls.iter().map(|c| with(json!({"args": c.args, "id": c.id, "name": c.name}), "raw", c.raw.as_deref())).collect();
-        json!({"t": "assistant", "msg": {"content": text, "role": "assistant", "tool_calls": calls}, "finish": finish, "usage": usage(u)})
+        let mut v = json!({"t": "assistant", "msg": {"content": text, "role": "assistant", "tool_calls": calls}, "finish": finish, "usage": usage(u)});
+        if let Some(b) = blocks { v["blocks"] = b.clone() }
+        v
     }
     pub fn ask(c: &Call, target: Option<&str>) -> Value { with(json!({"t": "ask", "id": c.id, "name": c.name, "args": c.args}), "target", target) }
-    pub fn approval(id: &str, verdict: &str) -> Value { json!({"t": "approval", "id": id, "verdict": verdict}) }
+    pub fn approval(id: &str, verdict: &str, rule: Option<usize>) -> Value {
+        let mut v = json!({"t": "approval", "id": id, "verdict": verdict});
+        if let Some(n) = rule { v["rule"] = n.into() }
+        v
+    }
     pub fn tool_result(id: &str, name: &str, content: &str, is_error: bool, ms: u64, bytes: u64) -> Value {
         json!({"t": "tool_result", "id": id, "name": name, "content": content, "is_error": is_error, "ms": ms, "bytes": bytes})
     }

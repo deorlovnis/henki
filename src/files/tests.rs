@@ -1,6 +1,8 @@
 #![allow(clippy::disallowed_methods, clippy::print_stdout, clippy::print_stderr, clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::string_slice)]
 use super::*;
-use crate::tools::{ALL, Ctx, target, validate};
+use crate::config::Config;
+use crate::tools::{target, validate};
+use crate::types::TOOLS;
 use serde_json::{Value, json};
 use std::os::unix::fs::{MetadataExt, symlink};
 use std::path::{Path, PathBuf};
@@ -45,10 +47,9 @@ impl Tmp {
     /// A validated call and its target, as the turn prepares them.
     fn prepare(&self, name: &str, args: Value) -> (Call, Target) {
         let mut c = Call { id: "c1".into(), name: name.into(), args, raw: None, error: None };
-        validate(&mut c, &ALL);
+        validate(&mut c, &TOOLS);
         assert_eq!(c.error, None);
-        let cx = Ctx { cwd: &self.0, root: &self.0, home: &self.0, protected: &[] };
-        let t = target(c.args["path"].as_str().unwrap(), name != "read", &cx).unwrap();
+        let t = target(c.args["path"].as_str().unwrap(), name != "read", &Config::test(&self.0)).unwrap();
         (c, t)
     }
     /// Runs the call with the default cap: (text, failed).
@@ -402,8 +403,7 @@ fn write_creates_parents() {
     assert_eq!(run(&c, &t, 16_384).text, "wrote 1 bytes to x/y/z.txt (created)");
     // Below a regular file nothing is created.
     tmp.file("plain", "x");
-    let cx = Ctx { cwd: &tmp.0, root: &tmp.0, home: &tmp.0, protected: &[] };
-    assert_eq!(target("plain/new.txt", true, &cx).err().unwrap(), "plain/new.txt: Not a directory");
+    assert_eq!(target("plain/new.txt", true, &Config::test(&tmp.0)).err().unwrap(), "plain/new.txt: Not a directory");
 }
 
 #[test]

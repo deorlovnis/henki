@@ -87,7 +87,7 @@ fn env_allowlist_exact() {
     let mut pairs: Vec<(&str, &str)> = vec![("PATH", "/inherited"), ("FOO", "1"), ("OPENAI_API_KEY", "sk-secret"), ("LD_PRELOAD", "/x.so"), ("LC_NUMERIC", "C")];
     pairs.extend(allowed.iter().map(|&k| (k, "v")));
     pairs.extend([("HENKI_STATE_DIR", "/s"), ("BASH_ENV", "/b"), ("ENV", "/e"), ("SHELLOPTS", "xtrace"), ("home", "lower")]);
-    let out = child_env(&env(&pairs), &[], "/usr/bin:/bin", "20261105T171203Z-3f9a");
+    let out = child_env(&env(&pairs), &[], "/usr/bin:/bin", "/usr/bin:/bin", "20261105T171203Z-3f9a");
     let mut want = allowed.clone();
     want.extend(["PATH", "HENKI_USER_PATH", "HENKI_SESSION", "HENKI_VERSION", "HENKI_DEPTH"]);
     assert_eq!(names(&out), want);
@@ -105,7 +105,7 @@ fn env_proxy_userinfo_dropped() {
         ("no_proxy", "localhost,127.0.0.1"),
         ("ALL_PROXY", "socks5://a:b@proxy:1080"),
     ]);
-    let out = child_env(&e, &["ALL_PROXY".into()], "/bin", "s");
+    let out = child_env(&e, &["ALL_PROXY".into()], "/bin", "/bin", "s");
     assert_eq!(get(&out, "http_proxy"), None);
     assert_eq!(get(&out, "HTTP_PROXY"), None);
     assert_eq!(get(&out, "ALL_PROXY"), None);
@@ -117,7 +117,7 @@ fn env_proxy_userinfo_dropped() {
 #[test]
 fn env_pass_env_added() {
     let e = env(&[("FOO", "1"), ("BAR", "2"), ("CARGO_HOME", "/c")]);
-    let out = child_env(&e, &["FOO".into(), "CARGO_HOME".into(), "MISSING".into()], "/bin", "s");
+    let out = child_env(&e, &["FOO".into(), "CARGO_HOME".into(), "MISSING".into()], "/bin", "/bin", "s");
     assert_eq!(names(&out), ["FOO", "CARGO_HOME", "PATH", "HENKI_USER_PATH", "HENKI_SESSION", "HENKI_VERSION", "HENKI_DEPTH"]);
     assert_eq!(get(&out, "FOO"), Some("1"));
     assert_eq!(get(&out, "CARGO_HOME"), Some("/c"));
@@ -126,7 +126,7 @@ fn env_pass_env_added() {
 #[test]
 fn env_henki_vars() {
     let e = env(&[("PATH", "./bin:/inherited"), ("HENKI_SESSION", "old"), ("HENKI_VERSION", "0.0.0")]);
-    let out = child_env(&e, &[], "/opt/homebrew/bin:/usr/bin:/bin", "20261105T171203Z-3f9a");
+    let out = child_env(&e, &[], "/opt/homebrew/bin:/usr/bin:/bin", "/opt/homebrew/bin:/usr/bin:/bin", "20261105T171203Z-3f9a");
     assert_eq!(get(&out, "PATH"), Some("/opt/homebrew/bin:/usr/bin:/bin"));
     assert_eq!(get(&out, "HENKI_USER_PATH"), Some("/opt/homebrew/bin:/usr/bin:/bin"));
     assert_eq!(get(&out, "HENKI_SESSION"), Some("20261105T171203Z-3f9a"));
@@ -138,7 +138,7 @@ fn env_henki_vars() {
 fn env_depth_plus_one() {
     let depth = |v: Option<&str>| {
         let e = v.map_or_else(Env::default, |v| env(&[("HENKI_DEPTH", v)]));
-        get(&child_env(&e, &[], "/bin", "s"), "HENKI_DEPTH").unwrap().to_string()
+        get(&child_env(&e, &[], "/bin", "/bin", "s"), "HENKI_DEPTH").unwrap().to_string()
     };
     assert_eq!(depth(None), "1");
     assert_eq!(depth(Some("0")), "1");
@@ -154,7 +154,7 @@ fn env_bash_env_never_passed() {
     fs::write(&rc, "echo sourced\n").unwrap();
     let rc = rc.to_str().unwrap();
     let e = env(&[("BASH_ENV", rc), ("ENV", rc), ("HOME", t.0.to_str().unwrap())]);
-    let vars = child_env(&e, &["BASH_ENV".into(), "ENV".into()], "/usr/bin:/bin", "s");
+    let vars = child_env(&e, &["BASH_ENV".into(), "ENV".into()], "/usr/bin:/bin", "/usr/bin:/bin", "s");
     assert_eq!(get(&vars, "BASH_ENV"), None);
     assert_eq!(get(&vars, "ENV"), None);
     let (tx, rx) = mpsc::channel();

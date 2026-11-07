@@ -2,20 +2,30 @@
 use serde_json::Value;
 use std::time::Duration;
 
+/// The built-in tools, in the order the model sees them.
+pub const TOOLS: [&str; 4] = ["shell", "read", "write", "edit"];
+/// The most a call's arguments may hold.
+pub const ARGS_MAX: usize = 1 << 20;
+/// The result of every call of a reply that was cut at max_tokens.
+pub const CUT_ARGS: &str = "arguments cut at max_tokens; not run. Send a shorter call.";
+
 /// Everything that wakes MAIN. A tagged event carries the tag MAIN gave its worker (one per model attempt, one per tool
 /// call); MAIN drops a tagged event whose tag is not the one it is waiting for.
 #[derive(Debug)]
 pub enum Ev {
     /// INT, QUIT, TERM or HUP, from the signal thread.
     Signal(i32),
-    /// `run -`: the task read from stdin; `None` when it is over 1 MiB or unreadable.
-    Line(Option<String>),
+    /// One line from the terminal, or `run -`'s whole task. `tag`: the read MAIN asked for when the line ended (0: none;
+    /// `run -` sends 0). None: EOF (`run -`: over 1 MiB or unreadable).
+    Line { tag: u32, text: Option<String> },
     /// A streamed piece of attempt `tag`'s reply.
     Part { tag: u32, part: Part },
     /// The end of attempt `tag`: exactly one per attempt.
     Reply { tag: u32, reply: Result<Reply, ProviderError> },
     /// The end of tool call `tag`: exactly one per call.
     Tool { tag: u32, out: ToolOutput },
+    /// The end of `!cmd` `tag`: its exit code, 128 + N when signal N ended it.
+    BangDone { tag: u32, code: i32 },
     /// The output writer got EPIPE on stdout.
     OutputClosed,
 }
@@ -55,6 +65,9 @@ pub struct Reply {
     pub calls: Vec<Call>,
     pub finish: String,
     pub usage: Usage,
+    /// Anthropic: the reply's content blocks as received (thinking with its signature, text, tool_use with its parsed
+    /// input), empty text blocks dropped. None for OpenAI.
+    pub blocks: Option<Value>,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
@@ -97,11 +110,31 @@ pub enum End {
 }
 
 /// The model endpoint from `base_url`: `http://HOST[:PORT]/PATH`.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct Url {
     pub host: String,
     pub port: u16,
     pub path: String,
+}
+
+/// How far a streamed reply got: more to come; its finish came (EOF or 2 s of silence now completes it); its end
+/// marker came.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Flow {
+    More,
+    Finished,
+    Done,
+}
+
+/// One wire format's reply as it arrives (OpenAI chat completions, Anthropic Messages); one loop drives either.
+pub trait Wire: Sized {
+    fn new(offered: &[&'static str]) -> Self;
+    /// One SSE `data` payload; streamed pieces go to `part`.
+    fn data(&mut self, data: &str, part: &mut dyn FnMut(Part)) -> Result<Flow, ProviderError>;
+    /// A 200 `application/json` completion.
+    fn json(self, body: &[u8]) -> Result<Reply, ProviderError>;
+    /// The after-stream rules; `complete` = the end marker came, or EOF or idle after the finish.
+    fn finish(self, complete: bool) -> Result<Reply, ProviderError>;
 }
 
 /// How a turn ends. `exit()` is the one exit table.
@@ -145,10 +178,16 @@ impl Outcome {
         if let Outcome::GaveUp(r) = self { Some(r) } else { None }
     }
 
+    /// `Ok`, `GaveUp`, `NeedsApproval`: a finished run whose reader needed its `result` (141 when stdout closed).
+    pub fn finished(&self) -> bool {
+        matches!(self, Outcome::Ok | Outcome::GaveUp(_) | Outcome::NeedsApproval(_))
+    }
+
     /// REASON of `not run: REASON` for the calls this end leaves unstarted.
     pub fn not_run(&self) -> &'static str {
         match self {
             Outcome::NeedsApproval(_) => "needs approval",
+            Outcome::Error { kind: "changed", .. } => "trust file changed",
             Outcome::Budget => "budget",
             Outcome::OutputClosed => "output closed",
             _ => "interrupted",

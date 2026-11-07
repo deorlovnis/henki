@@ -1,13 +1,11 @@
 //! What the model sees before its first call (the core prompt and the tool schemas), and what decides a call before it
 //! runs: validation, the target it would touch, and whether it needs a human.
-use crate::{config, sys, term, types::Call, types::End, types::ToolOutput};
+use crate::{config, config::Config, sys, term, types::ARGS_MAX, types::Call, types::End, types::ToolOutput};
 use serde_json::{Value, json};
 use std::{ffi::OsString, fs, io, os::unix::fs::MetadataExt, path::Path, path::PathBuf};
 
-pub const ALL: [&str; 4] = ["shell", "read", "write", "edit"];
 /// System part 1, byte-exact (563 B).
 pub const PART1: &str = include_str!("prompt.txt");
-pub const ARGS_MAX: usize = 1 << 20;
 pub const READ_MAX: usize = 32 << 10;
 pub const REPAIR: &str = "interrupted; the command may have partly run";
 
@@ -21,9 +19,9 @@ pub fn schema(enabled: &[&'static str]) -> Value {
     all.into_iter().filter(|t| t["function"]["name"].as_str().is_some_and(|n| enabled.contains(&n))).collect()
 }
 
-/// Part 1, then "\n\n" and part 3 when it is not empty (today: the global AGENTS.md).
-pub fn system(agents: Option<&str>) -> String {
-    agents.filter(|a| !a.is_empty()).map_or_else(|| PART1.to_string(), |a| format!("{PART1}\n\n{a}"))
+/// Part 1, then "\n\n" and part 3 when it is not empty; part 3 = the non-empty of [global AGENTS.md, EXTS] joined by "\n\n".
+pub fn system(agents: Option<&str>, exts: &str) -> String {
+    [PART1, agents.unwrap_or_default(), exts].into_iter().filter(|p| !p.is_empty()).collect::<Vec<_>>().join("\n\n")
 }
 
 /// Sets `c.error` to the first failing validation string; normalizes integer fields in `c.args`.
@@ -68,13 +66,6 @@ fn int(v: &Value) -> Option<u64> {
     }
 }
 
-pub struct Ctx<'a> {
-    pub cwd: &'a Path,
-    pub root: &'a Path,
-    pub home: &'a Path,
-    pub protected: &'a [PathBuf],
-}
-
 pub struct Target {
     pub path: PathBuf,          // resolved
     pub shown: String,          // `PATH`, or `PATH -> TARGET (symlink, outside project)` as they apply
@@ -86,13 +77,13 @@ pub struct Target {
     pub outside: bool,          // outside the project root
 }
 
-/// Resolve a file tool's path before anything is shown or run.
-pub fn target(path: &str, write: bool, cx: &Ctx) -> Result<Target, String> {
+/// Resolve a file tool's path before anything is shown or run (`cfg.cwd`, `cfg.root`, `cfg.home`, `cfg.protected`).
+pub fn target(path: &str, write: bool, cfg: &Config) -> Result<Target, String> {
     let fail = io_error(path);
     if write && matches!(path.rsplit('/').next(), Some("" | "." | "..")) {
         return Err(format!("{path}: not a file name"));
     }
-    let given = cx.cwd.join(config::expand(path, cx.home));
+    let given = cfg.cwd.join(config::expand(path, &cfg.home));
     // The nearest path that exists (a dangling symlink does); below it, the components a write creates, deepest first.
     let (mut at, mut missing) = (given.as_path(), Vec::new());
     let found = loop {
@@ -121,10 +112,10 @@ pub fn target(path: &str, write: bool, cx: &Ctx) -> Result<Target, String> {
     // Each protected path is resolved as a target is (realpath of its nearest existing ancestor, then the rest), so one
     // that does not exist yet still matches when it is named through a symlink.
     let resolve = |p: &Path| p.ancestors().find_map(|a| Some(fs::canonicalize(a).ok()?.join(p.strip_prefix(a).ok()?)));
-    if write && cx.protected.iter().filter_map(|p| resolve(p)).any(|p| resolved.starts_with(p)) {
+    if write && cfg.protected.iter().filter_map(|p| resolve(p)).any(|p| resolved.starts_with(p)) {
         return Err(format!("protected: {path} is henki's own file; change it through shell so the user sees it"));
     }
-    let root = fs::canonicalize(cx.root).unwrap_or_else(|_| cx.root.to_path_buf());
+    let root = fs::canonicalize(&cfg.root).unwrap_or_else(|_| cfg.root.clone());
     let outside = !resolved.starts_with(root);
     let (base, name, mode, missing) = match missing.split_first() {
         Some((name, dirs)) => (real, name.clone(), None, dirs.iter().rev().cloned().collect()),
@@ -142,9 +133,15 @@ pub fn io_error(path: &str) -> impl Fn(io::Error) -> String + Copy + '_ {
     move |e| format!("{path}: {}", e.to_string().split(" (os error").next().unwrap_or_default())
 }
 
-/// `ask` mode: shell, write and edit always; read only outside the project root. `auto`: never.
-pub fn needs_approval(name: &str, t: Option<&Target>, auto: bool) -> bool {
-    !auto && (name != "read" || t.is_none_or(|t| t.outside))
+/// `ask` mode: shell, write and edit always; read only outside the project root. `auto` (`cfg.auto`): never.
+pub fn needs_approval(name: &str, t: Option<&Target>, cfg: &Config, _session: &str) -> bool {
+    !cfg.auto && (name != "read" || t.is_none_or(|t| t.outside))
+}
+
+/// The approval display as lines, without the reset and the question.
+pub fn display(c: &Call, t: Option<&Target>) -> Vec<String> {
+    let _ = (c, t);
+    todo!()
 }
 
 pub enum Killed {
@@ -187,14 +184,18 @@ pub fn not_started(e: &io::Error) -> String {
     format!("[not started: {name} bash]")
 }
 
-/// The plain-mode stderr line: `$ FIRST_LINE -> exit 0, 0.3 s`, `read PATH -> ok, 0.0 s`, `edit PATH -> error, 0.0 s`.
-pub fn call_line(c: &Call, out: Option<&ToolOutput>, killed: Option<&Killed>, is_error: bool) -> String {
-    let head = match (c.name.as_str(), c.args["command"].as_str(), c.args["path"].as_str()) {
+/// A call's head: `$ FIRST_LINE` (shell), `read PATH`, `write PATH`, `edit PATH`, else the name.
+pub fn head(c: &Call) -> String {
+    match (c.name.as_str(), c.args["command"].as_str(), c.args["path"].as_str()) {
         ("shell", Some(cmd), _) => format!("$ {}", cmd.lines().next().unwrap_or_default()),
         (name, _, Some(p)) => format!("{name} {p}"),
         (name, ..) => name.to_string(),
-    };
-    format!("{head} -> {}", ended(out, killed, is_error))
+    }
+}
+
+/// The call line: `$ FIRST_LINE -> exit 0, 0.3 s`, `read PATH -> ok, 0.0 s`, `edit PATH -> error, 0.0 s`.
+pub fn call_line(c: &Call, out: Option<&ToolOutput>, killed: Option<&Killed>, is_error: bool) -> String {
+    format!("{} -> {}", head(c), ended(out, killed, is_error))
 }
 
 /// min(output_cap, window / 2) bytes.

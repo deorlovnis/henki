@@ -141,8 +141,8 @@ fn events(rx: &Receiver<Ev>) -> Vec<Ev> {
 fn out_json_record_line() {
     let (tx, rx) = mpsc::channel();
     let log = Log::new();
-    let out = Out::with(true, tx, log.on(1, None), log.on(2, None));
-    assert!(out.json);
+    let out = Out::with(Mode::Json, tx, log.on(1, None), log.on(2, None), false);
+    assert!(out.json() && !out.repl());
     out.record(&json!({"t": "text", "text": "a\u{202e}"}));
     out.answer("never in --json");
     out.line("never in --json");
@@ -156,8 +156,8 @@ fn out_json_record_line() {
 fn out_plain_answer_escaped() {
     let (tx, _rx) = mpsc::channel();
     let log = Log::new();
-    let out = Out::with(false, tx, log.on(1, None), log.on(2, None));
-    assert!(!out.json);
+    let out = Out::with(Mode::Plain, tx, log.on(1, None), log.on(2, None), false);
+    assert!(!out.json() && !out.repl());
     out.record(&json!({"t": "result"}));
     out.answer("done \x1b[2J\tok");
     out.flush(soon());
@@ -168,7 +168,7 @@ fn out_plain_answer_escaped() {
 fn out_note_prefix() {
     let (tx, _rx) = mpsc::channel();
     let log = Log::new();
-    let out = Out::with(false, tx, log.on(1, None), log.on(2, None));
+    let out = Out::with(Mode::Plain, tx, log.on(1, None), log.on(2, None), false);
     out.note("HTTP 429; retry 1/4 in 1.0 s \u{7}");
     out.flush(soon());
     assert_eq!(log.get(), [(2, "henki: HTTP 429; retry 1/4 in 1.0 s \\x07\n".to_string())]);
@@ -178,7 +178,7 @@ fn out_note_prefix() {
 fn out_line_unprefixed() {
     let (tx, _rx) = mpsc::channel();
     let log = Log::new();
-    let out = Out::with(false, tx, log.on(1, None), log.on(2, None));
+    let out = Out::with(Mode::Plain, tx, log.on(1, None), log.on(2, None), false);
     out.line("$ ls -> exit 0, 0.3 s");
     out.line("(gave up: stuck)");
     out.flush(soon());
@@ -189,7 +189,7 @@ fn out_line_unprefixed() {
 fn out_epipe_closed_once() {
     let (tx, rx) = mpsc::channel();
     let log = Log::new();
-    let out = Out::with(true, tx, log.on(1, Some(io::ErrorKind::BrokenPipe)), log.on(2, None));
+    let out = Out::with(Mode::Json, tx, log.on(1, Some(io::ErrorKind::BrokenPipe)), log.on(2, None), false);
     for i in 0..3 {
         out.record(&json!({"i": i}));
     }
@@ -205,7 +205,7 @@ fn out_epipe_closed_once() {
 fn out_stderr_error_ignored() {
     let (tx, rx) = mpsc::channel();
     let log = Log::new();
-    let out = Out::with(false, tx, log.on(1, None), log.on(2, Some(io::ErrorKind::BrokenPipe)));
+    let out = Out::with(Mode::Plain, tx, log.on(1, None), log.on(2, Some(io::ErrorKind::BrokenPipe)), false);
     out.note("lost");
     out.answer("kept");
     assert!(!out.flush(soon()));
@@ -230,7 +230,7 @@ impl Write for Stuck {
 fn out_flush_bounded() {
     let (tx, _rx) = mpsc::channel();
     let (release, hold) = mpsc::channel();
-    let out = Out::with(true, tx, Box::new(Stuck(hold)), Box::new(io::sink()));
+    let out = Out::with(Mode::Json, tx, Box::new(Stuck(hold)), Box::new(io::sink()), false);
     out.record(&json!({"t": "result"}));
     let t0 = Instant::now();
     assert!(out.flush(t0 + Duration::from_millis(200)), "a line still queued at the bound did not get out");
@@ -253,7 +253,7 @@ fn out_flush_reports_closed() {
         }
     }
     let (tx, rx) = mpsc::channel();
-    let out = Out::with(true, tx, Box::new(Once(0)), Box::new(io::sink()));
+    let out = Out::with(Mode::Json, tx, Box::new(Once(0)), Box::new(io::sink()), false);
     out.record(&json!({"t": "session"}));
     out.record(&json!({"t": "result"}));
     assert!(out.flush(soon()));
@@ -264,7 +264,7 @@ fn out_flush_reports_closed() {
 fn out_order_across_streams() {
     let (tx, _rx) = mpsc::channel();
     let log = Log::new();
-    let out = Out::with(false, tx, log.on(1, None), log.on(2, None));
+    let out = Out::with(Mode::Plain, tx, log.on(1, None), log.on(2, None), false);
     out.note("one");
     out.line("$ two -> exit 0, 0.1 s");
     out.answer("three");
@@ -281,7 +281,7 @@ fn out_flush_past_deadline() {
     let (tx, _rx) = mpsc::channel();
     let (release, hold) = mpsc::channel();
     let until = Instant::now();
-    let out = Out::with(true, tx, Box::new(Stuck(hold)), Box::new(io::sink()));
+    let out = Out::with(Mode::Json, tx, Box::new(Stuck(hold)), Box::new(io::sink()), false);
     out.record(&json!({"t": "result"}));
     assert!(out.flush(until), "the result was still queued");
     assert!(until.elapsed() < Duration::from_millis(500), "{:?}", until.elapsed());
@@ -354,4 +354,303 @@ fn json_line_roundtrip_fuzz() {
         assert!(!line.chars().any(escaped) && !line.contains('\n'), "{line:?}");
         assert_eq!(serde_json::from_str::<Value>(&line).unwrap(), v);
     }
+}
+
+/// The pieces a REPL-mode `Out` wrote, after `f` ran on it.
+fn repl(tty: bool, f: impl FnOnce(&Out)) -> Vec<(u8, String)> {
+    let (tx, _rx) = mpsc::channel();
+    let log = Log::new();
+    let out = Out::with(Mode::Repl, tx, log.on(1, None), log.on(2, None), tty);
+    f(&out);
+    assert!(!out.flush(soon()));
+    log.get()
+}
+
+fn pieces(want: &[(u8, &str)]) -> Vec<(u8, String)> {
+    want.iter().map(|&(fd, s)| (fd, s.to_string())).collect()
+}
+
+#[test]
+fn out_repl_delta_then_line_newline() {
+    let got = repl(false, |out| {
+        out.delta("Hel");
+        out.delta("lo \x1b");
+        out.line("$ ls");
+        out.delta("done\n");
+        out.note("after a whole line");
+        out.delta("");
+        out.line("(interrupted)");
+    });
+    let want = [(1, "Hel"), (1, "lo \\x1b"), (1, "\n"), (2, "$ ls\n"), (1, "done\n"), (2, "henki: after a whole line\n"), (2, "(interrupted)\n")];
+    assert_eq!(got, pieces(&want));
+}
+
+#[test]
+fn out_repl_prompt_no_newline() {
+    let got = repl(false, |out| {
+        out.prompt("> ");
+        out.delta("partial");
+        out.prompt("run? [y/N] \u{202e}");
+    });
+    assert_eq!(got, pieces(&[(2, "> "), (1, "partial"), (1, "\n"), (2, "run? [y/N] \\u{202e}")]));
+    for mode in [Mode::Plain, Mode::Json] {
+        let (tx, _rx) = mpsc::channel();
+        let log = Log::new();
+        let out = Out::with(mode, tx, log.on(1, None), log.on(2, None), true);
+        out.prompt("> ");
+        out.delta("not streamed outside the REPL");
+        out.flush(soon());
+        assert!(log.get().is_empty(), "{mode:?}");
+    }
+}
+
+#[test]
+fn out_repl_lines_on_stderr() {
+    let got = repl(true, |out| {
+        assert!(out.repl() && !out.json());
+        out.line("$ ls -> exit 0, 0.3 s");
+        out.note("context_window is unknown");
+        out.answer("the answer streams as deltas");
+        out.record(&json!({"t": "notice"}));
+    });
+    assert_eq!(got, pieces(&[(2, "$ ls -> exit 0, 0.3 s\n"), (2, "henki: context_window is unknown\n")]));
+}
+
+#[test]
+fn out_reset_only_tty() {
+    let got = repl(true, |out| {
+        out.delta("cut short");
+        out.reset();
+        out.line("-- shell --");
+    });
+    assert_eq!(got, pieces(&[(1, "cut short"), (1, "\n"), (2, RESET), (2, "-- shell --\n")]));
+    assert_eq!(RESET, "\x1b[!p\x1b[0m\x1b[r\x1b[?1049l\x1b[?7h\x1b[999;1H\x1bD");
+    assert_eq!(repl(false, |out| out.reset()), []);
+}
+
+#[test]
+fn out_reset_not_in_plain_or_json() {
+    for mode in [Mode::Plain, Mode::Json] {
+        let (tx, _rx) = mpsc::channel();
+        let log = Log::new();
+        let out = Out::with(mode, tx, log.on(1, None), log.on(2, None), true);
+        out.reset();
+        out.line("x \x1b[2J");
+        out.record(&json!({"t": "x\u{1b}"}));
+        out.flush(soon());
+        assert!(log.get().iter().all(|(_, s)| !s.contains('\x1b')), "{mode:?}: {:?}", log.get());
+    }
+}
+
+#[test]
+fn rows_wrap_and_minimum() {
+    let l = |s: &str| s.to_string();
+    assert_eq!(rows(&[], 80), 0);
+    assert_eq!(rows(&[l("")], 80), 1, "an empty line takes a row");
+    assert_eq!(rows(&[l(&"x".repeat(80))], 80), 1);
+    assert_eq!(rows(&[l(&"x".repeat(81))], 80), 2);
+    // Escaped forms count their ASCII width: ESC is shown as \x1b (4 columns), U+202E as \u{202e} (8).
+    assert_eq!(rows(&[l(&"\x1b".repeat(20))], 80), 1);
+    assert_eq!(rows(&[l(&"\x1b".repeat(21))], 80), 2);
+    assert_eq!(rows(&[l(&"\u{202e}".repeat(10))], 80), 1);
+    assert_eq!(rows(&[l(&"\u{202e}".repeat(11))], 80), 2);
+    // Any other character takes two columns.
+    assert_eq!(rows(&[l(&"é".repeat(40))], 80), 1);
+    assert_eq!(rows(&[l(&"é".repeat(41))], 80), 2);
+    assert_eq!(rows(&[l("ab"), l(""), l(&"日".repeat(50))], 10), 1 + 1 + 10);
+    assert_eq!(rows(&[l("abc")], 0), 3, "a width of 0 counts as 1");
+}
+
+/// An input over a pipe that counts the reads made from it.
+struct Counted(io::PipeReader, Arc<AtomicUsize>);
+
+impl Read for Counted {
+    fn read(&mut self, b: &mut [u8]) -> io::Result<usize> {
+        self.1.fetch_add(1, SeqCst);
+        self.0.read(b)
+    }
+}
+
+/// A reader over a fresh pipe: the reader, its events, the pipe's write end, and the read count.
+fn reader() -> (Reader, Receiver<Ev>, io::PipeWriter, Arc<AtomicUsize>) {
+    let (r, w) = io::pipe().unwrap();
+    let (tx, rx) = mpsc::channel();
+    let reads = Arc::new(AtomicUsize::new(0));
+    (Reader::with(Box::new(Counted(r, Arc::clone(&reads))), tx).unwrap(), rx, w, reads)
+}
+
+/// The next event, which must be a line, within 5 s.
+fn line(rx: &Receiver<Ev>) -> (u32, Option<String>) {
+    match rx.recv_timeout(Duration::from_secs(5)) {
+        Ok(Ev::Line { tag, text }) => (tag, text),
+        other => panic!("no line: {other:?}"),
+    }
+}
+
+/// Polls `f` every 5 ms for up to 5 s.
+fn until(f: impl Fn() -> bool) -> bool {
+    let t0 = Instant::now();
+    while !f() {
+        if t0.elapsed() > Duration::from_secs(5) {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    true
+}
+
+#[test]
+fn reader_only_when_asked() {
+    let (r, rx, mut w, reads) = reader();
+    w.write_all(b"early\n").unwrap();
+    // Nobody asked: no line comes and the input is never read.
+    assert!(rx.recv_timeout(Duration::from_millis(200)).is_err());
+    assert_eq!(reads.load(SeqCst), 0);
+    r.ask(1);
+    assert_eq!(line(&rx), (1, Some("early".into())));
+    assert_eq!(reads.load(SeqCst), 1);
+    // After the line it waits again, without reading what is typed next.
+    w.write_all(b"late\n").unwrap();
+    assert!(rx.recv_timeout(Duration::from_millis(200)).is_err());
+    assert_eq!(reads.load(SeqCst), 1);
+    r.ask(2);
+    assert_eq!(line(&rx), (2, Some("late".into())));
+}
+
+#[test]
+fn reader_tag_at_line_end() {
+    let (r, rx, mut w, reads) = reader();
+    r.ask(5);
+    w.write_all(b"hel").unwrap();
+    assert!(until(|| reads.load(SeqCst) >= 1), "the read never started");
+    r.ask(9);
+    w.write_all(b"lo\n").unwrap();
+    assert_eq!(line(&rx), (9, Some("hello".into())));
+}
+
+#[test]
+fn reader_stale_after_cancel() {
+    let (r, rx, mut w, reads) = reader();
+    r.ask(5);
+    assert!(until(|| reads.load(SeqCst) >= 1), "the read never started");
+    r.ask(0);
+    w.write_all(b"typed after the cancel\n").unwrap();
+    assert_eq!(line(&rx), (0, Some("typed after the cancel".into())));
+    // Then it waits for the next ask.
+    w.write_all(b"next\n").unwrap();
+    r.ask(6);
+    assert_eq!(line(&rx), (6, Some("next".into())));
+}
+
+#[test]
+fn reader_eof_sticky() {
+    let (r, rx, mut w, reads) = reader();
+    w.write_all(b"last").unwrap();
+    drop(w);
+    r.ask(1);
+    assert_eq!(line(&rx), (1, Some("last".into())), "a line cut by EOF is still a line");
+    r.ask(2);
+    assert_eq!(line(&rx), (2, None));
+    let n = reads.load(SeqCst);
+    r.ask(3);
+    assert_eq!(line(&rx), (3, None));
+    assert_eq!(reads.load(SeqCst), n, "nothing is read after EOF");
+}
+
+#[test]
+fn reader_strips_crlf() {
+    let (r, rx, mut w, _) = reader();
+    w.write_all(b"a\r\nb\n\r\nc\r\r\n\xffx\n").unwrap();
+    drop(w);
+    for (tag, want) in [(1, "a"), (2, "b"), (3, ""), (4, "c\r"), (5, "\u{fffd}x")] {
+        r.ask(tag);
+        assert_eq!(line(&rx), (tag, Some(want.into())));
+    }
+    r.ask(6);
+    assert_eq!(line(&rx), (6, None));
+}
+
+/// What a scripted input answers next: bytes, or EOF. An empty script answers WouldBlock, as a terminal left
+/// non-blocking (O_NONBLOCK) does while no whole line has been typed.
+enum In {
+    Data(&'static [u8]),
+    Eof,
+}
+
+/// An input that answers each read from a shared script and reports each read on `seen` (true: it was answered
+/// from the script; false: WouldBlock).
+struct Script(Arc<Mutex<std::collections::VecDeque<In>>>, mpsc::Sender<bool>);
+
+impl Read for Script {
+    fn read(&mut self, b: &mut [u8]) -> io::Result<usize> {
+        let next = self.0.lock().unwrap().pop_front();
+        let _ = self.1.send(next.is_some());
+        match next {
+            None => Err(io::ErrorKind::WouldBlock.into()),
+            Some(In::Eof) => Ok(0),
+            Some(In::Data(d)) => {
+                b[..d.len()].copy_from_slice(d);
+                Ok(d.len())
+            }
+        }
+    }
+}
+
+/// The next read the script saw, within 5 s: true when it was answered from the script.
+fn seen(reads: &Receiver<bool>) -> bool {
+    reads.recv_timeout(Duration::from_secs(5)).expect("no read within 5 s")
+}
+
+#[test]
+fn reader_nonblocking_not_eof() {
+    let script = Arc::new(Mutex::new(std::collections::VecDeque::new()));
+    let ((tx, rx), (seen_tx, reads)) = (mpsc::channel(), mpsc::channel());
+    let r = Reader::with(Box::new(Script(Arc::clone(&script), seen_tx)), tx).unwrap();
+    let push = |i: In| script.lock().unwrap().push_back(i);
+    // Nothing typed yet: WouldBlock, and the reader reads again instead of taking it for EOF.
+    r.ask(1);
+    assert!(!seen(&reads) && !seen(&reads), "two reads, both WouldBlock");
+    assert!(rx.try_recv().is_err(), "no line and no EOF yet");
+    push(In::Data(b"typed later\n"));
+    assert_eq!(line(&rx), (1, Some("typed later".into())));
+    // Every read up to the line was reported before the line was sent.
+    let drain = || reads.try_iter().count();
+    drain();
+    // A cancel while it waits for input: at most the read already under way, then no more reads.
+    r.ask(5);
+    assert!(!seen(&reads));
+    r.ask(0);
+    let after = std::iter::from_fn(|| reads.recv_timeout(Duration::from_millis(300)).ok()).count();
+    assert!(after <= 1, "{after} reads after the cancel");
+    assert!(rx.try_recv().is_err());
+    // Part of a line, then WouldBlock: the part is kept and the line completes later.
+    push(In::Data(b"par"));
+    r.ask(6);
+    while seen(&reads) {}
+    push(In::Data(b"tial\n"));
+    assert_eq!(line(&rx), (6, Some("partial".into())));
+    // A real EOF still ends input for good, without another read.
+    push(In::Eof);
+    r.ask(7);
+    assert_eq!(line(&rx), (7, None));
+    drain();
+    r.ask(8);
+    assert_eq!(line(&rx), (8, None));
+    assert!(reads.recv_timeout(Duration::from_millis(100)).is_err(), "nothing is read after EOF");
+}
+
+#[test]
+fn rows_wide_odd_width() {
+    let l = |s: &str| s.to_string();
+    // A terminal never splits a wide character: at an odd width it wraps one column early.
+    assert_eq!(rows(&[l(&"漢".repeat(4))], 3), 4);
+    assert_eq!(rows(&[l(&format!("!| {}", "漢".repeat(120)))], 81), 4, "39 + 40 + 40 + 1");
+    assert_eq!(rows(&[l(&"漢".repeat(40))], 80), 1);
+    assert_eq!(rows(&[l(&"漢".repeat(41))], 80), 2);
+    assert_eq!(rows(&[l("x漢")], 2), 2);
+    // A raw tab counts as the most it can move, 8 columns.
+    assert_eq!(rows(&[l(&"\t".repeat(10))], 80), 1);
+    assert_eq!(rows(&[l(&"\t".repeat(11))], 80), 2);
+    assert_eq!(rows(&[l(&format!("{}\t", "x".repeat(73)))], 80), 2);
+    assert_eq!(rows(&[l("漢")], 1), 1, "a character wider than the screen still takes one row");
 }

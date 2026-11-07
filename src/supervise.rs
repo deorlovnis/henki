@@ -26,14 +26,14 @@ pub struct Spill {
     pub shown: String,
 }
 
-/// Exactly the child environment: the allowlist, `pass_env`, PATH = `user_path`, HENKI_USER_PATH, HENKI_SESSION,
-/// HENKI_VERSION, HENKI_DEPTH + 1. A proxy value with userinfo is dropped.
-pub fn child_env(env: &Env, pass_env: &[String], user_path: &str, session: &str) -> Vec<(OsString, OsString)> {
+/// Exactly the child environment: the allowlist, `pass_env`, PATH = `path` (ext `bin/` dirs, then the user PATH),
+/// HENKI_USER_PATH = `user_path`, HENKI_SESSION, HENKI_VERSION, HENKI_DEPTH + 1. A proxy value with userinfo is dropped.
+pub fn child_env(env: &Env, pass_env: &[String], path: &str, user_path: &str, session: &str) -> Vec<(OsString, OsString)> {
     let keep = |k: &str| (ALLOW.split_whitespace().any(|a| a == k) || pass_env.iter().any(|p| p == k)) && k != "BASH_ENV" && k != "ENV";
     let userinfo = |k: &str, v: &OsString| k.to_ascii_lowercase().ends_with("proxy") && v.as_encoded_bytes().contains(&b'@');
     let mut out: Vec<_> = env.0.iter().filter(|(k, v)| k.to_str().is_some_and(|k| keep(k) && !userinfo(k, v))).cloned().collect();
     let depth = env.0.iter().find(|(k, _)| k == "HENKI_DEPTH").and_then(|(_, v)| v.to_str()?.parse::<u32>().ok()).map_or(1, |d| u64::from(d) + 1).to_string();
-    let henki = [("PATH", user_path), ("HENKI_USER_PATH", user_path), ("HENKI_SESSION", session), ("HENKI_VERSION", env!("CARGO_PKG_VERSION")), ("HENKI_DEPTH", &depth)];
+    let henki = [("PATH", path), ("HENKI_USER_PATH", user_path), ("HENKI_SESSION", session), ("HENKI_VERSION", env!("CARGO_PKG_VERSION")), ("HENKI_DEPTH", &depth)];
     out.extend(henki.map(|(k, v)| (k.into(), v.into())));
     out
 }
@@ -61,6 +61,20 @@ pub fn spawn(bash: &Path, cmd: &str, cwd: &Path, env: &[(OsString, OsString)], c
     lock(&LEDGER).push(pgid);
     let _ = give.send(child); // the waiter is in `recv` until it gets it
     Ok(pgid)
+}
+
+/// MAIN only. `!cmd`: `bash --noprofile --norc -c CMD` in henki's own process group on the terminal (stdin, stdout and
+/// stderr inherited), `cwd`, exactly `env`, `sys::bang_setup`; not in the ledger. A waiter thread sends one
+/// `Ev::BangDone { tag, code }` (128 + N for signal N). Returns the pid.
+pub fn bang(bash: &Path, cmd: &str, cwd: &Path, env: &[(OsString, OsString)], tag: u32, tx: &Sender<Ev>) -> io::Result<i32> {
+    let _ = (bash, cmd, cwd, env, tag, tx);
+    todo!()
+}
+
+/// The `!cmd` environment: henki's inherited environment with `HENKI_DEPTH` + 1.
+pub fn bang_env(env: &Env) -> Vec<(OsString, OsString)> {
+    let _ = env;
+    todo!()
 }
 
 /// Sends `sig` (0 probes) to every group in the ledger, drops the groups that are gone (ESRCH), returns how many remain.

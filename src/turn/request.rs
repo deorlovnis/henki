@@ -58,13 +58,13 @@ impl Session {
                 if !resp.sse {
                     return acc.json(&resp.body(http::JSON_MAX));
                 }
-                let mut flow = openai::Flow::More;
+                let mut flow = Flow::More;
                 loop {
-                    match resp.event(matches!(flow, openai::Flow::Finished), &lim)? {
-                        None => return acc.finish(matches!(flow, openai::Flow::Finished)),
+                    match resp.event(matches!(flow, Flow::Finished), &lim)? {
+                        None => return acc.finish(matches!(flow, Flow::Finished)),
                         Some((_, data)) => flow = acc.data(&data, &mut |part| drop(tx.send(Ev::Part { tag, part })))?,
                     }
-                    if matches!(flow, openai::Flow::Done) {
+                    if matches!(flow, Flow::Done) {
                         return acc.finish(true);
                     }
                 }
@@ -93,7 +93,7 @@ impl Session {
         if text.is_empty() {
             return o;
         }
-        self.record(rec::assistant(&text, &[], finish, Usage::default())).err().filter(|_| !matches!(o, Outcome::Error { .. })).unwrap_or(o)
+        self.record(rec::assistant(&text, &[], finish, Usage::default(), None)).err().filter(|_| !matches!(o, Outcome::Error { .. })).unwrap_or(o)
     }
 
     /// The error as the turn's outcome. After the last retry it says so, and a loopback server that refused every

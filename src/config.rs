@@ -1,6 +1,6 @@
 //! The configuration: one TOML-subset file, two environment variables and the flags, checked so that anything wrong
 //! stops henki with the file, the line and the fix.
-use crate::{http, sys, term, tools::ALL as TOOLS, types::Url};
+use crate::{allow, ext, http, sys, term, types::TOOLS, types::Url};
 use serde_json::Value;
 use std::path::{Component, Path, PathBuf};
 use std::{ffi::OsStr, ffi::OsString, fs, io::ErrorKind, io::Read, net::Ipv6Addr, os::unix::ffi::OsStrExt, os::unix::fs::MetadataExt};
@@ -20,6 +20,7 @@ impl Env {
 }
 
 /// The flags of `run` that override the file.
+#[derive(Default)]
 pub struct Flags {
     pub config: Option<PathBuf>,
     pub approve: Option<bool /* auto */>,
@@ -28,6 +29,7 @@ pub struct Flags {
     pub max_seconds: Option<u64>,
 }
 
+#[derive(Default)]
 pub struct Config {
     pub model: String,
     pub url: Url,
@@ -51,12 +53,18 @@ pub struct Config {
     pub cwd: PathBuf,           // the session cwd (`load`'s argument)
     pub env: Env,               // the snapshot `load` read; the child environment is built from it
     pub root: PathBuf,          // the project root of the cwd
-    pub user_path: String,      // the inherited PATH without relative entries
+    pub user_path: String,      // the inherited PATH without relative entries and without the ext `bin/` dirs
     pub bash: PathBuf,          // the first executable `bash` on an absolute user PATH entry
     pub agents: Option<String>, // <config dir>/AGENTS.md, trailing newlines trimmed
     pub agents_hash: Option<String>,
     pub protected: Vec<PathBuf>, // the config file and dir, each also as its realpath (main adds the state dir)
     pub notices: Vec<String>,
+    pub dialect: &'static str, // "openai" | "anthropic"
+    pub shadow: Vec<String>,   // `EXT/NAME` entries, checked by ext discovery
+    pub state: PathBuf,        // $XDG_STATE_HOME/henki (absolute only) or ~/.local/state/henki; journal::state_dir creates it
+    pub exts: Vec<ext::Ext>,
+    pub allow: allow::Allow, // read only in ask mode
+    pub trust: Vec<PathBuf>, // what the tripwire stamps
 }
 
 /// The HENKI_* variables henki reads or sets for its children; any other gives a notice.
@@ -85,7 +93,8 @@ pub fn load(f: &Flags, env: &Env, cwd: &Path) -> Result<Config, String> {
     let mut c = Config { model: String::new(), url: Url { host: String::new(), port: 80, path: String::new() }, url_from: "config", api_key: String::new(),
         auto: false, approve_from: "default".into(), tools: TOOLS.to_vec(), pass_env: Vec::new(), max_steps: 50, max_seconds: 0, tool_timeout_s: 120,
         output_cap: 16_384, window: 0, max_tokens: 4_096, file: None, dir, explicit, hash: None, home, cwd: cwd.to_path_buf(), env: env.clone(), root,
-        user_path: String::new(), bash: PathBuf::new(), agents: None, agents_hash: None, protected: Vec::new(), notices: Vec::new() };
+        user_path: String::new(), bash: PathBuf::new(), agents: None, agents_hash: None, protected: Vec::new(), notices: Vec::new(), dialect: "openai",
+        ..Config::default() };
     // Each layer is (where, key, value): the file's lines, then the two variables, then the flags; the last one wins.
     let mut layers: Vec<(String, String, Value)> = Vec::new();
     if explicit || file.exists() {
@@ -148,6 +157,8 @@ pub fn load(f: &Flags, env: &Env, cwd: &Path) -> Result<Config, String> {
         }
         (c.agents_hash, c.agents) = (Some(sys::fnv(text.as_bytes())), Some(text.trim_end_matches('\n').to_string()).filter(|a| !a.is_empty()));
     }
+    let xdg = env.get("XDG_STATE_HOME").map(Path::new).filter(|p| p.is_absolute());
+    c.state = xdg.map_or_else(|| c.home.join(".local/state"), Path::to_path_buf).join("henki");
     if c.window == 0 {
         c.window = 32_768;
         c.notices.push("context_window is unknown; using 32,768 tokens".into());
@@ -387,6 +398,12 @@ impl Config {
             agents_hash: None,
             protected: Vec::new(),
             notices: Vec::new(),
+            dialect: "openai",
+            shadow: Vec::new(),
+            state: dir.join("state"),
+            exts: Vec::new(),
+            allow: allow::Allow { file: dir.join("allow"), ..Default::default() },
+            trust: Vec::new(),
         }
     }
 }
