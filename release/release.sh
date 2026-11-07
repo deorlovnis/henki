@@ -107,8 +107,12 @@ build() {
   [ -f "$bin" ] || die "cargo built no $bin (is build.target set in a cargo config?)"
   # A static musl binary has no ELF interpreter; one with an interpreter would not run in a bare environment.
   case "$t" in *-linux-musl)
-    if command -v readelf >/dev/null 2>&1 && readelf -l "$bin" | grep -q 'INTERP'; then
-      die "$bin is dynamically linked; fix: build with the $t target's static default (no -C target-feature=-crt-static)"
+    # Read whole, not piped into grep -q: under pipefail a match that closes the pipe early would read as no match.
+    if command -v readelf >/dev/null 2>&1; then
+      case "$(readelf -l "$bin")" in *INTERP*)
+        die "$bin is dynamically linked; fix: build with the $t target's static default (no -C target-feature=-crt-static)"
+        ;;
+      esac
     fi
     ;;
   esac
@@ -125,8 +129,8 @@ copy_mod() {
     mkdir -p "$dest/$(dirname "${path#mods/}")"
     case "$mode" in
       120000) ln -s "$(readlink "$path")" "$dest/${path#mods/}" ;;
-      100755) cp "$path" "$dest/${path#mods/}" && chmod 755 "$dest/${path#mods/}" ;;
-      100644) cp "$path" "$dest/${path#mods/}" && chmod 644 "$dest/${path#mods/}" ;;
+      100755) cp "$path" "$dest/${path#mods/}" && chmod 755 "$dest/${path#mods/}" || die "cannot copy $path; fix: make it readable and check the free space in TMPDIR" ;;
+      100644) cp "$path" "$dest/${path#mods/}" && chmod 644 "$dest/${path#mods/}" || die "cannot copy $path; fix: make it readable and check the free space in TMPDIR" ;;
       *) die "$path: git mode $mode (a submodule?); fix: a module holds files and symlinks only" ;;
     esac
   done
@@ -288,7 +292,9 @@ expect() {
   shift 2
   err=$("$@" 2>&1 >/dev/null) || rc=$?
   if [ "$wanted" = pass ] && [ "$rc" = 0 ]; then return 0; fi
-  if [ "$wanted" != pass ] && [ "$rc" != 0 ] && case "$err" in *"$wanted"*) true ;; *) false ;; esac then return 0; fi
+  if [ "$wanted" != pass ] && [ "$rc" != 0 ]; then
+    case "$err" in *"$wanted"*) return 0 ;; esac
+  fi
   say "selftest: $what: expected ${wanted}, got exit $rc${err:+: $err}"
   return 1
 }
