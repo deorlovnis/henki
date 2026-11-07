@@ -25,9 +25,9 @@ pub const CUT_ARGS: &str = "arguments cut at max_tokens; not run. Send a shorter
 pub enum Ev {
     /// INT, QUIT, TERM or HUP, from the signal thread.
     Signal(i32),
-    /// One line from the terminal, or `run -`'s whole task. `tag`: the read MAIN asked for when the line ended (0: none;
-    /// `run -` sends 0). None: EOF (`run -`: over 1 MiB or unreadable).
-    Line { tag: u32, text: Option<String> },
+    /// What one read from the terminal returned, or `run -`'s whole task. `tag`: the read MAIN asked for (`run -` sends 0).
+    /// None: EOF or an error (`run -`: over 1 MiB or unreadable).
+    Input { tag: u32, bytes: Option<Vec<u8>> },
     /// A streamed piece of attempt `tag`'s reply.
     Part { tag: u32, part: Part },
     /// The end of attempt `tag`: exactly one per attempt.

@@ -1,7 +1,8 @@
 #![allow(clippy::disallowed_methods, clippy::print_stdout, clippy::print_stderr, clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::string_slice, unsafe_code)]
 //! The REPL under a pseudo-terminal: henki is the session leader with the pty as its controlling terminal, so Ctrl-C
 //! typed here reaches it as a terminal's would. A reader thread keeps every byte henki and its commands write. Every
-//! wait is a bounded poll on that screen; nothing sleeps blindly.
+//! wait is a bounded poll on that screen; nothing sleeps blindly. Every run that ends with the terminal still open is
+//! held to two things: the terminal modes are the ones it started with, and bracketed paste is off.
 use crate::harness::{Done, Run, bin, changed_journal};
 use std::cell::Cell;
 use std::collections::HashMap;
@@ -17,9 +18,14 @@ use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
-/// What the REPL writes before an approval display; the only control sequence henki itself sends. It ends on a newly
-/// scrolled bottom row, so the display lands below everything already on the screen.
+/// What the REPL writes before an approval display, as `screen` shows it (without the bracketed paste switch it ends
+/// with). It ends on a newly scrolled bottom row, so the display lands below everything already on the screen.
 pub const RESET: &str = "\x1b[!p\x1b[0m\x1b[r\x1b[?1049l\x1b[?7h\x1b[999;1H\x1bD";
+/// Bracketed paste on and off. henki writes them right away, out of order with what it queued before.
+pub const PASTE_ON: &str = "\x1b[?2004h";
+pub const PASTE_OFF: &str = "\x1b[?2004l";
+/// The line editor's redraws: up a row, and from column 0 everything below cleared.
+const REDRAW: [&str; 2] = ["\x1b[A", "\r\x1b[J"];
 
 /// Borrows its `Run`, whose drop deletes the directories henki works in.
 pub struct Pty<'a> {
@@ -36,6 +42,8 @@ pub struct Pty<'a> {
     /// The terminal's device path, as `tty` prints it.
     pub name: String,
     started: Instant,
+    /// The terminal modes before henki started.
+    pub initial: libc::termios,
     state: PathBuf,
     before: HashMap<PathBuf, u64>,
     marker: String,
@@ -69,6 +77,7 @@ impl<'a> Pty<'a> {
         assert_eq!(rc, 0, "ttyname_r");
         // SAFETY: on success ttyname_r left a NUL-terminated string in `buf`.
         let name = unsafe { std::ffi::CStr::from_ptr(buf.as_ptr()) }.to_string_lossy().into_owned();
+        let initial = modes(slave.as_raw_fd());
         let mut c = Command::new(bin());
         r.prepare(&mut c);
         c.args(args).stdin(slave.try_clone().unwrap()).stderr(slave.try_clone().unwrap());
@@ -111,7 +120,17 @@ impl<'a> Pty<'a> {
             e.store(true, Ordering::SeqCst);
         });
         let (from, started, state, marker) = (Cell::new(0), Instant::now(), r.state(), r.marker.clone());
-        Pty { master: Some(master), child, screen, eof, stop, reader: Some(reader), from, name, started, state, before, marker, run: PhantomData }
+        Pty { master: Some(master), child, screen, eof, stop, reader: Some(reader), from, name, started, initial, state, before, marker, run: PhantomData }
+    }
+
+    /// The terminal's modes now (tcgetattr on the master gives the terminal's own).
+    pub fn modes(&self) -> libc::termios {
+        modes(self.master.as_ref().expect("the terminal is open").as_raw_fd())
+    }
+
+    /// `text` as a terminal with bracketed paste on sends a paste.
+    pub fn paste(&self, text: &str) {
+        self.send(format!("\x1b[200~{text}\x1b[201~").as_bytes());
     }
 
     pub fn send(&self, b: &[u8]) {
@@ -154,7 +173,13 @@ impl<'a> Pty<'a> {
         self.expect("\n> ", within)
     }
 
+    /// Everything written to the terminal, without the bracketed paste switches.
     pub fn screen(&self) -> Vec<u8> {
+        unswitched(&self.raw_screen())
+    }
+
+    /// Everything written to the terminal.
+    pub fn raw_screen(&self) -> Vec<u8> {
         self.screen.lock().unwrap().clone()
     }
 
@@ -196,7 +221,11 @@ impl<'a> Pty<'a> {
         while !self.eof.load(Ordering::SeqCst) && Instant::now() < quiet {
             thread::sleep(Duration::from_millis(2));
         }
-        let text = String::from_utf8_lossy(&self.screen()).replace(RESET, "").replace("\r\n", "\n");
+        if self.master.is_some() {
+            assert!(same_modes(&self.modes(), &self.initial), "the terminal modes differ after the exit:\n{}", shown(&self.raw_screen()));
+            assert!(paste_off(&self.raw_screen()), "bracketed paste is on after the exit:\n{}", shown(&self.raw_screen()));
+        }
+        let text = plain(&self.raw_screen());
         let journal = changed_journal(&self.state, &self.before);
         Done {
             code: status.code(),
@@ -226,6 +255,38 @@ impl Drop for Pty<'_> {
             let _ = self.child.wait();
         }
     }
+}
+
+/// tcgetattr(fd).
+pub fn modes(fd: i32) -> libc::termios {
+    // SAFETY: an all-zero termios is a valid value to overwrite.
+    let mut t: libc::termios = unsafe { std::mem::zeroed() };
+    // SAFETY: a live termios, which tcgetattr fills.
+    assert_eq!(unsafe { libc::tcgetattr(fd, &mut t) }, 0, "tcgetattr: {}", std::io::Error::last_os_error());
+    t
+}
+
+/// The same input, output, control and local modes and control characters.
+pub fn same_modes(a: &libc::termios, b: &libc::termios) -> bool {
+    (a.c_iflag, a.c_oflag, a.c_cflag, a.c_lflag, a.c_cc) == (b.c_iflag, b.c_oflag, b.c_cflag, b.c_lflag, b.c_cc)
+}
+
+/// The last bracketed paste switch on `screen`, if any, turns it off.
+pub fn paste_off(screen: &[u8]) -> bool {
+    let s = String::from_utf8_lossy(screen);
+    s.rfind(PASTE_ON).is_none_or(|on| s.rfind(PASTE_OFF).is_some_and(|off| off > on))
+}
+
+/// `screen` without the bracketed paste switches, which henki writes out of order with the text it queued before them.
+pub fn unswitched(screen: &[u8]) -> Vec<u8> {
+    String::from_utf8_lossy(screen).replace(PASTE_ON, "").replace(PASTE_OFF, "").into_bytes()
+}
+
+/// The screen as text, "\r\n" as "\n", without what henki writes besides text: the reset, the bracketed paste switches and
+/// the line editor's redraws.
+pub fn plain(screen: &[u8]) -> String {
+    let s = String::from_utf8_lossy(&unswitched(screen)).replace(RESET, "");
+    REDRAW.iter().fold(s, |s, r| s.replace(r, "")).replace("\r\n", "\n")
 }
 
 /// The screen for a failure message: rows as lines, other control characters escaped.

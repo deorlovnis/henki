@@ -35,8 +35,10 @@ pub struct Session {
     env: Vec<(OsString, OsString)>,
     system: String,
     tools: Value,
-    /// The REPL's line reader: approvals are asked on the terminal. None in `run`, where they end the turn.
+    /// The REPL's terminal reader: approvals are asked on the terminal. None in `run`, where they end the turn.
     reader: Option<Reader>,
+    /// Ctrl-D ended a line: every later one ends at once (the REPL quits at its next prompt).
+    eof: bool,
     next_h: u32,
     tag: u32,
     t: Turn,
@@ -90,6 +92,7 @@ impl Session {
             system,
             tools,
             reader,
+            eof: false,
             next_h,
             tag: 0,
             t: Turn::default(),
@@ -164,15 +167,33 @@ impl Session {
         self.out
     }
 
-    /// One line from the terminal; None at EOF or without a reader. No deadline applies (the REPL has none). Err: a
-    /// signal (also in `sig`) or a closed stdout.
-    pub fn line(&mut self) -> Result<Option<String>, Stop> {
-        let tag = self.next_tag();
-        let Some(r) = &self.reader else { return Ok(None) };
-        r.ask(tag);
-        let got = self.wait(tag, None);
-        self.reader.iter().for_each(|r| r.ask(0)); // a line that ends later is stale
-        Ok(got?.and_then(|ev| if let Ev::Line { text, .. } = ev { text } else { None }))
+    /// `prompt`, then the line the user sends with Enter, read with the terminal in the editor's modes and bracketed paste
+    /// on, edited and echoed by `term::Edit`. Input typed before the prompt is dropped, with a note. Some((text, typed)):
+    /// `typed` is false for a line that holds a paste or came with more input pending, which is never a command or an
+    /// answer. None at EOF (Ctrl-D on an empty line, and every line after it) or without a reader. No deadline applies
+    /// (the REPL has none). Err: a signal (also in `sig`) or a closed stdout. On every way out the terminal has its modes
+    /// back and bracketed paste off.
+    pub fn line(&mut self, prompt: &str) -> Result<Option<(String, bool)>, Stop> {
+        let Some(_) = self.reader.as_ref().filter(|_| !self.eof) else { return Ok(None) };
+        let ahead = sys::raw(true).inspect(|_| term::paste(true)).unwrap_or(0);
+        (ahead > 0).then(|| self.out.note(&format!("dropped {} bytes typed before this prompt", term::num(ahead as u64))));
+        let mut e = term::Edit::new(prompt, sys::winsize(0).map_or(80, |w| usize::from(w.1)));
+        let got = loop {
+            self.out.echo(std::mem::take(&mut e.echo));
+            let tag = self.next_tag();
+            self.reader.iter().for_each(|r| r.ask(tag));
+            // Some(true): sent; Some(false): EOF, Ctrl-D or the reader's.
+            let done = self.wait(tag, None).map(|ev| if let Some(Ev::Input { bytes: Some(b), .. }) = ev { e.feed(&b, || sys::pending(0) > 0) } else { Some(false) });
+            if done != Ok(None) {
+                self.eof = done == Ok(Some(false));
+                break done.map(|d| d.filter(|&sent| sent).map(|_| (std::mem::take(&mut e.text), !e.pasted)));
+            }
+        };
+        self.reader.iter().for_each(|r| r.ask(0)); // what comes later is not read
+        sys::raw(false).inspect(|_| term::paste(false));
+        self.out.echo(e.echo);
+        (e.over > 0).then(|| self.out.note(&format!("the line is over {} bytes: the last {} were dropped", term::num(term::LINE_MAX as u64), term::num(e.over as u64))));
+        got
     }
 
     /// `!CMD` on the terminal: its exit code, None when bash did not start (a notice says why). INT and QUIT reach the
@@ -305,7 +326,7 @@ impl Session {
                 }
                 Some(Ev::OutputClosed) if !self.finishing => return Err(Stop::Closed),
                 Some(Ev::Part { tag: t, part }) if t == tag => self.part(part),
-                Some(ev @ (Ev::Reply { tag: t, .. } | Ev::Tool { tag: t, .. } | Ev::Line { tag: t, .. } | Ev::BangDone { tag: t, .. })) if t == tag => return Ok(Some(ev)),
+                Some(ev @ (Ev::Reply { tag: t, .. } | Ev::Tool { tag: t, .. } | Ev::Input { tag: t, .. } | Ev::BangDone { tag: t, .. })) if t == tag => return Ok(Some(ev)),
                 _ => {} // stale: an ended attempt, a timer, an answered call, a line nobody waits for
             }
         }
@@ -339,7 +360,7 @@ impl Session {
         self.record(rec::notice(text))
     }
 
-    /// Tags start at 1: one per attempt, backoff timer, call, line and `!cmd`.
+    /// Tags start at 1: one per attempt, backoff timer, call, read of the terminal and `!cmd`.
     fn next_tag(&mut self) -> u32 {
         self.tag += 1;
         self.tag

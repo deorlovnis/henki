@@ -4,7 +4,7 @@
 //! during a compound `!cmd`, and a stdout nobody reads.
 use crate::harness::*;
 use crate::mock::*;
-use crate::pty::{Pty, RESET, shown};
+use crate::pty::{Pty, plain, shown, unswitched};
 use std::cell::Cell;
 use std::collections::HashMap;
 use std::fs::{self, File};
@@ -45,28 +45,28 @@ fn exit(p: Pty<'_>) -> Done {
     d
 }
 
-/// A block pasted at the prompt: its first line is the message and the rest is dropped, with a note that says so, so a
-/// pasted `!` line never runs and no pasted line becomes a message of its own.
+/// A block pasted where the terminal does not mark pastes: every line after the first comes with more input pending, so
+/// the block is one message, and a pasted `!` line never runs.
 #[test]
 fn pty_paste_bang_line_not_run() {
-    let m = Mock::start(vec![say("first answer streams here"), say("second answer")]);
+    let m = Mock::start(vec![say("first answer streams here")]);
     let r = asking(&m);
     let pwned = r.path("PWNED");
     let p = start(&r);
-    let rest = format!("ERROR something failed\n!touch {}\n", pwned.display());
-    p.send(format!("please explain this log:\n{rest}").as_bytes());
-    p.expect(&format!("henki: dropped {} bytes after that line: one line is one message; save longer text to a file\r\n", rest.len()), W);
+    let block = format!("please explain this log:\nERROR something failed\n!touch {}", pwned.display());
+    p.send(format!("{block}\n").as_bytes());
     p.expect("first answer streams here", W);
     p.prompt(W);
     let d = exit(p);
     assert!(!pwned.exists(), "a pasted ! line ran\n{}", d.diag());
     assert_eq!(m.log().len(), 1, "a pasted line became a message\n{}", d.diag());
-    assert!(m.log()[0].contents("user")[0].ends_with("\n\nplease explain this log:"), "{:?}", m.log()[0].contents("user"));
+    assert!(m.log()[0].contents("user")[0].ends_with(&format!("\n\n{block}")), "{:?}", m.log()[0].contents("user"));
 }
 
-/// A line typed while the answer streams is the next message; a second line typed with it is dropped, so it never runs.
+/// What is typed while henki works is dropped at the next prompt, with a note, so a typed-ahead `!` line never runs and
+/// nothing typed ahead becomes a message.
 #[test]
-fn pty_typed_ahead_line_is_next_message() {
+fn pty_typed_ahead_dropped_with_note() {
     let pause = Step::Stall { before_first_byte: false, after_words: 0, for_ms: 30_000 };
     let first = Step::Stream { parts: vec![say("working on it"), pause, say(" done")], finish: Some("stop".into()), done: true, hold_ms: 0 };
     let m = Mock::start(vec![first, say("second reply")]);
@@ -75,36 +75,37 @@ fn pty_typed_ahead_line_is_next_message() {
     let p = start(&r);
     p.line("first");
     p.expect("working on it", W);
-    let rest = format!("!touch {}\n", ran.display());
-    p.send(format!("and then this\n{rest}").as_bytes());
+    let ahead = format!("and then this\n!touch {}\n", ran.display());
+    p.send(ahead.as_bytes());
+    // The terminal is canonical while henki works: its echo shows both lines are in its queue.
+    p.expect(&ahead.replace('\n', "\r\n"), W);
     m.open_gate();
-    p.expect(&format!("henki: dropped {} bytes after that line: one line is one message; save longer text to a file\r\n", rest.len()), W);
+    p.expect(" done", W);
+    p.expect(&format!("henki: dropped {} bytes typed before this prompt\r\n", ahead.len()), W);
+    p.prompt(W);
+    p.line("next");
     p.expect("second reply", W);
     p.prompt(W);
     let d = exit(p);
-    assert!(!ran.exists(), "the second typed-ahead line ran\n{}", d.diag());
+    assert!(!ran.exists(), "a typed-ahead line ran\n{}", d.diag());
     assert_eq!(m.log().len(), 2, "{}", d.diag());
-    assert_eq!(m.log()[1].contents("user")[1], "and then this");
+    assert_eq!(m.log()[1].contents("user")[1], "next");
 }
 
-/// A paste whose last line has no newline: the note counts that line too and starts on a row of its own, below the
-/// pasted text the terminal shows, and the unended line is not the start of the next message.
+/// A block without paste marks whose last line has no newline: the line holds it and waits for Enter, and Enter sends
+/// the whole block as one message.
 #[test]
-fn pty_paste_unended_last_line_counted() {
-    let m = Mock::start(vec![say("first answer"), say("second answer"), say("third answer")]);
+fn pty_paste_unended_last_line_waits() {
+    let m = Mock::start(vec![say("first answer")]);
     let r = asking(&m);
     let p = start(&r);
-    for (i, rest) in ["unended", "a whole line\nunended"].iter().enumerate() {
-        p.send(format!("question {i}\n{rest}").as_bytes());
-        p.expect(&format!("unended\r\nhenki: dropped {} bytes after that line: one line is one message; save longer text to a file\r\n", rest.len()), W);
-        p.prompt(W);
-    }
-    p.line("next");
-    p.expect("third answer", W);
+    p.send(b"question 0\nunended");
+    p.expect("question 0\r\nunended", W);
+    p.send(b"\r");
+    p.expect("first answer", W);
     p.prompt(W);
     let d = exit(p);
-    let users: Vec<String> = m.log().iter().map(|q| q.contents("user").last().unwrap().clone()).collect();
-    assert!(users[0].ends_with("\n\nquestion 0") && users[1..] == ["question 1", "next"], "{users:?}\n{}", d.diag());
+    assert!(m.log()[0].contents("user")[0].ends_with("\n\nquestion 0\nunended"), "{:?}\n{}", m.log()[0].contents("user"), d.diag());
 }
 
 /// `!` with nothing after it runs nothing and tells the model nothing.
@@ -325,7 +326,7 @@ impl<'a> Term<'a> {
     }
 
     fn screen(&self) -> Vec<u8> {
-        self.screen.lock().unwrap().clone()
+        unswitched(&self.screen.lock().unwrap())
     }
 
     /// Bounded poll on the screen for `text` after the last match.
@@ -371,7 +372,7 @@ impl<'a> Term<'a> {
         Done {
             code: status.code(),
             signal: status.signal(),
-            stdout: String::from_utf8_lossy(&self.screen()).replace(RESET, "").replace("\r\n", "\n").into_bytes(),
+            stdout: plain(&self.screen()).into_bytes(),
             stderr: Vec::new(),
             elapsed: exited - self.started,
             exited,

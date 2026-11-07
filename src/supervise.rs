@@ -1,6 +1,6 @@
 //! Tool processes: the child environment, the spawn recipe, bounded capture with spill, and the ledger of process groups
 //! that henki kills by group and, on Linux, by sweeping every descendant. Also the user's own `!cmd`, on the terminal.
-use crate::{config::Env, sys, term, types::End, types::Ev, types::ToolOutput, types::lock};
+use crate::{config::Env, sys, term, term::head_end, types::End, types::Ev, types::ToolOutput, types::lock};
 use std::sync::{Arc, Condvar, Mutex, OnceLock, PoisonError, mpsc, mpsc::Sender};
 use std::{collections::VecDeque, ffi::OsString, fs::File, os::unix::process::ExitStatusExt, thread};
 use std::{io, io::Read, io::Write, path::Path, path::PathBuf, process::Child, process::Command, process::Stdio, time::Duration, time::Instant};
@@ -254,15 +254,6 @@ impl Cap {
         let cut = self.total - (h + tail.len() - t) as u64;
         let (head, tail) = (String::from_utf8_lossy(&self.head[..h]), String::from_utf8_lossy(&tail[t..]));
         format!("{head}\n[... {} of {} bytes cut; {kept} ...]\n{tail}", term::num(cut), term::num(self.total))
-    }
-}
-
-/// The length of `b` without a code point cut short at its end.
-fn head_end(b: &[u8]) -> usize {
-    let n = b.len();
-    match (n.saturating_sub(3)..n).rev().find(|&i| b[i] & 0xC0 != 0x80) {
-        Some(i) if n - i < b[i].leading_ones().max(1) as usize => i, // a lead byte's leading ones are its width
-        _ => n,
     }
 }
 

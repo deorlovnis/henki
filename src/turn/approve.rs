@@ -17,7 +17,6 @@ impl Session {
         let bg = supervise::reap();
         let offer = shell && bg == 0 && allow::fits(cmd, &self.cfg.root);
         let ((rows, cols), lines) = (sys::winsize(0).unwrap_or((24, 80)), tools::display(c, t));
-        sys::flush_input();
         self.out.reset();
         lines.iter().for_each(|l| self.out.line(l));
         let n = term::rows(&lines, usize::from(cols)) + 1;
@@ -25,8 +24,7 @@ impl Session {
         (shell && bg > 0).then(|| self.notice(&format!("{} background processes still run; always is off until they end", term::num(bg as u64)))).transpose()?;
         let (root, file) = (allow::shown(&self.cfg.root, &self.cfg.home), allow::shown(&self.cfg.allow.file, &self.cfg.home));
         loop {
-            self.out.prompt(if offer { "run? [y/N/always] " } else { "run? [y/N] " });
-            match self.typed()?.as_str() {
+            match self.typed(if offer { "run? [y/N/always] " } else { "run? [y/N] " })?.as_str() {
                 "y" | "yes" => return self.verdict(c, "yes", None),
                 "always" if offer => {}
                 "always" => {
@@ -37,8 +35,7 @@ impl Session {
             }
             self.out.reset();
             self.out.line(&format!("a rule allows whatever this command does in {root}, including the files and config it reads"));
-            self.out.prompt(&format!("save rule for {root}: {cmd} ? [y/N] "));
-            if !matches!(self.typed()?.as_str(), "y" | "yes") {
+            if !matches!(self.typed(&format!("save rule for {root}: {cmd} ? [y/N] "))?.as_str(), "y" | "yes") {
                 continue;
             }
             self.tripwire()?;
@@ -56,12 +53,14 @@ impl Session {
         }
     }
 
-    /// An answer, trimmed and in lower case; INT and QUIT give "". One line is the answer, as at the prompt: the rest of
-    /// a pasted block, or of what was typed ahead, is dropped. EOF (Ctrl-D) ends the turn, and the REPL then quits. After
-    /// Ctrl-D or Ctrl-C, which leave the cursor after the question, what follows starts on its own row.
-    fn typed(&mut self) -> Result<String, Outcome> {
-        match self.line() {
-            Ok(Some(a)) => Ok(a.trim().to_ascii_lowercase()).inspect(|_| sys::flush_input()),
+    /// The answer to `prompt`, trimmed and in lower case; INT and QUIT give "". A paste is never an answer: it gives "", a
+    /// no, with a note, so no call ever runs on pasted text and the turn goes on as after any other no. EOF (Ctrl-D) ends
+    /// the turn, and the REPL then quits. After Ctrl-D or Ctrl-C, which leave the cursor after the question, what follows
+    /// starts on its own row.
+    fn typed(&mut self, prompt: &str) -> Result<String, Outcome> {
+        match self.line(prompt) {
+            Ok(Some((a, true))) => Ok(a.trim().to_ascii_lowercase()),
+            Ok(Some(_)) => Ok(String::new()).inspect(|_| self.out.note("a paste is not an answer; taken as no")),
             Ok(None) => Err(Outcome::Interrupted).inspect_err(|_| self.out.line("")),
             Err(Stop::Signal(libc::SIGINT | libc::SIGQUIT)) => Ok(String::new()).inspect(|_| self.out.line("")),
             Err(s) => Err(s.into()),

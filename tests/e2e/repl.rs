@@ -451,6 +451,8 @@ fn pty_after_bang_text_not_sent() {
     let r = asking(&m);
     let p = start(&r, &[]);
     p.line("!cat");
+    // henki gives the terminal back (its own modes) before cat starts; from then on it reads nothing.
+    assert!(poll(W, || p.modes().c_lflag & libc::ICANON != 0), "the terminal is not canonical again");
     p.line("typed-into-cat");
     p.expect("typed-into-cat\r\n", W);
     p.expect("typed-into-cat\r\n", W);
@@ -687,7 +689,8 @@ fn pty_always_after_outside_change_trips() {
     assert_eq!(m.log().len(), 1, "a request after the change");
 }
 
-/// `always` and a `y` typed with it: the `y` is dropped before the confirmation, which waits for an answer of its own.
+/// `always` and a `y` typed with it come as one block, which is no answer at all: a no, so no rule is saved without a
+/// confirmation of its own.
 #[test]
 fn pty_always_confirm_typeahead() {
     let m = Mock::start(vec![shell("echo typed-ahead"), say("asked again")]);
@@ -696,10 +699,7 @@ fn pty_always_confirm_typeahead() {
     p.line("go");
     p.expect("run? [y/N/always] ", W);
     p.send(b"always\ny\n");
-    p.expect(" ? [y/N] ", W);
-    p.line("n");
-    p.expect("run? [y/N/always] ", W);
-    p.line("n");
+    p.expect("henki: a paste is not an answer; taken as no\r\n", W);
     p.expect("asked again", W);
     p.prompt(W);
     let d = exit(p);
@@ -719,7 +719,7 @@ fn pty_always_confirm_ctrl_c() {
     p.line("always");
     p.expect(" ? [y/N] ", W);
     p.ctrl_c();
-    p.expect("^C\r\nrun? [y/N/always] ", W);
+    p.expect("\r\nrun? [y/N/always] ", W); // no ^C: the question reads without echo
     p.line("always");
     p.expect(" ? [y/N] ", W);
     p.ctrl_d();
@@ -799,7 +799,7 @@ fn pty_help_text() {
     p.expect(
         "/help\r\n/exit  quit (also Ctrl-D)\r\n/allow  list the allow rules; /allow rm N removes rule N\r\n/help  this list\r\n\
         !CMD  run CMD yourself on this terminal; the model is told you ran it\r\n\
-        One line is one message; for longer text, save it to a file and name the file.\r\n> ",
+        Enter sends the message; a paste goes into it whole (up to 1 MiB, newlines kept) and is never a command.\r\n> ",
         W,
     );
     let d = exit(p);
@@ -997,9 +997,10 @@ fn reader_blocks(pid: i32) -> u64 {
     status.lines().find_map(|l| l.strip_prefix("voluntary_ctxt_switches:")).unwrap().trim().parse().unwrap()
 }
 
-/// After a Ctrl-C at a question the reader still waits for that question's line. The first line typed before the turn
-/// ends completes that read and is dropped: it neither answers a later question nor becomes the next message. The next
-/// line typed at the prompt is the next message.
+/// After a Ctrl-C at a question the reader's read for it may still be under way, now with the terminal canonical again:
+/// a line typed before the turn ends completes it and is dropped as stale (or, when the read has not started, dropped at
+/// the next prompt). It neither answers a later question nor becomes the next message. The next line typed at the
+/// prompt is the next message.
 #[cfg(target_os = "linux")]
 #[test]
 fn pty_typeahead_after_ctrl_c_at_question() {
@@ -1028,47 +1029,24 @@ fn pty_typeahead_after_ctrl_c_at_question() {
     assert!(!r.path("q.txt").exists());
 }
 
-/// A block pasted at a question: its first line is the answer and the rest is dropped, so no pasted line becomes the next
-/// message or runs as a `!CMD`, whether the first line runs the call or not.
+/// `yes` confirms a rule as `y` does, in any case.
 #[test]
-fn pty_paste_at_question_one_line() {
-    for (first, verdict) in [("cd build", "no"), ("y", "yes")] {
-        let m = Mock::start(vec![shell("echo asked"), say("after the answer")]);
-        let r = asking(&m);
-        let pasted = r.path("PASTED");
-        let p = start(&r, &[]);
-        p.line("go");
-        p.expect("run? [y/N/always] ", W);
-        p.send(format!("{first}\n!touch {}\npasted-tail-line\n", pasted.display()).as_bytes());
-        p.expect("after the answer", W);
-        p.prompt(W);
-        let d = exit(p);
-        assert_eq!(verdicts(&d), [json!([verdict, null])], "{}", d.diag());
-        assert!(!pasted.exists(), "a pasted ! line ran\n{}", d.diag());
-        assert!(m.log().len() == 2 && m.log().iter().all(|l| !l.text().contains("pasted-tail-line")), "a pasted line became a message\n{}", d.diag());
-    }
-}
-
-/// `yes` confirms a rule as `y` does, in any case; and a block pasted at the confirmation is one answer, as at `run?`.
-#[test]
-fn pty_always_confirm_yes_and_paste() {
+fn pty_always_confirm_yes() {
     let m = Mock::start(vec![shell("echo confirmed"), say("saved it")]);
     let r = asking(&m);
-    let (root, pasted) = (r.root(), r.path("PASTED"));
+    let root = r.root();
     let p = start(&r, &[]);
     p.line("go");
     p.expect("run? [y/N/always] ", W);
     p.line("always");
     p.expect(" ? [y/N] ", W);
-    p.send(format!("YES\n!touch {}\npasted-tail-line\n", pasted.display()).as_bytes());
+    p.line("YES");
     p.expect(&format!("added to ~/.config/henki/allow as rule 1 for {root}; /allow lists and removes rules\r\n"), W);
     p.expect("saved it", W);
     p.prompt(W);
     let d = exit(p);
     assert_eq!(verdicts(&d), [json!(["always", 1])], "{}", d.diag());
     assert!(fs::read_to_string(r.allow()).unwrap().ends_with(&format!("{root}\techo confirmed\n")));
-    assert!(!pasted.exists(), "a pasted ! line ran\n{}", d.diag());
-    assert!(m.log().len() == 2 && m.log().iter().all(|l| !l.text().contains("pasted-tail-line")), "a pasted line became a message\n{}", d.diag());
 }
 
 /// An answer that comes without deltas (a server's JSON completion, an Anthropic text block sent whole) is shown all

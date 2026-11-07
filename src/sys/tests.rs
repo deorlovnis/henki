@@ -345,12 +345,14 @@ fn tty_save_not_a_tty() {
 }
 
 #[test]
-fn flush_input_not_a_tty() {
-    // No unit test saves terminal modes, so there is nothing to restore and nothing is flushed.
+fn raw_not_a_tty() {
+    // No unit test saves terminal modes, so there is nothing to set or restore.
     assert!(TTY.get().is_none());
-    flush_input();
-    assert_eq!(flush_typed(), (0, false), "nothing dropped");
-    assert!(TTY.get().is_none());
+    assert_eq!((raw(true), raw(false)), (None, None));
+    let (r, mut w) = io::pipe().unwrap();
+    w.write_all(b"abc").unwrap();
+    assert_eq!(pending(r.as_raw_fd()), 3);
+    assert_eq!(pending(-1), 0);
 }
 
 #[test]
@@ -433,14 +435,6 @@ fn set_fl(fd: i32, flags: i32) {
     assert_eq!(unsafe { libc::fcntl(fd, libc::F_SETFL, flags) }, 0);
 }
 
-/// The bytes waiting to be read on `fd` (FIONREAD).
-fn pending(fd: i32) -> i32 {
-    let mut n: libc::c_int = 0;
-    // SAFETY: the pointer is to a live int, the type FIONREAD writes.
-    assert_eq!(unsafe { libc::ioctl(fd, libc::FIONREAD, &mut n) }, 0);
-    n
-}
-
 #[test]
 fn isatty_pty_true() {
     let (_m, s) = pty();
@@ -483,35 +477,38 @@ fn blocking_clears_nonblocking() {
     blocking(-1);
 }
 
-/// Set in the child process `flush_input_restores_a_pty` starts.
+/// Set in the child process `raw_on_a_pty` starts.
 const PTY_CHILD: &str = "HENKI_TEST_PTY_CHILD";
 
-/// `tty_save`, `flush_typed` and `flush_input` on a terminal. They act on fd 0, so the test runs this same test again in
-/// a child process whose fd 0 is a fresh pty: the test process's own fd 0 is never touched. The parent leaves the pty
-/// non-blocking with a line typed ahead and one not yet ended; the child checks that `tty_save` clears O_NONBLOCK and
-/// keeps them, that `flush_typed` counts and drops both (a canonical terminal counts the whole line only) and restores
-/// the modes, then that `flush_input` restores the modes a command left raw and clears O_NONBLOCK again.
+/// `tty_save` and `raw` on a terminal. They act on fd 0, so the test runs this same test again in a child process whose
+/// fd 0 is a fresh pty: the test process's own fd 0 is never touched. The parent leaves the pty non-blocking with a line
+/// typed ahead and one not yet ended; the child checks that `tty_save` clears O_NONBLOCK and keeps the modes, that
+/// `raw(true)` sets the editor's modes and counts and drops both lines, then that `raw(false)` puts back the saved modes
+/// over the ones a command left raw and clears O_NONBLOCK again.
 #[test]
-fn flush_input_restores_a_pty() {
+fn raw_on_a_pty() {
     if std::env::var_os(PTY_CHILD).is_some() {
         assert!(fl(0) & libc::O_NONBLOCK != 0 && pending(0) > 0, "as the parent left it");
         assert!(tty_save());
         assert_eq!(fl(0) & libc::O_NONBLOCK, 0, "cleared at start");
-        assert_eq!(pending(0) as usize, "typed ahead\n".len(), "saving does not flush; whole lines only");
+        assert_eq!(pending(0), "typed ahead\n".len(), "saving does not flush; whole lines only");
         let saved = modes(0).unwrap();
-        assert_eq!(flush_typed(), ("typed ahead\nunended".len(), true), "the bytes it dropped, the last line unended");
+        assert_eq!(raw(true), Some("typed ahead\nunended".len()), "the bytes it dropped, the unended line too");
+        assert_eq!(pending(0), 0);
         let now = modes(0).unwrap();
-        assert_eq!((now.c_lflag, now.c_cc), (saved.c_lflag, saved.c_cc), "canonical again");
+        let off = libc::ICANON | libc::ECHO | libc::IEXTEN;
+        assert_eq!((now.c_lflag & off, now.c_iflag & libc::ICRNL), (0, 0));
+        assert_eq!(now.c_lflag | off, saved.c_lflag | off, "the rest as saved: ISIG {}", saved.c_lflag & libc::ISIG != 0);
+        assert_eq!((now.c_cc[libc::VMIN], now.c_cc[libc::VTIME], now.c_oflag), (1, 0, saved.c_oflag));
         // What a command that dies in raw mode leaves behind.
-        let mut raw = saved;
-        raw.c_lflag &= !(libc::ICANON | libc::ISIG);
-        // SAFETY: `raw` is a live termios; tcsetattr only reads it.
-        assert_eq!(unsafe { libc::tcsetattr(0, libc::TCSANOW, &raw) }, 0);
-        assert_eq!(pending(0), 0, "the unended line is dropped too");
+        let mut gone = saved;
+        gone.c_lflag &= !(libc::ICANON | libc::ISIG | libc::ECHO);
+        // SAFETY: `gone` is a live termios; tcsetattr only reads it.
+        assert_eq!(unsafe { libc::tcsetattr(0, libc::TCSANOW, &gone) }, 0);
         set_fl(0, fl(0) | libc::O_NONBLOCK);
-        flush_input();
+        assert_eq!(raw(false), Some(0));
         let now = modes(0).unwrap();
-        assert_eq!((now.c_lflag, now.c_iflag, now.c_oflag), (saved.c_lflag, saved.c_iflag, saved.c_oflag));
+        assert_eq!((now.c_lflag, now.c_iflag, now.c_oflag, now.c_cc), (saved.c_lflag, saved.c_iflag, saved.c_oflag, saved.c_cc));
         assert_eq!(fl(0) & libc::O_NONBLOCK, 0);
         return;
     }
@@ -529,7 +526,7 @@ fn flush_input_restores_a_pty() {
     }
     set_fl(s.as_raw_fd(), fl(s.as_raw_fd()) | libc::O_NONBLOCK);
     let me = std::env::current_exe().unwrap();
-    let args = ["--exact", "sys::tests::flush_input_restores_a_pty", "--test-threads=1", "--nocapture"];
+    let args = ["--exact", "sys::tests::raw_on_a_pty", "--test-threads=1", "--nocapture"];
     // A bounded wait that allows for a loaded machine: a child that hangs fails the test instead of holding it.
     let (tx, rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || tx.send(std::process::Command::new(me).args(args).env(PTY_CHILD, "1").stdin(s).output()));

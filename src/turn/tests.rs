@@ -625,17 +625,20 @@ fn line_stale_tag_dropped() {
     let d = dir("line");
     let (r, mut w) = std::io::pipe().unwrap();
     let (mut s, _, _) = open(Config::test(&d), Mode::Repl, Some(Box::new(r)));
-    w.write_all(b"one\n").unwrap();
-    assert_eq!(s.line(), Ok(Some("one".into())));
-    // A line sent for an earlier question, or after MAIN stopped waiting (tag 0), is not this one's answer.
-    s.tx.send(Ev::Line { tag: s.tag, text: Some("old".into()) }).unwrap();
-    s.tx.send(Ev::Line { tag: 0, text: Some("stale".into()) }).unwrap();
-    w.write_all(b"two\r\n").unwrap();
-    assert_eq!(s.line(), Ok(Some("two".into())));
+    w.write_all(b"one\r").unwrap();
+    assert_eq!(s.line("> "), Ok(Some(("one".into(), true))));
+    // Input read for an earlier question, or after MAIN stopped waiting (tag 0), is not this line's.
+    s.tx.send(Ev::Input { tag: s.tag, bytes: Some(b"old\r".to_vec()) }).unwrap();
+    s.tx.send(Ev::Input { tag: 0, bytes: Some(b"stale\r".to_vec()) }).unwrap();
+    w.write_all(b"tw").unwrap();
+    w.write_all(b"o\n").unwrap();
+    assert_eq!(s.line("> "), Ok(Some(("two".into(), true))), "a line over two reads");
+    w.write_all(b"\x1b[200~p\nq\x1b[201~\r").unwrap();
+    assert_eq!(s.line("> "), Ok(Some(("p\nq".into(), false))), "a paste is not typed");
     drop(w);
-    assert_eq!(s.line(), Ok(None), "EOF");
+    assert_eq!(s.line("> "), Ok(None), "EOF");
     let (mut run, _) = session(&d, 9);
-    assert_eq!(run.line(), Ok(None), "no reader");
+    assert_eq!(run.line("> "), Ok(None), "no reader");
     std::fs::remove_dir_all(d).unwrap();
 }
 

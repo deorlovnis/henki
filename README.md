@@ -14,15 +14,25 @@ echo "a long task" | henki run -
 
 ### The REPL
 
-`henki` starts a line REPL on the terminal it was started from (without a terminal on stdin it refuses: use `henki run`). Its banner names the model, the server and its dialect, the approval mode, the config file, the extensions, any notices, and every allow rule for this project. Each line you type at the `> ` prompt is one message. The answer streams to stdout; the banner, the prompt, questions, call lines and notices go to stderr, so `henki > answers.txt` keeps only the answers.
+`henki` starts a line REPL on the terminal it was started from (without a terminal on stdin it refuses: use `henki run`). Its banner names the model, the server and its dialect, the approval mode, the config file, the extensions, any notices, and every allow rule for this project. What you send with Enter at the `> ` prompt is one message. The answer streams to stdout; the banner, the prompt, what you type, questions, call lines and notices go to stderr, so `henki > answers.txt` keeps only the answers.
 
-- One line is one message, and henki takes one line at each prompt: the rest of a pasted block, or of what you typed ahead, is dropped, and a note says how many bytes. So a pasted line that starts with `!` runs only when it is the first line of the paste. For longer text, such as a log, save it to a file and name the file in your message, or use `henki run -`.
-- `/exit` or Ctrl-D quits (Ctrl-D at a question ends the turn first). `/help` lists the commands, `/allow` lists the allow rules and `/allow rm N` removes rule N. Any other line that starts with `/` is an unknown command and never reaches the model.
-- `!CMD` runs CMD yourself with bash on this terminal, so an editor or a pager works, and what you type (also right after the `!CMD` line) goes to the command. Your next message starts with `[the user ran in their terminal: CMD (exit N)]`. Afterwards henki restores the terminal modes it started with, so a change made with `!stty` does not last.
+- `/exit` or Ctrl-D on an empty line quits (Ctrl-D at a question ends the turn first, then quits). `/help` lists the commands, `/allow` lists the allow rules and `/allow rm N` removes rule N. Any other line that starts with `/` is an unknown command and never reaches the model.
+- `!CMD` runs CMD yourself with bash on this terminal, so an editor or a pager works, and what you type while it runs goes to the command. Your next message starts with `[the user ran in their terminal: CMD (exit N)]`. The command gets the terminal modes henki started with, and at the next prompt henki sets its own again, so a change made with `!stty` does not last.
 - Ctrl-C while the model answers or a call runs cancels the turn: the calls get SIGINT, then SIGTERM, then SIGKILL, and the text so far stays on the screen. At a question Ctrl-C answers no; during `!CMD` it goes to the command; at the prompt it does not quit, it prints a hint.
 - A process a call starts in the background keeps running between turns, and so does a `!CMD &` job. On Linux a cancel and the end of the session stop them all. On macOS henki stops what stays in a call's process group, but it cannot see a `!CMD &` job or a process that started a session of its own: such a process keeps running after henki exits (stop it yourself), and a `!CMD &` job does not hold back `always`.
 - `max_steps` (model requests) bounds a turn. `--max-seconds` and `max_seconds` apply to `henki run` only.
-- There is no line editor and no key binding beyond Ctrl-C and Ctrl-D; `rlwrap henki` adds editing and history.
+
+### Typing and pasting
+
+At the prompt and at a question henki reads the terminal itself, without the terminal's line mode and echo, and with bracketed paste on. It shows the line as it will be sent, with control and invisible characters escaped as everywhere else.
+
+- Enter sends the line. Backspace removes one character (a whole one, also outside ASCII), Ctrl-U the whole line, and Ctrl-D on an empty line is the end of input. Arrow keys, other special keys and other control characters (Tab too) do nothing; Ctrl-C and Ctrl-\\ stay signals. There is no history.
+- A paste goes into the line whole, newlines included, whatever its size up to 1 MiB; past that the line is cut at 1 MiB, with a note. Pasting an error message or a log is fine: Enter sends it as one message.
+- A line that holds a paste is always a message: never a `/` command or a `!CMD`, and at a question never an answer. A paste at a question counts as no, with a note: no call ever runs on pasted text, and the turn goes on as after any other no.
+- A terminal without bracketed paste sends a paste as if it were typed, so henki goes by what is waiting to be read: a line is a command or an answer only when nothing else is waiting when its Enter comes, and an Enter with more input behind it is a newline in the line. A block the terminal sends at once is therefore one message; a single pasted `!` line with its Enter looks exactly like typing it, and runs.
+- What you type while henki works (the answer streams, a call runs) is dropped when the next prompt or question appears, with a note that counts the bytes. So typed-ahead text never answers a question, never runs as a `!CMD` and never becomes a message.
+- henki wraps a long line itself before the last column, counting two columns for a character outside ASCII (so such a row may end early), and Backspace and Ctrl-U draw the line again from its first row. If the window changes width while you type a line, its display may be off until the line is sent.
+- The terminal is in henki's modes only while henki waits for a line. Once the line is sent or given up (Enter, Ctrl-D, Ctrl-C, TERM, HUP), and so before any call or `!CMD` runs, and when henki ends in any way it can see (also a closed stdout or a crash), the terminal has the modes it had when henki started, and bracketed paste is off. After a SIGKILL, run `reset`.
 
 ### Approvals
 
@@ -31,7 +41,7 @@ With `approve = "ask"` (the default), `shell`, `write` and `edit` calls ask firs
 - `y` or `yes` runs the call once. Anything else, an empty line or Ctrl-C answers no, and the model is told `denied by the user`. Ctrl-D ends the turn, and then the REPL quits.
 - `always` saves an allow rule for the command, after a second question (`y` or `yes`), and runs it. It is offered (`run? [y/N/always]`) only for a `shell` command that is one line of printable ASCII of at most 200 bytes, and only while no background process of the session runs (on macOS a `!CMD &` job does not count).
 
-What you type while henki works never answers a question: input typed ahead is dropped before each one. An answer is one line, as at the prompt: the rest of a pasted block is dropped, so no pasted line becomes a message or a `!CMD`. After Ctrl-C at a question, henki is still reading the line it asked for, so the first line you type before the turn ends is dropped too, rather than kept as your next message.
+An answer is a line you type at the question. What you typed before it appeared is dropped, and a paste is never an answer (see Typing and pasting).
 
 `henki run` never asks. In ask mode the first call that needs approval ends it with exit 3, naming the call (`(needs approval: $ CMD; ...)`); `henki --resume` (the latest session here) or `henki --resume=ID` continues that session in the REPL: tell the model to go on, and it asks before the call runs. `--approve auto` runs every call without asking.
 
@@ -81,7 +91,7 @@ cargo build --release
 ./check.sh install-hook  # check the commits of every git push
 ```
 
-`check.sh` holds henki to its budgets: at most 3,500 lines of non-test Rust (400 per file), at most 10 crates in the dependency tree, and a release binary of at most 1,000,000 bytes, including the static musl build on Linux when that target is installed.
+`check.sh` holds henki to its budgets: at most 3,600 lines of non-test Rust (400 per file), at most 10 crates in the dependency tree, and a release binary of at most 1,000,000 bytes, including the static musl build on Linux when that target is installed.
 
 ## License
 

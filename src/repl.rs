@@ -6,7 +6,7 @@ const HELP: &str = "/exit  quit (also Ctrl-D)
 /allow  list the allow rules; /allow rm N removes rule N
 /help  this list
 !CMD  run CMD yourself on this terminal; the model is told you ran it
-One line is one message; for longer text, save it to a file and name the file.";
+Enter sends the message; a paste goes into it whole (up to 1 MiB, newlines kept) and is never a command.";
 /// The answer to every message once a trust file changed: the session goes on only after a restart reads it again.
 const TRIPPED: &str = "a trust file changed; restart henki to go on (henki --resume continues this session)";
 
@@ -16,6 +16,7 @@ pub fn run(s: &mut Session) -> u8 {
     supervise::reap();
     banner(s);
     let code = lines(s);
+    sys::raw(false); // the modes it started with, also after a `!cmd` that changed them was stopped by TERM or HUP
     // However the REPL found stdout gone (in a turn, at the prompt, during a `!cmd`), it says so once, as a turn would.
     (code == 141).then(|| s.out().line(&outcome_line(&Outcome::OutputClosed)));
     let failed = s.close(None).err();
@@ -48,9 +49,8 @@ fn banner(s: &Session) {
 fn lines(s: &mut Session) -> u8 {
     let (mut notes, mut tripped) = (String::new(), false);
     loop {
-        s.out().prompt("> ");
-        let line = match s.line() {
-            Ok(Some(line)) => line,
+        let (line, typed) = match s.line("> ") {
+            Ok(Some(l)) => l,
             Ok(None) => {
                 s.out().line(""); // Ctrl-D leaves the cursor after the prompt
                 // A terminal that went away ends the input too, maybe before its SIGHUP arrives: a hangup all the same.
@@ -62,25 +62,20 @@ fn lines(s: &mut Session) -> u8 {
             }
             Err(e) => return Outcome::from(e).exit() as u8, // a closed stdout, or TERM or HUP
         };
+        // Only a line typed alone is a command; a paste, or a line that came with more input pending, is a message.
         let t = line.trim();
-        // One line per prompt: the rest of a pasted block, or of what was typed ahead, is dropped with a note, so that no
-        // pasted line runs as a `!cmd`. What follows a `!cmd` line is the command's to read.
-        let (dropped, unended) = if t.starts_with('!') { (0, false) } else { sys::flush_typed() };
-        unended.then(|| s.out().line("")); // the terminal shows that line, the cursor after it
-        (dropped > 0).then(|| s.out().note(&format!("dropped {} bytes after that line: one line is one message; save longer text to a file", term::num(dropped as u64))));
-        let rm = t.strip_prefix("/allow rm ").and_then(|n| n.trim().parse().ok());
-        match (t, rm, t.strip_prefix('!')) {
-            ("" | "!", ..) => {}
+        let cmd = if typed { t } else { "" };
+        let rm = cmd.strip_prefix("/allow rm ").and_then(|n| n.trim().parse().ok());
+        match (cmd, rm, cmd.strip_prefix('!')) {
+            _ if t.is_empty() || cmd == "!" => {}
             ("/exit", ..) => return 0,
             ("/help", ..) => s.out().line(HELP),
             ("/allow", ..) => allow::list(&s.cfg.allow.file, &s.cfg.home).iter().for_each(|l| s.out().line(l)),
             (_, Some(n), _) => tripped |= remove(s, n),
-            _ if t.starts_with('/') => s.out().note(&format!("unknown command {t}; /help lists the commands")),
+            _ if cmd.starts_with('/') => s.out().note(&format!("unknown command {t}; /help lists the commands")),
             (_, _, Some(cmd)) => {
                 let before = s.changed();
-                let done = s.bang(cmd);
-                sys::flush_input(); // a command that left the terminal raw or without echo does not leave it so
-                match done {
+                match s.bang(cmd) {
                     Ok(code) => code.iter().for_each(|n| notes += &format!("[the user ran in their terminal: {cmd} (exit {n})]\n")),
                     Err(e) => return Outcome::from(e).exit() as u8, // a closed stdout, or TERM or HUP
                 }
@@ -102,7 +97,6 @@ fn lines(s: &mut Session) -> u8 {
                     // stdout went away (only a turn writes to it), also when the turn did not end on it: a finishing turn
                     // drops that event.
                     _ if s.out().closed() => return 141,
-                    Outcome::Interrupted => sys::flush_input(), // what was typed during the turn is no answer
                     Outcome::Error { kind: "journal" | "tampered", .. } => return 2,
                     Outcome::Error { kind: "changed", .. } => {
                         s.out().note(TRIPPED);

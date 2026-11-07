@@ -13,6 +13,8 @@ mod ext;
 mod harness;
 #[path = "e2e/inert.rs"]
 mod inert;
+#[path = "e2e/input.rs"]
+mod input;
 #[path = "e2e/journal.rs"]
 mod journal;
 #[path = "e2e/outcomes.rs"]

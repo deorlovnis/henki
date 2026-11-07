@@ -48,6 +48,7 @@ fn main() -> ExitCode {
     let early = sys::signals(tx.clone()).and_then(|()| sys::harden());
     std::panic::set_hook(Box::new(|info| {
         supervise::panic_kill();
+        sys::raw(false); // the terminal modes the REPL started with
         term::panic_line(&info.to_string());
     }));
     let mut a = Args { mode: Mode::Plain, allow: false, flags: Flags::default(), resume: None, nested: false, task: None, rm: None };
@@ -177,11 +178,12 @@ fn start(a: Args, tx: &Sender<Ev>, rx: &Receiver<Ev>, t0: Instant, early: io::Re
     if !a.nested && depth.parse::<u32>().is_ok_and(|d| d >= 1) {
         return Err(Outcome::error("nested", format!("refusing to start inside henki (HENKI_DEPTH={depth}); pass --nested if this is intended")));
     }
-    // The REPL reads the terminal it was started on; `tty_save` keeps its modes, which every `!cmd` gets back.
+    // The REPL reads the terminal it was started on; `tty_save` keeps its modes, which it puts back after every line.
     if a.mode == Mode::Repl && !sys::tty_save() {
         return Err(bad("the REPL needs a terminal; use henki run".into()));
     }
-    let reader = (a.mode == Mode::Repl).then(|| Reader::start(tx.clone())).transpose().map_err(|e| Outcome::error("internal", format!("cannot start a thread: {e}")))?;
+    let no_thread = |e: io::Error| Outcome::error("internal", format!("cannot start a thread: {e}"));
+    let reader = (a.mode == Mode::Repl).then(|| Reader::with(Box::new(io::stdin()), tx.clone())).transpose().map_err(no_thread)?;
     let cwd = std::env::current_dir().map_err(|e| bad(format!("cannot read the working directory: {e}")))?;
     let mut cfg = config::load(&a.flags, &env, &cwd).map_err(bad)?;
     // The REPL has no time budget: Ctrl-C ends a turn, and `max_steps` bounds it.
@@ -216,13 +218,13 @@ fn stdin_task(tx: &Sender<Ev>, rx: &Receiver<Ev>, deadline: Option<Instant>) -> 
     let read = move || {
         let mut b = Vec::new();
         let ok = io::stdin().lock().take(TASK_MAX + 1).read_to_end(&mut b).is_ok() && b.len() as u64 <= TASK_MAX;
-        let _ = tx.send(Ev::Line { tag: 0, text: ok.then(|| String::from_utf8_lossy(&b).into_owned()) });
+        let _ = tx.send(Ev::Input { tag: 0, bytes: ok.then_some(b) });
     };
     std::thread::Builder::new().spawn(read).map_err(|e| Outcome::error("internal", format!("cannot start a thread: {e}")))?;
     loop {
         match deadline.map_or_else(|| rx.recv().ok(), |d| rx.recv_timeout(d.saturating_duration_since(Instant::now())).ok()) {
-            Some(Ev::Line { text: Some(t), .. }) => return Ok(t),
-            Some(Ev::Line { text: None, .. }) => return Err(Outcome::error("config", "the task on stdin is over 1 MiB or unreadable")),
+            Some(Ev::Input { bytes: Some(b), .. }) => return Ok(String::from_utf8_lossy(&b).into_owned()),
+            Some(Ev::Input { bytes: None, .. }) => return Err(Outcome::error("config", "the task on stdin is over 1 MiB or unreadable")),
             Some(Ev::Signal(_)) => return Err(Outcome::Interrupted),
             None => return Err(Outcome::Budget),
             Some(_) => {}

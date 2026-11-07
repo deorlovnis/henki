@@ -385,19 +385,22 @@ fn out_repl_delta_then_line_newline() {
     assert_eq!(got, pieces(&want));
 }
 
+/// The editor's echo goes to stderr as it is (the editor escaped it), after ending an open answer line; an empty one is
+/// not queued; nothing outside the REPL.
 #[test]
-fn out_repl_prompt_no_newline() {
+fn out_repl_echo_as_is() {
     let got = repl(false, |out| {
-        out.prompt("> ");
+        out.echo("> ".into());
         out.delta("partial");
-        out.prompt("run? [y/N] \u{202e}");
+        out.echo(String::new());
+        out.echo("run? [y/N] \\u{202e}\r\x1b[J".into());
     });
-    assert_eq!(got, pieces(&[(2, "> "), (1, "partial"), (1, "\n"), (2, "run? [y/N] \\u{202e}")]));
+    assert_eq!(got, pieces(&[(2, "> "), (1, "partial"), (1, "\n"), (2, "run? [y/N] \\u{202e}\r\x1b[J")]));
     for mode in [Mode::Plain, Mode::Json] {
         let (tx, _rx) = mpsc::channel();
         let log = Log::new();
         let out = Out::with(mode, tx, log.on(1, None), log.on(2, None), true);
-        out.prompt("> ");
+        out.echo("> ".into());
         out.delta("not streamed outside the REPL");
         out.flush(soon());
         assert!(log.get().is_empty(), "{mode:?}");
@@ -424,7 +427,7 @@ fn out_reset_only_tty() {
         out.line("-- shell --");
     });
     assert_eq!(got, pieces(&[(1, "cut short"), (1, "\n"), (2, RESET), (2, "-- shell --\n")]));
-    assert_eq!(RESET, "\x1b[!p\x1b[0m\x1b[r\x1b[?1049l\x1b[?7h\x1b[999;1H\x1bD");
+    assert_eq!(RESET, "\x1b[!p\x1b[0m\x1b[r\x1b[?1049l\x1b[?7h\x1b[999;1H\x1bD\x1b[?2004l", "bracketed paste off too");
     assert_eq!(repl(false, |out| out.reset()), []);
 }
 
@@ -479,12 +482,16 @@ fn reader() -> (Reader, Receiver<Ev>, io::PipeWriter, Arc<AtomicUsize>) {
     (Reader::with(Box::new(Counted(r, Arc::clone(&reads))), tx).unwrap(), rx, w, reads)
 }
 
-/// The next event, which must be a line, within 5 s.
-fn line(rx: &Receiver<Ev>) -> (u32, Option<String>) {
+/// The next event, which must be input, within 5 s.
+fn input(rx: &Receiver<Ev>) -> (u32, Option<Vec<u8>>) {
     match rx.recv_timeout(Duration::from_secs(5)) {
-        Ok(Ev::Line { tag, text }) => (tag, text),
-        other => panic!("no line: {other:?}"),
+        Ok(Ev::Input { tag, bytes }) => (tag, bytes),
+        other => panic!("no input: {other:?}"),
     }
+}
+
+fn got(b: &[u8]) -> Option<Vec<u8>> {
+    Some(b.to_vec())
 }
 
 /// Polls `f` every 5 ms for up to 5 s.
@@ -503,29 +510,29 @@ fn until(f: impl Fn() -> bool) -> bool {
 fn reader_only_when_asked() {
     let (r, rx, mut w, reads) = reader();
     w.write_all(b"early\n").unwrap();
-    // Nobody asked: no line comes and the input is never read.
+    // Nobody asked: nothing comes and the input is never read.
     assert!(rx.recv_timeout(Duration::from_millis(200)).is_err());
     assert_eq!(reads.load(SeqCst), 0);
     r.ask(1);
-    assert_eq!(line(&rx), (1, Some("early".into())));
+    assert_eq!(input(&rx), (1, got(b"early\n")));
     assert_eq!(reads.load(SeqCst), 1);
-    // After the line it waits again, without reading what is typed next.
-    w.write_all(b"late\n").unwrap();
+    // After one read it waits again, without reading what is typed next.
+    w.write_all(b"late").unwrap();
     assert!(rx.recv_timeout(Duration::from_millis(200)).is_err());
     assert_eq!(reads.load(SeqCst), 1);
     r.ask(2);
-    assert_eq!(line(&rx), (2, Some("late".into())));
+    assert_eq!(input(&rx), (2, got(b"late")), "what one read returns, a line ended or not");
 }
 
+/// A read under way goes out with the tag MAIN asks with when it returns.
 #[test]
-fn reader_tag_at_line_end() {
+fn reader_tag_when_read_returns() {
     let (r, rx, mut w, reads) = reader();
     r.ask(5);
-    w.write_all(b"hel").unwrap();
     assert!(until(|| reads.load(SeqCst) >= 1), "the read never started");
     r.ask(9);
-    w.write_all(b"lo\n").unwrap();
-    assert_eq!(line(&rx), (9, Some("hello".into())));
+    w.write_all(b"hello").unwrap();
+    assert_eq!(input(&rx), (9, got(b"hello")));
 }
 
 #[test]
@@ -535,43 +542,29 @@ fn reader_stale_after_cancel() {
     assert!(until(|| reads.load(SeqCst) >= 1), "the read never started");
     r.ask(0);
     w.write_all(b"typed after the cancel\n").unwrap();
-    assert_eq!(line(&rx), (0, Some("typed after the cancel".into())));
+    assert_eq!(input(&rx), (0, got(b"typed after the cancel\n")));
     // Then it waits for the next ask.
     w.write_all(b"next\n").unwrap();
+    assert!(rx.recv_timeout(Duration::from_millis(100)).is_err());
     r.ask(6);
-    assert_eq!(line(&rx), (6, Some("next".into())));
+    assert_eq!(input(&rx), (6, got(b"next\n")));
 }
 
 #[test]
-fn reader_eof_sticky() {
-    let (r, rx, mut w, reads) = reader();
+fn reader_eof_every_ask() {
+    let (r, rx, mut w, _) = reader();
     w.write_all(b"last").unwrap();
     drop(w);
     r.ask(1);
-    assert_eq!(line(&rx), (1, Some("last".into())), "a line cut by EOF is still a line");
-    r.ask(2);
-    assert_eq!(line(&rx), (2, None));
-    let n = reads.load(SeqCst);
-    r.ask(3);
-    assert_eq!(line(&rx), (3, None));
-    assert_eq!(reads.load(SeqCst), n, "nothing is read after EOF");
-}
-
-#[test]
-fn reader_strips_crlf() {
-    let (r, rx, mut w, _) = reader();
-    w.write_all(b"a\r\nb\n\r\nc\r\r\n\xffx\n").unwrap();
-    drop(w);
-    for (tag, want) in [(1, "a"), (2, "b"), (3, ""), (4, "c\r"), (5, "\u{fffd}x")] {
+    assert_eq!(input(&rx), (1, got(b"last")));
+    for tag in [2, 3] {
         r.ask(tag);
-        assert_eq!(line(&rx), (tag, Some(want.into())));
+        assert_eq!(input(&rx), (tag, None), "EOF, at once, for every ask");
     }
-    r.ask(6);
-    assert_eq!(line(&rx), (6, None));
 }
 
 /// What a scripted input answers next: bytes, or EOF. An empty script answers WouldBlock, as a terminal left
-/// non-blocking (O_NONBLOCK) does while no whole line has been typed.
+/// non-blocking (O_NONBLOCK) does while nothing has been typed.
 enum In {
     Data(&'static [u8]),
     Eof,
@@ -610,10 +603,9 @@ fn reader_nonblocking_not_eof() {
     // Nothing typed yet: WouldBlock, and the reader reads again instead of taking it for EOF.
     r.ask(1);
     assert!(!seen(&reads) && !seen(&reads), "two reads, both WouldBlock");
-    assert!(rx.try_recv().is_err(), "no line and no EOF yet");
-    push(In::Data(b"typed later\n"));
-    assert_eq!(line(&rx), (1, Some("typed later".into())));
-    // Every read up to the line was reported before the line was sent.
+    assert!(rx.try_recv().is_err(), "no input and no EOF yet");
+    push(In::Data(b"typed later"));
+    assert_eq!(input(&rx), (1, got(b"typed later")));
     let drain = || reads.try_iter().count();
     drain();
     // A cancel while it waits for input: at most the read already under way, then no more reads.
@@ -623,34 +615,161 @@ fn reader_nonblocking_not_eof() {
     let after = std::iter::from_fn(|| reads.recv_timeout(Duration::from_millis(300)).ok()).count();
     assert!(after <= 1, "{after} reads after the cancel");
     assert!(rx.try_recv().is_err());
-    // Part of a line, then WouldBlock: the part is kept and the line completes later.
-    push(In::Data(b"par"));
-    r.ask(6);
-    while seen(&reads) {}
-    push(In::Data(b"tial\n"));
-    assert_eq!(line(&rx), (6, Some("partial".into())));
-    // A real EOF still ends input for good, without another read.
+    // A real EOF is EOF.
     push(In::Eof);
     r.ask(7);
-    assert_eq!(line(&rx), (7, None));
-    drain();
-    r.ask(8);
-    assert_eq!(line(&rx), (8, None));
-    assert!(reads.recv_timeout(Duration::from_millis(100)).is_err(), "nothing is read after EOF");
+    assert_eq!(input(&rx), (7, None));
+}
+
+/// An editor 20 columns wide after the prompt `> `, fed `b` with nothing more waiting: its result and its echo.
+fn fed(e: &mut Edit, b: &[u8]) -> (Option<bool>, String) {
+    let done = e.feed(b, || false);
+    (done, std::mem::take(&mut e.echo))
+}
+
+fn edit() -> Edit {
+    let mut e = Edit::new("> ", 20);
+    assert_eq!(std::mem::take(&mut e.echo), "> ", "it writes the prompt first");
+    e
 }
 
 #[test]
-fn rows_wide_odd_width() {
-    let l = |s: &str| s.to_string();
-    // A terminal never splits a wide character: at an odd width it wraps one column early.
-    assert_eq!(rows(&[l(&"漢".repeat(4))], 3), 4);
-    assert_eq!(rows(&[l(&format!("!| {}", "漢".repeat(120)))], 81), 4, "39 + 40 + 40 + 1");
-    assert_eq!(rows(&[l(&"漢".repeat(40))], 80), 1);
-    assert_eq!(rows(&[l(&"漢".repeat(41))], 80), 2);
-    assert_eq!(rows(&[l("x漢")], 2), 2);
-    // A raw tab counts as the most it can move, 8 columns.
-    assert_eq!(rows(&[l(&"\t".repeat(10))], 80), 1);
-    assert_eq!(rows(&[l(&"\t".repeat(11))], 80), 2);
-    assert_eq!(rows(&[l(&format!("{}\t", "x".repeat(73)))], 80), 2);
-    assert_eq!(rows(&[l("漢")], 1), 1, "a character wider than the screen still takes one row");
+fn edit_typed_line() {
+    let mut e = Edit::new("> ", 80);
+    assert_eq!(fed(&mut e, b"hello w"), (None, "> hello w".into()));
+    assert_eq!(fed(&mut e, "örld \u{202e}".as_bytes()), (None, "örld \\u{202e}".into()), "echoed escaped");
+    assert_eq!(fed(&mut e, b"\r"), (Some(true), "\n".into()));
+    assert_eq!((e.text.as_str(), e.pasted, e.over), ("hello wörld \u{202e}", false, 0));
+    // Enter as a terminal without ICRNL sends it, or as LF.
+    let mut e = edit();
+    assert_eq!(fed(&mut e, b"/exit\n"), (Some(true), "/exit\n".into()));
+    assert!(!e.pasted);
+}
+
+/// A code point cut between two reads is one character, echoed once whole.
+#[test]
+fn edit_utf8_across_reads() {
+    let mut e = edit();
+    let b = "ä€😀".as_bytes();
+    for (i, part) in [&b[..1], &b[1..3], &b[3..6], &b[6..]].into_iter().enumerate() {
+        let (done, echo) = fed(&mut e, part);
+        assert_eq!(done, None);
+        assert_eq!(echo, ["", "ä", "€", "😀"][i], "read {i}");
+    }
+    assert_eq!(e.text, "ä€😀");
+    // A cut code point before Enter is not held back: it is U+FFFD.
+    assert_eq!(fed(&mut e, b"\xe2\x82\r").0, Some(true));
+    assert_eq!(e.text, "ä€😀\u{fffd}");
+}
+
+/// Backspace and DEL take one whole character, multi-byte ones included, and draw the line again from its first row.
+#[test]
+fn edit_backspace_whole_characters() {
+    let mut e = edit();
+    fed(&mut e, "aä€😀".as_bytes());
+    assert_eq!(fed(&mut e, b"\x7f"), (None, "\r\x1b[J> aä€".into()));
+    assert_eq!(fed(&mut e, b"\x08\x7f"), (None, "\r\x1b[J> aä\r\x1b[J> a".into()));
+    assert_eq!(fed(&mut e, b"b\r").0, Some(true));
+    assert_eq!(e.text, "ab");
+    let mut e = edit();
+    assert_eq!(fed(&mut e, b"\x7f\x7f"), (None, "\r\x1b[J> \r\x1b[J> ".into()), "on an empty line nothing goes");
+    assert_eq!(e.text, "");
+}
+
+/// Ctrl-U empties the line; from a line that took three rows it goes up two first.
+#[test]
+fn edit_ctrl_u() {
+    let mut e = edit();
+    let (_, echo) = fed(&mut e, &[b'x'; 40]);
+    assert_eq!(echo, format!("{}\n{}\n{}", "x".repeat(18), "x".repeat(20), "x".repeat(2)), "wrapped by the editor before the last column");
+    assert_eq!(fed(&mut e, b"\x15"), (None, "\x1b[A\x1b[A\r\x1b[J> ".into()));
+    assert_eq!(fed(&mut e, b"real\r"), (Some(true), "real\n".into()));
+    assert_eq!(e.text, "real");
+}
+
+/// Wrapping counts the most a character takes: a non-ASCII one two columns, a tab eight, an escaped one its escape.
+#[test]
+fn edit_wrap_widths() {
+    let mut e = edit();
+    assert_eq!(fed(&mut e, "日本語日本語日本語ab".as_bytes()).1, "日本語日本語日本語\nab", "9 wide characters fill 18 columns");
+    let mut e = edit();
+    assert_eq!(fed(&mut e, "abcdefghijkl\u{202e}".as_bytes()).1, "abcdefghijkl\n\\u{202e}", "an escape is not split");
+    // Backspace across a wrap draws the rows that are left.
+    let mut e = edit();
+    fed(&mut e, &[b'y'; 19]);
+    assert_eq!(fed(&mut e, b"\x7f").1, format!("\x1b[A\r\x1b[J> {}", "y".repeat(18)));
+}
+
+/// A prompt that fills its row: the line starts on the next row, and a redraw has no prompt to draw.
+#[test]
+fn edit_wide_prompt() {
+    let mut e = Edit::new(&"p".repeat(30), 20);
+    assert_eq!(std::mem::take(&mut e.echo), format!("{}\n", "p".repeat(30)));
+    assert_eq!(fed(&mut e, b"ab\x7f"), (None, "ab\r\x1b[Ja".into()));
+}
+
+/// Arrow keys (CSI and SS3), other sequences, Alt-x, a doubled ESC and control bytes are dropped, never echoed.
+#[test]
+fn edit_keys_dropped() {
+    let mut e = edit();
+    let keys: &[&[u8]] = &[b"a", b"\x1b[D", b"\x1b[A", b"\x1bOB", b"\x1b[1;5C", b"\x1b[3~", b"\x1bx", b"\x1b\x1b[A", b"\x01\x02\x07\x09\x0b\x0c\x1c", b"b"];
+    let echo: String = keys.iter().map(|k| fed(&mut e, k).1).collect();
+    assert_eq!(echo, "ab");
+    // A sequence cut between reads is dropped whole, too.
+    assert_eq!(fed(&mut e, b"\x1b["), (None, String::new()));
+    assert_eq!(fed(&mut e, b"Dc\r"), (Some(true), "c\n".into()));
+    assert_eq!(e.text, "abc");
+}
+
+/// Ctrl-D is EOF on an empty line only.
+#[test]
+fn edit_ctrl_d() {
+    let mut e = edit();
+    assert_eq!(fed(&mut e, b"x\x04"), (None, "x".into()));
+    assert_eq!(fed(&mut e, b"\x7f\x04").0, Some(false));
+}
+
+/// A bracketed paste is text, whole: newlines (a CR is one), control bytes and escape sequences are kept and echoed
+/// escaped, a `!` line is just text; its markers may be cut between reads; and the line is marked as pasted.
+#[test]
+fn edit_paste_whole() {
+    let mut e = edit();
+    fed(&mut e, b"see: ");
+    let (done, echo) = fed(&mut e, b"\x1b[200~line 1\n!touch x\r\x1b[31mred\x1b[0m\x1b[20");
+    assert_eq!(done, None, "Enter inside a paste does not send");
+    assert_eq!(echo, "line 1\n!touch x\n\\x1b[31mred\\x1b[0", "the last 5 bytes wait: they may start the end");
+    assert_eq!(fed(&mut e, b"1~").1, "m");
+    assert!(e.pasted);
+    assert_eq!(fed(&mut e, b" ok\r").0, Some(true));
+    assert_eq!(e.text, "see: line 1\n!touch x\n\x1b[31mred\x1b[0m ok");
+    // The start marker cut between reads, and a paste that ends with Enter after it.
+    let mut e = edit();
+    assert_eq!(fed(&mut e, b"\x1b[2"), (None, String::new()));
+    assert_eq!(fed(&mut e, b"00~y\x1b[201~"), (None, "y".into()));
+    assert!(e.pasted);
+    assert_eq!(fed(&mut e, b"\r").0, Some(true));
+    assert_eq!(e.text, "y");
+}
+
+/// Without bracketed paste, an Enter that comes with more input (in the same read, or waiting) is a newline in the line,
+/// which is then never a command: only a line read alone is typed.
+#[test]
+fn edit_enter_with_more_is_newline() {
+    let mut e = edit();
+    assert_eq!(fed(&mut e, b"!touch x\nmore\n"), (Some(true), "!touch x\nmore\n".into()));
+    assert_eq!((e.text.as_str(), e.pasted), ("!touch x\nmore", true));
+    let mut e = edit();
+    assert_eq!(e.feed(b"/help\r", || true), None, "more input waits");
+    assert_eq!(e.feed(b"x\r", || false), Some(true));
+    assert_eq!((e.text.as_str(), e.pasted), ("/help\nx", true));
+}
+
+/// A line holds at most `LINE_MAX` bytes; the rest is counted, not kept, and not echoed.
+#[test]
+fn edit_cap() {
+    let mut e = Edit::new("> ", 80);
+    let big = "é".repeat(LINE_MAX / 2 + 3);
+    e.feed(format!("\x1b[200~{big}\x1b[201~").as_bytes(), || false);
+    assert_eq!((e.text.len(), e.over), (LINE_MAX, 6));
+    assert!(e.text.chars().all(|c| c == 'é'));
 }

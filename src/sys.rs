@@ -130,8 +130,8 @@ pub fn winsize(fd: i32) -> Option<(u16, u16)> {
 /// fd 0's terminal modes from the first `tty_save` that found a terminal.
 static TTY: OnceLock<libc::termios> = OnceLock::new();
 
-/// tcgetattr(0): keeps fd 0's terminal modes for `flush_input`; false when fd 0 is not a terminal. The REPL calls it
-/// once at start; it is also the REPL's "stdin is a terminal" check. On a terminal it also clears O_NONBLOCK.
+/// tcgetattr(0): keeps fd 0's terminal modes for `raw`; false when fd 0 is not a terminal. The REPL calls it once at
+/// start; it is also the REPL's "stdin is a terminal" check. On a terminal it also clears O_NONBLOCK.
 pub fn tty_save() -> bool {
     modes(0).map(|t| TTY.get_or_init(|| t)).inspect(|_| blocking(0)).is_some()
 }
@@ -144,26 +144,30 @@ fn modes(fd: i32) -> Option<libc::termios> {
     (unsafe { libc::tcgetattr(fd, &mut t) } == 0).then_some(t)
 }
 
-/// tcsetattr(0, TCSAFLUSH, the saved modes): restores the modes `tty_save` kept and drops what was typed ahead, so a
-/// command that left the terminal raw or without echo cannot leave the line reader with it; then clears O_NONBLOCK.
-/// Nothing when no modes were saved (`run`, or fd 0 not a terminal).
-pub fn flush_input() {
-    // SAFETY: `t` is a termios tcgetattr filled, and tcsetattr only reads it.
-    let _ = TTY.get().map(|t| unsafe { libc::tcsetattr(0, libc::TCSAFLUSH, t) }).inspect(|_| blocking(0));
+/// `on`: fd 0 in the line editor's modes, the saved ones without ICANON, ECHO, IEXTEN and ICRNL, with VMIN 1 and VTIME 0:
+/// each read returns what has come, Enter comes as CR, and Ctrl-C and Ctrl-\ stay signals. What was typed before is
+/// dropped; Some(its bytes). `!on`: the saved modes back, so a command that left the terminal raw or without echo does
+/// not leave it so. Both clear O_NONBLOCK. None without saved modes (`run`, or fd 0 not a terminal).
+pub fn raw(on: bool) -> Option<usize> {
+    let mut t = *TTY.get()?;
+    if on {
+        (t.c_lflag, t.c_iflag) = (t.c_lflag & !(libc::ICANON | libc::ECHO | libc::IEXTEN), t.c_iflag & !libc::ICRNL);
+        (t.c_cc[libc::VMIN], t.c_cc[libc::VTIME]) = (1, 0);
+    }
+    // SAFETY: tcsetattr only reads `t`, a copy of a termios tcgetattr filled.
+    unsafe { libc::tcsetattr(0, libc::TCSANOW, &t) };
+    blocking(0);
+    // Counted with ICANON off, which counts a line not yet ended too, then dropped.
+    // SAFETY: tcflush takes integers only.
+    Some(if on { (pending(0), unsafe { libc::tcflush(0, libc::TCIFLUSH) }).0 } else { 0 })
 }
 
-/// `flush_input`, and what it dropped: the bytes, and whether the last of them ends no line (the terminal shows that
-/// text, the cursor after it). On a canonical terminal FIONREAD counts whole lines only, so a second count is taken
-/// with ICANON off: only while no read waits on fd 0, which would take the unended line. (0, false) without saved modes.
-pub fn flush_typed() -> (usize, bool) {
-    let mut n: [libc::c_int; 2] = [0; 2];
-    if let Some(mut raw) = TTY.get().copied() {
-        (raw.c_lflag, raw.c_cc[libc::VMIN]) = (raw.c_lflag & !libc::ICANON, 1);
-        // SAFETY: FIONREAD writes one int into each; tcsetattr only reads `raw`, a copy of a termios tcgetattr filled.
-        unsafe { (libc::ioctl(0, libc::FIONREAD, &mut n[0]), libc::tcsetattr(0, libc::TCSANOW, &raw), libc::ioctl(0, libc::FIONREAD, &mut n[1])) };
-    }
-    flush_input();
-    (usize::try_from(n[1]).unwrap_or(0), n[1] > n[0])
+/// The bytes waiting to be read on `fd` (FIONREAD); 0 when it cannot tell.
+pub fn pending(fd: i32) -> usize {
+    let mut n: libc::c_int = 0;
+    // SAFETY: the pointer is to a live int, the type FIONREAD writes.
+    unsafe { libc::ioctl(fd, libc::FIONREAD, &mut n) };
+    usize::try_from(n).unwrap_or(0)
 }
 
 /// Clears O_NONBLOCK on `fd`. A command that shares the terminal may set it on the open file and leave it set; reads
