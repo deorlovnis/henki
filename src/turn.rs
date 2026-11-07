@@ -75,8 +75,8 @@ impl Session {
         let system = tools::system(cfg.agents.as_deref(), &ext::prompt(&cfg.exts, &cfg.home));
         // The Anthropic API can be silent for minutes while it buffers a large tool input.
         let lim = http::Limits { stall: if cfg.dialect == "anthropic" { anthropic::STALL } else { http::LIMITS.stall }, ..http::LIMITS };
-        let (tools, next_h, snap) = (tools::schema(&cfg.tools), journal::next_h(&hist), stamps(&cfg.trust));
-        Session {
+        let (tools, next_h) = (tools::schema(&cfg.tools), journal::next_h(&hist));
+        let mut s = Session {
             cfg,
             sig: None,
             j,
@@ -90,7 +90,7 @@ impl Session {
             system,
             tools,
             reader,
-            snap,
+            snap: Vec::new(),
             next_h,
             tag: 0,
             t: Turn::default(),
@@ -99,7 +99,9 @@ impl Session {
             bg: 0,
             finishing: false,
             hurry: false,
-        }
+        };
+        s.rearm();
+        s
     }
 
     /// One turn: the `user` record (none for `run --resume` without TASK), then steps until an outcome. Every call of the
@@ -196,7 +198,7 @@ impl Session {
     /// A new snapshot of `cfg.trust`. Only right after a `changed()` that was empty, around henki's own write to the allow
     /// file, so that no outside change is ever absorbed.
     pub fn rearm(&mut self) {
-        self.snap = stamps(&self.cfg.trust);
+        self.snap = self.cfg.trust.iter().map(|p| (p.clone(), sys::stamp(p))).collect();
     }
 
     /// Requests and calls until an outcome; `Err` is the only way out.
@@ -355,11 +357,6 @@ pub fn outcome_line(o: &Outcome) -> String {
 /// What a session's first task starts with: where and when the model works.
 fn head(cwd: &Path) -> String {
     format!("cwd: {}\nos: {} {}\ndate: {}\n\n", cwd.display(), std::env::consts::OS, std::env::consts::ARCH, sys::local_date())
-}
-
-/// The tripwire's snapshot of `trust`.
-fn stamps(trust: &[PathBuf]) -> Vec<(PathBuf, (Stamp, Stamp))> {
-    trust.iter().map(|p| (p.clone(), sys::stamp(p))).collect()
 }
 
 #[cfg(test)]

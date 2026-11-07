@@ -79,9 +79,7 @@ impl Session {
         let (tag, cap, t0) = (self.next_tag(), tools::cap(self.cfg.output_cap, self.cfg.window), Instant::now());
         let secs = c.args["timeout"].as_u64().unwrap_or(self.cfg.tool_timeout_s).min(CALL_MAX_S);
         let (cmd, mut pgid) = (c.args["command"].as_str().unwrap_or_default(), None);
-        if head && self.out.repl() {
-            self.out.line(&tools::head(c));
-        }
+        (head && self.out.repl()).then(|| self.out.line(&tools::head(c)));
         if let Some(t) = t {
             files::start(c.clone(), t, cap, tag, &self.tx);
         } else {
