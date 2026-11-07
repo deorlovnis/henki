@@ -423,17 +423,19 @@ fn ext_bin_dotfile() {
     let t = T::new();
     t.ext("e/a", "# a");
     t.exe("e/a/bin/x");
-    // A dot entry in bin/ that cannot run is no command (Finder's, or what a copy from a Mac leaves): ignored, not watched.
+    // A dot entry in bin/ that cannot run is no command (Finder's, or what a copy from a Mac leaves), but it is watched:
+    // made runnable, it would be one.
     for n in [".DS_Store", ".gitkeep", "._x"] {
         t.file(&format!("e/a/bin/{n}"), "");
     }
     t.dir("e/a/bin/.git");
     let f = ok(&[t.p("e")]);
-    assert_eq!((&f.exts[0].cmds, f.exts[0].paths.len()), (&vec!["x".to_string()], 4), "{:?}", f.exts[0].paths);
+    let watched = |names: &[&str]| [t.p("e/a"), t.p("e/a/doc.md"), t.p("e/a/bin")].into_iter().chain(names.iter().map(|n| t.p(&format!("e/a/bin/{n}")))).collect::<Vec<_>>();
+    assert_eq!((&f.exts[0].cmds, &f.exts[0].paths), (&vec!["x".to_string()], &watched(&[".DS_Store", "._x", ".git", ".gitkeep", "x"])));
     // One that can run is a command like any other: listed and watched.
     t.exe("e/a/bin/.x");
     let f = ok(&[t.p("e")]);
-    assert_eq!((&f.exts[0].cmds, f.exts[0].paths.len()), (&vec![".x".to_string(), "x".to_string()], 5));
+    assert_eq!((&f.exts[0].cmds, &f.exts[0].paths), (&vec![".x".to_string(), "x".to_string()], &watched(&[".DS_Store", "._x", ".git", ".gitkeep", ".x", "x"])));
     // Without the dot, a file that cannot run is refused as before.
     let p = t.file("e/a/bin/y", "");
     assert_eq!(err(&[t.p("e")]), bin_refused(&p));

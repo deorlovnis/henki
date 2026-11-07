@@ -61,7 +61,7 @@ impl Session {
     /// Ctrl-D or Ctrl-C, which leave the cursor after the question, what follows starts on its own row.
     fn typed(&mut self) -> Result<String, Outcome> {
         match self.line() {
-            Ok(Some(a)) => Ok(a.trim().to_ascii_lowercase()).inspect(|_| _ = sys::flush_input()),
+            Ok(Some(a)) => Ok(a.trim().to_ascii_lowercase()).inspect(|_| sys::flush_input()),
             Ok(None) => Err(Outcome::Interrupted).inspect_err(|_| self.out.line("")),
             Err(Stop::Signal(libc::SIGINT | libc::SIGQUIT)) => Ok(String::new()).inspect(|_| self.out.line("")),
             Err(s) => Err(s.into()),

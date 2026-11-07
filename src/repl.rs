@@ -65,7 +65,8 @@ fn lines(s: &mut Session) -> u8 {
         let t = line.trim();
         // One line per prompt: the rest of a pasted block, or of what was typed ahead, is dropped with a note, so that no
         // pasted line runs as a `!cmd`. What follows a `!cmd` line is the command's to read.
-        let dropped = if t.starts_with('!') { 0 } else { sys::flush_input() };
+        let (dropped, unended) = if t.starts_with('!') { (0, false) } else { sys::flush_typed() };
+        unended.then(|| s.out().line("")); // the terminal shows that line, the cursor after it
         (dropped > 0).then(|| s.out().note(&format!("dropped {} bytes after that line: one line is one message; save longer text to a file", term::num(dropped as u64))));
         let rm = t.strip_prefix("/allow rm ").and_then(|n| n.trim().parse().ok());
         match (t, rm, t.strip_prefix('!')) {
@@ -101,7 +102,7 @@ fn lines(s: &mut Session) -> u8 {
                     // stdout went away (only a turn writes to it), also when the turn did not end on it: a finishing turn
                     // drops that event.
                     _ if s.out().closed() => return 141,
-                    Outcome::Interrupted => _ = sys::flush_input(), // what was typed during the turn is no answer
+                    Outcome::Interrupted => sys::flush_input(), // what was typed during the turn is no answer
                     Outcome::Error { kind: "journal" | "tampered", .. } => return 2,
                     Outcome::Error { kind: "changed", .. } => {
                         s.out().note(TRIPPED);
@@ -122,10 +123,7 @@ fn remove(s: &mut Session, n: usize) -> bool {
     if !changed.is_empty() {
         return true;
     }
-    match allow::remove(&s.cfg.allow.file, n, &s.cfg.home) {
-        Ok(line) => s.out().line(&line),
-        Err(e) => s.out().note(&e),
-    }
+    allow::remove(&s.cfg.allow.file, n, &s.cfg.home).map_or_else(|e| s.out().note(&e), |line| s.out().line(&line));
     let loaded = allow::load(&s.cfg.allow.file, !s.cfg.auto);
     s.rearm();
     loaded.map(|a| s.cfg.allow = a).map_err(|e| s.out().note(&e)).is_err()

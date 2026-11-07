@@ -87,10 +87,8 @@ impl Session {
     /// record without calls (`finish` is `interrupted` or `error`); FINISHING names the calls it opened.
     fn partial_reply(&mut self, finish: &str, o: Outcome) -> Outcome {
         let text = std::mem::take(&mut self.t.partial);
-        if text.is_empty() {
-            return o;
-        }
-        self.record(rec::assistant(&text, &[], finish, Usage::default(), None)).err().filter(|_| !matches!(o, Outcome::Error { .. })).unwrap_or(o)
+        let failed = if text.is_empty() { None } else { self.record(rec::assistant(&text, &[], finish, Usage::default(), None)).err() };
+        failed.filter(|_| !matches!(o, Outcome::Error { .. })).unwrap_or(o)
     }
 
     /// The error as the turn's outcome. After the last retry it says so, and a loopback server that refused every

@@ -87,6 +87,26 @@ fn pty_typed_ahead_line_is_next_message() {
     assert_eq!(m.log()[1].contents("user")[1], "and then this");
 }
 
+/// A paste whose last line has no newline: the note counts that line too and starts on a row of its own, below the
+/// pasted text the terminal shows, and the unended line is not the start of the next message.
+#[test]
+fn pty_paste_unended_last_line_counted() {
+    let m = Mock::start(vec![say("first answer"), say("second answer"), say("third answer")]);
+    let r = asking(&m);
+    let p = start(&r);
+    for (i, rest) in ["unended", "a whole line\nunended"].iter().enumerate() {
+        p.send(format!("question {i}\n{rest}").as_bytes());
+        p.expect(&format!("unended\r\nhenki: dropped {} bytes after that line: one line is one message; save longer text to a file\r\n", rest.len()), W);
+        p.prompt(W);
+    }
+    p.line("next");
+    p.expect("third answer", W);
+    p.prompt(W);
+    let d = exit(p);
+    let users: Vec<String> = m.log().iter().map(|q| q.contents("user").last().unwrap().clone()).collect();
+    assert!(users[0].ends_with("\n\nquestion 0") && users[1..] == ["question 1", "next"], "{users:?}\n{}", d.diag());
+}
+
 /// `!` with nothing after it runs nothing and tells the model nothing.
 #[test]
 fn pty_bare_bang_ignored() {

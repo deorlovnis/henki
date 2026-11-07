@@ -348,7 +348,8 @@ fn tty_save_not_a_tty() {
 fn flush_input_not_a_tty() {
     // No unit test saves terminal modes, so there is nothing to restore and nothing is flushed.
     assert!(TTY.get().is_none());
-    assert_eq!(flush_input(), 0, "nothing dropped");
+    flush_input();
+    assert_eq!(flush_typed(), (0, false), "nothing dropped");
     assert!(TTY.get().is_none());
 }
 
@@ -485,29 +486,32 @@ fn blocking_clears_nonblocking() {
 /// Set in the child process `flush_input_restores_a_pty` starts.
 const PTY_CHILD: &str = "HENKI_TEST_PTY_CHILD";
 
-/// `tty_save` and `flush_input` on a terminal. They act on fd 0, so the test runs this same test again in a child
-/// process whose fd 0 is a fresh pty: the test process's own fd 0 is never touched. The parent leaves the pty
-/// non-blocking with a line typed ahead; the child checks that `tty_save` clears O_NONBLOCK and keeps the typed line,
-/// then that `flush_input` restores the modes it saved, drops what was typed ahead (and counts it) and clears O_NONBLOCK
-/// again.
+/// `tty_save`, `flush_typed` and `flush_input` on a terminal. They act on fd 0, so the test runs this same test again in
+/// a child process whose fd 0 is a fresh pty: the test process's own fd 0 is never touched. The parent leaves the pty
+/// non-blocking with a line typed ahead and one not yet ended; the child checks that `tty_save` clears O_NONBLOCK and
+/// keeps them, that `flush_typed` counts and drops both (a canonical terminal counts the whole line only) and restores
+/// the modes, then that `flush_input` restores the modes a command left raw and clears O_NONBLOCK again.
 #[test]
 fn flush_input_restores_a_pty() {
     if std::env::var_os(PTY_CHILD).is_some() {
         assert!(fl(0) & libc::O_NONBLOCK != 0 && pending(0) > 0, "as the parent left it");
         assert!(tty_save());
         assert_eq!(fl(0) & libc::O_NONBLOCK, 0, "cleared at start");
-        assert!(pending(0) > 0, "saving does not flush");
+        assert_eq!(pending(0) as usize, "typed ahead\n".len(), "saving does not flush; whole lines only");
         let saved = modes(0).unwrap();
+        assert_eq!(flush_typed(), ("typed ahead\nunended".len(), true), "the bytes it dropped, the last line unended");
+        let now = modes(0).unwrap();
+        assert_eq!((now.c_lflag, now.c_cc), (saved.c_lflag, saved.c_cc), "canonical again");
         // What a command that dies in raw mode leaves behind.
         let mut raw = saved;
         raw.c_lflag &= !(libc::ICANON | libc::ISIG);
         // SAFETY: `raw` is a live termios; tcsetattr only reads it.
         assert_eq!(unsafe { libc::tcsetattr(0, libc::TCSANOW, &raw) }, 0);
+        assert_eq!(pending(0), 0, "the unended line is dropped too");
         set_fl(0, fl(0) | libc::O_NONBLOCK);
-        assert_eq!(flush_input(), "typed ahead\n".len(), "the bytes it dropped");
+        flush_input();
         let now = modes(0).unwrap();
         assert_eq!((now.c_lflag, now.c_iflag, now.c_oflag), (saved.c_lflag, saved.c_iflag, saved.c_oflag));
-        assert_eq!(pending(0), 0, "the typed-ahead line is dropped");
         assert_eq!(fl(0) & libc::O_NONBLOCK, 0);
         return;
     }
@@ -517,7 +521,7 @@ fn flush_input_restores_a_pty() {
     t.c_lflag &= !libc::ECHO;
     // SAFETY: `t` is a live termios; tcsetattr only reads it.
     assert_eq!(unsafe { libc::tcsetattr(s.as_raw_fd(), libc::TCSANOW, &t) }, 0);
-    m.write_all(b"typed ahead\n").unwrap();
+    m.write_all(b"typed ahead\nunended").unwrap();
     let t0 = std::time::Instant::now();
     while pending(s.as_raw_fd()) == 0 {
         assert!(t0.elapsed() < Duration::from_secs(5), "the typed line never reached the pty");

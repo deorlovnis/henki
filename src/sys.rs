@@ -146,13 +146,24 @@ fn modes(fd: i32) -> Option<libc::termios> {
 
 /// tcsetattr(0, TCSAFLUSH, the saved modes): restores the modes `tty_save` kept and drops what was typed ahead, so a
 /// command that left the terminal raw or without echo cannot leave the line reader with it; then clears O_NONBLOCK.
-/// Returns the bytes it dropped (FIONREAD; on a canonical terminal, of whole lines). Nothing, and 0, when no modes were
-/// saved (`run`, or fd 0 not a terminal).
-pub fn flush_input() -> usize {
-    let mut n: libc::c_int = 0;
-    // SAFETY: FIONREAD writes one int into `n`; `t` is a termios tcgetattr filled, and tcsetattr only reads it.
-    let _ = TTY.get().map(|t| unsafe { (libc::ioctl(0, libc::FIONREAD, &mut n), libc::tcsetattr(0, libc::TCSAFLUSH, t)) }).inspect(|_| blocking(0));
-    usize::try_from(n).unwrap_or(0)
+/// Nothing when no modes were saved (`run`, or fd 0 not a terminal).
+pub fn flush_input() {
+    // SAFETY: `t` is a termios tcgetattr filled, and tcsetattr only reads it.
+    let _ = TTY.get().map(|t| unsafe { libc::tcsetattr(0, libc::TCSAFLUSH, t) }).inspect(|_| blocking(0));
+}
+
+/// `flush_input`, and what it dropped: the bytes, and whether the last of them ends no line (the terminal shows that
+/// text, the cursor after it). On a canonical terminal FIONREAD counts whole lines only, so a second count is taken
+/// with ICANON off: only while no read waits on fd 0, which would take the unended line. (0, false) without saved modes.
+pub fn flush_typed() -> (usize, bool) {
+    let mut n: [libc::c_int; 2] = [0; 2];
+    if let Some(mut raw) = TTY.get().copied() {
+        (raw.c_lflag, raw.c_cc[libc::VMIN]) = (raw.c_lflag & !libc::ICANON, 1);
+        // SAFETY: FIONREAD writes one int into each; tcsetattr only reads `raw`, a copy of a termios tcgetattr filled.
+        unsafe { (libc::ioctl(0, libc::FIONREAD, &mut n[0]), libc::tcsetattr(0, libc::TCSANOW, &raw), libc::ioctl(0, libc::FIONREAD, &mut n[1])) };
+    }
+    flush_input();
+    (usize::try_from(n[1]).unwrap_or(0), n[1] > n[0])
 }
 
 /// Clears O_NONBLOCK on `fd`. A command that shares the terminal may set it on the open file and leave it set; reads
@@ -311,11 +322,8 @@ impl Dir {
     pub fn sub(&self, name: &OsStr, create: bool) -> io::Result<Dir> {
         let c = component(name)?;
         // SAFETY: the fd is open for as long as `self` lives and `c` is NUL-terminated.
-        let made = !create || check(unsafe { libc::mkdirat(self.0.as_raw_fd(), c.as_ptr(), 0o777) }).is_ok();
-        if !made && io::Error::last_os_error().kind() != io::ErrorKind::AlreadyExists {
-            return Err(io::Error::last_os_error());
-        }
-        self.openat(&c, libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW, 0).map(Dir)
+        let made = !create || unsafe { libc::mkdirat(self.0.as_raw_fd(), c.as_ptr(), 0o777) } == 0 || io::Error::last_os_error().kind() == io::ErrorKind::AlreadyExists;
+        if made { self.openat(&c, libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW, 0).map(Dir) } else { Err(io::Error::last_os_error()) }
     }
 
     /// openat O_CREAT|O_EXCL|O_NOFOLLOW|O_WRONLY|O_CLOEXEC.
@@ -351,10 +359,7 @@ impl Dir {
 /// One path component: not empty, `.` or `..`, and without `/` or NUL, so an *at call never walks out of its directory.
 fn component(name: &OsStr) -> io::Result<CString> {
     let b = name.as_bytes();
-    if b.is_empty() || b == b"." || b == b".." || b.contains(&b'/') {
-        return Err(io::Error::from(io::ErrorKind::InvalidInput));
-    }
-    CString::new(b).map_err(|_| io::Error::from(io::ErrorKind::InvalidInput))
+    CString::new(b).ok().filter(|_| !b.is_empty() && b != b"." && b != b".." && !b.contains(&b'/')).ok_or_else(|| io::ErrorKind::InvalidInput.into())
 }
 
 pub fn euid() -> u32 {

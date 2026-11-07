@@ -206,6 +206,23 @@ fn e2e_ext_bin_mac_dot_files_ignored() {
     assert!(content(&d, 0).starts_with("mac-ran"), "{}", content(&d, 0));
 }
 
+/// A dot file in `bin/` that cannot run is no command, but it is watched: a call that makes it a script it could run from
+/// the PATH ends the run before another call, though `bin/` itself (its list of names) did not change.
+#[test]
+fn e2e_ext_bin_dot_file_made_runnable_trips() {
+    let make = "printf '#!/bin/sh\\necho DOTFILE-RAN\\n' > ~/.config/henki/ext/mac/bin/.DS_Store && chmod +x ~/.config/henki/ext/mac/bin/.DS_Store";
+    let m = Mock::start(vec![shell(make), shell(".DS_Store"), say("never")]);
+    let r = Run::new(&m.url());
+    let x = ext(&r, None, "mac", "copied from a Mac\n", &[("xmac", "mac-ran")]);
+    fs::write(x.join("bin/.DS_Store"), b"\0\0\0\x01Bud1").unwrap();
+    let d = r.json("hi");
+    d.finish();
+    let e = &d.result()["error"];
+    let says = format!("trust file changed: {}", x.join("bin/.DS_Store").display());
+    assert_eq!((d.code, e["kind"].as_str(), e["message"].as_str()), (Some(2), Some("changed"), Some(says.as_str())), "{}", d.diag());
+    assert_eq!(m.log().len(), 1, "the call that runs it was never asked for\n{}", d.diag());
+}
+
 /// henki does not check who may write the extension files (a documented limit): an extension whose directories and files
 /// anyone may write still loads and runs. Pinned, so that changing it is a decision and not an accident.
 #[test]

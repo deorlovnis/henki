@@ -87,13 +87,15 @@ fn one(dir: &Path, name: &str) -> Result<Ext, String> {
     if let Some(b) = &bin {
         paths.push(b.clone());
         let runs = |p: &Path| fs::metadata(p).is_ok_and(|m| m.is_file() && m.mode() & 0o100 != 0);
-        // A dot file that cannot run is no command: Finder's .DS_Store, the ._NAME files a copy from a Mac leaves.
-        for c in names(b).map_err(|e| bad(b, e, "make bin a directory of commands"))?.into_iter().filter(|c| !c.as_bytes().starts_with(b".") || runs(&b.join(c))) {
+        for c in names(b).map_err(|e| bad(b, e, "make bin a directory of commands"))? {
             let p = b.join(&c);
-            if !c.to_str().is_some_and(cmd_name) || !runs(&p) {
+            // A dot file that cannot run is no command (Finder's .DS_Store, the ._NAME files a copy from a Mac leaves),
+            // but it is watched: made runnable, it would be one.
+            if runs(&p) && c.to_str().is_some_and(cmd_name) {
+                cmds.push(c.to_string_lossy().into_owned());
+            } else if runs(&p) || !c.as_bytes().starts_with(b".") {
                 return Err(bad(&p, "a command is a file you can run, named with A-Z, a-z, 0-9, ., _ and -", "rename it or chmod u+x it, or move it out of bin/"));
             }
-            cmds.push(c.to_string_lossy().into_owned());
             paths.push(p);
         }
     }
