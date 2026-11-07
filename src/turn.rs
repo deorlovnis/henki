@@ -255,7 +255,8 @@ impl Session {
         let int = self.reader.is_some() && o == Outcome::Interrupted && matches!(self.sig, Some(libc::SIGINT | libc::SIGQUIT));
         let got = if o.stops() || self.live.is_some() { self.stop_all(int).0 } else { None };
         let r = self.settle(&o, got);
-        self.finishing = false;
+        // A second signal hurries this kill only; the next turn's cancel gets its grace again.
+        (self.finishing, self.hurry) = (false, false);
         r.err().filter(|_| !matches!(o, Outcome::Error { .. })).unwrap_or(o)
     }
 

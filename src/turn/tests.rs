@@ -293,6 +293,16 @@ fn wait_deadline_before_queued_events() {
     std::fs::remove_dir_all(d).unwrap();
 }
 
+#[test]
+fn finish_clears_hurry() {
+    let d = dir("hurry");
+    let (mut s, _) = session(&d, 9);
+    s.hurry = true; // a second signal during the last kill
+    assert_eq!(s.finish(Outcome::Ok), Outcome::Ok);
+    assert!(!s.hurry && !s.finishing, "the next turn's kill waits its grace again");
+    std::fs::remove_dir_all(d).unwrap();
+}
+
 /// The session file under the test's state dir.
 fn journal_file(d: &Path) -> PathBuf {
     let sessions = d.join("state/sessions");
