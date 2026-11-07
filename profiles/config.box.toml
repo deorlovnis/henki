@@ -1,5 +1,6 @@
 # henki inside an isolated box, as the read-only mount /mnt/henki/config.toml; the box starts it with
-# henki run --config /mnt/henki/config.toml.
+# henki run --config /mnt/henki/config.toml. The mount must be owned by the user henki runs as (not root) and not be
+# group- or world-writable, or henki refuses to start.
 model = "claude-opus-5-5"               # an API model the box may use; set when the box is provisioned
 dialect = "anthropic"
 base_url = "http://127.0.0.2/model"     # the box's model gateway; henki appends /v1/messages
