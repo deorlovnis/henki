@@ -1,10 +1,9 @@
 //! Extensions: directories that teach the model a CLI. `NAME/doc.md`'s first line goes into the prompt; an optional
 //! `NAME/bin/` goes first on the tool PATH.
 use crate::{allow, sys, term};
+use std::io::{self, BufRead, Read};
 use std::path::{Path, PathBuf};
-use std::{
-    collections::BTreeMap, collections::BTreeSet, ffi::OsStr, ffi::OsString, fmt::Display, fs, io, io::BufRead, io::Read, os::unix::ffi::OsStrExt, os::unix::fs::MetadataExt,
-};
+use std::{collections::BTreeMap, collections::BTreeSet, ffi::OsStr, ffi::OsString, fmt::Display, fs, os::unix::ffi::OsStrExt, os::unix::fs::MetadataExt};
 
 pub struct Ext {
     pub name: String,
@@ -81,6 +80,10 @@ fn one(dir: &Path, name: &str) -> Result<Ext, String> {
         return Err(bad(&doc, "line 1 must be a summary of 1 to 160 bytes with no invisible characters", fix));
     }
     let bin = entries.contains(OsStr::new("bin")).then(|| dir.join("bin"));
+    // The child's PATH is a `:`-joined string: such a bin/ would split into other entries, one of them relative.
+    if let Some(b) = bin.as_ref().filter(|b| b.to_str().is_none_or(|s| s.contains(':'))) {
+        return Err(bad(b, "a PATH entry cannot hold ':' or bytes that are not UTF-8", "move the extensions to a path without them"));
+    }
     let (mut paths, mut cmds) = (vec![dir.to_path_buf(), doc.clone()], Vec::new());
     if let Some(b) = &bin {
         paths.push(b.clone());

@@ -1,7 +1,7 @@
 //! Allow rules: the user's standing approvals for exact shell commands in one project root, kept in a plain text file
 //! the user can read, edit and empty.
 use crate::{sys, term};
-use std::{ffi::OsString, fs, fs::File, fs::TryLockError, io, io::Read, io::Write, os::unix::fs::MetadataExt, path::Path, path::PathBuf};
+use std::{ffi::OsString, fs, fs::File, fs::TryLockError, io, io::Read, io::Write, os::unix::fs::MetadataExt, os::unix::fs::OpenOptionsExt, path::Path, path::PathBuf};
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct Rule {
@@ -24,11 +24,12 @@ const HEADER: &str = "# henki allow rules: ROOT<TAB>COMMAND, one per line; COMMA
 /// The allow file for rule use, at start. `read` false (auto mode): nothing is read. Fails closed.
 pub fn load(file: &Path, read: bool) -> Result<Allow, String> {
     let (none, f) = (Allow { file: file.to_path_buf(), ..Allow::default() }, file.display());
-    if read && fs::symlink_metadata(file).is_ok_and(|m| m.file_type().is_symlink()) {
-        return Err(format!("{f}: a symlink; fix: put the file itself in its place"));
-    }
-    let fix = |e: io::Error| format!("{f}: {e}; fix: keep the rules in a regular file of at most 64 KiB");
-    let Some(fd) = (if read { open(file).map_err(fix)? } else { None }) else { return Ok(none) };
+    // O_NOFOLLOW: the open itself refuses a symlink, so none can be swapped in after a check.
+    let fix = |e: io::Error| match e.raw_os_error() {
+        Some(libc::ELOOP) => format!("{f}: a symlink; fix: put the file itself in its place"),
+        _ => format!("{f}: {e}; fix: keep the rules in a regular file of at most 64 KiB"),
+    };
+    let Some(fd) = (if read { open(file, libc::O_NOFOLLOW).map_err(fix)? } else { None }) else { return Ok(none) };
     let (b, m) = bytes(&fd).and_then(|b| Ok((b, fd.metadata()?))).map_err(fix)?;
     if others(m.mode(), m.uid(), sys::euid()) {
         return Err(format!("{f}: another user can change it; fix: chown $USER {f}; chmod 600 {f}"));
@@ -60,6 +61,10 @@ impl Allow {
         // A last line without its newline stays a line of its own.
         let gap = if b.is_empty() || b.ends_with(b"\n") { "" } else { "\n" };
         let line = format!("{}{gap}{root}\t{cmd}\n", if new { HEADER } else { "" });
+        // Past the limit every start would fail closed, and list and remove would refuse the file.
+        if (b.len() + line.len()) as u64 > MAX {
+            return Err(io::Error::other(format!("would be over {} bytes", term::num(MAX))));
+        }
         (&f).write_all(line.as_bytes()).and_then(|()| f.sync_all())?;
         if !intact(b.len() as u64, line.len() as u64, &f.metadata()?, &fs::symlink_metadata(&self.file)?) {
             return Err(io::Error::other("changed while it was written"));
@@ -82,7 +87,7 @@ pub fn fits(cmd: &str, root: &Path) -> bool {
 
 /// `/allow` and `henki allow`: the file's path, then one line per rule. Lenient: any mode, invalid lines listed as such.
 pub fn list(file: &Path, home: &Path) -> Vec<String> {
-    let b = open(file).and_then(|f| f.map(|f| bytes(&f)).transpose()).map_err(|e| format!("cannot read it: {e}"));
+    let b = open(file, 0).and_then(|f| f.map(|f| bytes(&f)).transpose()).map_err(|e| format!("cannot read it: {e}"));
     let rules = b.map(|b| numbered(&b.unwrap_or_default()).enumerate().map(|(k, (_, l))| format!("{}  {}", k + 1, show(l, home))).collect());
     [vec![file.display().to_string()], rules.unwrap_or_else(|e| vec![e])].concat()
 }
@@ -91,11 +96,12 @@ pub fn list(file: &Path, home: &Path) -> Vec<String> {
 pub fn remove(file: &Path, n: usize, home: &Path) -> Result<String, String> {
     let err = |e: io::Error| format!("{}: {e}", file.display());
     let none = || format!("no rule {n} in {}", file.display());
-    let f = open(file).map_err(err)?.ok_or_else(none)?;
+    let f = open(file, 0).map_err(err)?.ok_or_else(none)?;
     let b = lock(&f).and_then(|()| bytes(&f)).map_err(err)?;
     let (i, l) = n.checked_sub(1).and_then(|k| numbered(&b).nth(k)).ok_or_else(none)?;
     let rest: Vec<&[u8]> = b.split(|&c| c == b'\n').enumerate().filter(|&(j, _)| j != i).map(|(_, l)| l).collect();
-    let dir = sys::Dir::open(file.parent().unwrap_or(Path::new("/"))).map_err(err)?;
+    // The directory's realpath: a config directory that is a symlink (dotfiles) works as it does for load and append.
+    let dir = fs::canonicalize(file.parent().unwrap_or(Path::new("/"))).and_then(|d| sys::Dir::open(&d)).map_err(err)?;
     let tmp = OsString::from(format!(".allow.henki-{}", std::process::id()));
     let write = |mut t: File| t.write_all(&rest.join(&b'\n')).and_then(|()| t.sync_all());
     let done = dir.create(&tmp, 0o600).and_then(write).and_then(|()| dir.rename(&tmp, file.file_name().unwrap_or_default()));
@@ -108,12 +114,12 @@ pub fn shown(p: &Path, home: &Path) -> String {
     p.strip_prefix(home).map_or_else(|_| p.display().to_string(), |r| format!("~/{}", r.display()).trim_end_matches('/').into())
 }
 
-/// The file opened without blocking, None when absent; anything but a regular file is an error.
-fn open(file: &Path) -> io::Result<Option<File>> {
-    match sys::open_read(file) {
+/// The file opened without blocking (`flags`: O_NOFOLLOW or 0), None when absent; anything but a regular file is an error.
+fn open(file: &Path, flags: i32) -> io::Result<Option<File>> {
+    match fs::OpenOptions::new().read(true).custom_flags(flags | libc::O_NONBLOCK | libc::O_NOCTTY).open(file) {
         Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
-        Ok((_, m)) if !m.is_file() => Err(io::Error::other("not a regular file")),
-        r => r.map(|(f, _)| Some(f)),
+        Ok(f) if !f.metadata()?.is_file() => Err(io::Error::other("not a regular file")),
+        r => r.map(Some),
     }
 }
 
