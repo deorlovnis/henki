@@ -2,6 +2,7 @@
 use super::*;
 use std::os::unix::fs::{PermissionsExt, symlink};
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::{sync::mpsc, time::Duration};
 
 const DOC_FIX: &str = "fix: write doc.md with a summary of the extension on line 1";
 const LINE_RULE: &str = "line 1 must be a summary of 1 to 160 bytes with no invisible characters";
@@ -271,7 +272,8 @@ fn ext_shadow_entry_unused_ignored() {
     let t = T::new();
     t.ext("e/a", "# a");
     t.exe("e/a/bin/x");
-    let f = find(&[t.p("e")], &["a/nope", "zz/x", "a/x"], "/usr/bin").map_err(|e| panic!("{e}")).ok().unwrap();
+    let usr = t.dir("usr");
+    let f = find(&[t.p("e")], &["a/nope", "zz/x", "a/x"], usr.to_str().unwrap()).map_err(|e| panic!("{e}")).ok().unwrap();
     assert!(f.notices.is_empty() && f.exts[0].shadows.is_empty());
 }
 
@@ -354,4 +356,123 @@ fn ext_listed_missing_fails() {
     let t = T::new();
     let want = format!("ext {}: No such file or directory (os error 2); fix: make it a readable directory, or set ext to readable ones", t.p("none").display());
     assert_eq!(err(&[t.p("none")]), want);
+}
+
+#[test]
+fn ext_doc_fifo_or_device_no_hang() {
+    let t = T::new();
+    let d = t.dir("e/a");
+    assert!(std::process::Command::new("mkfifo").arg(d.join("doc.md")).status().unwrap().success());
+    // Off the test thread, so a discovery that blocked would fail here instead of hanging the run.
+    let in_time = |paths: Vec<PathBuf>| {
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || tx.send(find(&paths, &[], "").err()).unwrap());
+        rx.recv_timeout(Duration::from_secs(30)).expect("discovery blocked")
+    };
+    assert_eq!(in_time(vec![t.p("e")]).unwrap(), format!("ext {0}: not a regular file: {0}/doc.md (fifo); {DOC_FIX}", d.display()));
+    fs::remove_file(d.join("doc.md")).unwrap();
+    symlink("/dev/zero", d.join("doc.md")).unwrap();
+    assert_eq!(in_time(vec![t.p("e")]).unwrap(), format!("ext {0}: not a regular file: {0}/doc.md (char device); {DOC_FIX}", d.display()));
+}
+
+#[test]
+fn ext_doc_line_tab() {
+    let t = T::new();
+    t.ext("e/a", "# a\tb \t\n");
+    assert_eq!(ok(&[t.p("e")]).exts[0].line, "a\tb", "a TAB inside the line is kept, around it trimmed");
+}
+
+fn bin_refused(p: &Path) -> String {
+    format!("ext {}: a command is a file you can run, named with A-Z, a-z, 0-9, ., _ and -; fix: rename it or chmod u+x it, or move it out of bin/", p.display())
+}
+
+#[test]
+fn ext_bin_group_exec_only() {
+    let t = T::new();
+    t.ext("e/a", "# a");
+    let x = t.exe("e/a/bin/x");
+    for mode in [0o055, 0o011, 0o644] {
+        fs::set_permissions(&x, fs::Permissions::from_mode(mode)).unwrap();
+        assert_eq!(err(&[t.p("e")]), bin_refused(&x), "{mode:o}");
+    }
+    fs::set_permissions(&x, fs::Permissions::from_mode(0o100)).unwrap();
+    assert_eq!(ok(&[t.p("e")]).exts[0].cmds, ["x"], "the user exec bit is the one");
+}
+
+#[test]
+fn ext_bin_broken_symlink() {
+    let t = T::new();
+    t.ext("e/a", "# a");
+    t.dir("e/a/bin");
+    let x = t.p("e/a/bin/x");
+    symlink(t.p("gone"), &x).unwrap();
+    assert_eq!(err(&[t.p("e")]), bin_refused(&x));
+}
+
+#[test]
+fn ext_bin_symlink_to_dir() {
+    let t = T::new();
+    t.ext("e/a", "# a");
+    t.dir("e/a/bin");
+    let x = t.p("e/a/bin/x");
+    symlink(t.dir("elsewhere"), &x).unwrap();
+    assert_eq!(err(&[t.p("e")]), bin_refused(&x));
+}
+
+#[test]
+fn ext_bin_dotfile() {
+    let t = T::new();
+    t.ext("e/a", "# a");
+    t.exe("e/a/bin/x");
+    // Only NAME directories and the entries of NAME skip dot names; in bin/ every entry is a command.
+    for n in [".DS_Store", ".gitkeep"] {
+        let p = t.file(&format!("e/a/bin/{n}"), "");
+        assert_eq!(err(&[t.p("e")]), bin_refused(&p));
+        fs::remove_file(p).unwrap();
+    }
+    t.exe("e/a/bin/.x");
+    assert_eq!(ok(&[t.p("e")]).exts[0].cmds, [".x", "x"]);
+}
+
+#[test]
+fn ext_path_with_colon_refused() {
+    let t = T::new();
+    t.ext("a:rel/e/x", "# x");
+    assert_eq!(names(&ok(&[t.p("a:rel/e")])), ["x"], "a doc-only extension adds nothing to PATH");
+    let tool = t.exe("a:rel/e/x/bin/tool");
+    let want = format!("ext {}: a PATH entry cannot hold ':' or bytes that are not UTF-8; fix: move the extensions to a path without them", tool.parent().unwrap().display());
+    assert_eq!(err(&[t.p("a:rel/e")]), want);
+    let odd = t.0.join(OsStr::from_bytes(b"\xff"));
+    fs::create_dir_all(odd.join("y/bin")).unwrap();
+    fs::write(odd.join("y/doc.md"), "# y").unwrap();
+    assert!(err(&[odd]).ends_with(": a PATH entry cannot hold ':' or bytes that are not UTF-8; fix: move the extensions to a path without them"));
+}
+
+#[test]
+fn ext_user_path_non_utf8_entry() {
+    let path = OsStr::from_bytes(b"/usr/bin:/opt/\xff/bin:/bin");
+    let f = discover(&[], false, &[], path).map_err(|e| panic!("{e}")).ok().unwrap();
+    assert_eq!(f.user_path, "/usr/bin:/bin", "an entry that is not UTF-8 is dropped, like a relative one");
+}
+
+#[test]
+fn ext_unreadable_name_dir() {
+    let t = T::new();
+    let d = t.ext("e/a", "# a");
+    fs::set_permissions(&d, fs::Permissions::from_mode(0o000)).unwrap();
+    let e = find(&[t.p("e")], &[], "").err();
+    fs::set_permissions(&d, fs::Permissions::from_mode(0o755)).unwrap();
+    if sys::euid() != 0 {
+        let want = format!("ext {}: Permission denied (os error 13); fix: make it an extension directory, or move it out of the ext path", d.display());
+        assert_eq!(e.unwrap(), want);
+    }
+}
+
+#[test]
+fn ext_optional_dangling_symlink() {
+    let t = T::new();
+    symlink(t.p("gone"), t.p("ext")).unwrap();
+    let f = discover(&[t.p("ext")], true, &[], OsStr::new("")).map_err(|e| panic!("{e}")).ok().unwrap();
+    assert!(f.exts.is_empty(), "the optional path is absent through a dangling link too");
+    assert_eq!(err(&[t.p("ext")]), format!("ext {}: No such file or directory (os error 2); fix: make it a readable directory, or set ext to readable ones", t.p("ext").display()));
 }

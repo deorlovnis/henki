@@ -2,6 +2,7 @@
 use super::*;
 use std::os::unix::{ffi::OsStrExt, fs::PermissionsExt, fs::symlink};
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::{Duration, Instant};
 
 const NO_TAB: &str = "no TAB between ROOT and COMMAND";
 const BAD_ROOT: &str = "ROOT is not * or an absolute path";
@@ -48,6 +49,19 @@ fn rules(rules: Vec<Rule>) -> Allow {
 
 fn read(p: &Path) -> String {
     String::from_utf8(fs::read(p).unwrap()).unwrap()
+}
+
+/// `op` again while it finds the file locked, for at most 10 s. A child that another test thread forks holds a copy of
+/// every open fd until it execs, so a lock this test already released can outlive its close for a moment. Only for a
+/// lock taken again on a file this test locked before; a lock held on purpose is asserted directly.
+fn unlocked<R, E: std::fmt::Display>(mut op: impl FnMut() -> Result<R, E>) -> Result<R, E> {
+    let end = Instant::now() + Duration::from_secs(10);
+    loop {
+        match op() {
+            Err(e) if e.to_string().ends_with("locked by another henki") && Instant::now() < end => std::thread::sleep(Duration::from_millis(5)),
+            r => return r,
+        }
+    }
 }
 
 #[test]
@@ -152,8 +166,16 @@ fn allow_load_fail_closed() {
     let fix = "fix: keep the rules in a regular file of at most 64 KiB";
     let target = t.p("target");
     fs::write(&target, "/a\tls\n").unwrap();
+    let link = format!("{s}: a symlink; fix: put the file itself in its place");
     symlink(&target, &f).unwrap();
-    assert_eq!(load(&f, true).unwrap_err(), format!("{s}: a symlink; fix: put the file itself in its place"));
+    assert_eq!(load(&f, true).unwrap_err(), link);
+    fs::remove_file(&f).unwrap();
+    symlink(t.p("gone"), &f).unwrap();
+    assert_eq!(load(&f, true).unwrap_err(), link, "a dangling symlink is not an absent file");
+    fs::remove_file(&f).unwrap();
+    assert!(std::process::Command::new("mkfifo").arg(t.p("fifo")).status().unwrap().success());
+    symlink(t.p("fifo"), &f).unwrap();
+    assert_eq!(load(&f, true).unwrap_err(), link, "refused at the open, before anything is read");
     fs::remove_file(&f).unwrap();
     assert!(std::process::Command::new("mkfifo").arg(&f).status().unwrap().success());
     assert_eq!(load(&f, true).unwrap_err(), format!("{s}: not a regular file; {fix}"));
@@ -197,7 +219,7 @@ fn allow_append_creates_with_header() {
     assert_eq!(fs::metadata(&f).unwrap().permissions().mode() & 0o7777, 0o600);
     let root = t.0.to_str().unwrap();
     assert_eq!(a.rules, [r(1, root, "git status")]);
-    assert_eq!(a.append(&t.0, "make").unwrap(), 2, "the second one appends");
+    assert_eq!(unlocked(|| a.append(&t.0, "make")).unwrap(), 2, "the second one appends");
     assert_eq!(load(&f, true).unwrap().rules, [r(1, root, "git status"), r(2, root, "make")]);
 }
 
@@ -211,7 +233,7 @@ fn allow_append_appends() {
     assert_eq!(a.rules, [r(3, "/src/app", "make test")]);
     assert_eq!(a.find("make test", Path::new("/src/app")).map(|r| r.n), Some(3));
     fs::write(&f, format!("{}*\tpwd\n", read(&f))).unwrap();
-    assert_eq!(a.append(Path::new("/src/app"), "ls").unwrap(), 5, "numbered from the file as it is");
+    assert_eq!(unlocked(|| a.append(Path::new("/src/app"), "ls")).unwrap(), 5, "numbered from the file as it is");
     let e = a.append(Path::new("/src/app"), "a\nb").unwrap_err();
     assert_eq!(e.kind(), io::ErrorKind::InvalidInput, "never a line that is not a rule");
 }
@@ -227,7 +249,7 @@ fn allow_append_locked() {
     assert_eq!(read(&f), "/x\tls\n");
     assert_eq!(remove(&f, 1, &t.0).unwrap_err(), format!("{}: locked by another henki", f.display()));
     drop(hold);
-    assert_eq!(a.append(Path::new("/x"), "make").unwrap(), 2);
+    assert_eq!(unlocked(|| a.append(Path::new("/x"), "make")).unwrap(), 2);
 }
 
 #[test]
@@ -252,6 +274,77 @@ fn allow_append_inode_check() {
     assert_eq!(m.len(), p.len());
     assert!(!intact(0, 10, &m, &p), "the path names another file now");
     assert!(intact(0, 10, &p, &p));
+}
+
+#[test]
+fn allow_append_over_limit() {
+    let t = T::new();
+    // 65,524 bytes, and the rule line `/src/app<TAB>ls\n` is 12: exactly the limit.
+    let f = t.allow(format!("#{}\n", "x".repeat(65_522)), 0o600);
+    let mut a = load(&f, true).unwrap();
+    assert_eq!(a.append(Path::new("/src/app"), "ls").unwrap(), 1, "up to the limit is fine");
+    assert_eq!(fs::metadata(&f).unwrap().len(), 65_536);
+    let before = fs::read(&f).unwrap();
+    assert_eq!(unlocked(|| a.append(Path::new("/src/app"), "x")).unwrap_err().to_string(), "would be over 65,536 bytes");
+    assert_eq!(fs::read(&f).unwrap(), before, "nothing written");
+    assert_eq!(a.rules, [r(1, "/src/app", "ls")]);
+    assert_eq!(load(&f, true).unwrap().rules, [r(1, "/src/app", "ls")], "the file still loads");
+
+    let f = t.allow(format!("#{}\n", "x".repeat(65_498)), 0o600);
+    let mut a = load(&f, true).unwrap();
+    assert_eq!(unlocked(|| a.append(Path::new("/src/app"), &"x".repeat(100))).unwrap_err().to_string(), "would be over 65,536 bytes");
+    assert_eq!(fs::metadata(&f).unwrap().len(), 65_500);
+    assert_eq!(list(&f, &t.0), [f.display().to_string()], "list and remove still read it");
+}
+
+#[test]
+fn allow_append_symlink_refused() {
+    let t = T::new();
+    let (f, target) = (t.p("allow"), t.p("target"));
+    fs::write(&target, "/x\tls\n").unwrap();
+    let mut a = load(&f, true).unwrap();
+    symlink(&target, &f).unwrap();
+    assert_eq!(a.append(Path::new("/x"), "make").unwrap_err().raw_os_error(), Some(libc::ELOOP), "linked after load");
+    assert_eq!(read(&target), "/x\tls\n");
+    fs::remove_file(&f).unwrap();
+    symlink(t.p("gone"), &f).unwrap();
+    assert_eq!(a.append(Path::new("/x"), "make").unwrap_err().raw_os_error(), Some(libc::ELOOP), "dangling");
+    assert!(!t.p("gone").exists() && a.rules.is_empty());
+}
+
+#[test]
+fn allow_append_missing_config_dir() {
+    let t = T::new();
+    let mut a = load(&t.p("missing/allow"), true).unwrap();
+    assert_eq!(a.append(Path::new("/x"), "make").unwrap_err().kind(), io::ErrorKind::NotFound, "always needs the config directory");
+    assert!(!t.p("missing").exists() && a.rules.is_empty());
+}
+
+#[test]
+fn allow_find_first_match() {
+    let t = T::new();
+    let f = t.allow("/src/app\tmake\n*\tmake\n*\tls\n/src/app\tls\n", 0o600);
+    let a = load(&f, true).unwrap();
+    assert_eq!(a.find("make", Path::new("/src/app")).map(|r| r.n), Some(1));
+    assert_eq!(a.find("make", Path::new("/elsewhere")).map(|r| r.n), Some(2));
+    assert_eq!(a.find("ls", Path::new("/src/app")).map(|r| r.n), Some(3), "the first in file order, a * rule too");
+}
+
+#[test]
+fn allow_load_non_utf8_comment() {
+    let t = T::new();
+    let f = t.allow(b"# caf\xe9 \x1b[31m\n/a\tls\n", 0o600);
+    assert_eq!(load(&f, true).unwrap().rules, [r(1, "/a", "ls")], "a comment is never parsed or shown");
+    assert_eq!(list(&f, &t.0), [f.display().to_string(), "1  /a  ls".into()]);
+}
+
+#[test]
+fn allow_load_whitespace_only_line() {
+    let t = T::new();
+    let f = t.allow("/a\tls\n\r\n   \n", 0o600);
+    assert_eq!(load(&f, true).unwrap_err(), format!("{}:3: {NO_TAB}; fix: henki allow rm 2, or edit the file", f.display()));
+    t.allow("/a\tls\n\t\n", 0o600);
+    assert_eq!(load(&f, true).unwrap_err(), format!("{}:2: {BAD_ROOT}; fix: henki allow rm 2, or edit the file", f.display()));
 }
 
 #[test]
@@ -312,11 +405,28 @@ fn allow_remove_keeps_rest() {
 }
 
 #[test]
+fn allow_remove_symlinked_config_dir() {
+    let t = T::new();
+    fs::create_dir(t.p("real")).unwrap();
+    symlink(t.p("real"), t.p("henki")).unwrap();
+    let f = t.p("henki/allow");
+    let mut a = load(&f, true).unwrap();
+    assert_eq!(a.append(Path::new("/src/app"), "ls").unwrap(), 1);
+    assert_eq!(load(&f, true).unwrap().rules, [r(1, "/src/app", "ls")]);
+    assert_eq!(list(&f, &t.0), [f.display().to_string(), "1  /src/app  ls".into()]);
+    assert_eq!(unlocked(|| remove(&f, 1, &t.0)).unwrap(), "removed rule 1: /src/app  ls");
+    assert!(load(&f, true).unwrap().rules.is_empty());
+    assert!(fs::symlink_metadata(t.p("henki")).unwrap().file_type().is_symlink(), "the link stays");
+    assert!(fs::symlink_metadata(t.p("real/allow")).unwrap().is_file());
+    assert_eq!(fs::read_dir(t.p("real")).unwrap().count(), 1, "no temp file left");
+}
+
+#[test]
 fn allow_remove_no_such_rule() {
     let t = T::new();
     let f = t.allow("# c\n/a\tone\n*\ttwo\n", 0o600);
     for n in [0, 3] {
-        assert_eq!(remove(&f, n, &t.0).unwrap_err(), format!("no rule {n} in {}", f.display()));
+        assert_eq!(unlocked(|| remove(&f, n, &t.0)).unwrap_err(), format!("no rule {n} in {}", f.display()));
     }
     assert_eq!(read(&f), "# c\n/a\tone\n*\ttwo\n");
     assert_eq!(remove(&t.p("none"), 1, &t.0).unwrap_err(), format!("no rule 1 in {}", t.p("none").display()));
