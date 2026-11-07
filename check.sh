@@ -1,12 +1,13 @@
 #!/usr/bin/env bash
 # Everything a change must pass that needs no human, in order, stopping at the first failure:
-# no private references, the gates' self-test, formatting, lints, the tests, the size budgets (lines of code, crates
-# in the dependency tree, release binary bytes), then the release gates: the tests marked
-# #[ignore = "release gate"] (timing and memory limits), built and run with the release profile.
+# no private references, the gates' self-test, formatting, lints, the tests, the module manager's tests and the
+# official modules, the size budgets (lines of code, crates in the dependency tree, release binary bytes), then the
+# release gates: the tests marked #[ignore = "release gate"] (timing and memory limits), built and run with the
+# release profile.
 # Run it before pushing. Bash on macOS and Linux.
 #
 # Each budget gate is a function of its input (gate_lines DIR, gate_crates TREE LOCK, gate_bytes
-# FILE, and refs). `./check.sh selftest` runs every one against fixtures it makes: an
+# FILE, gate_mods DIR, and refs). `./check.sh selftest` runs every one against fixtures it makes: an
 # over-budget fixture must fail with the gate's own message, a within-budget one must pass. The
 # full check runs it right after the reference check, so a gate that stops failing fails the check.
 #
@@ -250,6 +251,21 @@ packages() {
   awk -v n="$1" 'BEGIN { for (i = 1; i <= n; i++) print "p" i " v1.0.0" }'
 }
 
+# The mods gate over DIR: every DIR/*/ (the official modules) passes `henki-mods verify --dir`, which checks the
+# layout henki loads and the manifest. No DIR, or an empty one, is no module and passes.
+gate_mods() {
+  local m n=0
+  for m in "$1"/*/; do
+    [ -d "$m" ] || continue
+    if ! manager/henki-mods verify --dir "${m%/}"; then
+      say "mods: ${m%/} does not pass henki-mods verify --dir"
+      return 1
+    fi
+    n=$((n + 1))
+  done
+  echo "$n official modules"
+}
+
 # Every budget gate against fixtures made in a scratch directory, removed at the end.
 selftest() {
   local t bad=0 clean
@@ -281,6 +297,16 @@ selftest() {
   head -c "$max_bytes" /dev/zero >"$t/ok.bin"
   expect "bytes: $((max_bytes + 1))" "over $max_bytes" gate_bytes "$t/big.bin" || bad=1
   expect "bytes: $max_bytes" pass gate_bytes "$t/ok.bin" || bad=1
+
+  # A module that henki loads passes; one with an entry henki refuses fails, and so does a dir holding both.
+  mkdir -p "$t/mods/good/bin" "$t/mods-bad/good" "$t/mods-bad/bad/lib" "$t/mods-none"
+  printf 'good: a fixture module\n' >"$t/mods/good/doc.md"
+  printf '#!/bin/sh\n' >"$t/mods/good/bin/good" && chmod 755 "$t/mods/good/bin/good"
+  printf 'good: a fixture module\n' >"$t/mods-bad/good/doc.md"
+  printf 'bad: a fixture module\n' >"$t/mods-bad/bad/doc.md"
+  expect "mods: a module henki loads" pass gate_mods "$t/mods" || bad=1
+  expect "mods: an unknown entry lib/" "does not pass henki-mods verify --dir" gate_mods "$t/mods-bad" || bad=1
+  expect "mods: no modules" pass gate_mods "$t/mods-none" || bad=1
 
   # A scratch repository with its own pattern file; a hook runs with GIT_DIR set, which must not lead back here.
   # Commits there use a fixed identity and no signing or hooks, whatever the user's git config says.
@@ -381,6 +407,12 @@ cargo clippy --locked --all-targets -- -D warnings
 
 step tests
 cargo test --locked
+
+# The module manager: its own suite (hermetic, with a live prompt check against the henki the tests just built),
+# then the official modules.
+step "mods (manager/tests.sh, mods/*/)"
+MODS_TEST_HENKI="$target/debug/henki" manager/tests.sh
+gate_mods mods
 
 step "lines of code (src/, non-test)"
 gate_lines src
