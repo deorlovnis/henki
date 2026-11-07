@@ -424,7 +424,7 @@ fn out_reset_only_tty() {
         out.line("-- shell --");
     });
     assert_eq!(got, pieces(&[(1, "cut short"), (1, "\n"), (2, RESET), (2, "-- shell --\n")]));
-    assert_eq!(RESET, "\x1b[!p\x1b[0m\x1b[r\x1b[?1049l");
+    assert_eq!(RESET, "\x1b[!p\x1b[0m\x1b[r\x1b[?1049l\x1b[?7h\x1b[999;1H\x1bD");
     assert_eq!(repl(false, |out| out.reset()), []);
 }
 
@@ -568,4 +568,89 @@ fn reader_strips_crlf() {
     }
     r.ask(6);
     assert_eq!(line(&rx), (6, None));
+}
+
+/// What a scripted input answers next: bytes, or EOF. An empty script answers WouldBlock, as a terminal left
+/// non-blocking (O_NONBLOCK) does while no whole line has been typed.
+enum In {
+    Data(&'static [u8]),
+    Eof,
+}
+
+/// An input that answers each read from a shared script and reports each read on `seen` (true: it was answered
+/// from the script; false: WouldBlock).
+struct Script(Arc<Mutex<std::collections::VecDeque<In>>>, mpsc::Sender<bool>);
+
+impl Read for Script {
+    fn read(&mut self, b: &mut [u8]) -> io::Result<usize> {
+        let next = self.0.lock().unwrap().pop_front();
+        let _ = self.1.send(next.is_some());
+        match next {
+            None => Err(io::ErrorKind::WouldBlock.into()),
+            Some(In::Eof) => Ok(0),
+            Some(In::Data(d)) => {
+                b[..d.len()].copy_from_slice(d);
+                Ok(d.len())
+            }
+        }
+    }
+}
+
+/// The next read the script saw, within 5 s: true when it was answered from the script.
+fn seen(reads: &Receiver<bool>) -> bool {
+    reads.recv_timeout(Duration::from_secs(5)).expect("no read within 5 s")
+}
+
+#[test]
+fn reader_nonblocking_not_eof() {
+    let script = Arc::new(Mutex::new(std::collections::VecDeque::new()));
+    let ((tx, rx), (seen_tx, reads)) = (mpsc::channel(), mpsc::channel());
+    let r = Reader::with(Box::new(Script(Arc::clone(&script), seen_tx)), tx).unwrap();
+    let push = |i: In| script.lock().unwrap().push_back(i);
+    // Nothing typed yet: WouldBlock, and the reader reads again instead of taking it for EOF.
+    r.ask(1);
+    assert!(!seen(&reads) && !seen(&reads), "two reads, both WouldBlock");
+    assert!(rx.try_recv().is_err(), "no line and no EOF yet");
+    push(In::Data(b"typed later\n"));
+    assert_eq!(line(&rx), (1, Some("typed later".into())));
+    // Every read up to the line was reported before the line was sent.
+    let drain = || reads.try_iter().count();
+    drain();
+    // A cancel while it waits for input: at most the read already under way, then no more reads.
+    r.ask(5);
+    assert!(!seen(&reads));
+    r.ask(0);
+    let after = std::iter::from_fn(|| reads.recv_timeout(Duration::from_millis(300)).ok()).count();
+    assert!(after <= 1, "{after} reads after the cancel");
+    assert!(rx.try_recv().is_err());
+    // Part of a line, then WouldBlock: the part is kept and the line completes later.
+    push(In::Data(b"par"));
+    r.ask(6);
+    while seen(&reads) {}
+    push(In::Data(b"tial\n"));
+    assert_eq!(line(&rx), (6, Some("partial".into())));
+    // A real EOF still ends input for good, without another read.
+    push(In::Eof);
+    r.ask(7);
+    assert_eq!(line(&rx), (7, None));
+    drain();
+    r.ask(8);
+    assert_eq!(line(&rx), (8, None));
+    assert!(reads.recv_timeout(Duration::from_millis(100)).is_err(), "nothing is read after EOF");
+}
+
+#[test]
+fn rows_wide_odd_width() {
+    let l = |s: &str| s.to_string();
+    // A terminal never splits a wide character: at an odd width it wraps one column early.
+    assert_eq!(rows(&[l(&"漢".repeat(4))], 3), 4);
+    assert_eq!(rows(&[l(&format!("!| {}", "漢".repeat(120)))], 81), 4, "39 + 40 + 40 + 1");
+    assert_eq!(rows(&[l(&"漢".repeat(40))], 80), 1);
+    assert_eq!(rows(&[l(&"漢".repeat(41))], 80), 2);
+    assert_eq!(rows(&[l("x漢")], 2), 2);
+    // A raw tab counts as the most it can move, 8 columns.
+    assert_eq!(rows(&[l(&"\t".repeat(10))], 80), 1);
+    assert_eq!(rows(&[l(&"\t".repeat(11))], 80), 2);
+    assert_eq!(rows(&[l(&format!("{}\t", "x".repeat(73)))], 80), 2);
+    assert_eq!(rows(&[l("漢")], 1), 1, "a character wider than the screen still takes one row");
 }

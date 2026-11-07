@@ -3,7 +3,7 @@
 use crate::types::Ev;
 use serde_json::Value;
 use std::sync::{Arc, Condvar, Mutex, PoisonError, atomic::AtomicBool, atomic::Ordering::SeqCst, mpsc, mpsc::Receiver, mpsc::Sender};
-use std::{borrow::Cow, fmt::Write as _, io, io::BufRead, io::Read, io::Write, time::Instant};
+use std::{borrow::Cow, fmt::Write as _, io, io::BufRead, io::Read, io::Write, time::Duration, time::Instant};
 
 /// Plain `run`, `run --json`, or the REPL.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -13,8 +13,11 @@ pub enum Mode {
     Repl,
 }
 
-/// Soft reset, attributes off, no scroll region, main screen: written before every approval display.
-pub const RESET: &str = "\x1b[!p\x1b[0m\x1b[r\x1b[?1049l";
+/// Written before every approval display: soft reset, attributes off, no scroll region, main screen, line wrap on, then
+/// the cursor to the start of the bottom row and one row scrolled in. Removing the scroll region also moves the cursor
+/// to the top-left corner, where the display would be drawn over old text; from a fresh bottom row every display line
+/// lands on a blank row, below everything already on the screen.
+pub const RESET: &str = "\x1b[!p\x1b[0m\x1b[r\x1b[?1049l\x1b[?7h\x1b[999;1H\x1bD";
 
 /// Code points escaped on every output path (C0 except tab and newline, DEL, C1, Cf, Zl/Zp, Zs except space, default ignorables).
 #[rustfmt::skip]
@@ -194,11 +197,15 @@ impl Out {
     }
 }
 
-/// The rows `lines` take on a terminal `cols` wide after escaping (an ASCII character is one column, any other two); at
-/// least one per line.
+/// The rows `lines` take on a terminal `cols` wide after escaping (an ASCII character is one column, a tab 8, the most it
+/// can move, any other character two); at least one per line. A character that does not fit in what is left of a row
+/// starts the next one, as a terminal never splits a wide character.
 pub fn rows(lines: &[String], cols: usize) -> usize {
-    let width = |l: &String| escape(l).chars().map(|c| if c.is_ascii() { 1 } else { 2 }).sum::<usize>();
-    lines.iter().map(|l| width(l).div_ceil(cols.max(1)).max(1)).sum()
+    let put = |(rows, col): (usize, usize), c: char| {
+        let w = if c == '\t' { 8 } else { 2 - usize::from(c.is_ascii()) };
+        if col > 0 && col + w > cols { (rows + 1, w) } else { (rows, col + w) }
+    };
+    lines.iter().map(|l| escape(l).chars().fold((1, 0), put).0).sum()
 }
 
 /// The REPL's line reader. It reads only while MAIN waits for a line, so what the user types into a `!cmd` reaches the
@@ -218,13 +225,20 @@ impl Reader {
         let wanted = Arc::new((Mutex::new(0), Condvar::new()));
         let w = Arc::clone(&wanted);
         let read = move || {
-            let (mut input, mut eof) = (io::BufReader::new(input), false);
+            let (mut input, mut eof, mut b) = (io::BufReader::new(input), false, Vec::new());
             loop {
                 drop(w.1.wait_while(lock(&w.0), |t| *t == 0).unwrap_or_else(PoisonError::into_inner));
-                let mut b = Vec::new();
-                eof = eof || input.read_until(b'\n', &mut b).is_err() || b.is_empty();
+                let r = if eof { Ok(0) } else { input.read_until(b'\n', &mut b) };
+                // A terminal left non-blocking by a command that shares it has no line yet: that is not EOF. The part
+                // of the line read so far stays in `b`; read again after 50 ms, or at once when MAIN asks again.
+                if r.as_ref().is_err_and(|e| e.kind() == io::ErrorKind::WouldBlock) {
+                    drop(w.1.wait_timeout(lock(&w.0), Duration::from_millis(50)));
+                    continue;
+                }
+                eof = r.is_err() || b.is_empty();
                 let line = b.strip_suffix(b"\n").unwrap_or(&b);
                 let text = (!eof).then(|| String::from_utf8_lossy(line.strip_suffix(b"\r").unwrap_or(line)).into_owned());
+                b.clear();
                 if tx.send(Ev::Line { tag: std::mem::take(&mut *lock(&w.0)), text }).is_err() {
                     return;
                 }

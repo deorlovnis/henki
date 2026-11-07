@@ -224,6 +224,15 @@ code() {
   awk -v n="$2" 'BEGIN { for (i = 0; i < n; i++) print "const C: u8 = 0;" }' >"$1"
 }
 
+# N counted lines of Rust into DIR, spread over files of at most max_file_lines.
+spread() {
+  local n="$2" i=0
+  while [ "$n" -gt 0 ]; do
+    code "$1/f$i.rs" $((n < max_file_lines ? n : max_file_lines))
+    n=$((n - max_file_lines)) i=$((i + 1))
+  done
+}
+
 # N package lines, as cargo tree prints them.
 packages() {
   awk -v n="$1" 'BEGIN { for (i = 1; i <= n; i++) print "p" i " v1.0.0" }'
@@ -231,21 +240,19 @@ packages() {
 
 # Every budget gate against fixtures made in a scratch directory, removed at the end.
 selftest() {
-  local t bad=0 n i clean
+  local t bad=0 clean
   t="$(mktemp -d)"
   scratch="$t"
   trap 'rm -rf "$scratch"' EXIT
-  mkdir -p "$t/over" "$t/big" "$t/ok/x"
-  n=$((max_lines + 1)) i=0
-  while [ "$n" -gt 0 ]; do
-    code "$t/over/f$i.rs" $((n < max_file_lines ? n : max_file_lines))
-    n=$((n - max_file_lines)) i=$((i + 1))
-  done
+  mkdir -p "$t/over" "$t/full" "$t/big" "$t/ok/x"
+  spread "$t/over" $((max_lines + 1))
+  spread "$t/full" "$max_lines"
   code "$t/big/f.rs" $((max_file_lines + 1))
   code "$t/ok/x.rs" "$max_file_lines"
   printf '// a comment\n\n  /* a block\n     comment */\n#[cfg(test)]\nmod tests;\n' >>"$t/ok/x.rs"
   code "$t/ok/x/tests.rs" 500
   expect "lines: $((max_lines + 1)) in files of at most $max_file_lines" "over $max_lines" gate_lines "$t/over" || bad=1
+  expect "lines: exactly $max_lines in files of at most $max_file_lines" pass gate_lines "$t/full" || bad=1
   expect "lines: a file of $((max_file_lines + 1))" "files over $max_file_lines" gate_lines "$t/big" || bad=1
   expect "lines: $max_file_lines, comments, blank lines and a test module" pass gate_lines "$t/ok" || bad=1
 
@@ -261,8 +268,10 @@ selftest() {
   expect "bytes: $max_bytes" pass gate_bytes "$t/ok.bin" || bad=1
 
   # A scratch repository with its own pattern file; a hook runs with GIT_DIR set, which must not lead back here.
+  # Commits there use a fixed identity and no signing or hooks, whatever the user's git config says.
   (
     unset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE GIT_COMMON_DIR GIT_OBJECT_DIRECTORY
+    commit() { git -c user.name=fixture -c user.email=fixture@example.invalid -c commit.gpgsign=false -c core.hooksPath=/dev/null commit -q --no-verify "$@"; }
     cd "$t" && git init -q repo && cd repo && mkdir -p .git/info || exit 1
     echo 'fixture-[0-9]+-marker' >.git/info/private-patterns
     echo 'a fixture-7-marker here' >a.txt && git add a.txt || exit 1
@@ -270,6 +279,15 @@ selftest() {
     expect "refs: a tracked file matches" "the lines above match" refs || rc=1
     echo 'nothing to see' >a.txt
     expect "refs: no match" pass refs || rc=1
+    # A range, as the pre-push hook checks one: commit messages and every added line, even one removed later.
+    git add a.txt && commit -m 'add a fixture-7-marker file' || exit 1
+    expect "refs HEAD: a commit message matches" "the lines above match" refs HEAD || rc=1
+    echo 'a fixture-8-marker line' >b.txt && git add b.txt && commit -m 'add b' || exit 1
+    git rm -q b.txt && commit -m 'remove b' || exit 1
+    expect "refs HEAD~2..HEAD: a line added, then removed" "the lines above match" refs HEAD~2..HEAD || rc=1
+    expect "refs: the working tree after that" pass refs || rc=1
+    echo 'still nothing' >c.txt && git add c.txt && commit -m 'add c' || exit 1
+    expect "refs HEAD~1..HEAD: a clean commit" pass refs HEAD~1..HEAD || rc=1
     rm .git/info/private-patterns
     CHECK_FROM_HOOK=1 expect "refs: no pattern file, from the hook" "does not pass without them" refs || rc=1
     exit "$rc"

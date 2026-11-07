@@ -407,3 +407,158 @@ fn stamp_same_when_untouched() {
     let _ = fs::read(t.join("f")).unwrap();
     assert_eq!(stamp(&t.join("f")), before);
 }
+
+/// A fresh pty pair (master, slave), close-on-exec, closed when dropped.
+fn pty() -> (File, File) {
+    let (mut m, mut s) = (-1, -1);
+    // SAFETY: two live out pointers; a null name, modes and size are allowed and leave the defaults.
+    let rc = unsafe { libc::openpty(&mut m, &mut s, std::ptr::null_mut(), std::ptr::null_mut(), std::ptr::null_mut()) };
+    assert_eq!(rc, 0, "openpty: {}", io::Error::last_os_error());
+    for fd in [m, s] {
+        // SAFETY: integer arguments only, on a descriptor openpty just returned.
+        unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) };
+    }
+    // SAFETY: openpty returned two new descriptors that nothing else owns.
+    unsafe { (File::from_raw_fd(m), File::from_raw_fd(s)) }
+}
+
+fn fl(fd: i32) -> i32 {
+    // SAFETY: integer arguments only.
+    unsafe { libc::fcntl(fd, libc::F_GETFL) }
+}
+
+fn set_fl(fd: i32, flags: i32) {
+    // SAFETY: integer arguments only.
+    assert_eq!(unsafe { libc::fcntl(fd, libc::F_SETFL, flags) }, 0);
+}
+
+/// The bytes waiting to be read on `fd` (FIONREAD).
+fn pending(fd: i32) -> i32 {
+    let mut n: libc::c_int = 0;
+    // SAFETY: the pointer is to a live int, the type FIONREAD writes.
+    assert_eq!(unsafe { libc::ioctl(fd, libc::FIONREAD, &mut n) }, 0);
+    n
+}
+
+#[test]
+fn isatty_pty_true() {
+    let (_m, s) = pty();
+    assert!(isatty(s.as_raw_fd()));
+}
+
+#[test]
+fn winsize_pty_size() {
+    let (m, s) = pty();
+    let set = |rows: u16, cols: u16| {
+        let w = libc::winsize { ws_row: rows, ws_col: cols, ws_xpixel: 0, ws_ypixel: 0 };
+        // SAFETY: the pointer is to a live winsize, the type TIOCSWINSZ reads.
+        assert_eq!(unsafe { libc::ioctl(m.as_raw_fd(), libc::TIOCSWINSZ, &w) }, 0);
+    };
+    set(30, 100);
+    assert_eq!(winsize(s.as_raw_fd()), Some((30, 100)));
+    set(30, 0);
+    assert_eq!(winsize(s.as_raw_fd()), None, "0 columns is no size");
+}
+
+#[test]
+fn modes_pty_some() {
+    let (_m, s) = pty();
+    let t = modes(s.as_raw_fd()).expect("a terminal has modes");
+    assert_ne!(t.c_lflag & libc::ICANON, 0, "a new pty is canonical");
+}
+
+#[test]
+fn blocking_clears_nonblocking() {
+    let (_m, s) = pty();
+    let (r, _w) = io::pipe().unwrap();
+    for fd in [s.as_raw_fd(), r.as_raw_fd()] {
+        set_fl(fd, fl(fd) | libc::O_NONBLOCK | libc::O_APPEND);
+        blocking(fd);
+        assert_eq!(fl(fd) & libc::O_NONBLOCK, 0);
+        assert_ne!(fl(fd) & libc::O_APPEND, 0, "the other flags stay");
+        blocking(fd);
+        assert_eq!(fl(fd) & libc::O_NONBLOCK, 0);
+    }
+    blocking(-1);
+}
+
+/// Set in the child process `flush_input_restores_a_pty` starts.
+const PTY_CHILD: &str = "HENKI_TEST_PTY_CHILD";
+
+/// `tty_save` and `flush_input` on a terminal. They act on fd 0, so the test runs this same test again in a child
+/// process whose fd 0 is a fresh pty: the test process's own fd 0 is never touched. The parent leaves the pty
+/// non-blocking with a line typed ahead; the child checks that `tty_save` clears O_NONBLOCK and keeps the typed line,
+/// then that `flush_input` restores the modes it saved, drops what was typed ahead and clears O_NONBLOCK again.
+#[test]
+fn flush_input_restores_a_pty() {
+    if std::env::var_os(PTY_CHILD).is_some() {
+        assert!(fl(0) & libc::O_NONBLOCK != 0 && pending(0) > 0, "as the parent left it");
+        assert!(tty_save());
+        assert_eq!(fl(0) & libc::O_NONBLOCK, 0, "cleared at start");
+        assert!(pending(0) > 0, "saving does not flush");
+        let saved = modes(0).unwrap();
+        // What a command that dies in raw mode leaves behind.
+        let mut raw = saved;
+        raw.c_lflag &= !(libc::ICANON | libc::ISIG);
+        // SAFETY: `raw` is a live termios; tcsetattr only reads it.
+        assert_eq!(unsafe { libc::tcsetattr(0, libc::TCSANOW, &raw) }, 0);
+        set_fl(0, fl(0) | libc::O_NONBLOCK);
+        flush_input();
+        let now = modes(0).unwrap();
+        assert_eq!((now.c_lflag, now.c_iflag, now.c_oflag), (saved.c_lflag, saved.c_iflag, saved.c_oflag));
+        assert_eq!(pending(0), 0, "the typed-ahead line is dropped");
+        assert_eq!(fl(0) & libc::O_NONBLOCK, 0);
+        return;
+    }
+    let (mut m, s) = pty();
+    // No echo, so nothing waits in the pty's output for a reader that never comes.
+    let mut t = modes(s.as_raw_fd()).unwrap();
+    t.c_lflag &= !libc::ECHO;
+    // SAFETY: `t` is a live termios; tcsetattr only reads it.
+    assert_eq!(unsafe { libc::tcsetattr(s.as_raw_fd(), libc::TCSANOW, &t) }, 0);
+    m.write_all(b"typed ahead\n").unwrap();
+    let t0 = std::time::Instant::now();
+    while pending(s.as_raw_fd()) == 0 {
+        assert!(t0.elapsed() < Duration::from_secs(5), "the typed line never reached the pty");
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    set_fl(s.as_raw_fd(), fl(s.as_raw_fd()) | libc::O_NONBLOCK);
+    let me = std::env::current_exe().unwrap();
+    let args = ["--exact", "sys::tests::flush_input_restores_a_pty", "--test-threads=1", "--nocapture"];
+    // A bounded wait that allows for a loaded machine: a child that hangs fails the test instead of holding it.
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || tx.send(std::process::Command::new(me).args(args).env(PTY_CHILD, "1").stdin(s).output()));
+    let out = rx.recv_timeout(Duration::from_secs(60)).expect("the child test did not end within 60 s").unwrap();
+    let text = format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+    assert!(out.status.success() && text.contains("1 passed"), "the child test failed: {text}");
+}
+
+/// The `!cmd` child's signal state, read from its own /proc/self/status: no signal blocked, none of the four ignored,
+/// even when they were (an earlier hook ignores HUP and blocks INT and TERM, as a henki started under `nohup` could pass
+/// on); and it stays in henki's session and process group.
+#[cfg(target_os = "linux")]
+#[test]
+fn bang_setup_signal_defaults() {
+    let mut cmd = std::process::Command::new("cat");
+    cmd.arg("/proc/self/status");
+    let before = || {
+        // SAFETY: signal takes integers only; `sigset` fills a local; both are async-signal-safe.
+        unsafe { libc::signal(libc::SIGHUP, libc::SIG_IGN) };
+        // SAFETY: a live, initialized set and a null pointer for the old mask.
+        check(unsafe { libc::sigprocmask(libc::SIG_BLOCK, &sigset(&[libc::SIGINT, libc::SIGTERM]), std::ptr::null_mut()) })
+    };
+    // SAFETY: the hook allocates nothing and calls only async-signal-safe functions. Hooks run in the order they were added.
+    unsafe { cmd.pre_exec(before) };
+    bang_setup(&mut cmd);
+    let out = cmd.output().unwrap();
+    assert!(out.status.success());
+    let child = String::from_utf8(out.stdout).unwrap();
+    let ours = fs::read_to_string("/proc/self/status").unwrap();
+    let field = |s: &str, k: &str| s.lines().find_map(|l| l.strip_prefix(k)).map(|v| v.trim().to_string()).unwrap_or_else(|| panic!("no {k} in {s}"));
+    assert_eq!(u64::from_str_radix(&field(&child, "SigBlk:"), 16).unwrap(), 0, "an empty mask");
+    let four = SIGNALS.iter().fold(0u64, |m, &s| m | 1 << (s - 1));
+    assert_eq!(u64::from_str_radix(&field(&child, "SigIgn:"), 16).unwrap() & four, 0, "INT, QUIT, TERM and HUP at their default");
+    for k in ["NSsid:", "NSpgid:"] {
+        assert_eq!(field(&child, k), field(&ours, k), "{k} unchanged: no new session or process group");
+    }
+}

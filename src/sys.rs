@@ -131,9 +131,9 @@ pub fn winsize(fd: i32) -> Option<(u16, u16)> {
 static TTY: OnceLock<libc::termios> = OnceLock::new();
 
 /// tcgetattr(0): keeps fd 0's terminal modes for `flush_input`; false when fd 0 is not a terminal. The REPL calls it
-/// once at start; it is also the REPL's "stdin is a terminal" check.
+/// once at start; it is also the REPL's "stdin is a terminal" check. On a terminal it also clears O_NONBLOCK.
 pub fn tty_save() -> bool {
-    modes(0).map(|t| TTY.get_or_init(|| t)).is_some()
+    modes(0).map(|t| TTY.get_or_init(|| t)).inspect(|_| blocking(0)).is_some()
 }
 
 /// tcgetattr(fd); None when `fd` is not a terminal.
@@ -145,11 +145,22 @@ fn modes(fd: i32) -> Option<libc::termios> {
 }
 
 /// tcsetattr(0, TCSAFLUSH, the saved modes): restores the modes `tty_save` kept and drops what was typed ahead, so a
-/// command that left the terminal raw or without echo cannot leave the line reader with it; nothing when none were
-/// saved (`run`, or fd 0 not a terminal).
+/// command that left the terminal raw or without echo cannot leave the line reader with it; then clears O_NONBLOCK.
+/// Nothing when no modes were saved (`run`, or fd 0 not a terminal).
 pub fn flush_input() {
     // SAFETY: `t` is a termios tcgetattr filled, and tcsetattr only reads it.
-    let _ = TTY.get().map(|t| unsafe { libc::tcsetattr(0, libc::TCSAFLUSH, t) });
+    let _ = TTY.get().map(|t| unsafe { libc::tcsetattr(0, libc::TCSAFLUSH, t) }).inspect(|_| blocking(0));
+}
+
+/// Clears O_NONBLOCK on `fd`. A command that shares the terminal may set it on the open file and leave it set; reads
+/// from the terminal, henki's and the next command's, would then fail at once instead of waiting for input.
+fn blocking(fd: i32) {
+    // SAFETY: fcntl with F_GETFL and F_SETFL takes and returns integers only.
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+    if flags >= 0 && flags & libc::O_NONBLOCK != 0 {
+        // SAFETY: as above; only O_NONBLOCK changes.
+        unsafe { libc::fcntl(fd, libc::F_SETFL, flags & !libc::O_NONBLOCK) };
+    }
 }
 
 /// (dev, ino, size, mtime_ns, ctime_ns) of one path; None when it does not exist.
@@ -165,12 +176,8 @@ pub fn stamp(path: &Path) -> (Stamp, Stamp) {
 /// kill(2); a negative pid is a process group; sig 0 probes. False only on ESRCH. Never pid 0 or -1 (henki's own group,
 /// every process): those give false.
 pub fn kill(pid: i32, sig: i32) -> bool {
-    if pid == 0 || pid == -1 {
-        return false;
-    }
     // SAFETY: kill takes integers only.
-    let rc = unsafe { libc::kill(pid, sig) };
-    rc == 0 || io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH)
+    pid != 0 && pid != -1 && (unsafe { libc::kill(pid, sig) } == 0 || io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH))
 }
 
 /// waitpid(pid, WNOHANG) for one pid; true when it was reaped. Never waitpid(-1).
@@ -233,8 +240,7 @@ pub fn tree(ps: &[Proc], root: impl Fn(&Proc) -> bool) -> Vec<i32> {
 /// O_RDONLY|O_NONBLOCK|O_NOCTTY|O_CLOEXEC, then fstat. Never blocks on a FIFO or a device.
 pub fn open_read(path: &Path) -> io::Result<(File, fs::Metadata)> {
     let f = fs::OpenOptions::new().read(true).custom_flags(libc::O_NONBLOCK | libc::O_NOCTTY).open(path)?;
-    let m = f.metadata()?;
-    Ok((f, m))
+    f.metadata().map(|m| (f, m))
 }
 
 /// `open_read`, refusing anything but a regular file: Err("not a regular file: PATH (KIND)"); Ok carries the length.
