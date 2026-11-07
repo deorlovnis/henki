@@ -48,10 +48,6 @@ fn banner(s: &Session) {
 fn lines(s: &mut Session) -> u8 {
     let (mut notes, mut tripped) = (String::new(), false);
     loop {
-        // stdout went away in the last turn: the turn may not have ended on it, since a finishing turn drops that event.
-        if s.out().closed() {
-            return 141;
-        }
         s.out().prompt("> ");
         let line = match s.line() {
             Ok(Some(line)) => line,
@@ -101,8 +97,11 @@ fn lines(s: &mut Session) -> u8 {
                 }
                 match o {
                     Outcome::Interrupted if matches!(s.sig, Some(libc::SIGTERM | libc::SIGHUP)) => return 130,
+                    // stdout went away (only a turn writes to it), also when the turn did not end on it: a finishing turn
+                    // drops that event.
+                    _ if s.out().closed() => return 141,
                     Outcome::Interrupted => sys::flush_input(), // what was typed during the turn is no answer
-                    Outcome::OutputClosed | Outcome::Error { kind: "journal" | "tampered", .. } => return o.exit() as u8,
+                    Outcome::Error { kind: "journal" | "tampered", .. } => return 2,
                     Outcome::Error { kind: "changed", .. } => {
                         s.out().note(TRIPPED);
                         tripped = true;
