@@ -16,6 +16,8 @@ pub fn run(s: &mut Session) -> u8 {
     supervise::reap();
     banner(s);
     let code = lines(s);
+    // However the REPL found stdout gone (in a turn, at the prompt, during a `!cmd`), it says so once, as a turn would.
+    (code == 141).then(|| s.out().line(&outcome_line(&Outcome::OutputClosed)));
     let failed = s.close(None).err();
     failed.iter().for_each(|o| s.out().line(&outcome_line(o)));
     if failed.is_some() && code == 0 { 2 } else { code }
@@ -46,65 +48,70 @@ fn banner(s: &Session) {
 fn lines(s: &mut Session) -> u8 {
     let (mut notes, mut tripped) = (String::new(), false);
     loop {
+        // stdout went away in the last turn: the turn may not have ended on it, since a finishing turn drops that event.
+        if s.out().closed() {
+            return 141;
+        }
         s.out().prompt("> ");
         let line = match s.line() {
             Ok(Some(line)) => line,
             Ok(None) => {
                 s.out().line(""); // Ctrl-D leaves the cursor after the prompt
-                return 0;
+                // A terminal that went away ends the input too, maybe before its SIGHUP arrives: a hangup all the same.
+                return if sys::isatty(0) { 0 } else { 130 };
             }
             Err(Stop::Signal(libc::SIGINT | libc::SIGQUIT)) => {
                 s.out().line("\n(Ctrl-C does not quit; /exit or Ctrl-D quits)");
                 continue;
             }
-            Err(e) => return exit(e),
+            Err(e) => return Outcome::from(e).exit() as u8, // a closed stdout, or TERM or HUP
         };
         let t = line.trim();
+        // One line per prompt: the rest of a pasted block, or of what was typed ahead, is dropped, so that no pasted line
+        // runs as a `!cmd`. What follows a `!cmd` line is the command's to read.
+        (!t.starts_with('!')).then(sys::flush_input);
         let rm = t.strip_prefix("/allow rm ").and_then(|n| n.trim().parse().ok());
         match (t, rm, t.strip_prefix('!')) {
-            ("", ..) => {}
+            ("" | "!", ..) => {}
             ("/exit", ..) => return 0,
             ("/help", ..) => s.out().line(HELP),
             ("/allow", ..) => allow::list(&s.cfg.allow.file, &s.cfg.home).iter().for_each(|l| s.out().line(l)),
             (_, Some(n), _) => tripped |= remove(s, n),
             _ if t.starts_with('/') => s.out().note(&format!("unknown command {t}; /help lists the commands")),
             (_, _, Some(cmd)) => {
+                let before = s.changed();
                 let done = s.bang(cmd);
                 sys::flush_input(); // a command that left the terminal raw or without echo does not leave it so
                 match done {
                     Ok(code) => code.iter().for_each(|n| notes += &format!("[the user ran in their terminal: {cmd} (exit {n})]\n")),
-                    Err(e) => return exit(e),
+                    Err(e) => return Outcome::from(e).exit() as u8, // a closed stdout, or TERM or HUP
                 }
-                // Nothing is read again: what the command changed applies only after a restart.
-                let changed = s.changed();
-                changed.iter().for_each(|p| s.out().note(&format!("{} changed by !cmd; restart henki to apply it (henki --resume continues this session)", p.display())));
-                tripped |= !changed.is_empty();
+                // Nothing is read again: what the command changed applies only after a restart. A file that differed
+                // before it changed outside it: named once, as `/allow rm` names it, and never blamed on the command.
+                let (old, new): (Vec<_>, Vec<_>) = s.changed().into_iter().partition(|p| before.contains(p));
+                old.iter().filter(|_| !tripped).for_each(|p| s.out().note(&format!("trust file changed: {}", p.display())));
+                new.iter().for_each(|p| s.out().note(&format!("{} changed by !cmd; restart henki to apply it (henki --resume continues this session)", p.display())));
+                tripped |= !old.is_empty() || !new.is_empty();
             }
             _ if tripped => s.out().note(TRIPPED),
             _ => {
                 let o = s.turn(Some(std::mem::take(&mut notes) + &line));
-                if o != Outcome::Ok {
+                if !matches!(o, Outcome::Ok | Outcome::OutputClosed) {
                     s.out().line(&outcome_line(&o));
                 }
                 match o {
                     Outcome::Interrupted if matches!(s.sig, Some(libc::SIGTERM | libc::SIGHUP)) => return 130,
                     Outcome::Interrupted => sys::flush_input(), // what was typed during the turn is no answer
-                    Outcome::OutputClosed => return 141,
+                    Outcome::OutputClosed | Outcome::Error { kind: "journal" | "tampered", .. } => return o.exit() as u8,
                     Outcome::Error { kind: "changed", .. } => {
                         s.out().note(TRIPPED);
                         tripped = true;
                     }
-                    Outcome::Error { kind: "journal" | "tampered", .. } => return 2,
                     _ => {}
                 }
             }
         }
     }
-}
-
-/// A stop that ends the REPL: a closed stdout, or TERM or HUP.
-fn exit(e: Stop) -> u8 {
-    if e == Stop::Closed { 141 } else { 130 }
 }
 
 /// `/allow rm N`; true when it leaves the REPL TRIPPED. henki's own writes re-arm the tripwire, so a change it finds is

@@ -1,6 +1,5 @@
 //! henki: a small terminal agent. `henki` is a line REPL on the terminal it was started from; `henki run [--json] TASK`
 //! does one task headless. Both drive a model through a shell and three file tools.
-#![allow(dead_code)] // until every new item is wired in
 
 mod allow;
 mod anthropic;
@@ -120,7 +119,9 @@ fn allow(a: Args, out: Out) -> u8 {
     let home = PathBuf::from(std::env::var_os("HOME").unwrap_or_default());
     let config = a.flags.config.unwrap_or_else(|| home.join(".config/henki/config.toml"));
     let file = std::env::current_dir().unwrap_or_default().join(config).with_file_name("allow");
-    let o = match a.rm.map_or_else(|| Ok(allow::list(&file, &home)), |n| allow::remove(&file, n, &home).map(|l| vec![l])) {
+    // As for the config: a HOME that is not absolute would name a file below the working directory, and show `~` wrong.
+    let home = Some(home).filter(|h| h.is_absolute()).ok_or_else(|| "HOME is not set; fix: set HOME to your home directory".to_string());
+    let o = match home.and_then(|h| a.rm.map_or_else(|| Ok(allow::list(&file, &h)), |n| allow::remove(&file, n, &h).map(|l| vec![l]))) {
         Ok(lines) => {
             lines.iter().for_each(|l| out.answer(l));
             Outcome::Ok
@@ -153,7 +154,7 @@ fn run(a: Args, out: Out, tx: Sender<Ev>, rx: Receiver<Ev>, t0: Instant, early: 
     // A finished turn whose stdout reader went away never gave the reader what it waited for.
     let o = s.turn(task);
     let o = if o.finished() && s.out().closed() { Outcome::OutputClosed } else { o };
-    let result = s.result(&o, ms(t0));
+    let result = s.result(&o, t0.elapsed().as_millis() as u64);
     if o != Outcome::Ok {
         s.out().line(&outcome_line(&o));
     }
@@ -231,7 +232,7 @@ fn stdin_task(tx: &Sender<Ev>, rx: &Receiver<Ev>, deadline: Option<Instant>) -> 
 
 /// An end before any session exists: the `--json` result with `session: null`, or plain text on stderr.
 fn refuse(out: &Out, o: &Outcome, t0: Instant) {
-    out.record(&rec::result(o, "", Usage::default(), None, 0, ms(t0)));
+    out.record(&rec::result(o, "", Usage::default(), None, 0, t0.elapsed().as_millis() as u64));
     if let Outcome::Error { message, .. } = o { out.note(message) } else { out.line(&outcome_line(o)) }
 }
 
@@ -241,8 +242,4 @@ fn code(out: Out, o: &Outcome, deadline: Option<Instant>) -> u8 {
     let until = deadline.map_or_else(|| Instant::now() + Duration::from_secs(5), |d| d + Duration::from_millis(950));
     let closed = out.flush(until);
     if closed && o.finished() { 141 } else { o.exit() as u8 }
-}
-
-fn ms(t0: Instant) -> u64 {
-    t0.elapsed().as_millis() as u64
 }
