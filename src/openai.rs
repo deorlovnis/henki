@@ -1,8 +1,7 @@
 //! The OpenAI-compatible chat-completions wire format: the request body, the stream accumulator with its defensive
 //! call parser, and text calls for servers that leave tool markup in the content.
-use crate::http::{error_object, perr};
-use crate::tools::ARGS_MAX;
 use crate::types::{Call, Part, ProviderError, Reply, Usage};
+use crate::{http::error_object, http::perr, tools::ARGS_MAX};
 use serde_json::{Map, Value, json};
 
 pub const PATH: &str = "/chat/completions";

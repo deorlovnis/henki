@@ -1,12 +1,8 @@
 //! What the model sees before its first call (the core prompt and the tool schemas), and what decides a call before it
 //! runs: validation, the target it would touch, and whether it needs a human.
-use crate::types::{Call, End, ToolOutput};
-use crate::{config, term};
+use crate::{config, term, types::Call, types::End, types::ToolOutput};
 use serde_json::{Value, json};
-use std::ffi::OsString;
-use std::os::unix::fs::{FileTypeExt, MetadataExt};
-use std::path::{Path, PathBuf};
-use std::{fs, io};
+use std::{ffi::OsString, fs, io, os::unix::fs::FileTypeExt, os::unix::fs::MetadataExt, path::Path, path::PathBuf};
 
 pub const ALL: [&str; 4] = ["shell", "read", "write", "edit"];
 /// System part 1, byte-exact (563 B).

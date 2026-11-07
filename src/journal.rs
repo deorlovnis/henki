@@ -1,17 +1,9 @@
 //! The session journal: one JSON record per line, appended by the main thread alone, byte-counted and synced before the
 //! effect it explains; resume reads it back, repairs dangling calls by appending, and checks the call/result pairing.
-use crate::config::{Config, Env};
-use crate::supervise::Spill;
-use crate::types::Outcome;
-use crate::{sys, term, tools};
+use crate::{config::Config, config::Env, supervise::Spill, sys, term, tools, types::Outcome};
 use serde_json::Value;
-use std::collections::HashSet;
-use std::fmt::Display;
-use std::fs::{self, File};
-use std::io::{Read, Write};
-use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
-use std::time::{Duration, SystemTime};
+use std::{collections::HashSet, fmt::Display, fs, fs::File, io::Read, io::Write, os::unix::ffi::OsStrExt, time::Duration, time::SystemTime};
 
 pub struct Journal {
     file: File,
@@ -262,8 +254,7 @@ pub fn next_h(hist: &[Value]) -> u32 {
 /// module reads as the record table.
 #[rustfmt::skip]
 pub mod rec {
-    use crate::config::Config;
-    use crate::types::{Call, Outcome, Usage};
+    use crate::{config::Config, types::Call, types::Outcome, types::Usage};
     use serde_json::{Value, json};
     use std::path::Path;
 

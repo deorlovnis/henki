@@ -1,16 +1,9 @@
 //! The file tools, run on a worker thread: read (a file or a directory, bounded), write (atomic, through the directory's
 //! descriptor) and edit (bytes, one exact span).
-use crate::sys::{self, Dir};
-use crate::term::num;
-use crate::tools::{self, READ_MAX, Target};
-use crate::types::{Call, End, Ev, ToolOutput};
-use std::ffi::OsString;
+use crate::{sys, sys::Dir, term::num, tools, tools::READ_MAX, tools::Target, types::Call, types::End, types::Ev, types::ToolOutput};
 use std::io::{self, BufRead, BufReader, Cursor, Read, Write};
 use std::os::unix::{ffi::OsStrExt, fs::OpenOptionsExt, fs::PermissionsExt};
-use std::sync::atomic::{AtomicU32, Ordering};
-use std::sync::mpsc::Sender;
-use std::time::Instant;
-use std::{fs, thread};
+use std::{ffi::OsString, fs, sync::atomic::AtomicU32, sync::atomic::Ordering, sync::mpsc::Sender, thread, time::Instant};
 
 /// The largest file `edit` takes: it holds the whole file while it works.
 const EDIT_MAX: u64 = 8 << 20;

@@ -1,14 +1,9 @@
 //! Tool processes: the child environment, the spawn recipe, bounded capture with spill, and the ledger of process groups
 //! that henki kills by group and, on Linux, by sweeping every descendant.
-use crate::types::{End, Ev, ToolOutput};
-use crate::{config::Env, sys, term};
-use std::io::{self, Read, Write};
-use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
-use std::sync::mpsc::{self, Sender};
-use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
-use std::time::{Duration, Instant};
+use crate::{config::Env, sys, term, types::End, types::Ev, types::ToolOutput};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError, mpsc, mpsc::Sender};
 use std::{collections::VecDeque, ffi::OsString, fs::File, os::unix::process::ExitStatusExt, thread};
+use std::{io, io::Read, io::Write, path::Path, path::PathBuf, process::Child, process::Command, process::Stdio, time::Duration, time::Instant};
 
 pub const GRACE: Duration = Duration::from_millis(300);
 pub const SPILL_MAX: u64 = 8 << 20;

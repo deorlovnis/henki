@@ -4,8 +4,7 @@ use crate::types::{ProviderError, Url};
 use serde_json::Value;
 use std::io::{self, BufRead, BufReader, ErrorKind, Read, Write};
 use std::net::{Ipv4Addr, Shutdown, SocketAddr, TcpStream, ToSocketAddrs};
-use std::sync::{Arc, Mutex, PoisonError};
-use std::time::{Duration, Instant};
+use std::{sync::Arc, sync::Mutex, sync::PoisonError, time::Duration, time::Instant};
 
 /// `request` is one whole attempt, enforced by MAIN (`turn`), not by this module. Tests shorten any of them.
 #[derive(Clone, Copy, Debug)]

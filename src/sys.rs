@@ -1,14 +1,9 @@
 //! The OS calls henki needs beyond std, each behind a small safe function. The only file with `unsafe`.
 #![allow(unsafe_code)]
 use crate::types::Ev;
-use std::ffi::{CStr, CString, OsStr};
-use std::fs::{self, File};
-use std::io::{self, Read};
-use std::os::fd::{AsRawFd, FromRawFd};
 use std::os::unix::fs::{DirBuilderExt, FileTypeExt, MetadataExt, OpenOptionsExt, PermissionsExt};
-use std::os::unix::{ffi::OsStrExt, process::CommandExt};
-use std::time::{SystemTime, UNIX_EPOCH};
-use std::{path::Path, sync::mpsc::Sender};
+use std::os::{fd::AsRawFd, fd::FromRawFd, unix::ffi::OsStrExt, unix::process::CommandExt};
+use std::{ffi::CStr, ffi::CString, ffi::OsStr, fs, fs::File, io, io::Read, path::Path, sync::mpsc::Sender, time::SystemTime, time::UNIX_EPOCH};
 
 /// The signals that end a run; blocked in every thread and taken by `sigwait`.
 const SIGNALS: [i32; 4] = [libc::SIGINT, libc::SIGQUIT, libc::SIGTERM, libc::SIGHUP];

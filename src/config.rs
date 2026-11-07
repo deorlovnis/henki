@@ -1,13 +1,9 @@
 //! The configuration: one TOML-subset file, two environment variables and the flags, checked so that anything wrong
 //! stops henki with the file, the line and the fix.
-use crate::tools::ALL as TOOLS;
-use crate::types::Url;
-use crate::{http, sys, term};
+use crate::{http, sys, term, tools::ALL as TOOLS, types::Url};
 use serde_json::Value;
-use std::ffi::{OsStr, OsString};
-use std::os::unix::{ffi::OsStrExt, fs::MetadataExt};
 use std::path::{Component, Path, PathBuf};
-use std::{fs, io::ErrorKind, io::Read, net::Ipv6Addr};
+use std::{ffi::OsStr, ffi::OsString, fs, io::ErrorKind, io::Read, net::Ipv6Addr, os::unix::ffi::OsStrExt, os::unix::fs::MetadataExt};
 
 /// A snapshot of the process environment, taken once in `main`; tests build their own with `Env(vec![...])`.
 #[derive(Clone, Debug, Default)]

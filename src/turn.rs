@@ -1,15 +1,8 @@
 //! One session: the step loop of a turn, the only place the main thread waits, and the single way a turn and a session end.
-use crate::journal::{self, Journal, rec};
-use crate::term::{self, Out};
-use crate::tools::{self, Killed};
-use crate::{config::Config, http, supervise, types::*};
+use crate::{config::Config, http, journal, journal::Journal, journal::rec, supervise, term, term::Out, tools, tools::Killed, types::*};
 use call::Stuck;
 use serde_json::Value;
-use std::convert::Infallible;
-use std::ffi::OsString;
-use std::path::Path;
-use std::sync::mpsc::{Receiver, Sender};
-use std::time::{Duration, Instant};
+use std::{convert::Infallible, ffi::OsString, path::Path, sync::mpsc::Receiver, sync::mpsc::Sender, time::Duration, time::Instant};
 
 mod call;
 mod request;

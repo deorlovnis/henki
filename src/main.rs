@@ -12,16 +12,10 @@ mod tools;
 mod turn;
 mod types;
 
-use config::{Config, Env, Flags};
-use journal::{Journal, rec};
+use crate::{config::Config, config::Env, config::Flags, journal::Journal, journal::rec, term::Out, turn::Session, types::Ev, types::Outcome, types::Usage};
 use serde_json::Value;
-use std::io::{self, Read};
-use std::process::ExitCode;
 use std::sync::mpsc::{self, Receiver, Sender};
-use std::time::{Duration, Instant};
-use term::Out;
-use turn::Session;
-use types::{Ev, Outcome, Usage};
+use std::{io, io::Read, process::ExitCode, time::Duration, time::Instant};
 
 const USAGE: &str = "usage: henki run [--json] [--max-steps N] [--max-seconds N] [--approve ask|auto] [--config FILE] [--model NAME] [--resume[=ID]] [--nested] [TASK | -]
        henki --version | --help";

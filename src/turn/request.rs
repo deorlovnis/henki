@@ -1,9 +1,7 @@
 //! The model request of a step: the provider thread, retries and their waits, partial replies and context elision.
 use super::{ATTEMPTS, Session};
-use crate::journal::{self, rec};
-use crate::{http, openai, term, types::*};
-use std::sync::{Arc, Mutex};
-use std::time::Instant;
+use crate::{http, journal, journal::rec, openai, term, types::*};
+use std::{sync::Arc, sync::Mutex, time::Instant};
 
 impl Session {
     /// One reply for the step. Pairing holds before every attempt (else nothing is sent); old tool results are elided

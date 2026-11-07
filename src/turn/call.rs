@@ -1,8 +1,6 @@
 //! The calls of a step: ids and validation, one call with its timeout and escalation, its result, the stuck rule and the kill path.
 use super::{CALL_MAX_S, LATE, SLICE, Session};
-use crate::supervise::{self, GRACE};
-use crate::tools::{self, Killed, Target};
-use crate::{files, journal::rec, sys, term, types::*};
+use crate::{files, journal::rec, supervise, supervise::GRACE, sys, term, tools, tools::Killed, tools::Target, types::*};
 use std::time::{Duration, Instant};
 
 /// A call extends the run when it repeats the previous call (name and arguments) and both failed; another failure
