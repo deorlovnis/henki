@@ -233,7 +233,7 @@ fn out_flush_bounded() {
     let out = Out::with(true, tx, Box::new(Stuck(hold)), Box::new(io::sink()));
     out.record(&json!({"t": "result"}));
     let t0 = Instant::now();
-    assert!(!out.flush(t0 + Duration::from_millis(200)));
+    assert!(out.flush(t0 + Duration::from_millis(200)), "a line still queued at the bound did not get out");
     let took = t0.elapsed();
     assert!(took >= Duration::from_millis(200) && took < Duration::from_secs(2), "{took:?}");
     drop(release);
@@ -283,7 +283,7 @@ fn out_flush_past_deadline() {
     let until = Instant::now();
     let out = Out::with(true, tx, Box::new(Stuck(hold)), Box::new(io::sink()));
     out.record(&json!({"t": "result"}));
-    assert!(!out.flush(until));
+    assert!(out.flush(until), "the result was still queued");
     assert!(until.elapsed() < Duration::from_millis(500), "{:?}", until.elapsed());
     drop(release);
 }

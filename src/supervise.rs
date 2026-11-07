@@ -1,7 +1,7 @@
 //! Tool processes: the child environment, the spawn recipe, bounded capture with spill, and the ledger of process groups
 //! that henki kills by group and, on Linux, by sweeping every descendant.
 use crate::{config::Env, sys, term, types::End, types::Ev, types::ToolOutput};
-use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError, mpsc, mpsc::Sender};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock, PoisonError, mpsc, mpsc::Sender};
 use std::{collections::VecDeque, ffi::OsString, fs::File, os::unix::process::ExitStatusExt, thread};
 use std::{io, io::Read, io::Write, path::Path, path::PathBuf, process::Child, process::Command, process::Stdio, time::Duration, time::Instant};
 
@@ -16,6 +16,9 @@ const ALLOW: &str = "HOME USER LOGNAME SHELL TERM LANG LC_ALL LC_CTYPE LC_MESSAG
 
 /// The process groups of calls that may still have members, by leader pid; a group leaves when a signal gives ESRCH.
 static LEDGER: Mutex<Vec<i32>> = Mutex::new(Vec::new());
+/// The children henki had before its first call, such as a launcher's background job that came along through exec.
+/// henki did not start them, so the count and the sweep leave them and their descendants alone.
+static INHERITED: OnceLock<Vec<i32>> = OnceLock::new();
 
 /// Where a call's full output goes once it passes the cap; `shown` is the path as the marker prints it (`$HOME` as `~`).
 pub struct Spill {
@@ -50,6 +53,7 @@ pub fn spawn(bash: &Path, cmd: &str, cwd: &Path, env: &[(OsString, OsString)], c
     c.args(["--noprofile", "--norc", "-c", cmd]).current_dir(cwd).env_clear().envs(env.iter().map(|(k, v)| (k, v)));
     c.stdin(Stdio::null()).stdout(w.try_clone()?).stderr(w);
     sys::child_setup(&mut c, std::process::id());
+    INHERITED.get_or_init(|| children(&sys::procs()));
     #[allow(clippy::disallowed_methods)] // the one place a tool process starts
     let child = c.spawn()?;
     drop(c); // the parent's write ends close here, or EOF never comes
@@ -109,9 +113,15 @@ fn sweep(groups: &mut Vec<i32>) -> usize {
 /// zombie still answers for its group: a group whose members have all ended would never give ESRCH.
 fn pass(groups: &mut Vec<i32>, sig: i32) -> Vec<i32> {
     let (ps, me) = (sys::procs(), std::process::id() as i32);
+    let inherited = INHERITED.get_or_init(|| children(&ps));
     ps.iter().filter(|p| p.zombie && p.ppid == me && !groups.contains(&p.pid)).for_each(|p| _ = sys::reap(p.pid));
     groups.retain(|&pg| sys::kill(-pg, sig));
-    sys::tree(&ps, |p| p.ppid == me)
+    sys::tree(&ps, |p| p.ppid == me && !inherited.contains(&p.pid))
+}
+
+/// henki's direct children.
+fn children(ps: &[sys::Proc]) -> Vec<i32> {
+    ps.iter().filter(|p| p.ppid == std::process::id() as i32).map(|p| p.pid).collect()
 }
 
 type Shared = (Mutex<Cap>, Condvar);

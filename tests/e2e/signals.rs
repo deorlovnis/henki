@@ -86,6 +86,55 @@ fn e2e_budget_stalled_stdout() {
     closed_before_exit(&m, 0, &d);
 }
 
+/// A reader that keeps stdout open but takes nothing until henki is gone, like `henki run TASK | less` scrolled late.
+/// Without a budget the exit waits 5 s for it, then reports that the output did not get out: 141, never 0.
+fn slow_reader(json: bool) {
+    let long: String = (0..20_000).map(|i| format!("word{i} ")).collect();
+    let m = Mock::start(vec![say(&long)]);
+    let r = Run::new(&m.url());
+    let args: &[&str] = if json { &["--json", "talk"] } else { &["talk"] };
+    let d = r.cmd(args).unread_stdout().timeout(Duration::from_secs(15)).go();
+    d.finish();
+    assert_eq!((d.code, d.status().as_str()), (Some(141), "ok"), "the journal has the answer, stdout did not get it\n{}", d.diag());
+    assert!(d.elapsed >= Duration::from_secs(5) && d.elapsed < Duration::from_secs(7), "exit after {:?}", d.elapsed);
+    assert!(d.stdout.len() < long.len(), "stdout took everything: {} bytes", d.stdout.len());
+}
+
+#[test]
+fn e2e_slow_reader_plain_141() {
+    slow_reader(false);
+}
+
+#[test]
+fn e2e_slow_reader_json_141() {
+    slow_reader(true);
+}
+
+/// henki started with HUP and INT ignored, as `nohup` and a script's background job start it: it keeps them ignored
+/// (neither blocked nor waited for, so the run goes on to its answer), and a tool child still starts with both at their
+/// default action.
+#[test]
+#[cfg(target_os = "linux")]
+fn e2e_inherited_ignore_kept() {
+    let mut r = Run::new("");
+    let wait = format!("grep -E '^Sig(Blk|Ign)' /proc/self/status; for i in $(seq 1000); do [ -e go ] && break; sleep 0.01; done; : {}", r.marker);
+    let m = Mock::start(vec![shell(&wait), say("still here")]);
+    r.at(&m.url());
+    let mut l = r.cmd(&["--json", "carry on"]).ignore(&[libc::SIGHUP, libc::SIGINT]).spawn();
+    l.wait_marked(5 * SEC);
+    assert_eq!(sigmask(l.pid, "SigBlk") & 0x4007, 0x4004, "only QUIT and TERM are blocked");
+    l.signal(libc::SIGHUP);
+    l.signal(libc::SIGINT);
+    std::fs::write(r.path("go"), "").unwrap();
+    let d = l.wait();
+    d.finish();
+    assert_eq!((d.code, d.status().as_str()), (Some(0), "ok"), "{}", d.diag());
+    let inherited = sigmask(std::process::id() as i32, "SigIgn") & !0x5007;
+    let want = format!("SigBlk:\t0000000000000000\nSigIgn:\t{inherited:016x}\n");
+    let got = d.results()[0]["content"].as_str().unwrap().to_string();
+    assert!(got.starts_with(&want), "want {want:?}, got {got:?}");
+}
+
 #[test]
 fn e2e_budget_stdin_open() {
     let r = Run::new("http://127.0.0.1:9/v1");

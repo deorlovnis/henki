@@ -25,9 +25,11 @@ fn check(rc: libc::c_int) -> io::Result<()> {
 }
 
 /// Blocks INT, QUIT, TERM and HUP in the calling thread (so in every thread started later) and starts the thread that
-/// `sigwait`s for them and sends `Ev::Signal`. Must be the first call in `main`, before any other thread exists.
+/// `sigwait`s for them and sends `Ev::Signal`. One that henki started with ignored (`nohup`, a background job of a
+/// script) stays ignored: it is neither blocked nor waited for. Must be the first call in `main`, before any other
+/// thread exists.
 pub fn signals(tx: Sender<Ev>) -> io::Result<()> {
-    let set = sigset(&SIGNALS);
+    let set = sigset(&SIGNALS.into_iter().filter(|&s| !ignored(s)).collect::<Vec<_>>());
     // SAFETY: `set` is an initialized sigset_t and a null pointer for the old mask is allowed.
     let rc = unsafe { libc::pthread_sigmask(libc::SIG_BLOCK, &set, std::ptr::null_mut()) };
     if rc != 0 {
@@ -39,6 +41,15 @@ pub fn signals(tx: Sender<Ev>) -> io::Result<()> {
         while unsafe { libc::sigwait(&set, &mut sig) } == 0 && tx.send(Ev::Signal(sig)).is_ok() {}
     })?;
     Ok(())
+}
+
+/// Whether `sig` is set to SIG_IGN; reads the disposition without changing it.
+fn ignored(sig: i32) -> bool {
+    // SAFETY: an all-zero sigaction is a valid value to overwrite; with a null new action, sigaction only writes the old.
+    unsafe {
+        let mut old: libc::sigaction = std::mem::zeroed();
+        libc::sigaction(sig, std::ptr::null(), &mut old) == 0 && old.sa_sigaction == libc::SIG_IGN
+    }
 }
 
 /// RLIMIT_CORE 0. Linux: PR_SET_DUMPABLE 0 and PR_SET_CHILD_SUBREAPER. Errors are returned, never swallowed.
@@ -56,9 +67,10 @@ pub fn harden() -> io::Result<()> {
     Ok(())
 }
 
-/// Installs the tool child's `pre_exec` hook on `cmd` (so the `unsafe` call stays in this file): `setsid()`, an empty
-/// signal mask, then on Linux PR_SET_PDEATHSIG(SIGKILL) and `_exit(1)` if `getppid()` is no longer `henki`.
-/// Async-signal-safe calls only; the hook allocates nothing.
+/// Installs the tool child's `pre_exec` hook on `cmd` (so the `unsafe` call stays in this file): `setsid()`, INT, QUIT,
+/// TERM and HUP back to their default action (henki may have started with one ignored), an empty signal mask, then on
+/// Linux PR_SET_PDEATHSIG(SIGKILL) and `_exit(1)` if `getppid()` is no longer `henki`. Async-signal-safe calls only;
+/// the hook allocates nothing.
 pub fn child_setup(cmd: &mut std::process::Command, henki: u32) {
     let empty = sigset(&[]);
     #[cfg(not(target_os = "linux"))]
@@ -66,6 +78,10 @@ pub fn child_setup(cmd: &mut std::process::Command, henki: u32) {
     let hook = move || -> io::Result<()> {
         // SAFETY: setsid takes no arguments and is async-signal-safe.
         check(unsafe { libc::setsid() })?;
+        for s in SIGNALS {
+            // SAFETY: signal takes integers only and is async-signal-safe; SIG_DFL needs no handler.
+            unsafe { libc::signal(s, libc::SIG_DFL) };
+        }
         // SAFETY: `empty` is an initialized sigset_t copied into the hook; a null pointer for the old mask is allowed.
         check(unsafe { libc::sigprocmask(libc::SIG_SETMASK, &empty, std::ptr::null_mut()) })?;
         #[cfg(target_os = "linux")]

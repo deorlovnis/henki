@@ -15,7 +15,7 @@ echo "a long task" | henki run -
 - With `approve = "ask"` (the default), a call that needs a human (`shell`, `write`, `edit`, or a `read` outside the project) ends the run with exit 3 and the call it wanted; `--approve auto` runs every call.
 - Every session is journaled under `~/.local/state/henki`; `--resume[=ID]` continues one.
 - `--max-steps` bounds the model requests, `--max-seconds` the wall time. When a run ends, every process it started is stopped.
-- Exit codes: 0 answered, 1 gave up (step limit, stuck, empty answer), 2 error, 3 needs approval, 124 out of time, 130 interrupted, 141 stdout closed.
+- Exit codes: 0 answered, 1 gave up (step limit, stuck, empty answer), 2 error, 3 needs approval, 124 out of time, 130 interrupted, 141 stdout closed or not read in time (5 s after the end, or the `--max-seconds` budget).
 
 ## Plans
 

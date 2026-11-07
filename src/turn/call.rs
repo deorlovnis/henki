@@ -109,11 +109,11 @@ impl Session {
 
     /// The kill path of every stop and of the session end: SIGTERM to every live group and up to `GRACE` for them to go
     /// (ended early when all are gone, or by a second signal), then SIGKILL and up to five sweeps of what is left; with
-    /// nothing live, no wait at all. Returns the live call's output if it reported, and how many processes were signalled.
+    /// nothing live, no wait at all. Returns the live call's output if it reported, and how many processes there were to
+    /// stop (macOS: process groups).
     pub(super) fn stop_all(&mut self) -> (Option<ToolOutput>, usize) {
-        let (tag, mut got) = (self.live.as_ref().map_or(0, |l| l.0), None);
+        let (tag, mut got, n) = (self.live.as_ref().map_or(0, |l| l.0), None, supervise::reap());
         let (mut left, end) = (supervise::signal_groups(libc::SIGTERM), Instant::now() + GRACE);
-        let mut n = left;
         while left > 0 && !self.hurry && Instant::now() < end {
             self.hold(tag, end.saturating_duration_since(Instant::now()).min(SLICE), &mut got);
             supervise::reap();
@@ -123,7 +123,6 @@ impl Session {
         for _ in 0..5 {
             self.hold(tag, Duration::from_millis(if swept > 0 { 10 } else { 0 }), &mut got);
             swept = supervise::sweep_pass();
-            n += swept;
             if swept == 0 {
                 break;
             }

@@ -167,7 +167,8 @@ impl Run {
             timeout: Duration::from_secs(20),
             close_first: false,
             unread: false,
-            default_signals: false,
+            ignore: Vec::new(),
+            launch: None,
         }
     }
 
@@ -210,14 +211,23 @@ pub struct Cmd<'a> {
     timeout: Duration,
     close_first: bool,
     unread: bool,
-    default_signals: bool,
+    ignore: Vec<i32>,
+    launch: Option<String>,
 }
 
 impl<'a> Cmd<'a> {
-    /// henki starts with HUP, INT, QUIT, PIPE and TERM at their default action, whatever the test process ignores.
+    /// henki starts with these signals ignored, as `nohup` (HUP) or a script's background job (INT, QUIT) starts it.
+    /// Without this, HUP, INT, QUIT, PIPE and TERM are at their default action, whatever the test process ignores.
     #[cfg(target_os = "linux")]
-    pub fn default_signals(mut self) -> Cmd<'a> {
-        self.default_signals = true;
+    pub fn ignore(mut self, sigs: &[i32]) -> Cmd<'a> {
+        self.ignore = sigs.to_vec();
+        self
+    }
+
+    /// `sh -c 'PREFIX exec henki run ARGS'`: a launcher that runs `prefix` (a background job, say) and then becomes henki.
+    #[cfg(target_os = "linux")]
+    pub fn launch(mut self, prefix: &str) -> Cmd<'a> {
+        self.launch = Some(prefix.into());
         self
     }
 
@@ -256,8 +266,19 @@ impl<'a> Cmd<'a> {
         let r = self.run;
         r.write_config();
         let before: HashMap<PathBuf, u64> = r.journals().into_iter().map(|p| (p.clone(), fs::metadata(&p).map(|m| m.len()).unwrap_or(0))).collect();
-        let mut c = Command::new(bin());
-        c.arg("run").args(&self.args).current_dir(self.cwd.as_deref().unwrap_or(&r.cwd)).env_clear();
+        let mut c = match &self.launch {
+            Some(prefix) => {
+                let mut c = Command::new("/bin/sh");
+                c.arg("-c").arg(format!("{prefix} exec \"$0\" run \"$@\"")).arg(bin());
+                c
+            }
+            None => {
+                let mut c = Command::new(bin());
+                c.arg("run");
+                c
+            }
+        };
+        c.args(&self.args).current_dir(self.cwd.as_deref().unwrap_or(&r.cwd)).env_clear();
         for (k, v) in &r.env {
             if let Some(v) = v {
                 c.env(k, v);
@@ -270,13 +291,15 @@ impl<'a> Cmd<'a> {
             In::Open => (Stdio::piped(), None, None),
         };
         c.stdin(stdio).stdout(Stdio::piped()).stderr(Stdio::piped());
-        if self.default_signals {
+        {
             use std::os::unix::process::CommandExt;
-            // SAFETY: runs in the forked child before exec; signal(2) is async-signal-safe and touches no shared memory.
+            let ignore = self.ignore.clone();
+            // SAFETY: runs in the forked child before exec; signal(2) is async-signal-safe, and the closure only reads
+            // the vector the parent allocated before the fork.
             unsafe {
-                c.pre_exec(|| {
+                c.pre_exec(move || {
                     for s in [libc::SIGHUP, libc::SIGINT, libc::SIGQUIT, libc::SIGPIPE, libc::SIGTERM] {
-                        libc::signal(s, libc::SIG_DFL);
+                        libc::signal(s, if ignore.contains(&s) { libc::SIG_IGN } else { libc::SIG_DFL });
                     }
                     Ok(())
                 });
@@ -764,7 +787,8 @@ impl Done {
             let r = self.result();
             let status = r["status"].as_str().unwrap_or("").to_string();
             self.check(r["exit"].as_i64() == Some(code_of(&status) as i64), "the result's exit is not its status's code");
-            let closed_ok = code == 141 && self.closed_stdout && ["ok", "gave_up", "needs_approval"].contains(&status.as_str());
+            // A finished run whose stdout closed, or whose reader did not take everything, exits 141.
+            let closed_ok = code == 141 && (self.closed_stdout || !self.stdout_complete) && ["ok", "gave_up", "needs_approval"].contains(&status.as_str());
             self.check(code == code_of(&status) || closed_ok, &format!("exit {code} for status {status}"));
             if self.journal.is_none() {
                 self.check(r["session"].is_null(), "a result without a journal names a session");

@@ -98,14 +98,14 @@ fn parse(a: &mut Args) -> Result<Option<String>, lexopt::Error> {
 /// `henki run`: startup, one turn, the `result`, the session end.
 fn run(a: Args, out: Out, tx: Sender<Ev>, rx: Receiver<Ev>, t0: Instant, early: io::Result<()>) -> u8 {
     let mut deadline = None;
-    let (cfg, j, hist, task, session) = match start(a, &tx, &rx, t0, early, &mut deadline) {
+    let (cfg, j, hist, task, head) = match start(a, &tx, &rx, t0, early, &mut deadline) {
         Ok(r) => r,
         Err(o) => {
             refuse(&out, &o, t0);
             return code(out, &o, deadline);
         }
     };
-    out.record(&session);
+    head.iter().for_each(|r| out.record(r));
     let mut s = Session::new(cfg, j, hist, out, tx, rx, deadline);
     // A finished turn whose stdout reader went away never gave the reader what it waited for.
     let o = s.turn(task);
@@ -120,8 +120,9 @@ fn run(a: Args, out: Out, tx: Sender<Ev>, rx: Receiver<Ev>, t0: Instant, early: 
     code(s.into_out(), &failed.unwrap_or(o), deadline)
 }
 
-/// What startup hands to the session: the config, the journal, the history, the task and the `session` record.
-type Started = (Config, Journal, Vec<Value>, Option<String>, Value);
+/// What startup hands to the session: the config, the journal, the history, the task, and the records it journaled (a
+/// resume's repairs, then `session`).
+type Started = (Config, Journal, Vec<Value>, Option<String>, Vec<Value>);
 
 /// Startup up to the `session` record. An error ends the run before a session exists.
 fn start(a: Args, tx: &Sender<Ev>, rx: &Receiver<Ev>, t0: Instant, early: io::Result<()>, deadline: &mut Option<Instant>) -> Result<Started, Outcome> {
@@ -148,16 +149,16 @@ fn start(a: Args, tx: &Sender<Ev>, rx: &Receiver<Ev>, t0: Instant, early: io::Re
     if deadline.is_some_and(|d| Instant::now() >= d) {
         return Err(Outcome::Budget);
     }
-    let (mut j, hist, from) = match &a.resume {
-        None => (Journal::create(&state, &cfg.cwd)?, Vec::new(), None),
+    let (mut j, hist, from, mut head) = match &a.resume {
+        None => (Journal::create(&state, &cfg.cwd)?, Vec::new(), None, Vec::new()),
         Some(id) => {
             let r = Journal::resume(&state, &cfg.cwd, id.as_deref(), &cfg)?;
             cfg.notices.extend(r.notices);
-            (r.journal, r.hist, Some(r.from_bytes))
+            (r.journal, r.hist, Some(r.from_bytes), r.repairs)
         }
     };
-    let session = j.write(rec::session(&cfg, j.id(), &cfg.cwd, from))?;
-    Ok((cfg, j, hist, task, session))
+    head.push(j.write(rec::session(&cfg, j.id(), &cfg.cwd, from))?);
+    Ok((cfg, j, hist, task, head))
 }
 
 /// `run -`: stdin to EOF on its own thread, so that a signal or the deadline still ends the wait.
@@ -196,7 +197,8 @@ fn outcome_line(o: &Outcome) -> String {
     }
 }
 
-/// The bounded flush, then the exit code: 141 when stdout closed before a run that finished got its `result` out.
+/// The bounded flush, then the exit code: 141 when a run that finished did not get all its output out, its `result`
+/// included, because stdout closed or its reader did not keep up.
 fn code(out: Out, o: &Outcome, deadline: Option<Instant>) -> u8 {
     let until = deadline.map_or_else(|| Instant::now() + Duration::from_secs(5), |d| d + Duration::from_millis(950));
     let closed = out.flush(until);

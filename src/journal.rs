@@ -19,6 +19,8 @@ pub struct Resumed {
     pub hist: Vec<Value>,
     pub from_bytes: u64,
     pub notices: Vec<String>,
+    /// The repair records as written, also at the end of `hist`; `--json` stdout shows them before `session`.
+    pub repairs: Vec<Value>,
 }
 
 const ELIDED: &str = "[output elided: ";
@@ -86,10 +88,10 @@ impl Journal {
         // A name whose file the 24 h sweep removed may still be named in the history: each call took at most one name.
         let n = names.filter_map(|f| f.to_str()?.strip_prefix(&prefix)?.strip_suffix(".log")?.parse().ok()).max().unwrap_or(0).max(calls(&hist).count());
         let mut journal = Journal { file, path, bytes: keep as u64, id, spill, n };
-        for (id, name) in dangling(&hist) {
-            hist.push(journal.write(rec::tool_result(&id, &name, tools::REPAIR, true, 0, 0))?);
-        }
-        Ok(Resumed { journal, hist, from_bytes: keep as u64, notices })
+        let repairs = dangling(&hist).into_iter().map(|(id, name)| journal.write(rec::tool_result(&id, &name, tools::REPAIR, true, 0, 0)));
+        let repairs = repairs.collect::<Result<Vec<_>, _>>()?;
+        hist.extend(repairs.iter().cloned());
+        Ok(Resumed { journal, hist, from_bytes: keep as u64, notices, repairs })
     }
 
     /// Adds `ts`; checks fstat size = bytes written (else `tampered`); appends `term::json_line` + "\n" on the O_APPEND

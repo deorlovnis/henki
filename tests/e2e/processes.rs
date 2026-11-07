@@ -119,6 +119,50 @@ fn e2e_reap_notice() {
     assert_eq!(kinds[first - 1], "tool_result", "the notice follows the call that changed the count");
 }
 
+/// The count also falls: a call that ends the earlier background process gives the notice again, with 0, and the
+/// session end then has nothing to stop.
+#[test]
+#[cfg(target_os = "linux")]
+fn e2e_reap_notice_drop() {
+    // The second call waits until the killed sleep is a zombie (or reaped), so the count after it is settled.
+    let stop = "p=$(cat bg); kill $p; for i in $(seq 500); do case \"$(cut -d')' -f2 /proc/$p/stat 2>/dev/null)\" in ' Z'*|'') break;; esac; sleep 0.01; done; echo two";
+    let (r, _m) = scripted(|r| vec![shell(&format!("sleep {} & echo $! > bg; echo one", r.marker)), shell(stop), say("done")]);
+    let d = r.json("start one, then stop it");
+    d.finish();
+    assert_eq!(d.code, Some(0), "{}", d.diag());
+    let bg: Vec<String> = d.notices().into_iter().filter(|x| x.contains(" background processes ")).collect();
+    assert_eq!(bg, ["1 background processes from earlier calls still run", "0 background processes from earlier calls still run"]);
+}
+
+/// Three background processes of one call (one process group) are three processes, both while they run and at exit.
+#[test]
+#[cfg(target_os = "linux")]
+fn e2e_exit_count_is_processes() {
+    let (r, _m) = scripted(|r| vec![shell(&format!("sleep {m} & sleep {m} & sleep {m} & echo started", m = r.marker)), say("done")]);
+    let d = r.json("start three");
+    d.finish();
+    assert_eq!(d.code, Some(0), "{}", d.diag());
+    let bg: Vec<String> = d.notices().into_iter().filter(|x| x.contains(" background processes ")).collect();
+    assert_eq!(bg, ["3 background processes from earlier calls still run", "stopped 3 background processes at exit"]);
+}
+
+/// A launcher's own background job came with henki through exec (`sh -c 'sleep N & exec henki run ...'`): henki did
+/// not start it, so it is not counted as background work and it outlives the session end.
+#[test]
+#[cfg(target_os = "linux")]
+fn e2e_inherited_child_left_alone() {
+    let (r, _m) = scripted(|_| vec![shell("echo hi"), say("done")]);
+    let theirs = format!("4{}", &r.marker[1..]); // a sleep without the run's marker
+    let d = r.cmd(&["--json", "say hi"]).launch(&format!("sleep {theirs} &")).go();
+    let alive = marked(&theirs);
+    kill_marked(&theirs);
+    d.finish();
+    assert_eq!(d.code, Some(0), "{}", d.diag());
+    let bg: Vec<String> = d.notices().into_iter().filter(|x| x.contains(" background processes ")).collect();
+    assert!(bg.is_empty(), "{bg:?}");
+    assert_eq!(alive.len(), 1, "the launcher's job did not survive the session end");
+}
+
 #[test]
 #[cfg(target_os = "linux")]
 fn e2e_kill9_bash_dies() {
@@ -135,8 +179,9 @@ fn e2e_kill9_bash_dies() {
     d.finish();
 }
 
-/// henki starts with HUP, INT, QUIT, PIPE and TERM at their default action. A tool child then has an empty mask, none of
-/// those five ignored, and nothing else ignored that henki's own parent (this test process) did not ignore.
+/// henki starts with HUP, INT, QUIT, PIPE and TERM at their default action (the harness's default). A tool child then
+/// has an empty mask, none of those five ignored, and nothing else ignored that henki's own parent (this test process)
+/// did not ignore.
 #[test]
 #[cfg(target_os = "linux")]
 fn e2e_child_signals_default() {
@@ -144,7 +189,7 @@ fn e2e_child_signals_default() {
         let term = format!("sleep {} & pid=$!; kill -TERM $pid; wait $pid; echo status $?", r.marker);
         vec![shell("grep -E '^Sig(Blk|Ign)' /proc/self/status"), call("shell", json!({"command": term, "timeout": 5})), say("checked")]
     });
-    let d = r.cmd(&["--json", "check signals"]).default_signals().go();
+    let d = r.cmd(&["--json", "check signals"]).go();
     d.finish();
     assert_eq!(d.code, Some(0), "{}", d.diag());
     let inherited = sigmask(std::process::id() as i32, "SigIgn") & !0x5007;

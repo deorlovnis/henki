@@ -44,6 +44,10 @@ fn e2e_resume_kill9() {
     assert!(all.iter().any(|x| x["t"] == "notice" && x["text"] == "previous run did not close cleanly"), "{}", d.diag());
     let tool = m2.log()[0].messages().into_iter().rfind(|x| x["role"] == "tool").unwrap();
     assert_eq!((tool["content"].as_str(), &tool["tool_call_id"]), (Some(REPAIR), &dangling));
+    // `--json` stdout shows the repair as journaled, before the new `session` record.
+    let out = d.records();
+    let shown = out.iter().position(|x| x["t"] == "tool_result").expect("the repair on stdout");
+    assert_eq!((&out[shown], out[shown + 1]["t"].as_str()), (&all[repair], Some("session")), "{}", d.diag());
     let m3 = Mock::start(vec![say("resumed twice")]);
     r.at(&m3.url());
     let d = r.cmd(&["--json", "--resume", "and once more"]).go();
@@ -113,6 +117,27 @@ fn e2e_run_resume_no_task() {
     let msgs = m2.log()[0].messages();
     assert_eq!(msgs.iter().filter(|x| x["role"] == "user").count(), 1);
     assert_eq!(msgs.last().unwrap()["role"], "tool", "the request continues from the last result");
+}
+
+/// An interrupt in the middle of a streamed reply leaves a partial assistant record (`finish: interrupted`). A request
+/// may not end with it, so `run --resume` without a TASK refuses, and says why.
+#[test]
+fn e2e_run_resume_no_task_after_cut() {
+    let m = Mock::start(vec![Step::Stall { before_first_byte: false, after_words: 2, for_ms: 30_000 }]);
+    let r = Run::new(&m.url());
+    let mut l = r.cmd(&["--json", "talk"]).spawn();
+    l.ready();
+    l.wait_record(5 * SEC, |x| x["t"] == "text");
+    l.signal(libc::SIGINT);
+    let d = l.wait();
+    d.finish();
+    assert_eq!(d.code, Some(130), "{}", d.diag());
+    assert_eq!(d.of("assistant").last().unwrap()["finish"], "interrupted", "{}", d.diag());
+    let d = r.cmd(&["--json", "--resume"]).go();
+    d.finish();
+    let e = &d.result()["error"];
+    assert_eq!((d.code, e["kind"].as_str(), e["message"].as_str()), (Some(2), Some("config"), Some("the last reply was cut short; give a TASK")), "{}", d.diag());
+    assert_eq!(m.log().len(), 1, "nothing was sent");
 }
 
 #[test]

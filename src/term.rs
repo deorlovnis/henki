@@ -130,13 +130,13 @@ impl Out {
         self.closed.load(SeqCst)
     }
 
-    /// Close the queue and wait for the writer until `until`, then return regardless. Returns whether stdout was closed
-    /// at any point, including on lines written during this flush (the `result` line itself).
+    /// Close the queue and wait for the writer until `until`, then return regardless. Returns whether some line did not
+    /// get out: stdout was closed at any point (on the `result` line itself, too), or the writer was still writing at
+    /// `until` because the reader is too slow.
     pub fn flush(self, until: Instant) -> bool {
         let Out { queue, closed, done, .. } = self;
         drop(queue);
-        let _ = done.recv_timeout(until.saturating_duration_since(Instant::now()));
-        closed.load(SeqCst)
+        done.recv_timeout(until.saturating_duration_since(Instant::now())).is_err() || closed.load(SeqCst)
     }
 }
 

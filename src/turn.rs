@@ -127,9 +127,11 @@ impl Session {
         std::mem::take(&mut self.cfg.notices).iter().try_for_each(|n| self.notice(n))?;
         match task {
             Some(t) => self.record(rec::user(&(head(&self.cfg.cwd) + &t)))?,
-            // Only a task or a tool result leaves something for the model to continue.
+            // Only a task or a tool result leaves something for the model to continue. A request may not end with an
+            // assistant message, so a reply that was cut short (interrupted or failed) needs a task as well.
             None if !matches!(self.hist.last().and_then(|r| r["t"].as_str()), Some("user" | "tool_result")) => {
-                return Err(Outcome::error("config", "nothing to continue; give a TASK"));
+                let cut = self.hist.last().is_some_and(|r| r["finish"] == "interrupted" || r["finish"] == "error");
+                return Err(Outcome::error("config", if cut { "the last reply was cut short; give a TASK" } else { "nothing to continue; give a TASK" }));
             }
             None => {}
         }
