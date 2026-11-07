@@ -1,0 +1,5 @@
+#!/bin/sh
+# pbpaste as the model's calls see it: refused. The clipboard is where `halti copy` puts a secret value for the user,
+# so reading it would hand that value to the model. A seatbelt, not a boundary: another program can still read it.
+echo "henki: pbpaste reads the clipboard, which may hold a secret value; fix: ask the user to paste what is needed into the message" >&2
+exit 126

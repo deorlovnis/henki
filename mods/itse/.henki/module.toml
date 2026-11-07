@@ -1,0 +1,10 @@
+# The itse mod: a doc only. henki uses itse through its CLI: no MCP endpoint, no hook.
+henki_module = 1
+name = "itse"
+version = "0.1.0"
+license = "Apache-2.0"
+requires = ["henki >= 0.1"]
+contracts = ["ext/1", "module/1"]
+os = ["macos", "linux"]
+caps_net = "none"
+ports = []

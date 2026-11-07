@@ -1,0 +1,40 @@
+#!/bin/sh
+# halti as the model's calls see it: a seatbelt, not a boundary. It refuses the verbs that hand out secret values or
+# need the user at a terminal, so the model is told to ask the user instead, and runs the real halti for the rest. A
+# call that names the real halti by its path gets past it like any other program does: the boundary is halti's own
+# Touch ID and policies.
+#
+# The verb is the first argument that is not a flag: halti takes no flags before it but --help and --version.
+v=""
+for a in "$@"; do
+  case "$a" in --) break ;; -*) ;; *) v=$a && break ;; esac
+done
+case "$v" in
+  set | with | copy | update | rotate)
+    echo "henki: 'halti $v' handles secret values or needs the user's terminal; fix: ask the user to run !halti $v ..." >&2
+    exit 126
+    ;;
+  run)
+    # `halti run -s RES -- CMD` puts values into CMD's environment. What comes after -- is CMD's own.
+    for a in "$@"; do
+      case "$a" in
+        --) break ;;
+        -s | -s?* | --secret | --secret=*)
+          echo "henki: 'halti run -s' puts secret values into a command's environment; fix: ask the user to run it with !" >&2
+          exit 126
+          ;;
+      esac
+    done
+    ;;
+esac
+# The real halti is on the user's PATH, which henki passes in HENKI_USER_PATH (set even when empty). Outside henki,
+# the PATH without this directory, so the wrapper never runs itself.
+if [ -z "${HENKI_USER_PATH+x}" ]; then
+  here=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd) && real=$(cd -- "$here" && pwd -P) || exit 126
+  HENKI_USER_PATH=$(printf '%s\n' "$PATH" | tr ':' '\n' | command grep -vxF -e "$here" -e "$real" | paste -sd: -)
+fi
+PATH=$HENKI_USER_PATH command -v halti >/dev/null 2>&1 || {
+  echo "henki: halti is not installed on the user's PATH; fix: tell the user (the halti mod only wraps it)" >&2
+  exit 127
+}
+PATH=$HENKI_USER_PATH exec halti "$@"
