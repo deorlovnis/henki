@@ -1,6 +1,5 @@
 //! henki: a small terminal agent. `henki` is a line REPL on the terminal it was started from; `henki run [--json] TASK`
 //! does one task headless. Both drive a model through a shell and three file tools.
-#![allow(dead_code)] // until every new item is wired in
 
 mod allow;
 mod anthropic;
