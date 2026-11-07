@@ -1,9 +1,10 @@
 //! The configuration: one TOML-subset file, two environment variables and the flags, checked so that anything wrong
-//! stops henki with the file, the line and the fix.
+//! stops henki with the file, the line and the fix; then what it names: the extensions, the allow rules, and the files
+//! henki protects from the model and watches for changes.
 use crate::{allow, ext, http, sys, term, types::TOOLS, types::Url};
 use serde_json::Value;
 use std::path::{Component, Path, PathBuf};
-use std::{ffi::OsStr, ffi::OsString, fs, io::ErrorKind, io::Read, net::Ipv6Addr, os::unix::ffi::OsStrExt, os::unix::fs::MetadataExt};
+use std::{ffi::OsStr, ffi::OsString, fs, io::Read, net::Ipv6Addr, os::unix::fs::MetadataExt};
 
 /// A snapshot of the process environment, taken once in `main`; tests build their own with `Env(vec![...])`.
 #[derive(Clone, Debug, Default)]
@@ -34,6 +35,7 @@ pub struct Config {
     pub model: String,
     pub url: Url,
     pub url_from: &'static str, // "config" | "HENKI_BASE_URL"
+    pub dialect: &'static str,  // "openai" | "anthropic"
     pub api_key: String,        // "" = none
     pub auto: bool,
     pub approve_from: String,     // "default" | "FILE:LINE" | "--approve"
@@ -50,26 +52,25 @@ pub struct Config {
     pub explicit: bool,        // --config given
     pub hash: Option<String>,  // FNV-1a of the file bytes
     pub home: PathBuf,
-    pub cwd: PathBuf,           // the session cwd (`load`'s argument)
-    pub env: Env,               // the snapshot `load` read; the child environment is built from it
-    pub root: PathBuf,          // the project root of the cwd
-    pub user_path: String,      // the inherited PATH without relative entries and without the ext `bin/` dirs
-    pub bash: PathBuf,          // the first executable `bash` on an absolute user PATH entry
+    pub cwd: PathBuf,        // the session cwd (`load`'s argument)
+    pub env: Env,            // the snapshot `load` read; the child environment is built from it
+    pub root: PathBuf,       // the project root of the cwd
+    pub state: PathBuf,      // $XDG_STATE_HOME/henki (absolute only) or ~/.local/state/henki; created by the journal
+    pub shadow: Vec<String>, // `EXT/NAME`: extension commands allowed to shadow a user PATH executable
+    pub exts: Vec<ext::Ext>,
+    pub user_path: String,      // the inherited PATH without relative entries and without the extensions' bin/ dirs
+    pub bash: PathBuf,          // the first executable `bash` on the user PATH
     pub agents: Option<String>, // <config dir>/AGENTS.md, trailing newlines trimmed
     pub agents_hash: Option<String>,
-    pub protected: Vec<PathBuf>, // the config file and dir, each also as its realpath (main adds the state dir)
+    pub allow: allow::Allow,     // <config dir>/allow, read only in ask mode
+    pub protected: Vec<PathBuf>, // the config file and dir, the state dir, the ext paths and the link targets in them; each also as its realpath
+    pub trust: Vec<PathBuf>,     // what the tripwire stamps, absent files included
     pub notices: Vec<String>,
-    pub dialect: &'static str, // "openai" | "anthropic"
-    pub shadow: Vec<String>,   // `EXT/NAME` entries, checked by ext discovery
-    pub state: PathBuf,        // $XDG_STATE_HOME/henki (absolute only) or ~/.local/state/henki; journal::state_dir creates it
-    pub exts: Vec<ext::Ext>,
-    pub allow: allow::Allow, // read only in ask mode
-    pub trust: Vec<PathBuf>, // what the tripwire stamps
 }
 
 /// The HENKI_* variables henki reads or sets for its children; any other gives a notice.
 const KNOWN: [&str; 6] = ["HENKI_MODEL", "HENKI_BASE_URL", "HENKI_DEPTH", "HENKI_SESSION", "HENKI_USER_PATH", "HENKI_VERSION"];
-const KEYS: &str = "model, base_url, dialect, api_key, approve, tools, ext, pass_env, max_steps, max_seconds, tool_timeout_s, output_cap, context_window, max_tokens";
+const KEYS: &str = "model, base_url, dialect, api_key, approve, tools, ext, shadow, pass_env, max_steps, max_seconds, tool_timeout_s, output_cap, context_window, max_tokens";
 /// The integer keys and their ranges; `context_window` also takes 0 (unknown).
 #[rustfmt::skip]
 const INTS: [(&str, u64, u64); 6] = [("max_steps", 1, 10_000), ("max_seconds", 0, 604_800), ("tool_timeout_s", 1, 600), ("output_cap", 1_024, 262_144),
@@ -89,20 +90,30 @@ pub fn load(f: &Flags, env: &Env, cwd: &Path) -> Result<Config, String> {
     let base = cwd.ancestors().nth(up).unwrap_or(Path::new("/"));
     let file = f.config.as_ref().map_or_else(|| home.join(".config/henki/config.toml"), |p| base.join(p.components().skip(up).collect::<PathBuf>()));
     let (dir, explicit, root) = (file.parent().unwrap_or(&home).to_path_buf(), f.config.is_some(), project_root(cwd, &real(&home)));
-    #[rustfmt::skip]
-    let mut c = Config { model: String::new(), url: Url { host: String::new(), port: 80, path: String::new() }, url_from: "config", api_key: String::new(),
-        auto: false, approve_from: "default".into(), tools: TOOLS.to_vec(), pass_env: Vec::new(), max_steps: 50, max_seconds: 0, tool_timeout_s: 120,
-        output_cap: 16_384, window: 0, max_tokens: 4_096, file: None, dir, explicit, hash: None, home, cwd: cwd.to_path_buf(), env: env.clone(), root,
-        user_path: String::new(), bash: PathBuf::new(), agents: None, agents_hash: None, protected: Vec::new(), notices: Vec::new(), dialect: "openai",
-        ..Config::default() };
+    // Stored in the project or named through it (even by a link out of it), the project could choose what henki trusts.
+    let inside = |p: &Path| real(&root) != real(&home) && root != Path::new("/") && (p.starts_with(&root) || real(p).starts_with(real(&root)));
+    let mut c = Config {
+        dialect: "openai",
+        tools: TOOLS.to_vec(),
+        max_steps: 50,
+        tool_timeout_s: 120,
+        output_cap: 16_384,
+        max_tokens: 4_096,
+        dir,
+        explicit,
+        home: home.clone(),
+        cwd: cwd.to_path_buf(),
+        env: env.clone(),
+        root: root.clone(),
+        ..Config::default()
+    };
     // Each layer is (where, key, value): the file's lines, then the two variables, then the flags; the last one wins.
     let mut layers: Vec<(String, String, Value)> = Vec::new();
     if explicit || file.exists() {
         let text = read(&file, 64 << 10)?;
-        // Named through the project (even by a link out of it) or stored in it, the project could choose the config.
-        if real(&c.root) != real(&c.home) && c.root != Path::new("/") && (file.starts_with(&c.root) || real(&file).starts_with(real(&c.root))) {
+        if inside(&file) {
             let fix = "fix: keep the config outside the project, in ~/.config/henki, and name it by a path outside the project";
-            return Err(format!("{} is inside the project {} or named through it; {fix}", file.display(), c.root.display()));
+            return Err(format!("{} is inside the project {} or named through it; {fix}", file.display(), root.display()));
         }
         let lines = parse(&text).map_err(|e| format!("{}:{e}", file.display()))?;
         layers.extend(lines.into_iter().map(|(n, k, v)| (format!("{}:{n}", file.display()), k, v)));
@@ -139,16 +150,22 @@ pub fn load(f: &Flags, env: &Env, cwd: &Path) -> Result<Config, String> {
     }
     let unknown = env.0.iter().filter_map(|(k, _)| k.to_str()).filter(|k| k.starts_with("HENKI_") && !KNOWN.contains(k));
     c.notices.extend(unknown.map(|k| format!("ignoring {k}: henki does not read it")));
+    c.state = env.get("XDG_STATE_HOME").map(Path::new).filter(|p| p.is_absolute()).map_or_else(|| home.join(".local/state"), Path::to_path_buf).join("henki");
     let listed = at("ext");
-    let paths = listed.map_or_else(|| vec![c.dir.join("ext")], |l| l.2.as_array().into_iter().flatten().filter_map(Value::as_str).map(|p| expand(p, &c.home)).collect());
+    let paths = listed.map_or_else(|| vec![c.dir.join("ext")], |l| l.2.as_array().into_iter().flatten().filter_map(Value::as_str).map(|p| expand(p, &home)).collect());
     let from = listed.map(|l| l.0.clone()).or_else(|| c.file.as_ref().map(|f| f.display().to_string()));
-    for p in paths {
-        ext(&p, listed.is_none() && !c.explicit).map_err(|e| from.as_ref().map_or_else(|| e.clone(), |at| format!("{at}: {e}")))?;
+    let at_ext = |e: String| from.as_ref().map_or_else(|| e.clone(), |at| format!("{at}: {e}"));
+    if let Some(p) = paths.iter().find(|p| !p.is_absolute()) {
+        return Err(at_ext(format!("ext path {} is relative; fix: use an absolute path or ~/", p.display())));
     }
-    let dirs: Vec<String> = std::env::split_paths(env.get("PATH").unwrap_or_default()).filter(|p| p.is_absolute()).filter_map(|p| p.into_os_string().into_string().ok()).collect();
-    c.user_path = dirs.join(":");
+    // The default ext path may be absent only for the default config file.
+    let found = ext::discover(&paths, listed.is_none() && !explicit, &c.shadow, env.get("PATH").unwrap_or_default()).map_err(at_ext)?;
+    (c.exts, c.user_path) = (found.exts, found.user_path);
+    c.notices.extend(found.notices);
+    // Looked up on the user PATH, so no extension's bin/ supplies the shell henki runs.
     let exe = |b: &PathBuf| fs::metadata(b).is_ok_and(|m| m.is_file() && m.mode() & 0o111 != 0);
-    c.bash = dirs.iter().map(|d| Path::new(d).join("bash")).find(exe).ok_or("bash is not on PATH; fix: install bash, or add its directory to PATH")?;
+    let dirs = std::env::split_paths(&c.user_path).filter(|d| d.is_absolute());
+    c.bash = dirs.map(|d| d.join("bash")).find(exe).ok_or("bash is not on PATH; fix: install bash, or add its directory to PATH")?;
     let agents = c.dir.join("AGENTS.md");
     if agents.exists() {
         let text = read(&agents, 4 << 10)?;
@@ -157,13 +174,24 @@ pub fn load(f: &Flags, env: &Env, cwd: &Path) -> Result<Config, String> {
         }
         (c.agents_hash, c.agents) = (Some(sys::fnv(text.as_bytes())), Some(text.trim_end_matches('\n').to_string()).filter(|a| !a.is_empty()));
     }
-    let xdg = env.get("XDG_STATE_HOME").map(Path::new).filter(|p| p.is_absolute());
-    c.state = xdg.map_or_else(|| c.home.join(".local/state"), Path::to_path_buf).join("henki");
+    let allow = c.dir.join("allow");
+    if !c.auto && allow.exists() && inside(&allow) {
+        return Err(format!("{} is inside the project {} or named through it; fix: use a config dir outside the project", allow.display(), root.display()));
+    }
+    c.allow = allow::load(&allow, !c.auto)?;
+    let n = c.allow.rules.iter().filter(|r| allow::applies(r, &root)).count() as u64;
+    if n > 0 {
+        c.notices.push(format!("allow: {} rules apply to this root ({}; /allow lists them)", term::num(n), allow::shown(&allow, &home)));
+    }
     if c.window == 0 {
         c.window = 32_768;
         c.notices.push("context_window is unknown; using 32,768 tokens".into());
     }
-    c.protected = c.file.iter().chain([&c.dir]).flat_map(|p| [Some(p.clone()), fs::canonicalize(p).ok().filter(|r| r != p)]).flatten().collect();
+    let own = c.file.iter().chain([&c.dir, &c.state]).chain(&paths).chain(c.exts.iter().flat_map(|e| &e.targets));
+    c.protected = own.flat_map(|p| [Some(p.clone()), fs::canonicalize(p).ok().filter(|r| r != p)]).flatten().collect();
+    // Absent files too: creating one is a change.
+    let exts = paths.into_iter().chain(c.exts.iter().flat_map(|e| e.paths.iter().cloned()));
+    c.trust = [file, allow, agents, c.bash.clone()].into_iter().chain(exts).collect();
     Ok(c)
 }
 
@@ -175,15 +203,15 @@ fn set(c: &mut Config, k: &str, v: &Value) -> Result<(), String> {
         "model" | "base_url" if s()?.is_empty() => return Err(format!("{k} is empty; fix: set {k}")),
         "model" => c.model = s()?.to_string(),
         "base_url" => c.url = parse_url(s()?).map_err(|e| format!("{e}; fix: use http://HOST:PORT/PATH"))?,
-        "dialect" if s()? == "anthropic" => return Err("dialect anthropic is not supported by this build; fix: use dialect = \"openai\" with an OpenAI-compatible server".into()),
-        "dialect" if s()? != "openai" => return Err(format!("unknown dialect {}; fix: use dialect = \"openai\"", s()?)),
-        "dialect" => {}
+        "dialect" if !["openai", "anthropic"].contains(&s()?) => return Err(format!("unknown dialect {}; fix: use dialect = \"openai\" or \"anthropic\"", s()?)),
+        "dialect" => c.dialect = if s()? == "openai" { "openai" } else { "anthropic" },
         "api_key" if !s()?.bytes().all(|b| b.is_ascii_graphic()) => return Err("api_key holds a space or a byte outside printable ASCII; fix: correct the key".into()),
         "api_key" => c.api_key = s()?.to_string(),
         "approve" if !["ask", "auto"].contains(&s()?) => return Err(format!("approve is \"ask\" or \"auto\", not {:?}; fix: use one of them", s()?)),
         "approve" => c.auto = s()? == "auto",
         "tools" => c.tools = tools(&list()?)?,
         "ext" => drop(list()?), // checked once the config dir and the flags are known
+        "shadow" => c.shadow = list()?.into_iter().map(String::from).collect(),
         "pass_env" => c.pass_env = pass_env(&list()?, c.explicit)?,
         _ => {
             let Some(&(_, lo, hi)) = INTS.iter().find(|i| i.0 == k) else { return Err(format!("unknown key {k}; fix: remove it (this build knows {KEYS})")) };
@@ -230,20 +258,6 @@ fn pass_env(l: &[&str], explicit: bool) -> Result<Vec<String>, String> {
         }
     }
     Ok(l.iter().map(|n| n.to_string()).collect())
-}
-
-/// An ext path must be an absolute, readable directory holding nothing but dot entries: this build has no extensions.
-fn ext(p: &Path, optional: bool) -> Result<(), String> {
-    let d = p.display();
-    if !p.is_absolute() {
-        return Err(format!("ext path {d} is relative; fix: use an absolute path or ~/"));
-    }
-    let names = match fs::read_dir(p) {
-        Err(e) if optional && e.kind() == ErrorKind::NotFound => return Ok(()),
-        r => r.map_err(|e| format!("ext {d}: {e}; fix: make it a readable directory, or set ext to readable ones"))?,
-    };
-    let found = names.filter_map(|e| Some(e.ok()?.file_name())).find(|n| !n.as_bytes().starts_with(b"."));
-    found.map_or(Ok(()), |n| Err(format!("ext {d}: {0}: extensions are not supported by this build; fix: move {0} out of {d}", n.to_string_lossy())))
 }
 
 /// A UTF-8 regular file of at most `max` bytes, opened without blocking on a FIFO, that no other user can write (the
@@ -366,44 +380,31 @@ pub fn expand(path: &str, home: &Path) -> PathBuf {
 #[cfg(test)]
 impl Config {
     /// A valid `Config` rooted in `dir` (home, cwd, root and config dir), model `m`, base URL `http://127.0.0.1:9/v1`,
-    /// `/bin/bash`, defaults elsewhere, no config file and nothing protected. Tests build from it and change fields, so a
-    /// new field never breaks them.
+    /// `/bin/bash`, the state dir `dir/state`, the allow file `dir/allow` (no rules), defaults elsewhere: no config
+    /// file, no extensions, nothing protected or watched. Tests build from it and change fields, so a new field never
+    /// breaks them.
     pub fn test(dir: &Path) -> Config {
         Config {
             model: "m".into(),
             url: Url { host: "127.0.0.1".into(), port: 9, path: "/v1".into() },
             url_from: "config",
-            api_key: String::new(),
-            auto: false,
+            dialect: "openai",
             approve_from: "default".into(),
-            tools: vec!["shell", "read", "write", "edit"],
-            pass_env: Vec::new(),
+            tools: TOOLS.to_vec(),
             max_steps: 50,
-            max_seconds: 0,
             tool_timeout_s: 120,
             output_cap: 16_384,
             window: 32_768,
             max_tokens: 4_096,
-            file: None,
             dir: dir.to_path_buf(),
-            explicit: false,
-            hash: None,
             home: dir.to_path_buf(),
             cwd: dir.to_path_buf(),
-            env: Env::default(),
             root: dir.to_path_buf(),
+            state: dir.join("state"),
             user_path: "/usr/local/bin:/usr/bin:/bin".into(),
             bash: PathBuf::from("/bin/bash"),
-            agents: None,
-            agents_hash: None,
-            protected: Vec::new(),
-            notices: Vec::new(),
-            dialect: "openai",
-            shadow: Vec::new(),
-            state: dir.join("state"),
-            exts: Vec::new(),
             allow: allow::Allow { file: dir.join("allow"), ..Default::default() },
-            trust: Vec::new(),
+            ..Config::default()
         }
     }
 }

@@ -42,6 +42,10 @@ impl T {
         let base = [("HOME", self.home.to_str().unwrap()), ("PATH", self.bin.to_str().unwrap())];
         Env(base.iter().chain(extra).map(|(k, v)| (k.into(), v.into())).collect())
     }
+    /// HOME and this PATH only.
+    fn env_path(&self, path: &str) -> Env {
+        Env(vec![("HOME".into(), self.home.clone().into()), ("PATH".into(), path.into())])
+    }
     /// The default config file holding `text`, loaded with no flags and the base environment plus `extra`.
     fn load_env(&self, text: &str, extra: &[(&str, &str)]) -> Result<Config, String> {
         put(&self.cfg(), text, 0o600);
@@ -70,7 +74,31 @@ impl Drop for T {
 }
 
 fn flags() -> Flags {
-    Flags { config: None, approve: None, model: None, max_steps: None, max_seconds: None }
+    Flags::default()
+}
+
+/// The extension `name` in the ext path `path`: a `doc.md` and an executable `bin/CMD` per command.
+fn add_ext(path: &Path, name: &str, cmds: &[&str]) {
+    let dir = path.join(name);
+    fs::create_dir_all(dir.join(if cmds.is_empty() { "" } else { "bin" })).unwrap();
+    put(
+        &dir.join("doc.md"),
+        &format!(
+            "# {name}: a test tool
+
+How to use it.
+"
+        ),
+        0o644,
+    );
+    for c in cmds {
+        put(
+            &dir.join("bin").join(c),
+            "#!/bin/sh
+",
+            0o755,
+        );
+    }
 }
 
 fn chmod(p: &Path, mode: u32) {
@@ -210,7 +238,7 @@ fn config_syntax() {
 #[test]
 fn config_unknown_key() {
     let t = T::new();
-    for k in ["foo = 1", "shadow = [\"halti/halti\"]", "project_agents = true", "api_key_cmd = \"x\"", "shell = \"zsh\""] {
+    for k in ["foo = 1", "project_agents = true", "api_key_cmd = \"x\"", "shell = \"zsh\""] {
         let e = t.err(&format!("{BASE}{k}\n"));
         has(&e, &format!("config.toml:3: unknown key {}; fix: remove it", k.split(' ').next().unwrap()));
     }
@@ -452,7 +480,7 @@ fn config_env_only_start() {
     assert_eq!((c.model.as_str(), c.url.port, c.url_from), ("qwen", 8080, "HENKI_BASE_URL"));
     assert_eq!((c.file, c.hash, c.explicit, c.auto), (None, None, false, false));
     assert_eq!(c.dir, t.cfg_dir());
-    assert_eq!(c.protected, [t.cfg_dir()]);
+    assert_eq!(c.protected, [t.cfg_dir(), t.home.join(".local/state/henki"), t.cfg_dir().join("ext")]);
 }
 
 #[test]
@@ -616,25 +644,283 @@ fn config_ext_default_missing_explicit() {
 }
 
 #[test]
-fn config_ext_present_fails_closed() {
+fn config_ext_discovered() {
     let t = T::new();
     let ext = t.cfg_dir().join("ext");
     fs::create_dir_all(ext.join(".git")).unwrap();
     put(&ext.join(".keep"), "", 0o600);
-    assert!(t.load(BASE).is_ok(), "dot entries are ignored");
-    fs::create_dir_all(ext.join("halti")).unwrap();
+    assert!(t.load(BASE).unwrap().exts.is_empty(), "dot entries are ignored");
+    add_ext(&ext, "itse", &[]);
+    add_ext(&ext, "halti", &["halti"]);
+    for text in ["", "ext = [\"~/.config/henki/ext\"]\n"] {
+        let c = t.load(&format!("{BASE}context_window = 8192\n{text}")).unwrap();
+        let found: Vec<_> = c.exts.iter().map(|e| (e.name.as_str(), e.bin.clone())).collect();
+        assert_eq!(found, [("halti", Some(ext.join("halti/bin"))), ("itse", None)]);
+        assert!(c.notices.is_empty(), "{:?}", c.notices);
+    }
+    // What discovery refuses names the config line that chose the path, or the file for the default path.
+    put(&ext.join("notes.txt"), "", 0o600);
     let e = t.err(BASE);
-    assert!(e.starts_with(&format!("{}: ext {}: halti: extensions are not supported by this build; fix: ", t.cfg().display(), ext.display())), "{e}");
-    let e = t.err(&format!("{BASE}ext = [\"~/.config/henki/ext\"]\n"));
-    has(&e, &format!("config.toml:3: ext {}: halti: extensions are not supported by this build", ext.display()));
+    assert!(e.starts_with(&format!("{}: ext ", t.cfg().display())) && e.contains("; fix: "), "{e}");
+    let e = t.err(&format!("{BASE}context_window = 8192\next = [\"~/.config/henki/ext\"]\n"));
+    assert!(e.starts_with(&format!("{}:4: ext ", t.cfg().display())), "{e}");
 }
 
 #[test]
-fn config_dialect_anthropic_refused() {
+fn config_ext_relative_refused() {
     let t = T::new();
-    has(&t.err(&format!("{BASE}dialect = \"anthropic\"\n")), "config.toml:3: dialect anthropic is not supported by this build; fix: ");
-    has(&t.err(&format!("{BASE}dialect = \"gemini\"\n")), "config.toml:3: unknown dialect gemini");
-    assert!(t.load(&format!("{BASE}dialect = \"openai\"\n")).is_ok());
+    fs::create_dir_all(t.home.join("exts")).unwrap();
+    // Before any path is read: the relative one is named even after a missing absolute one.
+    for rel in ["rel/ext", "./ext", "~", "~user/ext", ""] {
+        for list in [format!("\"~/exts\", \"{rel}\""), format!("\"/nonexistent\", \"{rel}\"")] {
+            let e = t.err(&format!("{BASE}ext = [{list}]\n"));
+            assert_eq!(e, format!("{}:3: ext path {rel} is relative; fix: use an absolute path or ~/", t.cfg().display()));
+        }
+    }
+}
+
+#[test]
+fn config_user_path_drops_ext_bins() {
+    let t = T::new();
+    let ext = t.cfg_dir().join("ext");
+    add_ext(&ext, "tool", &["tool-x"]);
+    put(&t.cfg(), BASE, 0o600);
+    let path = format!("{}:/nonexistent:rel:{}::.", ext.join("tool/bin").display(), t.bin.display());
+    let c = load(&flags(), &t.env_path(&path), &t.cwd).unwrap();
+    assert_eq!(c.user_path, format!("/nonexistent:{}", t.bin.display()));
+    assert_eq!(c.exts[0].cmds, ["tool-x"]);
+}
+
+#[test]
+fn config_bash_not_from_ext() {
+    let t = T::new();
+    let ext = t.cfg_dir().join("ext");
+    add_ext(&ext, "sh", &["bash"]);
+    put(&t.cfg(), &format!("{BASE}shadow = [\"sh/bash\"]\n"), 0o600);
+    // The extension's bin/ comes first on the inherited PATH; henki's shell is still the user's.
+    let env = t.env_path(&format!("{}:{}", ext.join("sh/bin").display(), t.bin.display()));
+    let c = load(&flags(), &env, &t.cwd).unwrap();
+    assert_eq!(c.bash, t.bin.join("bash"));
+    assert_eq!(c.exts[0].shadows, [t.bin.join("bash")]);
+    // With bash only in the extension there is none.
+    fs::remove_file(t.bin.join("bash")).unwrap();
+    assert_eq!(load(&flags(), &env, &t.cwd).err().unwrap(), "bash is not on PATH; fix: install bash, or add its directory to PATH");
+}
+
+#[test]
+fn config_shadow_list() {
+    let t = T::new();
+    add_ext(&t.cfg_dir().join("ext"), "halti", &["tool"]);
+    put(&t.bin.join("tool"), "#!/bin/sh\n", 0o755);
+    let e = t.err(BASE);
+    has(&e, "bin/tool shadows ");
+    has(&e, "shadow = [\"halti/tool\"]");
+    // The entries go to discovery as written; one naming no command of an extension is ignored.
+    let c = t.load(&format!("{BASE}shadow = [\"halti/tool\", \"other/x\",]\n")).unwrap();
+    assert_eq!(c.shadow, ["halti/tool", "other/x"]);
+    assert_eq!(c.exts[0].shadows, [t.bin.join("tool")]);
+    assert!(t.load(&format!("{BASE}shadow = [\"other/x\"]\n")).is_err());
+}
+
+#[test]
+fn config_shadow_not_list() {
+    let t = T::new();
+    has(&t.err(&format!("{BASE}shadow = \"halti/halti\"\n")), ":3: shadow must be a list; fix: write shadow = [\"...\"]");
+    has(&t.err(&format!("{BASE}shadow = true\n")), ":3: shadow must be a list");
+    assert!(t.load(&format!("{BASE}shadow = []\n")).unwrap().shadow.is_empty());
+}
+
+#[test]
+fn config_dialect_anthropic_accepted() {
+    let t = T::new();
+    assert_eq!(t.load(BASE).unwrap().dialect, "openai");
+    assert_eq!(t.load(&format!("{BASE}dialect = \"openai\"\n")).unwrap().dialect, "openai");
+    assert_eq!(t.load(&format!("{BASE}dialect = \"anthropic\"\n")).unwrap().dialect, "anthropic");
+}
+
+#[test]
+fn config_dialect_unknown() {
+    let t = T::new();
+    for d in ["gemini", "", "Anthropic", "openai "] {
+        let e = t.err(&format!("{BASE}dialect = \"{d}\"\n"));
+        assert_eq!(e, format!("{}:3: unknown dialect {d}; fix: use dialect = \"openai\" or \"anthropic\"", t.cfg().display()));
+    }
+}
+
+#[test]
+fn config_project_agents_still_unknown() {
+    let t = T::new();
+    let e = t.err(&format!("{BASE}project_agents = true\n"));
+    assert_eq!(e, format!("{}:3: unknown key project_agents; fix: remove it (this build knows {KEYS})", t.cfg().display()));
+    assert!(KEYS.contains("ext, shadow, pass_env") && !KEYS.contains("project_agents"));
+}
+
+#[test]
+fn config_state_path_xdg() {
+    let t = T::new();
+    assert_eq!(t.load(BASE).unwrap().state, t.home.join(".local/state/henki"));
+    let xdg = t.dir.join("xdg-state");
+    assert_eq!(t.load_env(BASE, &[("XDG_STATE_HOME", xdg.to_str().unwrap())]).unwrap().state, xdg.join("henki"));
+    assert!(!xdg.exists() && !t.home.join(".local").exists(), "load creates nothing");
+}
+
+#[test]
+fn config_state_path_relative_xdg_ignored() {
+    let t = T::new();
+    for rel in ["state", "./state", "~/state", ""] {
+        assert_eq!(t.load_env(BASE, &[("XDG_STATE_HOME", rel)]).unwrap().state, t.home.join(".local/state/henki"), "{rel:?}");
+    }
+}
+
+#[test]
+fn config_state_protected() {
+    let t = T::new();
+    let xdg = t.dir.join("xdg");
+    assert!(t.load_env(BASE, &[("XDG_STATE_HOME", xdg.to_str().unwrap())]).unwrap().protected.contains(&xdg.join("henki")), "absent, by its path");
+    // Behind a link, by both names.
+    let real = t.dir.join("real-state");
+    fs::create_dir_all(real.join("henki")).unwrap();
+    fs::create_dir_all(t.home.join(".local")).unwrap();
+    symlink(&real, t.home.join(".local/state")).unwrap();
+    let c = t.load(BASE).unwrap();
+    for p in [t.home.join(".local/state/henki"), real.join("henki")] {
+        assert!(c.protected.contains(&p), "{p:?} not in {:?}", c.protected);
+    }
+}
+
+#[test]
+fn config_ext_paths_protected() {
+    let t = T::new();
+    assert!(t.load(BASE).unwrap().protected.contains(&t.cfg_dir().join("ext")), "the default path, absent");
+    let (plain, real, link) = (t.home.join("exts"), t.dir.join("real-exts"), t.home.join("linked-exts"));
+    fs::create_dir_all(&plain).unwrap();
+    fs::create_dir_all(&real).unwrap();
+    symlink(&real, &link).unwrap();
+    let c = t.load(&format!("{BASE}ext = [\"~/exts\", \"~/linked-exts\"]\n")).unwrap();
+    assert_eq!(c.protected[c.protected.len() - 3..], [plain, link, real]);
+    assert!(!c.protected.contains(&t.cfg_dir().join("ext")), "only the paths in use");
+}
+
+#[test]
+fn config_ext_symlink_target_protected() {
+    let t = T::new();
+    let ext = t.cfg_dir().join("ext");
+    fs::create_dir_all(&ext).unwrap();
+    // The extension dir is a link to a checkout, and one of its commands a link to a file elsewhere.
+    let src = t.dir.join("src");
+    add_ext(&src, "halti-checkout", &["halti"]);
+    put(&t.dir.join("tool-real"), "#!/bin/sh\n", 0o755);
+    symlink(t.dir.join("tool-real"), src.join("halti-checkout/bin/tool")).unwrap();
+    symlink(src.join("halti-checkout"), ext.join("halti")).unwrap();
+    let c = t.load(BASE).unwrap();
+    assert_eq!(c.exts[0].name, "halti");
+    for p in [src.join("halti-checkout"), t.dir.join("tool-real")] {
+        assert!(c.exts[0].targets.contains(&p) && c.protected.contains(&p), "{p:?} not in {:?}", c.protected);
+    }
+}
+
+#[test]
+fn config_allow_loaded_in_ask() {
+    let t = T::new();
+    let allow = t.cfg_dir().join("allow");
+    let c = t.load(BASE).unwrap();
+    assert_eq!((c.allow.file, c.allow.rules.len(), c.allow.hash), (allow.clone(), 0, None), "absent: no rules");
+    put(&allow, &format!("# mine\n{}\tgit status\n*\tls -la\n", t.cwd.display()), 0o600);
+    let c = t.load(BASE).unwrap();
+    let rules: Vec<_> = c.allow.rules.iter().map(|r| (r.root.as_str(), r.cmd.as_str())).collect();
+    assert_eq!(rules, [(t.cwd.to_str().unwrap(), "git status"), ("*", "ls -la")]);
+    let direct = allow::load(&allow, true).unwrap();
+    assert_eq!((c.allow.file, c.allow.rules, c.allow.hash), (direct.file, direct.rules, direct.hash));
+}
+
+#[test]
+fn config_allow_not_read_in_auto() {
+    let t = T::new();
+    let allow = t.cfg_dir().join("allow");
+    put(&allow, "not a rule\n", 0o666);
+    let text = format!("{BASE}context_window = 8192\n");
+    let auto = [t.load(&format!("{text}approve = \"auto\"\n")).unwrap(), load(&Flags { approve: Some(true), ..flags() }, &t.env(&[]), &t.cwd).unwrap()];
+    for c in auto {
+        assert_eq!((c.allow.file, c.allow.rules.len(), c.allow.hash), (allow.clone(), 0, None));
+        assert!(c.notices.is_empty(), "{:?}", c.notices);
+    }
+    assert!(t.load(&text).is_err(), "ask mode reads it");
+}
+
+#[test]
+fn config_allow_fail_closed() {
+    let t = T::new();
+    let allow = t.cfg_dir().join("allow");
+    put(&t.dir.join("elsewhere"), "*\tls\n", 0o600);
+    for what in ["a line without a tab", "world-writable", "a link"] {
+        let _ = fs::remove_file(&allow);
+        match what {
+            "a line without a tab" => put(&allow, "git status\n", 0o600),
+            "world-writable" => put(&allow, "*\tls\n", 0o666),
+            _ => symlink(t.dir.join("elsewhere"), &allow).unwrap(),
+        }
+        let want = allow::load(&allow, true).err().unwrap_or_else(|| panic!("allow::load takes {what}"));
+        assert_eq!(t.err(BASE), want, "{what}");
+    }
+}
+
+#[test]
+fn config_allow_inside_project() {
+    let t = T::new();
+    let allow = t.cfg_dir().join("allow");
+    // A link from the config dir into the project.
+    put(&t.cwd.join("rules"), "*\tls\n", 0o600);
+    symlink(t.cwd.join("rules"), &allow).unwrap();
+    assert_eq!(t.err(BASE), format!("{} is inside the project {} or named through it; fix: use a config dir outside the project", allow.display(), t.cwd.display()));
+    // No config file, and the default config dir in a repository at ~/.config.
+    fs::remove_file(&allow).unwrap();
+    fs::remove_file(t.cfg()).unwrap();
+    let root = t.home.join(".config");
+    fs::create_dir_all(root.join(".git")).unwrap();
+    fs::create_dir_all(root.join("sub")).unwrap();
+    let env = t.env(&[("HENKI_MODEL", "m"), ("HENKI_BASE_URL", "http://127.0.0.1:1/v1")]);
+    assert!(load(&flags(), &env, &root.join("sub")).is_ok(), "absent, it holds no rules");
+    put(&allow, "*\tls\n", 0o600);
+    let e = load(&flags(), &env, &root.join("sub")).err().unwrap();
+    assert_eq!(e, format!("{} is inside the project {} or named through it; fix: use a config dir outside the project", allow.display(), root.display()));
+    assert!(load(&Flags { approve: Some(true), ..flags() }, &env, &root.join("sub")).is_ok(), "auto never reads it");
+}
+
+#[test]
+fn config_allow_notice() {
+    let t = T::new();
+    let allow = t.cfg_dir().join("allow");
+    let (here, other) = (t.cwd.display(), t.dir.join("other"));
+    let text = format!("{BASE}context_window = 8192\n");
+    put(&allow, &format!("{here}\tgit status\n{}\tmake\n*\tls\n# {here}\tx\n{here}\tcargo test\n", other.display()), 0o600);
+    assert_eq!(t.load(&text).unwrap().notices, ["allow: 3 rules apply to this root (~/.config/henki/allow; /allow lists them)"]);
+    // Rules for other roots only, or auto mode: no notice.
+    put(&allow, &format!("{}\tmake\n", other.display()), 0o600);
+    assert!(t.load(&text).unwrap().notices.is_empty());
+    put(&allow, "*\tls\n", 0o600);
+    assert_eq!(t.load(&text).unwrap().notices, ["allow: 1 rules apply to this root (~/.config/henki/allow; /allow lists them)"]);
+    assert!(t.load(&format!("{text}approve = \"auto\"\n")).unwrap().notices.is_empty());
+}
+
+#[test]
+fn config_trust_paths() {
+    let t = T::new();
+    let (d, ext) = (t.cfg_dir(), t.cfg_dir().join("ext"));
+    add_ext(&ext, "halti", &["halti"]);
+    let c = t.load(BASE).unwrap();
+    assert!(c.exts[0].paths.contains(&ext.join("halti/doc.md")) && c.exts[0].paths.contains(&ext.join("halti/bin/halti")));
+    let want: Vec<_> = [t.cfg(), d.join("allow"), d.join("AGENTS.md"), t.bin.join("bash"), ext.clone()].into_iter().chain(c.exts[0].paths.clone()).collect();
+    assert_eq!(c.trust, want);
+    assert!(!d.join("allow").exists() && !d.join("AGENTS.md").exists(), "absent files are watched too");
+    // Without a config file its default path is watched; with --config, the file named and the ext paths listed.
+    fs::remove_dir_all(&ext).unwrap();
+    fs::remove_file(t.cfg()).unwrap();
+    let c = load(&flags(), &t.env(&[("HENKI_MODEL", "m"), ("HENKI_BASE_URL", "http://127.0.0.1:1/v1")]), &t.cwd).unwrap();
+    assert_eq!(c.trust, [t.cfg(), d.join("allow"), d.join("AGENTS.md"), t.bin.join("bash"), ext.clone()]);
+    fs::create_dir_all(t.home.join("exts")).unwrap();
+    let c = t.explicit(&format!("{BASE}ext = [\"~/exts\"]\n")).unwrap();
+    let cfg = t.dir.join("cfg");
+    assert_eq!(c.trust, [cfg.join("config.toml"), cfg.join("allow"), cfg.join("AGENTS.md"), t.bin.join("bash"), t.home.join("exts")]);
 }
 
 #[test]
@@ -645,16 +931,21 @@ fn profiles_parse() {
     assert!(!parse(boxed).unwrap().is_empty());
     let t = T::new();
     let c = t.load(mac).unwrap();
-    assert_eq!((c.max_steps, c.auto, c.window, c.url.port), (12, false, 32_768, 8080));
-    assert!(c.notices.is_empty());
-    // The box file, with its mount moved under the test dir: the dialect line is the only error.
+    assert_eq!((c.dialect, c.max_steps, c.auto, c.window, c.url.port), ("openai", 12, false, 32_768, 8080));
+    assert!(c.notices.is_empty() && c.exts.is_empty());
+    // With the halti extension installed, its commands shadow the real ones that line names.
+    for cmd in ["halti", "pbpaste", "security"] {
+        put(&t.bin.join(cmd), "#!/bin/sh\n", 0o755);
+    }
+    add_ext(&t.cfg_dir().join("ext"), "halti", &["halti", "pbpaste", "security"]);
+    assert!(t.load(&mac.replace("shadow", "# shadow")).is_err());
+    assert_eq!(t.load(mac).unwrap().exts[0].shadows.len(), 3);
+    // The box file, with its mount moved under the test dir and a doc-only extension in it.
     let mnt = t.dir.join("cfg");
-    let text = boxed.replace("/mnt/henki", mnt.to_str().unwrap());
-    let dialect = text.lines().position(|l| l.starts_with("dialect")).unwrap() + 1;
-    has(&t.explicit(&text).err().unwrap(), &format!("config.toml:{dialect}: dialect anthropic is not supported by this build"));
-    let without: String = text.lines().filter(|l| !l.starts_with("dialect")).map(|l| format!("{l}\n")).collect();
-    let c = t.explicit(&without).unwrap();
-    assert_eq!((c.max_steps, c.auto, c.url.host.as_str(), c.pass_env.len(), c.output_cap), (100, true, "127.0.0.2", 8, 32_768));
+    add_ext(&mnt.join("ext"), "itse", &[]);
+    let c = t.explicit(&boxed.replace("/mnt/henki", mnt.to_str().unwrap())).unwrap();
+    assert_eq!((c.dialect, c.max_steps, c.auto, c.url.host.as_str(), c.pass_env.len(), c.output_cap), ("anthropic", 100, true, "127.0.0.2", 8, 32_768));
+    assert_eq!((c.exts.len(), c.exts[0].name.as_str(), c.exts[0].bin.is_none()), (1, "itse", true));
 }
 
 #[test]
@@ -735,7 +1026,7 @@ fn config_protected_realpaths() {
     symlink(&real, t.cfg_dir()).unwrap();
     let c = t.load(BASE).unwrap();
     let real = fs::canonicalize(&real).unwrap();
-    assert_eq!(c.protected, [t.cfg(), real.join("config.toml"), t.cfg_dir(), real]);
+    assert_eq!(c.protected, [t.cfg(), real.join("config.toml"), t.cfg_dir(), real, t.home.join(".local/state/henki"), t.cfg_dir().join("ext")]);
     assert_eq!((c.file, c.dir), (Some(t.cfg()), t.cfg_dir()));
 }
 
@@ -906,7 +1197,7 @@ fn config_ext_unreadable() {
     let listed = t.err(&format!("{BASE}ext = [\"~/exts\"]\n"));
     chmod(&exts, 0o700);
     assert!(listed.starts_with(&format!("{}:3: ext {}: ", t.cfg().display(), exts.display())), "{listed}");
-    has(&listed, "; fix: make it a readable directory");
+    has(&listed, "; fix: ");
     // The default ext path may be absent, but an unreadable one fails closed too.
     let ext = t.cfg_dir().join("ext");
     fs::create_dir_all(&ext).unwrap();
