@@ -2,7 +2,6 @@
 use super::call::Stuck;
 use super::request::ctx_use;
 use super::*;
-use crate::config::Env;
 use std::io::{Read, Write};
 use std::net::TcpListener;
 use std::path::PathBuf;
@@ -34,12 +33,12 @@ impl Write for Buf {
 fn session(d: &Path, port: u16) -> (Session, Buf) {
     let mut cfg = Config::test(d);
     cfg.url.port = port;
-    let state = journal::state_dir(&Env::default(), d).unwrap();
-    let j = Journal::create(&state, d).unwrap();
+    journal::state_dir(&cfg.state).unwrap();
+    let j = Journal::create(&cfg.state, d).unwrap();
     let (tx, rx) = mpsc::channel();
     let buf = Buf::default();
-    let out = Out::with(true, tx.clone(), Box::new(buf.clone()), Box::new(std::io::sink()));
-    (Session::new(cfg, j, Vec::new(), out, tx, rx, None), buf)
+    let out = Out::with(term::Mode::Json, tx.clone(), Box::new(buf.clone()), Box::new(std::io::sink()), false);
+    (Session::new(cfg, j, Vec::new(), out, tx, rx, None, None), buf)
 }
 
 /// A model server on loopback: request N gets `replies[N]` (a whole HTTP response), then the connection closes.
@@ -180,7 +179,7 @@ fn reasoning_tail_500() {
 fn record_hist_kinds() {
     let d = dir("hist");
     let (mut s, buf) = session(&d, 9);
-    s.record(rec::approval("h1", "auto")).unwrap();
+    s.record(rec::approval("h1", "auto", None)).unwrap();
     s.notice("a notice").unwrap();
     s.record(rec::tool_result("h1", "shell", "ok", false, 1, 2)).unwrap();
     assert_eq!(kinds(&s.hist), ["tool_result"]);
@@ -285,7 +284,7 @@ fn wait_deadline_before_queued_events() {
 
 /// The session file under the test's state dir.
 fn journal_file(d: &Path) -> PathBuf {
-    let sessions = d.join(".local/state/henki/sessions");
+    let sessions = d.join("state/sessions");
     let scope = std::fs::read_dir(sessions).unwrap().next().unwrap().unwrap().path();
     std::fs::read_dir(scope).unwrap().map(|e| e.unwrap().path()).find(|p| p.extension().is_some_and(|x| x == "jsonl")).unwrap()
 }
@@ -345,7 +344,7 @@ fn end_journal_failure_plain_no_answer() {
     let (mut s, _) = session(&d, 9);
     let (tx, rx) = mpsc::channel();
     let (out, err) = (Buf::default(), Buf::default());
-    s.out = Out::with(false, tx, Box::new(out.clone()), Box::new(err.clone()));
+    s.out = Out::with(term::Mode::Plain, tx, Box::new(out.clone()), Box::new(err.clone()), false);
     drop(rx);
     s.text = "an answer".into();
     let id = s.j.id().to_string();
@@ -412,7 +411,7 @@ fn usage_overflow_no_panic() {
 /// An assistant record with calls of these ids.
 fn assistant_with(ids: &[&str]) -> Value {
     let calls: Vec<Call> = ids.iter().map(|id| Call { id: (*id).into(), name: "shell".into(), args: serde_json::json!({"command": "ls"}), ..Call::default() }).collect();
-    rec::assistant("", &calls, "tool_calls", Usage::default())
+    rec::assistant("", &calls, "tool_calls", Usage::default(), None)
 }
 
 fn shell_call(id: &str) -> Call {

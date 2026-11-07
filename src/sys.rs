@@ -3,7 +3,7 @@
 use crate::types::Ev;
 use std::os::unix::fs::{DirBuilderExt, FileTypeExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::os::{fd::AsRawFd, fd::FromRawFd, unix::ffi::OsStrExt, unix::process::CommandExt};
-use std::{ffi::CStr, ffi::CString, ffi::OsStr, fs, fs::File, io, io::Read, path::Path, sync::mpsc::Sender, time::SystemTime, time::UNIX_EPOCH};
+use std::{ffi::CStr, ffi::CString, ffi::OsStr, fs, fs::File, io, io::Read, path::Path, sync::OnceLock, sync::mpsc::Sender, time::SystemTime, time::UNIX_EPOCH};
 
 /// The signals that end a run; blocked in every thread and taken by `sigwait`.
 const SIGNALS: [i32; 4] = [libc::SIGINT, libc::SIGQUIT, libc::SIGTERM, libc::SIGHUP];
@@ -72,18 +72,12 @@ pub fn harden() -> io::Result<()> {
 /// Linux PR_SET_PDEATHSIG(SIGKILL) and `_exit(1)` if `getppid()` is no longer `henki`. Async-signal-safe calls only;
 /// the hook allocates nothing.
 pub fn child_setup(cmd: &mut std::process::Command, henki: u32) {
-    let empty = sigset(&[]);
     #[cfg(not(target_os = "linux"))]
     let _ = henki;
     let hook = move || -> io::Result<()> {
         // SAFETY: setsid takes no arguments and is async-signal-safe.
         check(unsafe { libc::setsid() })?;
-        for s in SIGNALS {
-            // SAFETY: signal takes integers only and is async-signal-safe; SIG_DFL needs no handler.
-            unsafe { libc::signal(s, libc::SIG_DFL) };
-        }
-        // SAFETY: `empty` is an initialized sigset_t copied into the hook; a null pointer for the old mask is allowed.
-        check(unsafe { libc::sigprocmask(libc::SIG_SETMASK, &empty, std::ptr::null_mut()) })?;
+        defaults()?;
         #[cfg(target_os = "linux")]
         {
             // SAFETY: integer arguments only, passed as the unsigned longs prctl reads.
@@ -100,6 +94,72 @@ pub fn child_setup(cmd: &mut std::process::Command, henki: u32) {
     };
     // SAFETY: the hook allocates nothing and calls only async-signal-safe functions, as `pre_exec` requires.
     unsafe { cmd.pre_exec(hook) };
+}
+
+/// The `!cmd` child's pre_exec: INT, QUIT, TERM, HUP back to SIG_DFL, an empty signal mask; no new session and no
+/// parent-death signal (the command runs in henki's foreground process group, on the terminal). Async-signal-safe.
+pub fn bang_setup(cmd: &mut std::process::Command) {
+    // SAFETY: the hook allocates nothing and calls only async-signal-safe functions, as `pre_exec` requires.
+    unsafe { cmd.pre_exec(defaults) };
+}
+
+/// A child's signal state before exec: the four signals back to their default action (henki may have started with one
+/// ignored), then an empty mask. Async-signal-safe calls only (`sigset` too), no allocation.
+fn defaults() -> io::Result<()> {
+    for s in SIGNALS {
+        // SAFETY: signal takes integers only and is async-signal-safe; SIG_DFL needs no handler.
+        unsafe { libc::signal(s, libc::SIG_DFL) };
+    }
+    // SAFETY: the empty set is an initialized sigset_t; a null pointer for the old mask is allowed.
+    check(unsafe { libc::sigprocmask(libc::SIG_SETMASK, &sigset(&[]), std::ptr::null_mut()) })
+}
+
+/// isatty(3).
+pub fn isatty(fd: i32) -> bool {
+    // SAFETY: isatty takes an integer only.
+    unsafe { libc::isatty(fd) == 1 }
+}
+
+/// (rows, cols) of the terminal on `fd` (TIOCGWINSZ); None when it is not a terminal or reports 0 columns.
+pub fn winsize(fd: i32) -> Option<(u16, u16)> {
+    let mut w = libc::winsize { ws_row: 0, ws_col: 0, ws_xpixel: 0, ws_ypixel: 0 };
+    // SAFETY: the pointer is to a live winsize, the type TIOCGWINSZ writes.
+    (unsafe { libc::ioctl(fd, libc::TIOCGWINSZ, &mut w) } == 0 && w.ws_col > 0).then_some((w.ws_row, w.ws_col))
+}
+
+/// fd 0's terminal modes from the first `tty_save` that found a terminal.
+static TTY: OnceLock<libc::termios> = OnceLock::new();
+
+/// tcgetattr(0): keeps fd 0's terminal modes for `flush_input`; false when fd 0 is not a terminal. The REPL calls it
+/// once at start; it is also the REPL's "stdin is a terminal" check.
+pub fn tty_save() -> bool {
+    modes(0).map(|t| TTY.get_or_init(|| t)).is_some()
+}
+
+/// tcgetattr(fd); None when `fd` is not a terminal.
+fn modes(fd: i32) -> Option<libc::termios> {
+    // SAFETY: an all-zero termios is a valid value to overwrite.
+    let mut t: libc::termios = unsafe { std::mem::zeroed() };
+    // SAFETY: the pointer is to a live termios, which tcgetattr fills.
+    (unsafe { libc::tcgetattr(fd, &mut t) } == 0).then_some(t)
+}
+
+/// tcsetattr(0, TCSAFLUSH, the saved modes): restores the modes `tty_save` kept and drops what was typed ahead, so a
+/// command that left the terminal raw or without echo cannot leave the line reader with it; nothing when none were
+/// saved (`run`, or fd 0 not a terminal).
+pub fn flush_input() {
+    // SAFETY: `t` is a termios tcgetattr filled, and tcsetattr only reads it.
+    let _ = TTY.get().map(|t| unsafe { libc::tcsetattr(0, libc::TCSAFLUSH, t) });
+}
+
+/// (dev, ino, size, mtime_ns, ctime_ns) of one path; None when it does not exist.
+pub type Stamp = Option<[i64; 5]>;
+
+/// lstat, then stat (following symlinks): retargeting a link and changing what it points at both show.
+pub fn stamp(path: &Path) -> (Stamp, Stamp) {
+    let ns = |s: i64, n: i64| s.wrapping_mul(1_000_000_000).wrapping_add(n);
+    let of = |m: fs::Metadata| [m.dev() as i64, m.ino() as i64, m.size() as i64, ns(m.mtime(), m.mtime_nsec()), ns(m.ctime(), m.ctime_nsec())];
+    (fs::symlink_metadata(path).ok().map(of), fs::metadata(path).ok().map(of))
 }
 
 /// kill(2); a negative pid is a process group; sig 0 probes. False only on ESRCH. Never pid 0 or -1 (henki's own group,

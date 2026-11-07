@@ -315,3 +315,95 @@ fn kill_esrch_false() {
     assert!(!kill(0, 0) && !kill(-1, 0), "never the own group or every process");
     assert!(!reap(pid) && !reap(0) && !reap(-1));
 }
+
+#[test]
+fn isatty_dev_null_false() {
+    let f = File::open("/dev/null").unwrap();
+    assert!(!isatty(f.as_raw_fd()));
+    assert!(!isatty(-1));
+}
+
+#[test]
+fn winsize_not_a_tty() {
+    let f = File::open("/dev/null").unwrap();
+    assert_eq!(winsize(f.as_raw_fd()), None);
+    let (r, _w) = io::pipe().unwrap();
+    assert_eq!(winsize(r.as_raw_fd()), None);
+}
+
+#[test]
+fn tty_save_not_a_tty() {
+    let f = File::open("/dev/null").unwrap();
+    assert!(modes(f.as_raw_fd()).is_none());
+    let (r, _w) = io::pipe().unwrap();
+    assert!(modes(r.as_raw_fd()).is_none());
+    // Saving the modes of a real terminal would change this whole test process, so fd 0 is tried only when it is not one.
+    if !isatty(0) {
+        assert!(!tty_save());
+        assert!(TTY.get().is_none());
+    }
+}
+
+#[test]
+fn flush_input_not_a_tty() {
+    // No unit test saves terminal modes, so there is nothing to restore and nothing is flushed.
+    assert!(TTY.get().is_none());
+    flush_input();
+    assert!(TTY.get().is_none());
+}
+
+#[test]
+fn stamp_missing() {
+    let t = Tmp::new();
+    assert_eq!(stamp(&t.join("none")), (None, None));
+    symlink(t.join("none"), t.join("dangling")).unwrap();
+    let (l, s) = stamp(&t.join("dangling"));
+    assert!(l.is_some() && s.is_none(), "a dangling link has its own stamp only");
+}
+
+#[test]
+fn stamp_changes_on_write() {
+    let t = Tmp::new();
+    let f = t.join("allow");
+    fs::write(&f, "a\n").unwrap();
+    let before = stamp(&f);
+    assert!(before.0.is_some() && before.0 == before.1);
+    fs::OpenOptions::new().append(true).open(&f).unwrap().write_all(b"b\n").unwrap();
+    let after = stamp(&f);
+    assert_ne!(after, before);
+    assert_eq!(after.1.unwrap()[2], 4, "the size is part of the stamp");
+    // Rewritten to the same size: the change time still differs or the inode does.
+    let same = stamp(&f);
+    fs::write(t.join("new"), "c\nd\n").unwrap();
+    fs::rename(t.join("new"), &f).unwrap();
+    assert_ne!(stamp(&f), same);
+}
+
+#[test]
+fn stamp_changes_on_symlink_retarget() {
+    let t = Tmp::new();
+    fs::write(t.join("a"), "same").unwrap();
+    fs::write(t.join("bb"), "same").unwrap();
+    symlink(t.join("a"), t.join("link")).unwrap();
+    let before = stamp(&t.join("link"));
+    assert_ne!(before.0, before.1, "the link and its target have their own stamps");
+    fs::remove_file(t.join("link")).unwrap();
+    symlink(t.join("bb"), t.join("link")).unwrap();
+    let after = stamp(&t.join("link"));
+    assert_ne!(after.0, before.0, "the link itself changed");
+    assert_ne!(after.1, before.1, "it leads to another file");
+}
+
+#[test]
+fn stamp_same_when_untouched() {
+    let t = Tmp::new();
+    fs::write(t.join("f"), "x").unwrap();
+    symlink(t.join("f"), t.join("link")).unwrap();
+    for p in [t.join("f"), t.join("link"), t.join("missing")] {
+        assert_eq!(stamp(&p), stamp(&p), "{}", p.display());
+    }
+    // Reading a file is not a change.
+    let before = stamp(&t.join("f"));
+    let _ = fs::read(t.join("f")).unwrap();
+    assert_eq!(stamp(&t.join("f")), before);
+}

@@ -1,5 +1,6 @@
 #![allow(clippy::disallowed_methods, clippy::print_stdout, clippy::print_stderr, clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::string_slice)]
 use super::*;
+use crate::types::TOOLS;
 use std::os::unix::fs::symlink;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -23,8 +24,8 @@ impl Tmp {
         fs::write(&p, text).unwrap();
         p
     }
-    fn ctx<'a>(&'a self, protected: &'a [PathBuf]) -> Ctx<'a> {
-        Ctx { cwd: &self.0, root: &self.0, home: &self.0, protected }
+    fn ctx(&self, protected: &[PathBuf]) -> Config {
+        Config { protected: protected.to_vec(), ..Config::test(&self.0) }
     }
     fn write(&self, path: &str) -> Result<Target, String> {
         target(path, true, &self.ctx(&[]))
@@ -44,7 +45,7 @@ fn call(name: &str, args: Value) -> Call {
 /// The validation result of `name(args)` with every tool enabled: the error, and the arguments as normalized.
 fn checked(name: &str, args: Value) -> (Option<String>, Value) {
     let mut c = call(name, args);
-    validate(&mut c, &ALL);
+    validate(&mut c, &TOOLS);
     (c.error, c.args)
 }
 
@@ -70,7 +71,7 @@ fn tools_json_bytes() {
     assert_eq!(include_str!("../tools.json"), want);
     assert_eq!(want.len(), 1104);
     // What a request carries is the schema re-serialized: the same bytes.
-    assert_eq!(serde_json::to_string(&schema(&ALL)).unwrap(), want);
+    assert_eq!(serde_json::to_string(&schema(&TOOLS)).unwrap(), want);
 }
 
 #[test]
@@ -79,14 +80,14 @@ fn schema_filtered_order() {
     assert_eq!(names(schema(&["edit", "shell"])), ["shell", "edit"]);
     assert_eq!(names(schema(&["read"])), ["read"]);
     assert_eq!(schema(&[]), json!([]));
-    assert_eq!(names(schema(&["write", "read", "edit", "shell"])), ALL);
+    assert_eq!(names(schema(&["write", "read", "edit", "shell"])), TOOLS);
 }
 
 #[test]
 fn system_joins_part3() {
-    assert_eq!(system(None), PART1);
-    assert_eq!(system(Some("")), PART1);
-    assert_eq!(system(Some("Prefer small commits.\n\nKeep answers short.")), format!("{PART1}\n\nPrefer small commits.\n\nKeep answers short."));
+    assert_eq!(system(None, ""), PART1);
+    assert_eq!(system(Some(""), ""), PART1);
+    assert_eq!(system(Some("Prefer small commits.\n\nKeep answers short."), ""), format!("{PART1}\n\nPrefer small commits.\n\nKeep answers short."));
 }
 
 #[test]
@@ -101,17 +102,17 @@ fn string_unknown_tool() {
 fn string_too_big() {
     let mut c = call("shell", json!({}));
     c.raw = Some(format!("{{\"command\": \"{}\"}}", "x".repeat(ARGS_MAX)));
-    validate(&mut c, &ALL);
+    validate(&mut c, &TOOLS);
     assert_eq!(c.error.unwrap(), "arguments over 1 MiB; not run");
     // The size is checked before the JSON: an oversized string that is not JSON either gets the size error.
     let mut c = call("shell", json!({}));
     c.raw = Some(format!("{{\"command\": \"{}", "x".repeat(ARGS_MAX)));
-    validate(&mut c, &ALL);
+    validate(&mut c, &TOOLS);
     assert_eq!(c.error.unwrap(), "arguments over 1 MiB; not run");
     // Exactly at the limit, the JSON check applies.
     let mut c = call("shell", json!({}));
     c.raw = Some(format!("[{}", " ".repeat(ARGS_MAX - 1)));
-    validate(&mut c, &ALL);
+    validate(&mut c, &TOOLS);
     assert!(c.error.unwrap().starts_with("arguments are not valid JSON (line 1 col "));
 }
 
@@ -119,12 +120,12 @@ fn string_too_big() {
 fn string_bad_json() {
     let mut c = call("shell", json!({}));
     c.raw = Some(r#"{"command": "ls""#.into());
-    validate(&mut c, &ALL);
+    validate(&mut c, &TOOLS);
     assert_eq!(c.error.unwrap(), r#"arguments are not valid JSON (line 1 col 16): {"command": "ls""#);
     // Only the first 200 bytes are quoted, never splitting a character.
     let mut c = call("write", json!({}));
     c.raw = Some(format!("{{\n\"path\": \"{}", "é".repeat(200)));
-    validate(&mut c, &ALL);
+    validate(&mut c, &TOOLS);
     let e = c.error.unwrap();
     let head = e.split_once("): ").unwrap().1;
     assert!(e.starts_with("arguments are not valid JSON (line 2 col "), "{e}");
@@ -195,11 +196,11 @@ fn validate_unknown_fields_ignored() {
 fn validate_keeps_existing_error() {
     let mut c = call("unknown", json!({}));
     c.error = Some("incomplete tool call".into());
-    validate(&mut c, &ALL);
+    validate(&mut c, &TOOLS);
     assert_eq!(c.error.as_deref(), Some("incomplete tool call"));
     let mut c = call("shell", json!({"command": "ls", "timeout": "9999"}));
     c.error = Some("arguments cut at max_tokens; not run. Send a shorter call.".into());
-    validate(&mut c, &ALL);
+    validate(&mut c, &TOOLS);
     assert_eq!(c.error.as_deref(), Some("arguments cut at max_tokens; not run. Send a shorter call."));
     assert_eq!(c.args["timeout"], "9999");
 }
@@ -285,7 +286,7 @@ fn write_protected_missing_through_symlink() {
     symlink(tmp.join("data/home"), tmp.join("home")).unwrap();
     let home = tmp.join("home/u");
     let protected = [home.join(".config/henki")];
-    let cx = Ctx { cwd: &home, root: &home, home: &home, protected: &protected };
+    let cx = Config { protected: protected.to_vec(), ..Config::test(&home) };
     let msg = |p: &str| format!("protected: {p} is henki's own file; change it through shell so the user sees it");
     // `..` from the real home dir (data/home/u) leads to data: the last one names the dir by its real path.
     for p in ["~/.config/henki/config.toml", "~/.config/henki", "../../home/u/.config/henki/allow"] {
@@ -343,7 +344,7 @@ fn read_outside_flag() {
     let t = target(far.to_str().unwrap(), false, &tmp.ctx(&[])).unwrap();
     assert!(t.outside);
     assert_eq!(t.shown, format!("{} (outside project)", far.display()));
-    assert!(needs_approval("read", Some(&t), false));
+    assert!(needs_approval("read", Some(&t), &tmp.ctx(&[]), "s"));
     // Through a symlink inside the project: shown with where it leads.
     symlink(&far, tmp.join("link.txt")).unwrap();
     let t = target("link.txt", false, &tmp.ctx(&[])).unwrap();
@@ -390,7 +391,7 @@ fn target_tilde() {
     let project = tmp.join("proj");
     fs::create_dir_all(&home).unwrap();
     fs::create_dir_all(&project).unwrap();
-    let cx = Ctx { cwd: &project, root: &project, home: &home, protected: &[] };
+    let cx = Config { home: home.clone(), ..Config::test(&project) };
     let t = target("~/notes.md", true, &cx).unwrap();
     assert_eq!(t.path, home.join("notes.md"));
     assert!(t.outside);
@@ -410,8 +411,8 @@ fn needs_approval_table() {
     for (name, t, ask) in
         [("shell", None, true), ("write", Some(&inside), true), ("edit", Some(&inside), true), ("read", Some(&inside), false), ("read", Some(&outside), true), ("read", None, true)]
     {
-        assert_eq!(needs_approval(name, t, false), ask, "{name} ask");
-        assert!(!needs_approval(name, t, true), "{name} auto");
+        assert_eq!(needs_approval(name, t, &tmp.ctx(&[]), "s"), ask, "{name} ask");
+        assert!(!needs_approval(name, t, &Config { auto: true, ..tmp.ctx(&[]) }, "s"), "{name} auto");
     }
 }
 
@@ -511,7 +512,7 @@ fn validate_never_panics() {
     ];
     let keys = ["path", "command", "content", "old_text", "new_text", "timeout", "offset", "limit", "junk"];
     let names = ["shell", "read", "write", "edit", "grep", "", "Shell"];
-    let sets: [&[&'static str]; 4] = [&ALL, &["read"], &["shell", "edit"], &[]];
+    let sets: [&[&'static str]; 4] = [&TOOLS, &["read"], &["shell", "edit"], &[]];
     let bits = ["{", "}", "[", "]", "\"path\"", "\"x\"", ":", ",", "1", "-", ".5", "é", "\n", "\\", "\"", "\u{0}", " ", "null", "\u{1F600}"];
     for _ in 0..10_000 {
         let args = if rng.next().is_multiple_of(8) {

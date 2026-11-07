@@ -4,7 +4,7 @@ allow-unwrap-in-tests = true
 allow-expect-in-tests = true
 allow-panic-in-tests = true
 allow-print-in-tests = true
-# supervise::spawn takes eight.
+# supervise::spawn and Session::new take eight.
 too-many-arguments-threshold = 8
 # types::Outcome is every turn function's error and carries a whole Call (128 bytes); clippy's default flags 128.
 large-error-threshold = 160

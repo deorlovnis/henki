@@ -37,6 +37,22 @@ fn not_run_reasons() {
 }
 
 #[test]
+fn not_run_changed() {
+    assert_eq!(Outcome::error("changed", "trust file changed: /c/allow").not_run(), "trust file changed");
+    assert_eq!(Outcome::error("config", "x").not_run(), "interrupted");
+}
+
+#[test]
+fn finished_set() {
+    assert_eq!(every().map(|o| o.finished()), [true, true, false, true, false, false, false]);
+}
+
+#[test]
+fn tools_order() {
+    assert_eq!(TOOLS, ["shell", "read", "write", "edit"]);
+}
+
+#[test]
 fn stops_set() {
     assert_eq!(every().map(|o| o.stops()), [false, false, false, false, true, true, true]);
 }

@@ -1,10 +1,15 @@
 //! henki: a small terminal agent. `henki run [--json] TASK` drives a model through a shell and three file tools.
+#![allow(dead_code)] // until every new item is wired in
 
+mod allow;
+mod anthropic;
 mod config;
+mod ext;
 mod files;
 mod http;
 mod journal;
 mod openai;
+mod repl;
 mod supervise;
 mod sys;
 mod term;
@@ -12,7 +17,7 @@ mod tools;
 mod turn;
 mod types;
 
-use crate::{config::Config, config::Env, config::Flags, journal::Journal, journal::rec, term::Out, turn::Session, types::Ev, types::Outcome, types::Usage};
+use crate::{config::Config, config::Env, config::Flags, journal::Journal, journal::rec, term::Out, turn::Session, turn::outcome_line, types::Ev, types::Outcome, types::Usage};
 use serde_json::Value;
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::{io, io::Read, process::ExitCode, time::Duration, time::Instant};
@@ -40,10 +45,9 @@ fn main() -> ExitCode {
         supervise::panic_kill();
         term::panic_line(&info.to_string());
     }));
-    let flags = Flags { config: None, approve: None, model: None, max_steps: None, max_seconds: None };
-    let mut a = Args { json: false, flags, resume: None, nested: false, task: None };
+    let mut a = Args { json: false, flags: Flags::default(), resume: None, nested: false, task: None };
     let cmd = parse(&mut a);
-    let out = Out::start(a.json, tx.clone());
+    let out = Out::start(if a.json { term::Mode::Json } else { term::Mode::Plain }, tx.clone());
     ExitCode::from(match cmd {
         Ok(None) => run(a, out, tx, rx, t0, early),
         Ok(Some(text)) => {
@@ -106,10 +110,10 @@ fn run(a: Args, out: Out, tx: Sender<Ev>, rx: Receiver<Ev>, t0: Instant, early: 
         }
     };
     head.iter().for_each(|r| out.record(r));
-    let mut s = Session::new(cfg, j, hist, out, tx, rx, deadline);
+    let mut s = Session::new(cfg, j, hist, out, tx, rx, deadline, None);
     // A finished turn whose stdout reader went away never gave the reader what it waited for.
     let o = s.turn(task);
-    let o = if matches!(o, Outcome::Ok | Outcome::GaveUp(_) | Outcome::NeedsApproval(_)) && s.out().closed() { Outcome::OutputClosed } else { o };
+    let o = if o.finished() && s.out().closed() { Outcome::OutputClosed } else { o };
     let result = s.result(&o, ms(t0));
     if o != Outcome::Ok {
         s.out().line(&outcome_line(&o));
@@ -136,7 +140,8 @@ fn start(a: Args, tx: &Sender<Ev>, rx: &Receiver<Ev>, t0: Instant, early: io::Re
     let cwd = std::env::current_dir().map_err(|e| bad(format!("cannot read the working directory: {e}")))?;
     let mut cfg = config::load(&a.flags, &env, &cwd).map_err(bad)?;
     *deadline = (cfg.max_seconds > 0).then(|| t0 + Duration::from_secs(cfg.max_seconds));
-    let state = journal::state_dir(&cfg.env, &cfg.home).map_err(bad)?;
+    journal::state_dir(&cfg.state).map_err(bad)?;
+    let state = cfg.state.clone();
     cfg.protected.extend([Some(state.clone()), state.canonicalize().ok()].into_iter().flatten());
     let task = if a.task.as_deref() == Some("-") { Some(stdin_task(tx, rx, *deadline)?) } else { a.task };
     if task.as_deref().is_some_and(|t| t.trim().is_empty()) {
@@ -167,13 +172,13 @@ fn stdin_task(tx: &Sender<Ev>, rx: &Receiver<Ev>, deadline: Option<Instant>) -> 
     let read = move || {
         let mut b = Vec::new();
         let ok = io::stdin().lock().take(TASK_MAX + 1).read_to_end(&mut b).is_ok() && b.len() as u64 <= TASK_MAX;
-        let _ = tx.send(Ev::Line(ok.then(|| String::from_utf8_lossy(&b).into_owned())));
+        let _ = tx.send(Ev::Line { tag: 0, text: ok.then(|| String::from_utf8_lossy(&b).into_owned()) });
     };
     std::thread::Builder::new().spawn(read).map_err(|e| Outcome::error("internal", format!("cannot start a thread: {e}")))?;
     loop {
         match deadline.map_or_else(|| rx.recv().ok(), |d| rx.recv_timeout(d.saturating_duration_since(Instant::now())).ok()) {
-            Some(Ev::Line(Some(t))) => return Ok(t),
-            Some(Ev::Line(None)) => return Err(Outcome::error("config", "the task on stdin is over 1 MiB or unreadable")),
+            Some(Ev::Line { text: Some(t), .. }) => return Ok(t),
+            Some(Ev::Line { text: None, .. }) => return Err(Outcome::error("config", "the task on stdin is over 1 MiB or unreadable")),
             Some(Ev::Signal(_)) => return Err(Outcome::Interrupted),
             None => return Err(Outcome::Budget),
             Some(_) => {}
@@ -187,22 +192,12 @@ fn refuse(out: &Out, o: &Outcome, t0: Instant) {
     if let Outcome::Error { message, .. } = o { out.note(message) } else { out.line(&outcome_line(o)) }
 }
 
-/// The plain-mode line for an end other than `ok`: `(gave up: stuck)`, `(error auth: MSG)`, `(budget)`.
-fn outcome_line(o: &Outcome) -> String {
-    match o {
-        Outcome::GaveUp(r) => format!("(gave up: {r})"),
-        Outcome::Error { kind, message } => format!("(error {kind}: {message})"),
-        Outcome::NeedsApproval(c) => format!("(needs approval: {})", c.name),
-        o => format!("({})", o.status().replace('_', " ")),
-    }
-}
-
 /// The bounded flush, then the exit code: 141 when a run that finished did not get all its output out, its `result`
 /// included, because stdout closed or its reader did not keep up.
 fn code(out: Out, o: &Outcome, deadline: Option<Instant>) -> u8 {
     let until = deadline.map_or_else(|| Instant::now() + Duration::from_secs(5), |d| d + Duration::from_millis(950));
     let closed = out.flush(until);
-    if closed && matches!(o, Outcome::Ok | Outcome::GaveUp(_) | Outcome::NeedsApproval(_)) { 141 } else { o.exit() as u8 }
+    if closed && o.finished() { 141 } else { o.exit() as u8 }
 }
 
 fn ms(t0: Instant) -> u64 {

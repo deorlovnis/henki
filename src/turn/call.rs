@@ -40,16 +40,15 @@ impl Session {
             return self.answer(c, e, true, None, None);
         }
         // A file tool's target is resolved before anything is shown or run.
-        let cx = tools::Ctx { cwd: &self.cfg.cwd, root: &self.cfg.root, home: &self.cfg.home, protected: &self.cfg.protected };
-        let t = match (c.name != "shell").then(|| tools::target(c.args["path"].as_str().unwrap_or_default(), c.name != "read", &cx)) {
+        let t = match (c.name != "shell").then(|| tools::target(c.args["path"].as_str().unwrap_or_default(), c.name != "read", &self.cfg)) {
             Some(Err(text)) => return self.answer(c, &text, true, None, None),
             t => t.and_then(Result::ok),
         };
-        if tools::needs_approval(&c.name, t.as_ref(), self.cfg.auto) {
+        if tools::needs_approval(&c.name, t.as_ref(), &self.cfg, self.j.id()) {
             self.record(rec::ask(c, t.as_ref().map(|t| t.shown.as_str())))?;
             return Err(Outcome::NeedsApproval(c.clone()));
         }
-        self.record(rec::approval(&c.id, "auto"))?;
+        self.record(rec::approval(&c.id, "auto", None))?;
         self.call(c, t)
     }
 

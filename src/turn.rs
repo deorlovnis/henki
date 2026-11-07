@@ -1,9 +1,10 @@
 //! One session: the step loop of a turn, the only place the main thread waits, and the single way a turn and a session end.
-use crate::{config::Config, http, journal, journal::Journal, journal::rec, supervise, term, term::Out, tools, tools::Killed, types::*};
+use crate::{config::Config, http, journal, journal::Journal, journal::rec, supervise, sys::Stamp, term, term::Out, term::Reader, tools, tools::Killed, types::*};
 use call::Stuck;
 use serde_json::Value;
-use std::{convert::Infallible, ffi::OsString, path::Path, sync::mpsc::Receiver, sync::mpsc::Sender, time::Duration, time::Instant};
+use std::{convert::Infallible, ffi::OsString, path::Path, path::PathBuf, sync::mpsc::Receiver, sync::mpsc::Sender, time::Duration, time::Instant};
 
+mod approve;
 mod call;
 mod request;
 
@@ -16,7 +17,10 @@ pub const REASONING_TAIL: usize = 500;
 // The 1,800 s attempt limit is `http::LIMITS.request`, held in `Session.lim` so a unit test can shorten it.
 
 pub struct Session {
-    cfg: Config,
+    /// The REPL reads it (banner, allow) and replaces `cfg.allow` after `/allow rm`.
+    pub(crate) cfg: Config,
+    /// The signal that ended the last wait (INT/QUIT vs TERM/HUP).
+    pub(crate) sig: Option<i32>,
     j: Journal,
     out: Out,
     /// Exactly the `user`, `assistant` and `tool_result` records, in journal order: what the next request renders.
@@ -51,17 +55,22 @@ pub struct Session {
     /// FINISHING or `close`: `wait` ignores the deadline, and a signal only hurries the kill.
     finishing: bool,
     hurry: bool,
+    /// The REPL's terminal reader; None in `run`.
+    reader: Option<Reader>,
+    /// The tripwire's stamps of `cfg.trust`.
+    snap: Vec<(PathBuf, (Stamp, Stamp))>,
 }
 
 impl Session {
     /// Takes the child environment from `cfg.env`, `cfg.pass_env`, `cfg.user_path` and `j.id()`; the cwd is `cfg.cwd`.
+    /// `reader`: Some in the REPL (approvals are asked on the terminal), None in `run` (they end the turn).
     #[rustfmt::skip]
-    pub fn new(cfg: Config, j: Journal, hist: Vec<Value>, out: Out, tx: Sender<Ev>, rx: Receiver<Ev>, deadline: Option<Instant>) -> Session {
-        let env = supervise::child_env(&cfg.env, &cfg.pass_env, &cfg.user_path, j.id());
-        let (system, tools, next_h) = (tools::system(cfg.agents.as_deref()), tools::schema(&cfg.tools), journal::next_h(&hist));
-        Session { cfg, j, out, hist, tx, rx, deadline, lim: http::LIMITS, env, system, tools, next_h, tag: 0, conn: None, partial: String::new(),
+    pub fn new(cfg: Config, j: Journal, hist: Vec<Value>, out: Out, tx: Sender<Ev>, rx: Receiver<Ev>, deadline: Option<Instant>, reader: Option<Reader>) -> Session {
+        let env = supervise::child_env(&cfg.env, &cfg.pass_env, &cfg.user_path, &cfg.user_path, j.id());
+        let (system, tools, next_h) = (tools::system(cfg.agents.as_deref(), ""), tools::schema(&cfg.tools), journal::next_h(&hist));
+        Session { cfg, sig: None, j, out, hist, tx, rx, deadline, lim: http::LIMITS, env, system, tools, next_h, tag: 0, conn: None, partial: String::new(),
             opened: Vec::new(), open: Vec::new(), live: None, steps: 0, usage_turn: Usage::default(), usage_proc: Usage::default(), text: String::new(),
-            stuck: Stuck::default(), ctx: (0, 0), bg: 0, finishing: false, hurry: false }
+            stuck: Stuck::default(), ctx: (0, 0), bg: 0, finishing: false, hurry: false, reader, snap: Vec::new() }
     }
 
     /// One turn: the `user` record (none for `run --resume` without TASK), then steps until an outcome. Every call of the
@@ -138,7 +147,7 @@ impl Session {
         loop {
             let mut r = self.request()?;
             let calls = self.prepare(std::mem::take(&mut r.calls));
-            self.record(rec::assistant(&r.text, &calls, &r.finish, r.usage))?;
+            self.record(rec::assistant(&r.text, &calls, &r.finish, r.usage, r.blocks.as_ref()))?;
             (self.steps, self.text) = (self.steps + 1, r.text);
             self.usage_turn.add(r.usage);
             self.usage_proc.add(r.usage);
@@ -252,6 +261,39 @@ impl Session {
     fn next_tag(&mut self) -> u32 {
         self.tag += 1;
         self.tag
+    }
+
+    /// One line from the terminal; None at EOF or without a reader. Err: a signal (also in `sig`) or a closed stdout.
+    pub fn line(&mut self) -> Result<Option<String>, Stop> {
+        todo!()
+    }
+
+    /// `!CMD`: its exit code, None when bash did not start (a notice says why). INT and QUIT go to the command alone;
+    /// TERM, HUP and a closed stdout SIGKILL it and return Err.
+    pub fn bang(&mut self, cmd: &str) -> Result<Option<i32>, Stop> {
+        let _ = cmd;
+        todo!()
+    }
+
+    /// Every trust file whose stamps differ from the snapshot, in `cfg.trust` order.
+    pub fn changed(&self) -> Vec<PathBuf> {
+        todo!()
+    }
+
+    /// A new snapshot of `cfg.trust`, taken only right after a `changed()` that was empty, around henki's own write to
+    /// the allow file, so no outside change is ever absorbed.
+    pub fn rearm(&mut self) {
+        todo!()
+    }
+}
+
+/// The line for an end other than `ok`: `(gave up: stuck)`, `(error auth: MSG)`, `(needs approval: NAME)`, `(budget)`.
+pub fn outcome_line(o: &Outcome) -> String {
+    match o {
+        Outcome::GaveUp(r) => format!("(gave up: {r})"),
+        Outcome::Error { kind, message } => format!("(error {kind}: {message})"),
+        Outcome::NeedsApproval(c) => format!("(needs approval: {})", c.name),
+        o => format!("({})", o.status().replace('_', " ")),
     }
 }
 

@@ -1,11 +1,10 @@
 //! The OpenAI-compatible chat-completions wire format: the request body, the stream accumulator with its defensive
 //! call parser, and text calls for servers that leave tool markup in the content.
-use crate::types::{Call, Part, ProviderError, Reply, Usage};
-use crate::{http::error_object, http::perr, tools::ARGS_MAX};
+use crate::types::{ARGS_MAX, CUT_ARGS, Call, Flow, Part, ProviderError, Reply, Usage, Wire};
+use crate::{http::error_object, http::perr};
 use serde_json::{Map, Value, json};
 
 pub const PATH: &str = "/chat/completions";
-pub const CUT_ARGS: &str = "arguments cut at max_tokens; not run. Send a shorter call.";
 pub const INCOMPLETE: &str = "incomplete tool call";
 
 /// `Authorization: Bearer KEY` only when `key` is not empty.
@@ -41,13 +40,6 @@ fn native(c: &Value) -> Value {
     json!({"function": {"arguments": args, "name": c["name"]}, "id": c["id"], "type": "function"})
 }
 
-/// Finished: a finish_reason came (2 s idle or EOF completes); Done: `[DONE]`.
-pub enum Flow {
-    More,
-    Finished,
-    Done,
-}
-
 /// One reply as it arrives. A call slot is (its `index`, the call so far with its arguments' text in `raw`).
 pub struct Acc {
     text: String,
@@ -59,13 +51,13 @@ pub struct Acc {
     seen: bool, // a data event came: an error now is not the first event
 }
 
-impl Acc {
-    pub fn new(offered: &[&'static str]) -> Acc {
+impl Wire for Acc {
+    fn new(offered: &[&'static str]) -> Acc {
         Acc { text: String::new(), reasoning: String::new(), slots: vec![], finish: String::new(), usage: Usage::default(), offered: offered.to_vec(), seen: false }
     }
 
-    /// One SSE `data` payload; streamed pieces go to `part`.
-    pub fn data(&mut self, data: &str, part: &mut dyn FnMut(Part)) -> Result<Flow, ProviderError> {
+    /// One SSE `data` payload; streamed pieces go to `part`. Finished: a finish_reason came; Done: `[DONE]`.
+    fn data(&mut self, data: &str, part: &mut dyn FnMut(Part)) -> Result<Flow, ProviderError> {
         match data.trim() {
             "[DONE]" => return Ok(Flow::Done),
             "" => {} // an empty event (a keep-alive) changes nothing
@@ -79,7 +71,7 @@ impl Acc {
     }
 
     /// A 200 `application/json` completion: the same rules applied to `choices[0].message`.
-    pub fn json(mut self, body: &[u8]) -> Result<Reply, ProviderError> {
+    fn json(mut self, body: &[u8]) -> Result<Reply, ProviderError> {
         let v: Value = serde_json::from_slice(body).map_err(|e| bad(&format!("the completion is not JSON ({e})"), &String::from_utf8_lossy(body)))?;
         self.take(&v, "message", true, &mut |_| {})?;
         v["choices"][0]["message"].as_object().ok_or_else(|| bad("the completion has no choices[0].message", &String::from_utf8_lossy(body)))?;
@@ -87,7 +79,7 @@ impl Acc {
     }
 
     /// The after-stream rules; `complete` = `[DONE]`, or EOF/idle after a finish.
-    pub fn finish(self, complete: bool) -> Result<Reply, ProviderError> {
+    fn finish(self, complete: bool) -> Result<Reply, ProviderError> {
         if !complete {
             let names: Vec<&str> = self.slots.iter().map(|(_, c)| shown(&c.name)).collect();
             let dropped = if names.is_empty() { String::new() } else { format!("; dropped calls: {}", names.join(", ")) };
@@ -106,9 +98,11 @@ impl Acc {
                 calls = text_calls(&self.reasoning, &self.offered).0;
             }
         }
-        Ok(Reply { text, reasoning: self.reasoning, calls, finish: self.finish, usage: self.usage })
+        Ok(Reply { text, reasoning: self.reasoning, calls, finish: self.finish, usage: self.usage, blocks: None })
     }
+}
 
+impl Acc {
     /// One chunk (`key` = `delta`) or a whole completion (`message`): an error member ends it; else the usage, then
     /// `choices[0]`, its delta before its finish reason.
     fn take(&mut self, v: &Value, key: &str, first: bool, part: &mut dyn FnMut(Part)) -> Result<(), ProviderError> {
