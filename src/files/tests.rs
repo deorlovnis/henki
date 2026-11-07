@@ -6,14 +6,20 @@ use std::os::unix::fs::{MetadataExt, symlink};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicUsize;
 use std::sync::mpsc::channel;
-use std::sync::{Mutex, MutexGuard};
 use std::time::Duration;
 
-/// Held by the test that measures the peak memory and by every test that holds megabytes, so neither sees the other.
-static MEMORY: Mutex<()> = Mutex::new(());
-
-fn memory() -> MutexGuard<'static, ()> {
-    MEMORY.lock().unwrap_or_else(|e| e.into_inner())
+/// In the test process: runs the test `name` again in a new process of this test binary, alone, and returns false. In
+/// that process (marked by `HENKI_TEST_ALONE`) it returns true and the test runs its body there. The peak memory is the
+/// whole process's, so a test that measures it must not share the process with tests that hold megabytes.
+fn alone(name: &str) -> bool {
+    if std::env::var_os("HENKI_TEST_ALONE").is_some() {
+        return true;
+    }
+    let args = ["--exact", &format!("files::tests::{name}"), "--test-threads=1", "--nocapture"];
+    let out = std::process::Command::new(std::env::current_exe().unwrap()).args(args).env("HENKI_TEST_ALONE", "1").output().unwrap();
+    let text = format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+    assert!(out.status.success() && text.contains(" 1 passed;"), "{text}");
+    false
 }
 
 /// A fresh project directory under the temp dir (as its realpath), removed when dropped.
@@ -249,7 +255,9 @@ fn read_dir_pages() {
 
 #[test]
 fn read_long_line_bounded() {
-    let _alone = memory();
+    if !alone("read_long_line_bounded") {
+        return;
+    }
     let tmp = Tmp::new();
     // Written in chunks, so making the file does not raise the peak the check below measures.
     let mut f = fs::File::create(tmp.join("long.txt")).unwrap();
@@ -480,7 +488,6 @@ fn edit_crlf_keeps_crlf_new_text() {
 
 #[test]
 fn edit_large_file_bounded() {
-    let _alone = memory();
     let tmp = Tmp::new();
     // One byte over the limit: refused before a byte is read, however big the file.
     let p = tmp.file("big.log", "needle\n");
