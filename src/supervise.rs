@@ -1,5 +1,5 @@
 //! Tool processes: the child environment, the spawn recipe, bounded capture with spill, and the ledger of process groups
-//! that henki kills by group and, on Linux, by sweeping every descendant.
+//! that henki kills by group and, on Linux, by sweeping every descendant. Also the user's own `!cmd`, on the terminal.
 use crate::{config::Env, sys, term, types::End, types::Ev, types::ToolOutput};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock, PoisonError, mpsc, mpsc::Sender};
 use std::{collections::VecDeque, ffi::OsString, fs::File, os::unix::process::ExitStatusExt, thread};
@@ -16,8 +16,8 @@ const ALLOW: &str = "HOME USER LOGNAME SHELL TERM LANG LC_ALL LC_CTYPE LC_MESSAG
 
 /// The process groups of calls that may still have members, by leader pid; a group leaves when a signal gives ESRCH.
 static LEDGER: Mutex<Vec<i32>> = Mutex::new(Vec::new());
-/// The children henki had before its first call, such as a launcher's background job that came along through exec.
-/// henki did not start them, so the count and the sweep leave them and their descendants alone.
+/// The children henki had before its first call or `!cmd`, such as a launcher's background job that came along through
+/// exec. henki did not start them, so the count and the sweep leave them and their descendants alone.
 static INHERITED: OnceLock<Vec<i32>> = OnceLock::new();
 
 /// Where a call's full output goes once it passes the cap; `shown` is the path as the marker prints it (`$HOME` as `~`).
@@ -26,16 +26,28 @@ pub struct Spill {
     pub shown: String,
 }
 
-/// Exactly the child environment: the allowlist, `pass_env`, PATH = `path` (ext `bin/` dirs, then the user PATH),
-/// HENKI_USER_PATH = `user_path`, HENKI_SESSION, HENKI_VERSION, HENKI_DEPTH + 1. A proxy value with userinfo is dropped.
+/// Exactly the child environment: the allowlist, `pass_env`, PATH = `path` (the extensions' `bin/` dirs, then the user
+/// PATH), HENKI_USER_PATH = `user_path`, HENKI_SESSION, HENKI_VERSION, HENKI_DEPTH + 1. A proxy value with userinfo is
+/// dropped.
 pub fn child_env(env: &Env, pass_env: &[String], path: &str, user_path: &str, session: &str) -> Vec<(OsString, OsString)> {
     let keep = |k: &str| (ALLOW.split_whitespace().any(|a| a == k) || pass_env.iter().any(|p| p == k)) && k != "BASH_ENV" && k != "ENV";
     let userinfo = |k: &str, v: &OsString| k.to_ascii_lowercase().ends_with("proxy") && v.as_encoded_bytes().contains(&b'@');
     let mut out: Vec<_> = env.0.iter().filter(|(k, v)| k.to_str().is_some_and(|k| keep(k) && !userinfo(k, v))).cloned().collect();
-    let depth = env.0.iter().find(|(k, _)| k == "HENKI_DEPTH").and_then(|(_, v)| v.to_str()?.parse::<u32>().ok()).map_or(1, |d| u64::from(d) + 1).to_string();
-    let henki = [("PATH", path), ("HENKI_USER_PATH", user_path), ("HENKI_SESSION", session), ("HENKI_VERSION", env!("CARGO_PKG_VERSION")), ("HENKI_DEPTH", &depth)];
+    let henki = [("PATH", path), ("HENKI_USER_PATH", user_path), ("HENKI_SESSION", session), ("HENKI_VERSION", env!("CARGO_PKG_VERSION")), ("HENKI_DEPTH", &depth(env))];
     out.extend(henki.map(|(k, v)| (k.into(), v.into())));
     out
+}
+
+/// The `!cmd` environment: henki's inherited one, with HENKI_DEPTH + 1.
+pub fn bang_env(env: &Env) -> Vec<(OsString, OsString)> {
+    let mut out: Vec<_> = env.0.iter().filter(|(k, _)| k != "HENKI_DEPTH").cloned().collect();
+    out.push(("HENKI_DEPTH".into(), depth(env).into()));
+    out
+}
+
+/// henki's HENKI_DEPTH + 1 (1 when unset or not a number).
+fn depth(env: &Env) -> String {
+    env.get("HENKI_DEPTH").and_then(|v| v.to_str()?.parse::<u32>().ok()).map_or(1, |d| u64::from(d) + 1).to_string()
 }
 
 /// MAIN thread only. `bash --noprofile --norc -c CMD` in its own session, no tty, stdin /dev/null, one pipe for stdout
@@ -63,18 +75,27 @@ pub fn spawn(bash: &Path, cmd: &str, cwd: &Path, env: &[(OsString, OsString)], c
     Ok(pgid)
 }
 
-/// MAIN only. `!cmd`: `bash --noprofile --norc -c CMD` in henki's own process group on the terminal (stdin, stdout and
-/// stderr inherited), `cwd`, exactly `env`, `sys::bang_setup`; not in the ledger. A waiter thread sends one
-/// `Ev::BangDone { tag, code }` (128 + N for signal N). Returns the pid.
+/// MAIN thread only. The user's `!cmd`: `bash --noprofile --norc -c CMD` in henki's own process group on the terminal
+/// (stdin, stdout and stderr inherited), exactly `env`; not in the ledger, though a `!cmd &` job it leaves is counted and
+/// swept like a call's. A waiter thread reaps it and sends one `Ev::BangDone { tag, code }` (128 + N when signal N ended
+/// it). Returns the pid.
 pub fn bang(bash: &Path, cmd: &str, cwd: &Path, env: &[(OsString, OsString)], tag: u32, tx: &Sender<Ev>) -> io::Result<i32> {
-    let _ = (bash, cmd, cwd, env, tag, tx);
-    todo!()
-}
-
-/// The `!cmd` environment: henki's inherited environment with `HENKI_DEPTH` + 1.
-pub fn bang_env(env: &Env) -> Vec<(OsString, OsString)> {
-    let _ = env;
-    todo!()
+    let (tx, (give, take)) = (tx.clone(), mpsc::channel::<Child>());
+    // The waiter starts before the fork, so nothing can fail once the command runs.
+    thread::Builder::new().spawn(move || {
+        let code = take.recv().map(|mut c| c.wait().map_or(-1, |st| st.code().unwrap_or_else(|| 128 + st.signal().unwrap_or(0))));
+        let _ = code.map(|code| tx.send(Ev::BangDone { tag, code }));
+    })?;
+    let mut c = Command::new(bash);
+    c.args(["--noprofile", "--norc", "-c", cmd]).current_dir(cwd).env_clear().envs(env.iter().map(|(k, v)| (k, v)));
+    sys::bang_setup(&mut c);
+    // As before a call: the children henki had before it started anything are fixed first, so the job is not one of them.
+    INHERITED.get_or_init(|| children(&sys::procs()));
+    #[allow(clippy::disallowed_methods)] // the user's own command, typed at the prompt
+    let child = c.spawn()?;
+    let pid = child.id() as i32;
+    let _ = give.send(child);
+    Ok(pid)
 }
 
 /// Sends `sig` (0 probes) to every group in the ledger, drops the groups that are gone (ESRCH), returns how many remain.
