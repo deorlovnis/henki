@@ -1,6 +1,6 @@
 #![allow(clippy::disallowed_methods, clippy::print_stdout, clippy::print_stderr, clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::string_slice)]
-//! What henki sends: a byte-stable prefix, the task once, the history as the journal holds it, and a small first
-//! request.
+//! What henki sends: a byte-stable prefix, the task once (where and when the model works on the session's first task
+//! only), the history as the journal holds it, and a small first request.
 use crate::harness::*;
 use crate::mock::*;
 
@@ -65,7 +65,7 @@ fn e2e_request_user_once() {
             assert_eq!(u.iter().filter(|c| c.ends_with("first task")).count(), 1);
         }
     }
-    assert!(m3.log()[0].contents("user")[1].ends_with("\n\nsecond task"));
+    assert_eq!(m3.log()[0].contents("user")[1], "second task", "a session's later tasks carry no cwd, os and date");
     grows(&[m.log(), m2.log(), m3.log()].concat());
 }
 
@@ -94,14 +94,28 @@ fn before_last_answer(d: &Done) -> Vec<serde_json::Value> {
     all[..i].to_vec()
 }
 
+/// The plain-answer request of a fresh session with the built-in tools only: its size against the 2,048-byte gate.
+fn first_request(r: &Run, m: &Mock) -> Result<(), String> {
+    let d = r.json("Reply with the single word ready.");
+    d.finish();
+    let l = m.log().pop().unwrap();
+    let (system, tools) = (l.contents("system")[0].len(), l.json["tools"].to_string().len());
+    println!("first request {} bytes: system {system}, tools {tools}, user {}", l.bytes, l.contents("user")[0].len());
+    if l.bytes <= 2048 { Ok(()) } else { Err(format!("the first request is {} bytes, over the 2,048-byte gate", l.bytes)) }
+}
+
 #[test]
 fn first_request_le_2048() {
     let m = Mock::start(vec![say("ready")]);
+    first_request(&Run::new(&m.url()), &m).unwrap();
+}
+
+#[test]
+fn first_request_gate_fires() {
+    let m = Mock::start(vec![say("ready")]);
     let r = Run::new(&m.url());
-    let d = r.json("Reply with the single word ready.");
-    d.finish();
-    let l = &m.log()[0];
-    let (system, tools) = (l.contents("system")[0].len(), l.json["tools"].to_string().len());
-    println!("first request {} bytes: system {system}, tools {tools}, user {}", l.bytes, l.contents("user")[0].len());
-    assert!(l.bytes <= 2048, "first request {} bytes", l.bytes);
+    std::fs::create_dir_all(r.config_dir()).unwrap();
+    std::fs::write(r.config_dir().join("AGENTS.md"), "Keep answers short.\n".repeat(80)).unwrap();
+    let e = first_request(&r, &m).unwrap_err();
+    assert!(e.ends_with("bytes, over the 2,048-byte gate"), "{e}");
 }

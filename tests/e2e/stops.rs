@@ -51,16 +51,13 @@ fn e2e_max_steps() {
 
 #[test]
 fn e2e_empty_answer() {
-    let tail: String = (0..200).map(|i| format!("r{i} ")).collect();
-    let m = Mock::start(vec![reason(&tail)]);
+    let m = Mock::start(vec![reason("I could look at the files first.")]);
     let r = Run::new(&m.url());
     let d = r.cmd(&["answer"]).go();
     d.finish();
     assert_eq!((d.code, d.out()), (Some(1), String::new()), "never ok with an empty answer\n{}", d.diag());
-    let n = d.notices();
-    let notice = n.iter().find(|x| x.starts_with("the model ended without an answer; its reasoning ended: ")).unwrap_or_else(|| panic!("{n:?}"));
-    let shown = notice.strip_prefix("the model ended without an answer; its reasoning ended: ").unwrap();
-    assert!(shown.len() <= 500 && tail.trim_end().ends_with(shown.trim()) && shown.contains("r199"), "the last 500 bytes of reasoning: {shown}");
+    assert_eq!(d.notices(), ["the model ended without an answer"], "{}", d.diag());
+    assert!(d.err().lines().any(|l| l == "henki: the model ended without an answer"), "{}", d.err());
     assert!(d.err().lines().any(|l| l == "(gave up: empty_answer)"), "{}", d.err());
     let m = Mock::start(vec![say("   ")]);
     let d = Run::new(&m.url()).json("answer blank");

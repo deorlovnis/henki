@@ -1,0 +1,645 @@
+#![allow(clippy::disallowed_methods, clippy::print_stdout, clippy::print_stderr, clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::string_slice)]
+//! The REPL over a pseudo-terminal: the banner and prompt, streamed answers, the approval display and its answers
+//! (`always` saves a rule), `/allow`, Ctrl-C at every state, `!CMD` on the terminal, the tripwire's refusal, resume.
+use crate::harness::*;
+use crate::mock::*;
+use crate::pty::{Pty, RESET};
+use serde_json::{Value, json};
+use std::fs;
+use std::os::unix::fs::PermissionsExt;
+use std::time::{Duration, Instant};
+
+/// Generous for a loaded machine; every wait ends as soon as the text shows.
+const W: Duration = Duration::from_secs(15);
+const VERSION: &str = env!("CARGO_PKG_VERSION");
+const REFUSED: &str = "henki: a trust file changed; restart henki to go on (henki --resume continues this session)\r\n";
+const HINT: &str = "(Ctrl-C does not quit; /exit or Ctrl-D quits)\r\n";
+
+/// A run in ask mode at `m`.
+fn asking(m: &Mock) -> Run {
+    let mut r = Run::new(&m.url());
+    r.set("approve", "\"ask\"");
+    r
+}
+
+/// The REPL with `args` on a 24 x 80 terminal, at its first prompt.
+fn start<'a>(r: &'a Run, args: &[&str]) -> Pty<'a> {
+    let p = Pty::spawn(r, args, 24, 80);
+    p.prompt(W);
+    p
+}
+
+/// The end with exit `code`, and the postconditions.
+fn ended(p: Pty<'_>, code: i32) -> Done {
+    let d = p.wait(W);
+    d.finish();
+    assert_eq!(d.code, Some(code), "{}", d.diag());
+    d
+}
+
+/// `/exit`: exit 0.
+fn exit(p: Pty<'_>) -> Done {
+    p.line("/exit");
+    ended(p, 0)
+}
+
+/// A message and the end of its turn.
+fn message(p: &Pty, text: &str, answer: &str) {
+    p.line(text);
+    p.expect(answer, W);
+    p.prompt(W);
+}
+
+fn verdicts(d: &Done) -> Vec<Value> {
+    d.of("approval").iter().map(|a| json!([a["verdict"], a["rule"]])).collect()
+}
+
+/// The rule line a matched call prints.
+fn rule_used(r: &Run, cmd: &str, n: usize) -> String {
+    format!("$ {cmd}  (allowed by rule {n} for {}, ~/.config/henki/allow)\r\n", r.root())
+}
+
+/// `!CMD` noted a changed trust file.
+fn bang_changed(path: &std::path::Path) -> String {
+    format!("henki: {} changed by !cmd; restart henki to apply it (henki --resume continues this session)\r\n", path.display())
+}
+
+#[test]
+fn pty_banner_and_prompt() {
+    let m = Mock::start(vec![]);
+    let r = asking(&m);
+    let p = Pty::spawn(&r, &[], 24, 80);
+    p.expect(&format!("henki {VERSION} · mock-model · {} (openai) · ctx 32,768\r\n", m.url()), W);
+    p.expect("approval: ask\r\n", W);
+    p.expect("config: ~/.config/henki/config.toml\r\n", W);
+    p.prompt(W);
+    exit(p);
+}
+
+#[test]
+fn pty_answer_streams() {
+    let pause = Step::Stall { before_first_byte: false, after_words: 0, for_ms: 30_000 };
+    let m = Mock::start(vec![Step::Stream { parts: vec![say("early words"), pause, say(" late words")], finish: Some("stop".into()), done: true, hold_ms: 0 }]);
+    let r = asking(&m);
+    let p = start(&r, &[]);
+    p.line("talk to me");
+    p.expect("early words", W);
+    assert!(m.log()[0].done.is_none(), "the words showed only after the reply ended");
+    m.open_gate();
+    p.expect(" late words\r\n> ", W);
+    let d = exit(p);
+    assert_eq!(d.of("assistant")[0]["msg"]["content"], "early words late words");
+}
+
+#[test]
+fn pty_no_session_without_message() {
+    let m = Mock::start(vec![]);
+    let r = asking(&m);
+    let d = exit(start(&r, &[]));
+    assert!(d.journal.is_none() && r.journals().is_empty(), "a session file without a message: {:?}", r.journals());
+}
+
+#[test]
+fn pty_exit_command() {
+    let m = Mock::start(vec![say("hello back")]);
+    let r = asking(&m);
+    let p = start(&r, &[]);
+    message(&p, "hello", "hello back");
+    let d = exit(p);
+    assert_eq!(d.kinds(), ["session", "user", "assistant", "turn_end", "close"]);
+}
+
+#[test]
+fn pty_eof_exits() {
+    let m = Mock::start(vec![]);
+    let r = asking(&m);
+    let p = start(&r, &[]);
+    p.ctrl_d();
+    ended(p, 0);
+}
+
+/// Every line of the call, never cut: escapes, a bidi override, a long run of spaces and a tab are shown and marked.
+#[test]
+fn pty_approval_display_full() {
+    let cmd = format!("echo one\x1b[31m\u{202e}\necho{}done\t# check", " ".repeat(40));
+    let m = Mock::start(vec![shell(&cmd), say("not run then")]);
+    let r = asking(&m);
+    let p = start(&r, &[]);
+    p.line("show it");
+    p.expect("run? [y/N] ", W);
+    let shown = format!(
+        "{RESET}-- shell {}\r\n-- command (2 lines, 73 bytes) {}\r\n!| echo one\\x1b[31m\\u{{202e}}\r\n!| echo[40 spaces]done\\t# check\r\nrun? [y/N] ",
+        "-".repeat(63),
+        "-".repeat(41)
+    );
+    let screen = String::from_utf8_lossy(&p.screen()).into_owned();
+    assert!(screen.contains(&shown), "the reset, then the display:\n{shown:?}\nnot in\n{screen:?}");
+    p.line("n");
+    p.expect("not run then", W);
+    p.prompt(W);
+    let d = exit(p);
+    assert_eq!((verdicts(&d), &d.results()[0]["content"]), (vec![json!(["no", null])], &json!("denied by the user")));
+}
+
+#[test]
+fn pty_approval_yes() {
+    let m = Mock::start(vec![shell("echo approved > yes.txt"), say("ran it")]);
+    let r = asking(&m);
+    let p = start(&r, &[]);
+    p.line("make the file");
+    p.expect("run? [y/N/always] ", W);
+    p.line("y");
+    p.expect("$ echo approved > yes.txt\r\n", W);
+    p.expect("$ echo approved > yes.txt -> exit 0, ", W);
+    p.expect("ran it", W);
+    p.prompt(W);
+    let d = exit(p);
+    assert_eq!(verdicts(&d), [json!(["yes", null])]);
+    assert_eq!(fs::read_to_string(r.path("yes.txt")).unwrap(), "approved\n");
+}
+
+#[test]
+fn pty_approval_no_denied() {
+    let m = Mock::start(vec![shell("touch no.txt"), say("fine, I will not")]);
+    let r = asking(&m);
+    let p = start(&r, &[]);
+    p.line("make the file");
+    p.expect("run? [y/N/always] ", W);
+    p.line("nope");
+    p.expect("fine, I will not", W);
+    p.prompt(W);
+    let d = exit(p);
+    assert_eq!((verdicts(&d), &d.results()[0]["content"], &d.results()[0]["is_error"]), (vec![json!(["no", null])], &json!("denied by the user"), &json!(true)));
+    assert!(!r.path("no.txt").exists() && m.log().len() == 2, "the turn goes on after a denial");
+}
+
+#[test]
+fn pty_approval_eof_no() {
+    let m = Mock::start(vec![shell("touch eof.txt"), say("nothing ran")]);
+    let r = asking(&m);
+    let p = start(&r, &[]);
+    p.line("make the file");
+    p.expect("run? [y/N/always] ", W);
+    p.ctrl_d();
+    p.expect("nothing ran", W);
+    let d = ended(p, 0); // at the next prompt
+    assert_eq!(verdicts(&d), [json!(["no", null])], "EOF is a no");
+    assert!(!r.path("eof.txt").exists());
+}
+
+#[test]
+fn pty_approval_taller_than_screen() {
+    let cmd: Vec<String> = (1..=30).map(|i| format!("echo {i}")).collect();
+    let m = Mock::start(vec![shell(&cmd.join("\n")), say("too tall")]);
+    let r = asking(&m);
+    let p = start(&r, &[]);
+    p.line("count");
+    p.expect("| echo 30\r\n", W);
+    p.expect("33 rows: taller than the screen; scroll up or answer n\r\nrun? [y/N] ", W);
+    p.line("n");
+    p.expect("too tall", W);
+    p.prompt(W);
+    exit(p);
+}
+
+#[test]
+fn pty_always_saves_rule() {
+    let m = Mock::start(vec![shell("echo saved-rule"), say("saved and ran")]);
+    let mut r = asking(&m);
+    let root = r.root();
+    let p = start(&r, &[]);
+    p.line("save it");
+    p.expect("run? [y/N/always] ", W);
+    p.line("always");
+    p.expect(&format!("a rule allows whatever this command does in {root}, including the files and config it reads\r\n"), W);
+    p.expect(&format!("save rule for {root}: echo saved-rule ? [y/N] "), W);
+    p.line("y");
+    p.expect(&format!("added to ~/.config/henki/allow as rule 1 for {root}; /allow lists and removes rules\r\n"), W);
+    p.expect("saved and ran", W);
+    p.prompt(W);
+    let d = exit(p);
+    assert_eq!(verdicts(&d), [json!(["always", 1])]);
+    let header = "# henki allow rules: ROOT<TAB>COMMAND, one per line; COMMAND then runs without asking in ROOT.\n\
+        # List and remove them with /allow in henki or henki allow [rm N]; or edit this file.\n";
+    assert_eq!(fs::read_to_string(r.allow()).unwrap(), format!("{header}{root}\techo saved-rule\n"));
+    assert_eq!(fs::metadata(r.allow()).unwrap().permissions().mode() & 0o777, 0o600);
+    let m2 = Mock::start(vec![shell("echo saved-rule"), say("ran by the rule")]);
+    r.at(&m2.url());
+    let p = Pty::spawn(&r, &[], 24, 80);
+    p.expect("allow:   1  echo saved-rule\r\n", W);
+    p.prompt(W);
+    p.line("again");
+    p.expect(&rule_used(&r, "echo saved-rule", 1), W);
+    p.expect("ran by the rule", W);
+    p.prompt(W);
+    let d = exit(p);
+    assert_eq!((verdicts(&d), d.of("ask").len()), (vec![json!(["rule", 1])], 0), "{}", d.diag());
+}
+
+#[test]
+fn pty_always_confirm_no() {
+    let m = Mock::start(vec![shell("touch confirm.txt"), say("left alone")]);
+    let r = asking(&m);
+    let p = start(&r, &[]);
+    p.line("make the file");
+    p.expect("run? [y/N/always] ", W);
+    p.line("always");
+    p.expect(" ? [y/N] ", W);
+    p.line("n");
+    p.expect("run? [y/N/always] ", W);
+    p.line("n");
+    p.expect("left alone", W);
+    p.prompt(W);
+    let d = exit(p);
+    assert_eq!(verdicts(&d), [json!(["no", null])]);
+    assert!(!r.allow().exists() && !r.path("confirm.txt").exists());
+}
+
+/// While a process from an earlier call runs, `always` is not offered: the command may be what talks to it.
+#[test]
+fn pty_always_off_background() {
+    let mut r = Run::new("");
+    let m = Mock::start(vec![shell(&format!("sleep {} & echo started", r.marker)), shell("echo next"), say("done")]);
+    r.at(&m.url()).set("approve", "\"ask\"");
+    let p = start(&r, &[]);
+    p.line("start it");
+    p.expect("run? [y/N/always] ", W);
+    p.line("y");
+    p.expect("henki: 1 background processes still run; always is off until they end\r\n", W);
+    p.expect("run? [y/N] ", W);
+    p.line("n");
+    p.expect("done", W);
+    p.prompt(W);
+    exit(p);
+}
+
+/// A call `always` cannot save: the question omits it, and typed anyway it gets the one note.
+#[test]
+fn pty_always_refused_shapes() {
+    let calls = [shell("echo a\necho b"), shell(&format!("echo {}", "x".repeat(196))), shell("g\u{456}t status"), call("write", json!({"path": "f.txt", "content": "x"}))];
+    let m = Mock::start([calls.to_vec(), vec![say("all refused")]].concat());
+    let r = asking(&m);
+    let p = start(&r, &[]);
+    p.line("try them");
+    for _ in &calls {
+        p.expect("run? [y/N] ", W);
+        p.line("always");
+        p.expect("henki: always is not offered for this call; answer y or n\r\nrun? [y/N] ", W);
+        p.line("n");
+    }
+    p.expect("all refused", W);
+    p.prompt(W);
+    let d = exit(p);
+    assert_eq!(verdicts(&d), vec![json!(["no", null]); 4]);
+    assert!(!r.allow().exists());
+}
+
+#[test]
+fn pty_allow_list_and_rm() {
+    let m = Mock::start(vec![]);
+    let r = asking(&m);
+    let root = r.root();
+    r.write_allow(&format!("# mine\n{root}\techo one\n{root}\techo two\n"));
+    let p = start(&r, &[]);
+    p.line("/allow");
+    p.expect(&format!("{}\r\n1  {root}  echo one\r\n2  {root}  echo two\r\n", r.allow().display()), W);
+    p.line("/allow rm 1");
+    p.expect(&format!("removed rule 1: {root}  echo one\r\n"), W);
+    p.line("/allow");
+    p.expect(&format!("{}\r\n1  {root}  echo two\r\n", r.allow().display()), W);
+    p.prompt(W);
+    exit(p);
+    assert_eq!(fs::read_to_string(r.allow()).unwrap(), format!("# mine\n{root}\techo two\n"));
+    assert!(m.log().is_empty(), "commands never reach the model");
+}
+
+/// The allow file changed outside henki since it was loaded: `/allow rm` removes nothing and the session stops.
+#[test]
+fn pty_allow_rm_after_outside_change_trips() {
+    let m = Mock::start(vec![say("never")]);
+    let r = asking(&m);
+    let text = format!("{}\techo one\n", r.root());
+    r.write_allow(&text);
+    let p = start(&r, &[]);
+    let more = format!("{text}*\techo two\n");
+    fs::write(r.allow(), &more).unwrap();
+    p.line("/allow rm 1");
+    p.expect(&format!("henki: trust file changed: {}\r\n", r.allow().display()), W);
+    p.prompt(W);
+    assert_eq!(fs::read_to_string(r.allow()).unwrap(), more, "nothing removed");
+    p.line("hello");
+    p.expect(REFUSED, W);
+    p.prompt(W);
+    exit(p);
+    assert!(m.log().is_empty());
+}
+
+#[test]
+fn pty_ctrl_c_idle_hint() {
+    let m = Mock::start(vec![]);
+    let r = asking(&m);
+    let p = start(&r, &[]);
+    for _ in 0..2 {
+        p.ctrl_c();
+        p.expect(&format!("\r\n{HINT}> "), W);
+    }
+    exit(p);
+}
+
+#[test]
+fn pty_ctrl_c_busy_cancels() {
+    let m = Mock::start(vec![Step::Stall { before_first_byte: false, after_words: 2, for_ms: 30_000 }, say("after the cancel")]);
+    let r = asking(&m);
+    let p = start(&r, &[]);
+    p.line("talk");
+    p.expect("w1 w2", W);
+    p.ctrl_c();
+    p.expect("\r\n(interrupted)\r\n", W);
+    p.prompt(W);
+    assert!(m.wait_closed(0, W), "the request stayed open");
+    message(&p, "again", "after the cancel");
+    let d = exit(p);
+    let a = &d.of("assistant")[0];
+    assert_eq!((a["finish"].as_str(), a["msg"]["content"].as_str()), (Some("interrupted"), Some("w1 w2")), "{}", d.diag());
+    let kept = ["w1 w2\n(interrupted)\n", "w1 w2^C\n(interrupted)\n"].iter().any(|k| d.out().contains(k));
+    assert!(kept, "the partial answer keeps its row (the terminal may echo ^C):\n{}", d.out());
+}
+
+/// Ctrl-C while a call runs sends its process group SIGINT first, as a shell would.
+#[test]
+fn pty_ctrl_c_call_sigint_first() {
+    let mut r = Run::new("");
+    let m = Mock::start(vec![shell(&format!("trap 'echo got-int > int.txt; exit 0' INT; sleep {} & wait", r.marker))]);
+    r.at(&m.url());
+    let p = start(&r, &[]);
+    p.line("run it");
+    p.expect(&format!("$ trap 'echo got-int > int.txt; exit 0' INT; sleep {} & wait\r\n", r.marker), W);
+    assert!(poll(W, || !marked(&r.marker).is_empty()), "the call did not start");
+    p.ctrl_c();
+    p.expect("(interrupted)\r\n", W);
+    p.prompt(W);
+    assert!(poll(W, || fs::read_to_string(r.path("int.txt")).is_ok_and(|t| t == "got-int\n")), "the call never saw SIGINT");
+    exit(p);
+}
+
+#[test]
+fn pty_ctrl_c_approval_denies() {
+    let m = Mock::start(vec![shell("touch cc.txt"), say("moving on")]);
+    let r = asking(&m);
+    let p = start(&r, &[]);
+    p.line("make the file");
+    p.expect("run? [y/N/always] ", W);
+    p.ctrl_c();
+    p.expect("moving on", W);
+    p.prompt(W);
+    let d = exit(p);
+    assert_eq!((verdicts(&d), &d.results()[0]["content"]), (vec![json!(["no", null])], &json!("denied by the user")));
+    assert!(!r.path("cc.txt").exists());
+}
+
+/// A `y` typed while the answer streams is dropped before the question, so it never answers it.
+#[test]
+fn pty_typeahead_not_an_answer() {
+    let pause = Step::Stall { before_first_byte: false, after_words: 0, for_ms: 30_000 };
+    let reply = Step::Stream { parts: vec![say("thinking it over"), pause, shell("touch ahead.txt")], finish: Some("tool_calls".into()), done: true, hold_ms: 0 };
+    let m = Mock::start(vec![reply, say("asked properly")]);
+    let r = asking(&m);
+    let p = start(&r, &[]);
+    p.line("go");
+    p.expect("thinking it over", W);
+    p.line("y");
+    m.open_gate();
+    p.expect("run? [y/N/always] ", W);
+    p.line("n");
+    p.expect("asked properly", W);
+    p.prompt(W);
+    let d = exit(p);
+    assert_eq!(verdicts(&d), [json!(["no", null])], "the typed-ahead y answered\n{}", d.diag());
+    assert!(!r.path("ahead.txt").exists());
+}
+
+#[test]
+fn pty_bang_on_terminal() {
+    let m = Mock::start(vec![say("reply-one"), say("reply-two")]);
+    let r = asking(&m);
+    let p = start(&r, &[]);
+    message(&p, "first", "reply-one");
+    p.line("!tty");
+    p.expect(&format!("\r\n{}\r\n> ", p.name), W);
+    message(&p, "second", "reply-two");
+    let d = exit(p);
+    let users = m.log()[1].contents("user");
+    assert!(users[0].ends_with("\n\nfirst"), "{users:?}");
+    assert_eq!(users[1], "[the user ran in their terminal: tty (exit 0)]\nsecond", "{}", d.diag());
+}
+
+/// What the user types while `!cat` runs goes to cat, never to the model.
+#[test]
+fn pty_after_bang_text_not_sent() {
+    let m = Mock::start(vec![say("never")]);
+    let r = asking(&m);
+    let p = start(&r, &[]);
+    p.line("!cat");
+    p.line("typed-into-cat");
+    p.expect("typed-into-cat\r\n", W);
+    p.expect("typed-into-cat\r\n", W);
+    p.ctrl_d();
+    p.prompt(W);
+    let d = exit(p);
+    assert!(m.log().is_empty() && d.journal.is_none(), "{}", d.diag());
+}
+
+#[test]
+fn pty_bang_ctrl_c_to_command() {
+    let m = Mock::start(vec![say("noted")]);
+    let r = asking(&m);
+    let p = start(&r, &[]);
+    p.line(&format!("!sleep {}", r.marker));
+    assert!(poll(W, || !marked(&r.marker).is_empty()), "the command did not start");
+    p.ctrl_c();
+    p.expect("> ", W); // on the row of the echoed ^C
+    assert!(poll(W, || marked(&r.marker).is_empty()), "the command outlived Ctrl-C");
+    message(&p, "what happened", "noted");
+    let d = exit(p);
+    let user = d.of("user")[0]["msg"]["content"].as_str().unwrap().to_string();
+    assert!(user.ends_with(&format!("[the user ran in their terminal: sleep {} (exit 130)]\nwhat happened", r.marker)), "{user}");
+}
+
+#[test]
+fn pty_bang_term_exits() {
+    let m = Mock::start(vec![]);
+    let r = asking(&m);
+    let p = start(&r, &[]);
+    p.line(&format!("!sleep {}", r.marker));
+    assert!(poll(W, || !marked(&r.marker).is_empty()), "the command did not start");
+    let t = Instant::now();
+    p.signal(libc::SIGTERM);
+    let d = ended(p, 130);
+    assert!(d.exited - t <= Duration::from_secs(1), "exit {:?} after SIGTERM", d.exited - t);
+}
+
+/// A command that leaves the terminal raw and silent: henki restores the modes, so Ctrl-C and Enter work again.
+#[test]
+fn pty_bang_raw_mode_restored() {
+    let m = Mock::start(vec![]);
+    let r = asking(&m);
+    let p = start(&r, &[]);
+    p.line("!stty raw -echo");
+    p.prompt(W);
+    p.ctrl_c();
+    p.expect(HINT, W);
+    p.expect("> ", W);
+    p.send(b"/exit\r");
+    ended(p, 0);
+}
+
+/// When a call starts the REPL shows its head line on a row of its own, before the call ends; then the call line.
+#[test]
+fn pty_call_head_line() {
+    let wait = "for i in $(seq 300); do [ -f go ] && break; sleep 0.05; done; echo went";
+    let m = Mock::start(vec![Step::Stream { parts: vec![say("Let me check."), shell(wait)], finish: Some("tool_calls".into()), done: true, hold_ms: 0 }, say("all done")]);
+    let r = Run::new(&m.url());
+    let p = start(&r, &[]);
+    p.line("check");
+    p.expect(&format!("Let me check.\r\n$ {wait}\r\n"), W);
+    assert!(!String::from_utf8_lossy(&p.screen()).contains(" -> exit"), "the call ended before its head line showed");
+    fs::write(r.path("go"), "").unwrap();
+    p.expect(&format!("$ {wait} -> exit 0, "), W);
+    p.expect("all done", W);
+    p.prompt(W);
+    exit(p);
+}
+
+#[test]
+fn pty_tripwire_refuses_messages() {
+    let mut r = Run::new("");
+    let m = Mock::start(vec![shell(&format!("echo '# changed' >> {}", r.config_path.display())), say("never")]);
+    r.at(&m.url()).set("approve", "\"ask\"");
+    let says = format!("trust file changed: {}", r.config_path.display());
+    let p = start(&r, &[]);
+    p.line("change the config");
+    p.expect("run? [y/N/always] ", W);
+    p.line("y");
+    p.expect(&format!("henki: {says}\r\n"), W);
+    p.expect(&format!("(error changed: {says})\r\n"), W);
+    p.prompt(W);
+    p.line("are you there");
+    p.expect(REFUSED, W);
+    p.prompt(W);
+    exit(p);
+    assert_eq!(m.log().len(), 1, "nothing sent after the change");
+}
+
+#[test]
+fn pty_bang_trust_change_trips() {
+    let m = Mock::start(vec![say("never")]);
+    let r = asking(&m);
+    let agents = r.config_dir().join("AGENTS.md");
+    let p = start(&r, &[]);
+    p.line(&format!("!touch {}", agents.display()));
+    p.expect(&bang_changed(&agents), W);
+    p.prompt(W);
+    p.line("hello");
+    p.expect(REFUSED, W);
+    p.prompt(W);
+    exit(p);
+    assert!(m.log().is_empty());
+}
+
+/// `!henki allow rm 1` revokes a rule: the session stops, and after a restart the same call asks again.
+#[test]
+fn pty_bang_revoke_applies() {
+    let m = Mock::start(vec![shell("echo rule-call"), say("first done")]);
+    let mut r = asking(&m);
+    r.write_allow(&format!("{}\techo rule-call\n", r.root()));
+    let p = start(&r, &[]);
+    p.line("use the rule");
+    p.expect(&rule_used(&r, "echo rule-call", 1), W);
+    p.expect("first done", W);
+    p.prompt(W);
+    p.line(&format!("!{} allow rm 1", bin().to_str().unwrap()));
+    p.expect(&format!("removed rule 1: {}  echo rule-call\r\n", r.root()), W);
+    p.expect(&bang_changed(&r.allow()), W);
+    p.prompt(W);
+    p.line("and again");
+    p.expect(REFUSED, W);
+    p.prompt(W);
+    exit(p);
+    let m2 = Mock::start(vec![shell("echo rule-call"), say("asked this time")]);
+    r.at(&m2.url());
+    let p = start(&r, &["--resume"]);
+    p.line("again please");
+    p.expect("run? [y/N/always] ", W);
+    p.line("n");
+    p.expect("asked this time", W);
+    p.prompt(W);
+    let d = exit(p);
+    assert!(!d.out().contains("(allowed by rule"), "a revoked rule matched:\n{}", d.out());
+    assert_eq!(verdicts(&d), [json!(["no", null])]);
+}
+
+#[test]
+fn pty_term_at_idle_130() {
+    let m = Mock::start(vec![]);
+    let r = asking(&m);
+    let p = start(&r, &[]);
+    p.signal(libc::SIGTERM);
+    ended(p, 130);
+}
+
+#[test]
+fn pty_resume_continues() {
+    let m = Mock::start(vec![say("first reply")]);
+    let mut r = asking(&m);
+    let p = start(&r, &[]);
+    message(&p, "first message", "first reply");
+    let first = exit(p);
+    let m2 = Mock::start(vec![say("second reply")]);
+    r.at(&m2.url());
+    let p = start(&r, &["--resume"]);
+    message(&p, "second message", "second reply");
+    let d = exit(p);
+    assert_eq!(d.journal, first.journal, "the same session file");
+    let l = &m2.log()[0];
+    let users = l.contents("user");
+    assert!(users.len() == 2 && users[0].ends_with("\n\nfirst message") && users[1] == "second message", "{users:?}");
+    assert_eq!(l.contents("assistant"), ["first reply"]);
+}
+
+#[test]
+fn pty_auto_banner() {
+    let m = Mock::start(vec![]);
+    let r = Run::new(&m.url());
+    let p = Pty::spawn(&r, &[], 24, 80);
+    p.expect(&format!("approval: AUTO (from {}:3)\r\n", r.config_path.display()), W);
+    p.prompt(W);
+    exit(p);
+}
+
+#[test]
+fn pty_small_window_warning() {
+    let m = Mock::start(vec![]);
+    let mut r = asking(&m);
+    r.set("context_window", "8192");
+    let p = Pty::spawn(&r, &[], 24, 80);
+    p.expect(
+        "henki: context_window is 8,192 tokens, too small for most tasks; fix: start llama-server with -c 32768 (Ollama: OLLAMA_CONTEXT_LENGTH=32768) and set context_window = 32768\r\n",
+        W,
+    );
+    p.prompt(W);
+    exit(p);
+}
+
+/// At start the banner counts this root's rules and lists each of them, never another root's.
+#[test]
+fn pty_rules_listed_at_start() {
+    let m = Mock::start(vec![]);
+    let r = asking(&m);
+    r.write_allow(&format!("/somewhere/else\techo other\n{root}\techo mine\n{root}\techo also mine\n", root = r.root()));
+    let p = Pty::spawn(&r, &[], 24, 80);
+    p.expect("henki: allow: 2 rules apply to this root (~/.config/henki/allow; /allow lists them)\r\n", W);
+    p.expect("allow:   2  echo mine\r\nallow:   3  echo also mine\r\n", W);
+    p.prompt(W);
+    let d = exit(p);
+    assert!(!d.out().contains("echo other"), "{}", d.out());
+}
