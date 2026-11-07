@@ -14,18 +14,23 @@ use std::path::PathBuf;
 use std::process::{Child, Command};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use std::thread;
+use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
-/// What the REPL writes before an approval display; the only control sequence henki itself sends.
-pub const RESET: &str = "\x1b[!p\x1b[0m\x1b[r\x1b[?1049l";
+/// What the REPL writes before an approval display; the only control sequence henki itself sends. It ends on a newly
+/// scrolled bottom row, so the display lands below everything already on the screen.
+pub const RESET: &str = "\x1b[!p\x1b[0m\x1b[r\x1b[?1049l\x1b[?7h\x1b[999;1H\x1bD";
 
 /// Borrows its `Run`, whose drop deletes the directories henki works in.
 pub struct Pty<'a> {
-    master: File,
+    /// None once `hang_up` closed it.
+    master: Option<File>,
     child: Child,
     screen: Arc<Mutex<Vec<u8>>>,
+    /// Set when the reader thread ended: no process has the terminal open, or `hang_up` stopped it.
     eof: Arc<AtomicBool>,
+    stop: Arc<AtomicBool>,
+    reader: Option<JoinHandle<()>>,
     /// Where the next `expect` starts looking.
     from: Cell<usize>,
     /// The terminal's device path, as `tty` prints it.
@@ -41,6 +46,11 @@ impl<'a> Pty<'a> {
     /// henki with `args` under a fresh pty of `rows` x `cols`: the slave is fds 0-2; pre_exec runs setsid and
     /// TIOCSCTTY, so the pty is henki's controlling terminal and its group the foreground one.
     pub fn spawn(r: &'a Run, args: &[&str], rows: u16, cols: u16) -> Pty<'a> {
+        Pty::spawn_to(r, args, rows, cols, None)
+    }
+
+    /// The same, with henki's stdout to `stdout` when given (the pty stays its stdin and stderr).
+    pub fn spawn_to(r: &'a Run, args: &[&str], rows: u16, cols: u16, stdout: Option<File>) -> Pty<'a> {
         let (mut m, mut s) = (0, 0);
         let ws = libc::winsize { ws_row: rows, ws_col: cols, ws_xpixel: 0, ws_ypixel: 0 };
         // SAFETY: openpty writes two descriptors into the out-pointers; the name and termios pointers may be null and
@@ -61,7 +71,11 @@ impl<'a> Pty<'a> {
         let name = unsafe { std::ffi::CStr::from_ptr(buf.as_ptr()) }.to_string_lossy().into_owned();
         let mut c = Command::new(bin());
         r.prepare(&mut c);
-        c.args(args).stdin(slave.try_clone().unwrap()).stdout(slave.try_clone().unwrap()).stderr(slave);
+        c.args(args).stdin(slave.try_clone().unwrap()).stderr(slave.try_clone().unwrap());
+        match stdout {
+            Some(f) => c.stdout(f),
+            None => c.stdout(slave),
+        };
         // SAFETY: runs in the forked child before exec; setsid, ioctl and signal are async-signal-safe.
         unsafe {
             c.pre_exec(|| {
@@ -78,11 +92,11 @@ impl<'a> Pty<'a> {
         let child = c.spawn().expect("start henki");
         drop(c); // the slave's last copies here: the master reads EIO once henki and its commands close theirs
         let master = File::from(master);
-        let (screen, eof) = (Arc::new(Mutex::new(Vec::new())), Arc::new(AtomicBool::new(false)));
-        let (mut rd, sc, e) = (master.try_clone().unwrap(), screen.clone(), eof.clone());
-        thread::spawn(move || {
+        let (screen, eof, stop) = (Arc::new(Mutex::new(Vec::new())), Arc::new(AtomicBool::new(false)), Arc::new(AtomicBool::new(false)));
+        let (mut rd, sc, e, st) = (master.try_clone().unwrap(), screen.clone(), eof.clone(), stop.clone());
+        let reader = thread::spawn(move || {
             let mut b = [0u8; 65536];
-            loop {
+            while !st.load(Ordering::SeqCst) {
                 let mut pfd = libc::pollfd { fd: rd.as_raw_fd(), events: libc::POLLIN, revents: 0 };
                 // SAFETY: one valid pollfd on the stack, count 1, a 20 ms timeout.
                 if unsafe { libc::poll(&mut pfd, 1, 20) } == 0 {
@@ -91,15 +105,17 @@ impl<'a> Pty<'a> {
                 match rd.read(&mut b) {
                     Ok(k) if k > 0 => sc.lock().unwrap().extend_from_slice(&b[..k]),
                     Err(err) if err.kind() == std::io::ErrorKind::Interrupted => {}
-                    _ => return e.store(true, Ordering::SeqCst), // EIO: no process has the terminal open
+                    _ => break, // EIO: no process has the terminal open
                 }
             }
+            e.store(true, Ordering::SeqCst);
         });
-        Pty { master, child, screen, eof, from: Cell::new(0), name, started: Instant::now(), state: r.state(), before, marker: r.marker.clone(), run: PhantomData }
+        let (from, started, state, marker) = (Cell::new(0), Instant::now(), r.state(), r.marker.clone());
+        Pty { master: Some(master), child, screen, eof, stop, reader: Some(reader), from, name, started, state, before, marker, run: PhantomData }
     }
 
     pub fn send(&self, b: &[u8]) {
-        (&self.master).write_all(b).unwrap();
+        self.master.as_ref().expect("the terminal is open").write_all(b).unwrap();
     }
 
     pub fn line(&self, s: &str) {
@@ -140,6 +156,15 @@ impl<'a> Pty<'a> {
 
     pub fn screen(&self) -> Vec<u8> {
         self.screen.lock().unwrap().clone()
+    }
+
+    /// The terminal goes away, as when its window closes: every copy of the master is closed (the reader thread's
+    /// too, after it took what was on the screen), so henki gets SIGHUP and its reads end. Then `wait`.
+    pub fn hang_up(mut self, within: Duration) -> Done {
+        self.stop.store(true, Ordering::SeqCst);
+        self.reader.take().unwrap().join().unwrap();
+        drop(self.master.take());
+        self.wait(within)
     }
 
     pub fn signal(&self, sig: i32) {

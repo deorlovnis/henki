@@ -391,7 +391,9 @@ fn content(events: &[Value]) -> Vec<Value> {
     blocks.into_iter().map(parsed).collect()
 }
 
-/// The mock refuses what the API refuses, so a test that passes against it would pass against the API.
+/// The mock refuses the request shapes below as the API refuses them, so every Anthropic test checks henki's requests
+/// against them. Text-only assistant content is not compared on replay: the API binds only thinking blocks to what it
+/// sent, and a reply cut short is replayed as its partial text.
 #[test]
 fn mock_anthropic_refuses_like_the_api() {
     let m = Mock::start_api(Api::Anthropic, vec![thinking("hmm", shell("ls")), say("ok"), say("ok")]);
@@ -404,6 +406,7 @@ fn mock_anthropic_refuses_like_the_api() {
     let id = reply[1]["id"].as_str().unwrap().to_string();
     let result = json!({"role": "user", "content": [{"type": "tool_result", "tool_use_id": id, "content": "a\n", "is_error": false}]});
     let turn = |reply: &[Value]| vec![user("hi"), json!({"role": "assistant", "content": reply}), result.clone()];
+    let late = json!({"role": "user", "content": [{"type": "text", "text": "and then"}, result["content"][0]]});
     let mut changed = reply.clone();
     changed[0]["thinking"] = json!("hmm, no");
     let mut renamed = reply.clone();
@@ -415,6 +418,8 @@ fn mock_anthropic_refuses_like_the_api() {
         (&v[..], json!({"model": "m", "max_tokens": 9, "messages": [user("hi")], "temperature": 0}), "temperature: Extra inputs are not permitted"),
         (&v[..], req("sys", vec![user("hi"), user("again")]), "messages.1: roles must alternate"),
         (&v[..], req("sys", vec![user("")]), "messages.0.content.0.text: text content blocks must be non-empty"),
+        (&v[..], req("sys", vec![user(" \n\t")]), "messages.0.content.0.text: text content blocks must contain non-whitespace text"),
+        (&v[..], req("sys", vec![user("hi"), json!({"role": "assistant", "content": reply}), late]), "messages.2.content.1: tool_result blocks must come first"),
         (&v[..], req("sys", turn(&reply)[..2].to_vec()), "`tool_use` ids were found without `tool_result` blocks"),
         (&v[..], req("sys", vec![user("hi"), json!({"role": "assistant", "content": [{"type": "text", "text": "x"}]}), result.clone()]), "unexpected `tool_use_id`"),
         (&v[..], req("sys", turn(&changed)), "the assistant content was changed"),
@@ -432,4 +437,19 @@ fn mock_anthropic_refuses_like_the_api() {
     let (status, err) = post(&m, "/model/v1/messages", &v, &req("sys", vec![user("hi")]));
     assert!(status == 401 && err[0]["error"]["message"].as_str().unwrap().starts_with("blocked:no-standin"), "{err:?}");
     assert_eq!(post(&m, "/model/v1/messages", &[v[0], ("x-api-key", "cred-managed")], &req("sys", vec![user("hi")])).0, 200);
+}
+
+/// A reply whose text before its call is whitespace alone: the API refuses such a block in a request, so the next
+/// request replays the reply without it.
+#[test]
+fn e2e_anthropic_whitespace_text_dropped() {
+    let reply = Step::Stream { parts: vec![say("\n\n"), shell("echo ws")], finish: Some("tool_calls".into()), done: true, hold_ms: 0 };
+    let (r, m) = scripted(vec![reply, say("done")]);
+    let d = r.json("go");
+    d.finish();
+    assert_eq!(d.code, Some(0), "{}", d.diag());
+    clean(&m);
+    let replayed = &m.log()[1].messages()[1];
+    assert_eq!((&replayed["role"], replayed["content"].as_array().map(Vec::len)), (&json!("assistant"), Some(1)), "{replayed}");
+    assert_eq!((&replayed["content"][0]["type"], &replayed["content"][0]["input"]), (&json!("tool_use"), &json!({"command": "echo ws"})), "{replayed}");
 }

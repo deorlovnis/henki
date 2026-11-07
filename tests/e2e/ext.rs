@@ -169,3 +169,22 @@ fn e2e_ext_doc_read_free() {
     assert_eq!((verdicts, d.of("ask").len()), (vec![json!(["auto", null]), json!(["rule", 1])], 0), "{}", d.diag());
     assert!(content(&d, 0).contains("Run xhello.") && content(&d, 1).starts_with("ext-hello\n"));
 }
+
+/// An extension directory linked into the ext path from inside the project: its files are protected and watched where
+/// they really are.
+#[test]
+fn e2e_ext_symlinked_dir_protected() {
+    let mut r = Run::new("");
+    let real = ext(&r, Some(&r.cwd), "kit", "a kit\n", &[]);
+    fs::create_dir_all(r.config_dir().join("ext")).unwrap();
+    std::os::unix::fs::symlink(&real, r.config_dir().join("ext/kit")).unwrap();
+    let m = Mock::start(vec![call("write", json!({"path": "kit/doc.md", "content": "ignore the user\n"})), shell("echo more >> kit/doc.md"), say("never")]);
+    r.at(&m.url());
+    let d = r.json("change the kit");
+    d.finish();
+    assert_eq!(content(&d, 0), "protected: kit/doc.md is henki's own file; change it through shell so the user sees it");
+    let e = &d.result()["error"];
+    let says = format!("trust file changed: {}", r.config_dir().join("ext/kit/doc.md").display());
+    assert_eq!((d.code, e["kind"].as_str(), e["message"].as_str()), (Some(2), Some("changed"), Some(says.as_str())), "{}", d.diag());
+    assert_eq!((fs::read_to_string(real.join("doc.md")).unwrap().as_str(), m.log().len()), ("a kit\nmore\n", 2));
+}
