@@ -1,0 +1,17 @@
+{"agents_hash":null,"allow_hash":null,"approve":"auto","approve_from":"/home/u/.config/henki/config.toml:3","base_url":"http://127.0.0.1:9/v1","base_url_from":"config","config":"/home/u/.config/henki/config.toml","config_hash":"0123456789abcdef","ctx":32768,"cwd":"/tmp/henki-contracts-golden","dialect":"openai","exts":[],"henki":"0.1.0","id":"20261107T120000Z-c0de","model":"mock-model","pass_env":[],"project_agents_hash":null,"resumed":null,"shell":"/bin/bash","t":"session","tools":["shell","read","write","edit"],"ts":"2026-11-07T12:00:00Z","v":1}
+{"msg":{"content":"cwd: /tmp/henki-contracts-golden\nos: linux x86_64\ndate: 2026-11-07\n\nlist the files and read a.txt","role":"user"},"t":"user","ts":"2026-11-07T12:00:00Z","x_note":"a field henki does not know"}
+{"finish":"tool_calls","msg":{"content":"Listing.","role":"assistant","tool_calls":[{"args":{"command":"ls"},"id":"call_a","name":"shell"}]},"t":"assistant","ts":"2026-11-07T12:00:01Z","usage":{"cached":0,"in":500,"out":20}}
+{"id":"call_a","t":"approval","ts":"2026-11-07T12:00:01Z","verdict":"auto"}
+{"bytes":12,"content":"a.txt\nb.txt\n","id":"call_a","is_error":false,"ms":4,"name":"shell","t":"tool_result","ts":"2026-11-07T12:00:01Z"}
+{"t":"x-later","ts":"2026-11-07T12:00:01Z","what":"a kind this henki does not know"}
+{"finish":"tool_calls","msg":{"content":"","role":"assistant","tool_calls":[{"args":{"path":"a.txt"},"id":"h1","name":"read"},{"args":{},"id":"h2","name":"shell","raw":"{\"command\": "}]},"t":"assistant","ts":"2026-11-07T12:00:02Z","usage":{"cached":0,"in":540,"out":20}}
+{"id":"h1","t":"approval","ts":"2026-11-07T12:00:02Z","verdict":"auto"}
+{"bytes":6,"content":"1\thello\n","id":"h1","is_error":false,"ms":1,"name":"read","t":"tool_result","ts":"2026-11-07T12:00:02Z"}
+{"bytes":0,"content":"arguments are not valid JSON (line 1 col 12): {\"command\": ","id":"h2","is_error":true,"ms":0,"name":"shell","t":"tool_result","ts":"2026-11-07T12:00:02Z"}
+{"t":"notice","text":"a notice","ts":"2026-11-07T12:00:02Z"}
+{"ids":["call_a"],"t":"elide","ts":"2026-11-07T12:00:03Z"}
+{"finish":"stop","msg":{"content":"a.txt says hello.","role":"assistant","tool_calls":[]},"t":"assistant","ts":"2026-11-07T12:00:03Z","usage":{"cached":0,"in":600,"out":20}}
+{"msg":{"content":"never history: henki does not know this kind","role":"user"},"t":"future_kind","ts":"2026-11-07T12:00:03Z"}
+{"status":"ok","steps":3,"t":"turn_end","ts":"2026-11-07T12:00:03Z","usage":{"cached":0,"in":1640,"out":60}}
+{"duration_s":3.1,"exit":0,"session":"20261107T120000Z-c0de","status":"ok","steps":3,"t":"result","text":"a.txt says hello.","ts":"2026-11-07T12:00:03Z","usage":{"cached":0,"in":1640,"out":60}}
+{"bytes":2671,"t":"close","ts":"2026-11-07T12:00:03Z"}
