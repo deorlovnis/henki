@@ -1,0 +1,65 @@
+[
+ {
+  "content": "cwd: /tmp/henki-contracts-golden\nos: linux x86_64\ndate: 2026-11-07\n\nlist the files and read a.txt",
+  "role": "user"
+ },
+ {
+  "content": "Listing.",
+  "role": "assistant",
+  "tool_calls": [
+   {
+    "function": {
+     "arguments": "{\"command\":\"ls\"}",
+     "name": "shell"
+    },
+    "id": "call_a",
+    "type": "function"
+   }
+  ]
+ },
+ {
+  "content": "[output elided: 12 bytes]",
+  "role": "tool",
+  "tool_call_id": "call_a"
+ },
+ {
+  "content": "",
+  "role": "assistant",
+  "tool_calls": [
+   {
+    "function": {
+     "arguments": "{\"path\":\"a.txt\"}",
+     "name": "read"
+    },
+    "id": "h1",
+    "type": "function"
+   },
+   {
+    "function": {
+     "arguments": "{}",
+     "name": "shell"
+    },
+    "id": "h2",
+    "type": "function"
+   }
+  ]
+ },
+ {
+  "content": "1\thello\n",
+  "role": "tool",
+  "tool_call_id": "h1"
+ },
+ {
+  "content": "arguments are not valid JSON (line 1 col 12): {\"command\": ",
+  "role": "tool",
+  "tool_call_id": "h2"
+ },
+ {
+  "content": "a.txt says hello.",
+  "role": "assistant"
+ },
+ {
+  "content": "and now",
+  "role": "user"
+ }
+]
