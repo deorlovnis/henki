@@ -144,15 +144,16 @@ fn modes(fd: i32) -> Option<libc::termios> {
     (unsafe { libc::tcgetattr(fd, &mut t) } == 0).then_some(t)
 }
 
-/// `on`: fd 0 in the line editor's modes, the saved ones without ICANON, ECHO, IEXTEN and ICRNL, with VMIN 1 and VTIME 0:
-/// each read returns what has come, Enter comes as CR, and Ctrl-C and Ctrl-\ stay signals. What was typed before is
+/// `on`: fd 0 in the line editor's modes, the saved ones without ICANON, ECHO, IEXTEN and ICRNL, with VMIN 1 and VTIME 0
+/// and no suspend character: each read returns what has come, Enter comes as CR, Ctrl-Z is a byte like any other (henki
+/// is never stopped with the terminal in these modes), and Ctrl-C and Ctrl-\ stay signals. What was typed before is
 /// dropped; Some(its bytes). `!on`: the saved modes back, so a command that left the terminal raw or without echo does
 /// not leave it so. Both clear O_NONBLOCK. None without saved modes (`run`, or fd 0 not a terminal).
 pub fn raw(on: bool) -> Option<usize> {
     let mut t = *TTY.get()?;
     if on {
         (t.c_lflag, t.c_iflag) = (t.c_lflag & !(libc::ICANON | libc::ECHO | libc::IEXTEN), t.c_iflag & !libc::ICRNL);
-        (t.c_cc[libc::VMIN], t.c_cc[libc::VTIME]) = (1, 0);
+        (t.c_cc[libc::VMIN], t.c_cc[libc::VTIME], t.c_cc[libc::VSUSP]) = (1, 0, libc::_POSIX_VDISABLE);
     }
     // SAFETY: tcsetattr only reads `t`, a copy of a termios tcgetattr filled.
     unsafe { libc::tcsetattr(0, libc::TCSANOW, &t) };

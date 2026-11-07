@@ -3,7 +3,7 @@
 use crate::{sys, types::Ev, types::lock};
 use serde_json::Value;
 use std::sync::{Arc, Condvar, Mutex, PoisonError, atomic::AtomicBool, atomic::Ordering::SeqCst, mpsc, mpsc::Receiver, mpsc::Sender};
-use std::{borrow::Cow, fmt::Write as _, io, io::Read, io::Write, time::Duration, time::Instant};
+use std::{borrow::Cow, fmt::Write as _, io, io::Read, io::Write, os::fd::AsRawFd, time::Duration, time::Instant};
 
 /// Plain `run`, `run --json`, or the REPL.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -14,13 +14,15 @@ pub enum Mode {
 }
 
 /// Written before every approval display: soft reset, attributes off, no scroll region, main screen, line wrap on, then
-/// the cursor to the start of the bottom row and one row scrolled in, bracketed paste off. Removing the scroll region also
-/// moves the cursor to the top-left corner, where the display would be drawn over old text; from a fresh bottom row every
-/// display line lands on a blank row, below everything already on the screen.
-pub const RESET: &str = "\x1b[!p\x1b[0m\x1b[r\x1b[?1049l\x1b[?7h\x1b[999;1H\x1bD\x1b[?2004l";
-/// The start and end of a paste, as a terminal with bracketed paste on (`paste`) sends it.
+/// the cursor to the start of the bottom row and one row scrolled in. Removing the scroll region also moves the cursor to
+/// the top-left corner, where the display would be drawn over old text; from a fresh bottom row every display line lands
+/// on a blank row, below everything already on the screen.
+pub const RESET: &str = "\x1b[!p\x1b[0m\x1b[r\x1b[?1049l\x1b[?7h\x1b[999;1H\x1bD";
+/// Bracketed paste off and on.
+pub const PASTE_MODE: [&str; 2] = ["\x1b[?2004l", "\x1b[?2004h"];
+/// The start and end of a paste, as a terminal with bracketed paste on sends it.
 const PASTE: [&[u8]; 2] = [b"\x1b[200~", b"\x1b[201~"];
-/// The most a line holds; more is dropped.
+/// The most a line holds (more is dropped), and the most `run -` takes from stdin.
 pub const LINE_MAX: usize = 1 << 20;
 
 /// Code points escaped on every output path (C0 except tab and newline, DEL, C1, Cf, Zl/Zp, Zs except space, default ignorables).
@@ -76,10 +78,12 @@ pub fn secs(ms: u64) -> String {
     format!("{}.{}", t / 10, t % 10)
 }
 
-/// Where a queued piece goes: a stdout line, stderr, or a streamed piece of the REPL's answer (stdout, no newline).
+/// Where a queued piece goes: a stdout line, stderr, or a streamed piece of the REPL's answer (stdout, no newline); or a
+/// mark that writes nothing (`sync`).
 const STDOUT: u8 = 1;
 const STDERR: u8 = 2;
 const DELTA: u8 = 3;
+const SYNC: u8 = 4;
 
 /// The queue to the writer thread; pieces leave in the order they were queued, across both streams.
 pub struct Out {
@@ -91,16 +95,19 @@ pub struct Out {
 }
 
 impl Out {
-    /// The writer thread over fd 1 and fd 2. `main` calls it after argument parsing, when the mode is known.
+    /// The writer thread over fd 1 and fd 2. `main` calls it after argument parsing, when the mode is known. The REPL
+    /// runs only with stderr a terminal; one that is `dumb` (or no TERM, as in an editor's shell buffer) gets no reset
+    /// and no bracketed paste switches.
     #[allow(clippy::disallowed_methods)] // the one place that takes fd 1 and fd 2
     pub fn start(mode: Mode, tx: Sender<Ev>) -> Out {
-        Out::with(mode, tx, Box::new(std::io::stdout()), Box::new(std::io::stderr()), crate::sys::isatty(2))
+        Out::with(mode, tx, Box::new(std::io::stdout()), Box::new(std::io::stderr()), std::env::var_os("TERM").is_some_and(|t| !t.is_empty() && t != "dumb"))
     }
 
-    /// The same over any two writers (tests); `tty`: stderr is a terminal (the reset is drawn). The first stdout error
-    /// marks stdout closed, sends `Ev::OutputClosed` once and drops every later stdout piece; stderr errors are ignored.
-    /// The writer keeps one fact, `open`: the last stdout piece was a delta not ending in "\n". Anything but a delta first
-    /// ends that line, so a cut answer keeps its text and what follows starts on its own row.
+    /// The same over any two writers (tests); `tty`: stderr takes escape sequences (the reset and the bracketed paste
+    /// switches are written). The first stdout error marks stdout closed, sends `Ev::OutputClosed` once and drops every
+    /// later stdout piece; stderr errors are ignored. The writer keeps one fact, `open`: the last stdout piece was a delta
+    /// not ending in "\n". Anything but a delta first ends that line, so a cut answer keeps its text and what follows
+    /// starts on its own row.
     pub fn with(mode: Mode, tx: Sender<Ev>, mut out: Box<dyn Write + Send>, mut err: Box<dyn Write + Send>, tty: bool) -> Out {
         let (queue, pieces) = mpsc::channel::<(u8, Vec<u8>)>();
         let (end, done) = mpsc::channel();
@@ -120,6 +127,7 @@ impl Out {
                 }
                 match to {
                     STDERR => drop(err.write_all(&b).and_then(|()| err.flush())),
+                    SYNC => drop(tx.send(Ev::Input { tag: u32::from_le_bytes(b.as_slice().try_into().unwrap_or_default()), bytes: Some(Vec::new()) })),
                     _ => put(&b),
                 }
                 if to == DELTA && !b.is_empty() {
@@ -176,9 +184,17 @@ impl Out {
         self.send(DELTA, self.repl(), || escape(text).into_owned());
     }
 
-    /// The REPL with stderr a terminal: `RESET` to stderr, unescaped.
-    pub fn reset(&self) {
-        self.send(STDERR, self.repl() && self.tty, || RESET.into());
+    /// The REPL with stderr a terminal that takes escape sequences: `seq` (`RESET`, a `PASTE_MODE` switch) to stderr as it
+    /// is, in order with everything else, so a paste switch holds from the next prompt on, also after a `RESET` (whose
+    /// soft reset may clear it).
+    pub fn control(&self, seq: &'static str) {
+        self.send(STDERR, self.repl() && self.tty, || seq.into());
+    }
+
+    /// A mark: when the writer reaches it, everything queued before it is written, and it sends `Ev::Input { tag, bytes:
+    /// Some(empty) }`. False when there is no writer to send it.
+    pub fn sync(&self, tag: u32) -> bool {
+        self.queue.send((SYNC, tag.to_le_bytes().to_vec())).is_ok()
     }
 
     /// The REPL: the line editor's echo, already escaped, to stderr as it is.
@@ -201,15 +217,12 @@ impl Out {
     }
 }
 
-/// The rows `lines` take on a terminal `cols` wide after escaping (an ASCII character is one column, a tab 8, the most it
-/// can move, any other character two); at least one per line. A character that does not fit in what is left of a row
-/// starts the next one, as a terminal never splits a wide character.
+/// The rows `lines` take on a terminal `cols` wide: laid out from column 0 as the line editor lays out a line, one line
+/// after another.
 pub fn rows(lines: &[String], cols: usize) -> usize {
-    let put = |(rows, col): (usize, usize), c: char| {
-        let w = width(c.encode_utf8(&mut [0; 4]));
-        if col > 0 && col + w > cols { (rows + 1, w) } else { (rows, col + w) }
-    };
-    lines.iter().map(|l| escape(l).chars().fold((1, 0), put).0).sum()
+    let mut e = Edit::new("", cols);
+    lines.join("\n").chars().for_each(|c| e.put(c));
+    e.rows.len() + 1
 }
 
 /// The columns `s` takes at most: an ASCII character one, a tab eight, any other character two.
@@ -219,14 +232,14 @@ fn width(s: &str) -> usize {
 
 /// The REPL's terminal reader. It reads only while MAIN waits for input, so what the user types into a `!cmd` reaches
 /// the command. Each read goes out as `Ev::Input { tag, bytes }` (None: EOF or an error) with the tag MAIN asked with
-/// when it returned: 0 when MAIN no longer waits, and MAIN drops it as stale.
-pub struct Reader(Arc<(Mutex<u32>, Condvar)>);
+/// when it returned: 0 when MAIN no longer waits, and MAIN drops it as stale. `.1` is the descriptor it reads.
+pub struct Reader(Arc<(Mutex<u32>, Condvar)>, pub i32);
 
 impl Reader {
-    /// The thread over `input`: stdin, or any input in tests. Reads of 64 KiB go past std's buffer for stdin, which stays
+    /// The thread over `input`: stdin, or a pipe in tests. Reads of 64 KiB go past std's buffer for stdin, which stays
     /// empty.
-    pub fn with(mut input: Box<dyn Read + Send>, tx: Sender<Ev>) -> io::Result<Reader> {
-        let wanted = Arc::new((Mutex::new(0), Condvar::new()));
+    pub fn with(mut input: impl Read + AsRawFd + Send + 'static, tx: Sender<Ev>) -> io::Result<Reader> {
+        let (wanted, fd) = (Arc::new((Mutex::new(0), Condvar::new())), input.as_raw_fd());
         let w = Arc::clone(&wanted);
         let read = move || {
             let mut b = vec![0; 64 << 10];
@@ -248,7 +261,7 @@ impl Reader {
             }
         };
         std::thread::Builder::new().name("input".into()).spawn(read)?;
-        Ok(Reader(wanted))
+        Ok(Reader(wanted, fd))
     }
 
     /// Read once for `tag`; `ask(0)` stops waiting: what a read under way returns later is stale.
@@ -258,18 +271,12 @@ impl Reader {
     }
 }
 
-/// Bracketed paste on or off, written to stderr right away when it is a terminal, so it holds before a `!cmd` starts.
-#[allow(clippy::disallowed_methods)] // ordered before a command's own output, which the writer thread cannot do
-pub fn paste(on: bool) {
-    let _ = sys::isatty(2).then(|| std::io::stderr().write_all(if on { b"\x1b[?2004h" } else { b"\x1b[?2004l" }));
-}
-
 /// The REPL's line editor over what the terminal sends in the editor's modes: printable text, Backspace and DEL (one
 /// whole character), Ctrl-U (the whole line), Enter, Ctrl-D on an empty line (EOF), and a bracketed paste kept whole,
 /// newlines included. Every other control byte and escape sequence is dropped. It echoes each character escaped (a
 /// newline as "\n", which the terminal's output processing makes CR LF, as for all henki writes) and wraps rows itself
-/// before the last column, counting the most a character can take (`width`), so the terminal never wraps a
-/// row and henki knows how many the line takes: Backspace and Ctrl-U go up to the first and draw the line again.
+/// before the last column, counting the most a character can take (`width`), so the terminal never wraps a row and every
+/// row starts at a column henki knows: Backspace draws only the row it changes, and Ctrl-U goes up to the first.
 #[derive(Default)]
 pub struct Edit {
     pub text: String,
@@ -282,8 +289,10 @@ pub struct Edit {
     /// The prompt, escaped, as the first row starts with it ("" when the line starts on the row after it).
     prompt: String,
     cols: usize,
-    /// The rows below the first that the line takes, and the column after its last character.
-    rows: usize,
+    /// Where each row below the first starts in `text`: at its first character, or at the newline that ends the row
+    /// above.
+    rows: Vec<usize>,
+    /// The column after the last character.
     col: usize,
     utf8: Vec<u8>,
     esc: Vec<u8>,
@@ -301,9 +310,10 @@ impl Edit {
     }
 
     /// Takes `b`, read from the terminal; `more`: input waits beyond `b`. Some(true): Enter sent the line; Some(false): EOF.
+    /// A CR LF that ends `b` is one Enter, as a terminal that sends both for it means.
     pub fn feed(&mut self, b: &[u8], more: impl Fn() -> bool) -> Option<bool> {
-        let done = b.iter().enumerate().find_map(|(i, &c)| self.byte(c, &|| i + 1 < b.len() || more()));
-        self.decode(done.is_some());
+        let done = b.iter().enumerate().find_map(|(i, &c)| self.byte(c, &|| !matches!((c, &b[i + 1..]), (_, []) | (b'\r', b"\n")) || more()));
+        self.decode(false); // after Enter or EOF `byte` has decoded everything already
         done
     }
 
@@ -318,24 +328,25 @@ impl Edit {
             }
             return None;
         }
-        if c == 0x1b || !self.esc.is_empty() {
+        // A printable byte after ESC: CSI (ESC [ ... final byte), SS3 (ESC O x) or ESC x, dropped whole.
+        if c >= 0x20 && c != 0x7f {
             self.esc.push(c);
             let e = &self.esc[..];
-            // CSI (ESC [ ... final byte), SS3 (ESC O x) or ESC x, dropped whole; a second ESC starts over.
-            if e == b"\x1b\x1b" {
-                self.esc.pop();
-            } else if !(matches!(e, [_] | [_, b'[' | b'O']) || matches!(e, [_, b'[', .., f] if !(0x40..=0x7e).contains(f) && e.len() < 32)) {
+            if !(matches!(e, [_, b'[' | b'O']) || matches!(e, [_, b'[', .., f] if !(0x40..=0x7e).contains(f) && e.len() < 32)) {
                 self.paste = std::mem::take(&mut self.esc) == PASTE[0];
             }
             return None;
         }
+        // Any other byte ends a sequence and counts as itself (Esc or Alt, then Enter, is Enter); ESC starts one.
+        self.esc.clear();
         self.decode(true);
         match c {
+            0x1b => self.esc.push(c),
             b'\r' | b'\n' if more() => self.put('\n'),
             b'\r' | b'\n' => return Some(true).inspect(|_| self.echo.push('\n')),
-            0x7f | 0x08 => self.redo(self.text.chars().count().saturating_sub(1)),
-            0x15 => self.redo(0),
-            0x04 if self.text.is_empty() => return Some(false),
+            0x7f | 0x08 => self.cut(self.text.char_indices().last().map_or(0, |(i, _)| i)),
+            0x15 => self.cut(0),
+            0x04 if self.text.is_empty() => return Some(false).inspect(|_| self.echo.push('\n')),
             _ => {}
         }
         None
@@ -357,27 +368,30 @@ impl Edit {
             self.over += c.len_utf8();
             return;
         }
-        let shown = escape(c.encode_utf8(&mut [0; 4])).into_owned();
+        let shown = if c == '\n' { String::new() } else { escape(c.encode_utf8(&mut [0; 4])).into_owned() };
         let w = width(&shown);
         // A newline ends the row; a character that does not fit in what is left of it starts the next one.
         if c == '\n' || self.col > 0 && self.col + w > self.cols {
             self.echo.push('\n');
-            (self.rows, self.col, self.pasted) = (self.rows + 1, 0, self.pasted || c == '\n');
+            self.rows.push(self.text.len());
+            (self.col, self.pasted) = (0, self.pasted || c == '\n');
         }
         self.text.push(c);
-        if c != '\n' {
-            self.echo.push_str(&shown);
-            self.col += w;
-        }
+        self.echo.push_str(&shown);
+        self.col += w;
     }
 
-    /// Backspace (`keep` all but the last character) and Ctrl-U (`keep` 0): up to the first row, everything from there
-    /// cleared, the prompt again and the line's first `keep` characters.
-    fn redo(&mut self, keep: usize) {
-        let text = std::mem::take(&mut self.text);
-        let _ = write!(self.echo, "{}\r\x1b[J{}", "\x1b[A".repeat(self.rows), self.prompt);
-        (self.rows, self.col) = (0, width(&self.prompt));
-        text.chars().take(keep).for_each(|c| self.put(c));
+    /// Backspace (`keep`: the bytes before the last character) and Ctrl-U (`keep` 0): the text cut to `keep` bytes, then
+    /// up to the row where it now ends, which is cleared with everything below and drawn again (the prompt first on the
+    /// first row). Backspace writes one row at most, however long the line. An emptied line is no longer pasted.
+    fn cut(&mut self, keep: usize) {
+        self.text.truncate(keep);
+        let up = self.rows.split_off(self.rows.partition_point(|&s| s < keep)).len();
+        let start = self.rows.last().map_or(0, |&s| s + usize::from(self.text.as_bytes().get(s) == Some(&b'\n')));
+        let (row, first) = (self.text.split_off(start), self.rows.is_empty());
+        let _ = write!(self.echo, "{}\r\x1b[J{}", "\x1b[A".repeat(up), if first { self.prompt.as_str() } else { "" });
+        (self.col, self.pasted) = (if first { width(&self.prompt) } else { 0 }, self.pasted && keep > 0);
+        row.chars().for_each(|c| self.put(c));
     }
 }
 
@@ -395,7 +409,7 @@ pub fn head_end(b: &[u8]) -> usize {
 #[allow(clippy::disallowed_methods)] // the hook cannot rely on the writer thread, which may be the one that panicked
 pub fn panic_line(msg: &str) {
     // A panic at the prompt leaves no bracketed paste on (the hook has put the terminal modes back).
-    let off = if sys::isatty(2) { "\x1b[?2004l" } else { "" };
+    let off = if sys::isatty(2) { PASTE_MODE[0] } else { "" };
     let (line, (done, wait)) = (format!("{off}henki: {}\n", escape(msg)), mpsc::channel::<()>());
     let write = move || drop((std::io::stderr().write_all(line.as_bytes()), done)); // `wait` ends when `done` drops
     let _ = std::thread::Builder::new().spawn(write).map(|_| wait.recv_timeout(std::time::Duration::from_millis(100)));

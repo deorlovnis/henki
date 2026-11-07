@@ -9,6 +9,11 @@ use std::io::{Read, Write};
 use std::net::TcpListener;
 use std::sync::{Arc, Mutex, mpsc};
 
+/// A terminal input at its end: a pipe whose write end is closed.
+fn ended() -> std::io::PipeReader {
+    std::io::pipe().unwrap().0
+}
+
 /// A fresh directory for one test, removed first if an earlier run left it.
 fn dir(name: &str) -> PathBuf {
     let d = std::env::temp_dir().join(format!("henki-turn-{name}-{}", std::process::id()));
@@ -40,7 +45,7 @@ fn cfg(d: &Path, port: u16) -> Config {
 
 /// A session over `cfg` with no history, its stdout and stderr captured; a REPL session when `input` is given (the
 /// reader reads it). The trust files are stamped first, as `config::load` stamps them at its end.
-fn open(mut cfg: Config, mode: Mode, input: Option<Box<dyn Read + Send>>) -> (Session, Buf, Buf) {
+fn open(mut cfg: Config, mode: Mode, input: Option<std::io::PipeReader>) -> (Session, Buf, Buf) {
     cfg.snap = cfg.trust.iter().map(|p| (p.clone(), sys::stamp(p))).collect();
     journal::state_dir(&cfg.state).unwrap();
     let j = Journal::create(&cfg.state, &cfg.cwd).unwrap();
@@ -624,15 +629,21 @@ fn elision_openai_only() {
 fn line_stale_tag_dropped() {
     let d = dir("line");
     let (r, mut w) = std::io::pipe().unwrap();
-    let (mut s, _, _) = open(Config::test(&d), Mode::Repl, Some(Box::new(r)));
+    let (mut s, _, _) = open(Config::test(&d), Mode::Repl, Some(r));
     w.write_all(b"one\r").unwrap();
     assert_eq!(s.line("> "), Ok(Some(("one".into(), true))));
     // Input read for an earlier question, or after MAIN stopped waiting (tag 0), is not this line's.
     s.tx.send(Ev::Input { tag: s.tag, bytes: Some(b"old\r".to_vec()) }).unwrap();
     s.tx.send(Ev::Input { tag: 0, bytes: Some(b"stale\r".to_vec()) }).unwrap();
-    w.write_all(b"tw").unwrap();
-    w.write_all(b"o\n").unwrap();
+    // Two writes 100 ms apart: two reads. Whether more input waits is asked of the reader's own input, never of fd 0.
+    let late = std::thread::spawn(move || {
+        w.write_all(b"tw").unwrap();
+        std::thread::sleep(Duration::from_millis(100));
+        w.write_all(b"o\n").unwrap();
+        w
+    });
     assert_eq!(s.line("> "), Ok(Some(("two".into(), true))), "a line over two reads");
+    let mut w = late.join().unwrap();
     w.write_all(b"\x1b[200~p\nq\x1b[201~\r").unwrap();
     assert_eq!(s.line("> "), Ok(Some(("p\nq".into(), false))), "a paste is not typed");
     drop(w);
@@ -818,7 +829,7 @@ fn outcome_line_forms() {
 
 #[test]
 fn discard_only_without_user() {
-    let repl = |d: &Path| open(Config::test(d), Mode::Repl, Some(Box::new(std::io::empty()))).0;
+    let repl = |d: &Path| open(Config::test(d), Mode::Repl, Some(ended())).0;
     let d = dir("discard1");
     let mut s = repl(&d);
     let file = journal_file(&d);
@@ -840,7 +851,7 @@ fn discard_only_without_user() {
 #[test]
 fn discard_notes_stopped_processes() {
     let d = dir("discard4");
-    let (mut s, out, err) = open(Config::test(&d), Mode::Repl, Some(Box::new(std::io::empty())));
+    let (mut s, out, err) = open(Config::test(&d), Mode::Repl, Some(ended()));
     let file = journal_file(&d);
     s.end(2, None).unwrap();
     s.into_out().flush(Instant::now() + Duration::from_secs(1));
@@ -854,7 +865,7 @@ fn notices_repl_journaled_only() {
     let d = dir("notices");
     let mut c = cfg(&d, serve(vec![say("hi")]));
     c.notices = vec!["a notice".into()];
-    let (mut s, out, err) = open(c, Mode::Repl, Some(Box::new(std::io::empty())));
+    let (mut s, out, err) = open(c, Mode::Repl, Some(ended()));
     assert_eq!(s.turn(Some("x".into())), Outcome::Ok);
     s.into_out().flush(Instant::now() + Duration::from_secs(1));
     assert!(text(&out).starts_with("hi"), "the answer streams to stdout");

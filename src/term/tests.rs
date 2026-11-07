@@ -2,6 +2,7 @@
 use super::*;
 use serde_json::json;
 use std::io;
+use std::os::fd::RawFd;
 use std::sync::Mutex;
 use std::sync::atomic::AtomicUsize;
 use std::time::Duration;
@@ -419,25 +420,32 @@ fn out_repl_lines_on_stderr() {
     assert_eq!(got, pieces(&[(2, "$ ls -> exit 0, 0.3 s\n"), (2, "henki: context_window is unknown\n")]));
 }
 
+/// The reset and the bracketed paste switches go out in queue order, on a terminal that takes them only. A paste switch
+/// queued after a reset lands after it, so the reset (whose soft reset may turn bracketed paste off) cannot undo it.
 #[test]
-fn out_reset_only_tty() {
+fn out_control_only_tty() {
     let got = repl(true, |out| {
         out.delta("cut short");
-        out.reset();
+        out.control(RESET);
         out.line("-- shell --");
+        out.control(PASTE_MODE[1]);
+        out.echo("run? [y/N] ".into());
+        out.control(PASTE_MODE[0]);
     });
-    assert_eq!(got, pieces(&[(1, "cut short"), (1, "\n"), (2, RESET), (2, "-- shell --\n")]));
-    assert_eq!(RESET, "\x1b[!p\x1b[0m\x1b[r\x1b[?1049l\x1b[?7h\x1b[999;1H\x1bD\x1b[?2004l", "bracketed paste off too");
-    assert_eq!(repl(false, |out| out.reset()), []);
+    let want = [(1, "cut short"), (1, "\n"), (2, RESET), (2, "-- shell --\n"), (2, "\x1b[?2004h"), (2, "run? [y/N] "), (2, "\x1b[?2004l")];
+    assert_eq!(got, pieces(&want));
+    assert_eq!(RESET, "\x1b[!p\x1b[0m\x1b[r\x1b[?1049l\x1b[?7h\x1b[999;1H\x1bD", "no bracketed paste switch in it");
+    assert_eq!(repl(false, |out| PASTE_MODE.into_iter().chain([RESET]).for_each(|c| out.control(c))), []);
 }
 
 #[test]
-fn out_reset_not_in_plain_or_json() {
+fn out_control_not_in_plain_or_json() {
     for mode in [Mode::Plain, Mode::Json] {
         let (tx, _rx) = mpsc::channel();
         let log = Log::new();
         let out = Out::with(mode, tx, log.on(1, None), log.on(2, None), true);
-        out.reset();
+        out.control(RESET);
+        out.control(PASTE_MODE[1]);
         out.line("x \x1b[2J");
         out.record(&json!({"t": "x\u{1b}"}));
         out.flush(soon());
@@ -445,10 +453,31 @@ fn out_reset_not_in_plain_or_json() {
     }
 }
 
+/// A sync mark answers only once everything queued before it is written: while stdout blocks (a pipe nobody reads) no
+/// answer comes, and none of what was queued after the stuck piece is on stderr yet. Once stdout gives way, the answer
+/// comes with the tag, after the display. It answers in every mode, also with stdout closed.
+#[test]
+fn out_sync_after_what_was_queued() {
+    let (tx, rx) = mpsc::channel();
+    let (release, hold) = mpsc::channel();
+    let log = Log::new();
+    let out = Out::with(Mode::Repl, tx, Box::new(Stuck(hold)), log.on(2, None), true);
+    out.delta("a long answer");
+    out.control(RESET);
+    out.line("-- shell --");
+    assert!(out.sync(7));
+    assert!(rx.recv_timeout(Duration::from_millis(300)).is_err(), "answered while stdout blocks");
+    assert!(log.get().is_empty(), "the display went out ahead of the answer");
+    drop(release);
+    let evs: Vec<Ev> = rx.iter().take(2).collect();
+    assert!(matches!(&evs[..], [Ev::OutputClosed, Ev::Input { tag: 7, bytes: Some(b) }] if b.is_empty()), "{evs:?}");
+    assert_eq!(log.get(), pieces(&[(2, RESET), (2, "-- shell --\n")]));
+    assert!(out.flush(soon()));
+}
+
 #[test]
 fn rows_wrap_and_minimum() {
     let l = |s: &str| s.to_string();
-    assert_eq!(rows(&[], 80), 0);
     assert_eq!(rows(&[l("")], 80), 1, "an empty line takes a row");
     assert_eq!(rows(&[l(&"x".repeat(80))], 80), 1);
     assert_eq!(rows(&[l(&"x".repeat(81))], 80), 2);
@@ -464,6 +493,22 @@ fn rows_wrap_and_minimum() {
     assert_eq!(rows(&[l("abc")], 0), 3, "a width of 0 counts as 1");
 }
 
+#[test]
+fn rows_wide_odd_width() {
+    let l = |s: &str| s.to_string();
+    // A terminal never splits a wide character: at an odd width it wraps one column early.
+    assert_eq!(rows(&[l(&"漢".repeat(4))], 3), 4);
+    assert_eq!(rows(&[l(&format!("!| {}", "漢".repeat(120)))], 81), 4, "39 + 40 + 40 + 1");
+    assert_eq!(rows(&[l(&"漢".repeat(40))], 80), 1);
+    assert_eq!(rows(&[l(&"漢".repeat(41))], 80), 2);
+    assert_eq!(rows(&[l("x漢")], 2), 2);
+    // A raw tab counts as the most it can move, 8 columns.
+    assert_eq!(rows(&[l(&"\t".repeat(10))], 80), 1);
+    assert_eq!(rows(&[l(&"\t".repeat(11))], 80), 2);
+    assert_eq!(rows(&[l(&format!("{}\t", "x".repeat(73)))], 80), 2);
+    assert_eq!(rows(&[l("漢")], 1), 1, "a character wider than the screen still takes one row");
+}
+
 /// An input over a pipe that counts the reads made from it.
 struct Counted(io::PipeReader, Arc<AtomicUsize>);
 
@@ -474,12 +519,18 @@ impl Read for Counted {
     }
 }
 
+impl AsRawFd for Counted {
+    fn as_raw_fd(&self) -> RawFd {
+        self.0.as_raw_fd()
+    }
+}
+
 /// A reader over a fresh pipe: the reader, its events, the pipe's write end, and the read count.
 fn reader() -> (Reader, Receiver<Ev>, io::PipeWriter, Arc<AtomicUsize>) {
     let (r, w) = io::pipe().unwrap();
     let (tx, rx) = mpsc::channel();
     let reads = Arc::new(AtomicUsize::new(0));
-    (Reader::with(Box::new(Counted(r, Arc::clone(&reads))), tx).unwrap(), rx, w, reads)
+    (Reader::with(Counted(r, Arc::clone(&reads)), tx).unwrap(), rx, w, reads)
 }
 
 /// The next event, which must be input, within 5 s.
@@ -574,6 +625,13 @@ enum In {
 /// from the script; false: WouldBlock).
 struct Script(Arc<Mutex<std::collections::VecDeque<In>>>, mpsc::Sender<bool>);
 
+/// No descriptor: the reader never asks for one.
+impl AsRawFd for Script {
+    fn as_raw_fd(&self) -> RawFd {
+        -1
+    }
+}
+
 impl Read for Script {
     fn read(&mut self, b: &mut [u8]) -> io::Result<usize> {
         let next = self.0.lock().unwrap().pop_front();
@@ -598,7 +656,7 @@ fn seen(reads: &Receiver<bool>) -> bool {
 fn reader_nonblocking_not_eof() {
     let script = Arc::new(Mutex::new(std::collections::VecDeque::new()));
     let ((tx, rx), (seen_tx, reads)) = (mpsc::channel(), mpsc::channel());
-    let r = Reader::with(Box::new(Script(Arc::clone(&script), seen_tx)), tx).unwrap();
+    let r = Reader::with(Script(Arc::clone(&script), seen_tx), tx).unwrap();
     let push = |i: In| script.lock().unwrap().push_back(i);
     // Nothing typed yet: WouldBlock, and the reader reads again instead of taking it for EOF.
     r.ask(1);
@@ -694,10 +752,51 @@ fn edit_wrap_widths() {
     assert_eq!(fed(&mut e, "日本語日本語日本語ab".as_bytes()).1, "日本語日本語日本語\nab", "9 wide characters fill 18 columns");
     let mut e = edit();
     assert_eq!(fed(&mut e, "abcdefghijkl\u{202e}".as_bytes()).1, "abcdefghijkl\n\\u{202e}", "an escape is not split");
-    // Backspace across a wrap draws the rows that are left.
+    // Pasted tabs count eight columns each: after the prompt two fit in 20 columns, the third wraps.
+    let mut e = edit();
+    assert_eq!(fed(&mut e, b"\x1b[200~\t\t\t\x1b[201~").1, "\t\t\n\t");
+    // Backspace across a wrap goes up and draws the row above.
     let mut e = edit();
     fed(&mut e, &[b'y'; 19]);
     assert_eq!(fed(&mut e, b"\x7f").1, format!("\x1b[A\r\x1b[J> {}", "y".repeat(18)));
+}
+
+/// Backspace draws one row however long the line: the row it changes, or the row above when it takes the newline (or
+/// the first character) that starts a row. After a paste of a log, erasing what was typed after it stays cheap.
+#[test]
+fn edit_backspace_one_row() {
+    let mut e = Edit::new("> ", 80);
+    let log: String = (0..250).map(|i| format!("UNIQUE-{i:03} a line of the log\n")).collect();
+    fed(&mut e, format!("\x1b[200~{log}\x1b[201~ please explain").as_bytes());
+    let (rows, text) = (e.rows.len(), e.text.clone());
+    assert_eq!(rows, 250);
+    assert_eq!(fed(&mut e, b"\x7f\x7f\x7f").1, "\r\x1b[J please explai\r\x1b[J please expla\r\x1b[J please expl");
+    assert_eq!((e.text.as_str(), e.rows.len()), (&text[..text.len() - 3], rows));
+    // " please expl" is 12 characters: the 12th Backspace leaves the row empty, the newline that starts it kept.
+    fed(&mut e, &[0x7f; 11]);
+    assert_eq!(fed(&mut e, b"\x7f").1, "\r\x1b[J");
+    assert_eq!(fed(&mut e, b"\x7f").1, "\x1b[A\r\x1b[JUNIQUE-249 a line of the log", "the newline: up, and that row only");
+    assert_eq!(fed(&mut e, b"\x7f").1, "\r\x1b[JUNIQUE-249 a line of the lo");
+    assert_eq!((e.text.as_str(), e.rows.len()), (&log[..log.len() - 2], rows - 1));
+}
+
+/// A line emptied by Ctrl-U or Backspace no longer holds a paste or a newline: what is typed next is typed.
+#[test]
+fn edit_emptied_not_pasted() {
+    let mut e = edit();
+    fed(&mut e, b"\x1b[200~junk\x1b[201~\x15");
+    assert_eq!(fed(&mut e, b"/exit\r").0, Some(true));
+    assert_eq!((e.text.as_str(), e.pasted), ("/exit", false));
+    let mut e = edit();
+    assert_eq!(e.feed(b"y\r", || true), None, "more input waits: a newline");
+    fed(&mut e, b"\x7f\x7f");
+    assert_eq!(fed(&mut e, b"y\r").0, Some(true));
+    assert_eq!((e.text.as_str(), e.pasted), ("y", false));
+    // A line that still holds some of a paste stays pasted.
+    let mut e = edit();
+    fed(&mut e, b"\x1b[200~ab\x1b[201~\x7f");
+    assert_eq!(fed(&mut e, b"\r").0, Some(true));
+    assert_eq!((e.text.as_str(), e.pasted), ("a", true));
 }
 
 /// A prompt that fills its row: the line starts on the next row, and a redraw has no prompt to draw.
@@ -726,7 +825,28 @@ fn edit_keys_dropped() {
 fn edit_ctrl_d() {
     let mut e = edit();
     assert_eq!(fed(&mut e, b"x\x04"), (None, "x".into()));
-    assert_eq!(fed(&mut e, b"\x7f\x04").0, Some(false));
+    assert_eq!(fed(&mut e, b"\x7f\x04"), (Some(false), "\r\x1b[J> \n".into()), "what follows starts on its own row");
+}
+
+/// A control byte ends an escape sequence and counts as itself: Esc then Enter, and Alt+Enter (ESC CR), send the line;
+/// Alt+Backspace (ESC DEL) is a Backspace. A CR LF that ends a read is one Enter, typed.
+#[test]
+fn edit_control_ends_escape() {
+    for keys in [&b"hello\x1b\r"[..], b"hello\x1b[1;5\r"] {
+        let mut e = edit();
+        assert_eq!(fed(&mut e, keys).0, Some(true), "{keys:?}");
+        assert_eq!((e.text.as_str(), e.pasted), ("hello", false));
+    }
+    let mut e = edit();
+    fed(&mut e, b"hello");
+    assert_eq!(fed(&mut e, b"\x1b"), (None, String::new()));
+    assert_eq!(fed(&mut e, b"\r").0, Some(true), "Esc, then Enter in a read of its own");
+    let mut e = edit();
+    assert_eq!(fed(&mut e, b"ab\x1b\x7fc\r").0, Some(true));
+    assert_eq!(e.text, "ac");
+    let mut e = edit();
+    assert_eq!(fed(&mut e, b"/help\r\n"), (Some(true), "/help\n".into()));
+    assert_eq!((e.text.as_str(), e.pasted), ("/help", false));
 }
 
 /// A bracketed paste is text, whole: newlines (a CR is one), control bytes and escape sequences are kept and echoed
@@ -772,4 +892,5 @@ fn edit_cap() {
     e.feed(format!("\x1b[200~{big}\x1b[201~").as_bytes(), || false);
     assert_eq!((e.text.len(), e.over), (LINE_MAX, 6));
     assert!(e.text.chars().all(|c| c == 'é'));
+    assert_eq!(e.echo.matches('é').count(), LINE_MAX / 2, "the dropped part is not echoed");
 }

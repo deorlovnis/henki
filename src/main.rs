@@ -27,8 +27,6 @@ const USAGE: &str = "usage: henki [--config FILE] [--approve ask|auto] [--model 
        henki run [--json] [--max-steps N] [--max-seconds N] [--approve ask|auto] [--config FILE] [--model NAME] [--resume[=ID]] [--nested] [TASK | -]
        henki allow [--config FILE] [rm N]
        henki --version | --help";
-/// The most `run -` takes from stdin.
-const TASK_MAX: u64 = 1 << 20;
 
 /// The arguments of the REPL (`mode` Repl), `run` (Plain or Json) and `allow`.
 struct Args {
@@ -166,7 +164,7 @@ fn run(a: Args, out: Out, tx: Sender<Ev>, rx: Receiver<Ev>, t0: Instant, early: 
 }
 
 /// What startup hands to the session: the config, the journal, the history, the task, the records it journaled (a
-/// resume's repairs, then `session`), and the REPL's line reader.
+/// resume's repairs, then `session`), and the REPL's terminal reader.
 type Started = (Config, Journal, Vec<Value>, Option<String>, Vec<Value>, Option<Reader>);
 
 /// Startup up to the `session` record. An error ends the run before a session exists.
@@ -178,12 +176,13 @@ fn start(a: Args, tx: &Sender<Ev>, rx: &Receiver<Ev>, t0: Instant, early: io::Re
     if !a.nested && depth.parse::<u32>().is_ok_and(|d| d >= 1) {
         return Err(Outcome::error("nested", format!("refusing to start inside henki (HENKI_DEPTH={depth}); pass --nested if this is intended")));
     }
-    // The REPL reads the terminal it was started on; `tty_save` keeps its modes, which it puts back after every line.
-    if a.mode == Mode::Repl && !sys::tty_save() {
+    // The REPL reads the terminal it was started on, and shows what is typed on it through stderr; `tty_save` keeps its
+    // modes, which it puts back after every line.
+    if a.mode == Mode::Repl && !(sys::isatty(2) && sys::tty_save()) {
         return Err(bad("the REPL needs a terminal; use henki run".into()));
     }
     let no_thread = |e: io::Error| Outcome::error("internal", format!("cannot start a thread: {e}"));
-    let reader = (a.mode == Mode::Repl).then(|| Reader::with(Box::new(io::stdin()), tx.clone())).transpose().map_err(no_thread)?;
+    let reader = (a.mode == Mode::Repl).then(|| Reader::with(io::stdin(), tx.clone())).transpose().map_err(no_thread)?;
     let cwd = std::env::current_dir().map_err(|e| bad(format!("cannot read the working directory: {e}")))?;
     let mut cfg = config::load(&a.flags, &env, &cwd).map_err(bad)?;
     // The REPL has no time budget: Ctrl-C ends a turn, and `max_steps` bounds it.
@@ -217,7 +216,7 @@ fn stdin_task(tx: &Sender<Ev>, rx: &Receiver<Ev>, deadline: Option<Instant>) -> 
     let tx = tx.clone();
     let read = move || {
         let mut b = Vec::new();
-        let ok = io::stdin().lock().take(TASK_MAX + 1).read_to_end(&mut b).is_ok() && b.len() as u64 <= TASK_MAX;
+        let ok = io::stdin().lock().take(term::LINE_MAX as u64 + 1).read_to_end(&mut b).is_ok() && b.len() <= term::LINE_MAX;
         let _ = tx.send(Ev::Input { tag: 0, bytes: ok.then_some(b) });
     };
     std::thread::Builder::new().spawn(read).map_err(|e| Outcome::error("internal", format!("cannot start a thread: {e}")))?;

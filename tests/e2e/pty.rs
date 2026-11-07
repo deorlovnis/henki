@@ -18,10 +18,10 @@ use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
-/// What the REPL writes before an approval display, as `screen` shows it (without the bracketed paste switch it ends
-/// with). It ends on a newly scrolled bottom row, so the display lands below everything already on the screen.
+/// What the REPL writes before an approval display. It ends on a newly scrolled bottom row, so the display lands below
+/// everything already on the screen.
 pub const RESET: &str = "\x1b[!p\x1b[0m\x1b[r\x1b[?1049l\x1b[?7h\x1b[999;1H\x1bD";
-/// Bracketed paste on and off. henki writes them right away, out of order with what it queued before.
+/// Bracketed paste on and off, in order with everything else henki writes.
 pub const PASTE_ON: &str = "\x1b[?2004h";
 pub const PASTE_OFF: &str = "\x1b[?2004l";
 /// The line editor's redraws: up a row, and from column 0 everything below cleared.
@@ -52,13 +52,19 @@ pub struct Pty<'a> {
 
 impl<'a> Pty<'a> {
     /// henki with `args` under a fresh pty of `rows` x `cols`: the slave is fds 0-2; pre_exec runs setsid and
-    /// TIOCSCTTY, so the pty is henki's controlling terminal and its group the foreground one.
+    /// TIOCSCTTY, so the pty is henki's controlling terminal and its group the foreground one. TERM is
+    /// `xterm-256color`, as a terminal emulator sets it, unless the run sets its own.
     pub fn spawn(r: &'a Run, args: &[&str], rows: u16, cols: u16) -> Pty<'a> {
         Pty::spawn_to(r, args, rows, cols, None)
     }
 
     /// The same, with henki's stdout to `stdout` when given (the pty stays its stdin and stderr).
     pub fn spawn_to(r: &'a Run, args: &[&str], rows: u16, cols: u16, stdout: Option<File>) -> Pty<'a> {
+        Pty::spawn_io(r, args, rows, cols, stdout, None)
+    }
+
+    /// The same, with henki's stdout and stderr to the files given (the pty stays its stdin).
+    pub fn spawn_io(r: &'a Run, args: &[&str], rows: u16, cols: u16, stdout: Option<File>, stderr: Option<File>) -> Pty<'a> {
         let (mut m, mut s) = (0, 0);
         let ws = libc::winsize { ws_row: rows, ws_col: cols, ws_xpixel: 0, ws_ypixel: 0 };
         // SAFETY: openpty writes two descriptors into the out-pointers; the name and termios pointers may be null and
@@ -80,7 +86,11 @@ impl<'a> Pty<'a> {
         let initial = modes(slave.as_raw_fd());
         let mut c = Command::new(bin());
         r.prepare(&mut c);
-        c.args(args).stdin(slave.try_clone().unwrap()).stderr(slave.try_clone().unwrap());
+        if !c.get_envs().any(|(k, _)| k == "TERM") {
+            c.env("TERM", "xterm-256color");
+        }
+        c.args(args).stdin(slave.try_clone().unwrap());
+        c.stderr(stderr.unwrap_or_else(|| File::from(slave.try_clone().unwrap())));
         match stdout {
             Some(f) => c.stdout(f),
             None => c.stdout(slave),
@@ -277,7 +287,16 @@ pub fn paste_off(screen: &[u8]) -> bool {
     s.rfind(PASTE_ON).is_none_or(|on| s.rfind(PASTE_OFF).is_some_and(|off| off > on))
 }
 
-/// `screen` without the bracketed paste switches, which henki writes out of order with the text it queued before them.
+/// At every place `text` is on `screen`, bracketed paste is on: the last switch before it turns it on, as a terminal
+/// that acts on each switch in the order it gets them would have it (so a paste comes with its marks). False when `text`
+/// is not on the screen.
+pub fn paste_on_at(screen: &[u8], text: &str) -> bool {
+    let s = String::from_utf8_lossy(screen);
+    let on = |at: usize| s[..at].rfind(PASTE_ON).is_some_and(|on| s[..at].rfind(PASTE_OFF).is_none_or(|off| off < on));
+    s.match_indices(text).count() > 0 && s.match_indices(text).all(|(at, _)| on(at))
+}
+
+/// `screen` without the bracketed paste switches.
 pub fn unswitched(screen: &[u8]) -> Vec<u8> {
     String::from_utf8_lossy(screen).replace(PASTE_ON, "").replace(PASTE_OFF, "").into_bytes()
 }

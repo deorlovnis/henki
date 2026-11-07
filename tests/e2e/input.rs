@@ -1,13 +1,15 @@
 #![allow(clippy::disallowed_methods, clippy::print_stdout, clippy::print_stderr, clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::string_slice)]
 //! The REPL's line editor on a terminal: a paste of any size is one message, never a command and never an answer; a long
 //! line arrives whole and is shown as it is; Backspace, Ctrl-U, keys henki drops, Ctrl-C and Ctrl-D while editing; and
-//! the terminal as henki found it on every way out, bracketed paste off, also while a `!cmd` runs. (Every `Pty` run
-//! also checks the modes and bracketed paste at its end.)
+//! the terminal as henki found it on every way out, bracketed paste off, also while a `!cmd` runs; input typed before a
+//! question shows never answers it; and terminals henki does not draw on (`dumb`, stderr not a terminal). (Every `Pty`
+//! run also checks the modes and bracketed paste at its end.)
 use crate::harness::*;
 use crate::mock::*;
-use crate::pty::{Pty, paste_off, same_modes};
+use crate::pty::{Pty, RESET, paste_off, paste_on_at, same_modes, shown};
 use serde_json::{Value, json};
 use std::fs;
+use std::io::Read;
 use std::time::Duration;
 
 /// Generous: a 1 MiB paste is echoed through the terminal on a loaded machine.
@@ -160,6 +162,8 @@ fn pty_unmarked_paste_past_line_buffer() {
 
 /// At an approval question a paste is never an answer: a pasted `y`, and a block sent at once without marks, are a no,
 /// with a note, and so is a paste at the rule's confirmation (which asks `run?` again). A pasted `!` line never runs.
+/// Bracketed paste is on while each question waits, also after the reset drawn before it, so a terminal marks a paste
+/// there as it does at the prompt.
 #[test]
 fn pty_paste_at_question_not_an_answer() {
     let m = Mock::start(vec![shell("echo first"), say("after the first"), shell("echo second"), say("after the second")]);
@@ -185,10 +189,104 @@ fn pty_paste_at_question_not_an_answer() {
     p.expect(NOT_AN_ANSWER, W);
     p.expect("after the second", W);
     p.prompt(W);
+    let screen = p.raw_screen();
     let d = exit(p);
     assert_eq!(verdicts(&d), [json!(["no", null]), json!(["no", null])], "{}", d.diag());
     assert!(!f.exists() && !r.allow().exists(), "{}", d.diag());
     assert!(m.log().len() == 4 && m.log().iter().all(|l| !l.text().contains("pasted-tail-line")), "{}", d.diag());
+    for question in ["run? [y/N/always] ", " ? [y/N] "] {
+        assert!(paste_on_at(&screen, question), "bracketed paste is off while {question:?} waits:\n{}", shown(&screen));
+    }
+}
+
+/// What is typed before the call's display reaches the terminal never answers its question. henki's stdout is a pipe
+/// nobody reads yet, so the long answer before the call holds the display and the question back while `y` and Enter are
+/// typed. henki drops them, with a note, once everything before the question is written, and only then asks.
+#[test]
+fn pty_typeahead_before_question_shown() {
+    let mut r = Run::new("");
+    let f = r.path("CALLED");
+    let reply = Step::Stream { parts: vec![say(&"x".repeat(300_000)), shell(&format!("touch {}", f.display()))], finish: Some("tool_calls".into()), done: true, hold_ms: 0 };
+    let m = Mock::start(vec![reply, say("after the no")]);
+    r.at(&m.url()).set("approve", "\"ask\"");
+    let (mut rd, wr) = std::io::pipe().unwrap();
+    let p = Pty::spawn_to(&r, &[], 24, 80, Some(fs::File::from(std::os::fd::OwnedFd::from(wr))));
+    p.prompt(W);
+    p.line("go");
+    assert!(poll(W, || m.log().len() == 1), "no request");
+    std::thread::sleep(Duration::from_millis(500));
+    assert!(!String::from_utf8_lossy(&p.screen()).contains("run? "), "the question is on the screen: stdout did not hold it back");
+    p.send(b"y\r");
+    p.expect("y\r\n", W); // the terminal's own echo: henki is not reading
+    std::thread::sleep(Duration::from_millis(300));
+    let drain = std::thread::spawn(move || {
+        let mut b = Vec::new();
+        rd.read_to_end(&mut b).unwrap();
+        String::from_utf8(b).unwrap()
+    });
+    p.expect("henki: dropped 2 bytes typed before this prompt\r\nrun? [y/N/always] ", W);
+    p.line("n");
+    p.prompt(W);
+    let d = exit(p);
+    assert!(drain.join().unwrap().ends_with("after the no\n"), "the answers on stdout");
+    assert!(!f.exists(), "the call ran on what was typed before its question showed\n{}", d.diag());
+    assert_eq!(verdicts(&d), [json!(["no", null])], "{}", d.diag());
+}
+
+/// Backspace after a pasted log draws one row, not the whole line again: three of them write a few dozen bytes however
+/// long the paste before them.
+#[test]
+fn pty_backspace_after_paste_one_row() {
+    let m = Mock::start(vec![say("explained")]);
+    let r = asking(&m);
+    let p = start(&r);
+    let log: String = (0..250).map(|i| format!("UNIQUE-{i:03} {}\n", "x".repeat(60))).collect();
+    p.paste(&log);
+    p.send(b" please explain");
+    p.expect(" please explain", W);
+    let before = p.raw_screen().len();
+    p.send(b"\x7f\x7f\x7f");
+    p.expect("\r\x1b[J please expl", W);
+    let wrote = p.raw_screen().len() - before;
+    assert!(wrote < 100, "{wrote} bytes written for 3 Backspaces");
+    p.send(b"\r");
+    p.expect("explained", W);
+    p.prompt(W);
+    let d = exit(p);
+    assert!(sent(&m, 0).ends_with(&format!("\n\n{log} please expl")), "{}", d.diag());
+}
+
+/// With TERM=dumb (an editor's shell buffer) henki writes no bracketed paste switch and no reset, at the prompt or at a
+/// question.
+#[test]
+fn pty_dumb_terminal_no_switches() {
+    let m = Mock::start(vec![shell("echo asked"), say("after the no")]);
+    let mut r = asking(&m);
+    r.env("TERM", "dumb");
+    let p = start(&r);
+    p.line("go");
+    p.expect("run? [y/N/always] ", W);
+    p.line("n");
+    p.expect("after the no", W);
+    p.prompt(W);
+    let screen = String::from_utf8_lossy(&p.raw_screen()).into_owned();
+    let d = exit(p);
+    assert!(!screen.contains("\x1b[?2004") && !screen.contains(RESET), "{}", shown(screen.as_bytes()));
+    assert_eq!(verdicts(&d), [json!(["no", null])], "{}", d.diag());
+}
+
+/// With stderr not a terminal (`henki 2>log`) nothing typed could be shown, nor a question: the REPL does not start, and
+/// says why on stderr.
+#[test]
+fn pty_stderr_not_a_terminal() {
+    let m = Mock::start(vec![]);
+    let r = asking(&m);
+    let log = r.dir.join("stderr.log");
+    let p = Pty::spawn_io(&r, &[], 24, 80, None, Some(fs::File::create(&log).unwrap()));
+    let d = p.wait(W);
+    assert_eq!(d.code, Some(2), "{}", d.diag());
+    assert_eq!(fs::read_to_string(&log).unwrap(), "henki: the REPL needs a terminal; use henki run\n");
+    assert!(m.log().is_empty() && d.journal.is_none());
 }
 
 /// A line of 3,000 bytes, typed in one go and then pasted: each arrives whole, and the screen shows it as it is, in rows

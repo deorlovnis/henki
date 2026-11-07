@@ -51,11 +51,8 @@ fn lines(s: &mut Session) -> u8 {
     loop {
         let (line, typed) = match s.line("> ") {
             Ok(Some(l)) => l,
-            Ok(None) => {
-                s.out().line(""); // Ctrl-D leaves the cursor after the prompt
-                // A terminal that went away ends the input too, maybe before its SIGHUP arrives: a hangup all the same.
-                return if sys::isatty(0) { 0 } else { 130 };
-            }
+            // A terminal that went away ends the input too, maybe before its SIGHUP arrives: a hangup all the same.
+            Ok(None) => return if sys::isatty(0) { 0 } else { 130 },
             Err(Stop::Signal(libc::SIGINT | libc::SIGQUIT)) => {
                 s.out().line("\n(Ctrl-C does not quit; /exit or Ctrl-D quits)");
                 continue;

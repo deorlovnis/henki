@@ -483,8 +483,8 @@ const PTY_CHILD: &str = "HENKI_TEST_PTY_CHILD";
 /// `tty_save` and `raw` on a terminal. They act on fd 0, so the test runs this same test again in a child process whose
 /// fd 0 is a fresh pty: the test process's own fd 0 is never touched. The parent leaves the pty non-blocking with a line
 /// typed ahead and one not yet ended; the child checks that `tty_save` clears O_NONBLOCK and keeps the modes, that
-/// `raw(true)` sets the editor's modes and counts and drops both lines, then that `raw(false)` puts back the saved modes
-/// over the ones a command left raw and clears O_NONBLOCK again.
+/// `raw(true)` sets the editor's modes (no suspend character among them) and counts and drops both lines, then that
+/// `raw(false)` puts back the saved modes over the ones a command left raw and clears O_NONBLOCK again.
 #[test]
 fn raw_on_a_pty() {
     if std::env::var_os(PTY_CHILD).is_some() {
@@ -500,6 +500,8 @@ fn raw_on_a_pty() {
         assert_eq!((now.c_lflag & off, now.c_iflag & libc::ICRNL), (0, 0));
         assert_eq!(now.c_lflag | off, saved.c_lflag | off, "the rest as saved: ISIG {}", saved.c_lflag & libc::ISIG != 0);
         assert_eq!((now.c_cc[libc::VMIN], now.c_cc[libc::VTIME], now.c_oflag), (1, 0, saved.c_oflag));
+        assert_eq!(now.c_cc[libc::VSUSP], libc::_POSIX_VDISABLE, "Ctrl-Z never stops henki in these modes");
+        assert_ne!(saved.c_cc[libc::VSUSP], libc::_POSIX_VDISABLE, "the saved modes have a suspend character");
         // What a command that dies in raw mode leaves behind.
         let mut gone = saved;
         gone.c_lflag &= !(libc::ICANON | libc::ISIG | libc::ECHO);

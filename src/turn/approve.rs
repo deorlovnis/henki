@@ -17,7 +17,7 @@ impl Session {
         let bg = supervise::reap();
         let offer = shell && bg == 0 && allow::fits(cmd, &self.cfg.root);
         let ((rows, cols), lines) = (sys::winsize(0).unwrap_or((24, 80)), tools::display(c, t));
-        self.out.reset();
+        self.out.control(term::RESET);
         lines.iter().for_each(|l| self.out.line(l));
         let n = term::rows(&lines, usize::from(cols)) + 1;
         (n > usize::from(rows)).then(|| self.out.line(&format!("{} rows: taller than the screen; scroll up or answer n", term::num(n as u64))));
@@ -26,42 +26,40 @@ impl Session {
         loop {
             match self.typed(if offer { "run? [y/N/always] " } else { "run? [y/N] " })?.as_str() {
                 "y" | "yes" => return self.verdict(c, "yes", None),
-                "always" if offer => {}
+                "always" if !offer => self.out.note("always is not offered for this call; answer y or n"),
                 "always" => {
-                    self.out.note("always is not offered for this call; answer y or n");
-                    continue;
+                    self.out.control(term::RESET);
+                    self.out.line(&format!("a rule allows whatever this command does in {root}, including the files and config it reads"));
+                    if !matches!(self.typed(&format!("save rule for {root}: {cmd} ? [y/N] "))?.as_str(), "y" | "yes") {
+                        continue;
+                    }
+                    self.tripwire()?;
+                    match self.cfg.allow.append(&self.cfg.root, cmd) {
+                        Ok(n) => {
+                            self.rearm();
+                            self.out.line(&format!("added to {file} as rule {n} for {root}; /allow lists and removes rules"));
+                            return self.verdict(c, "always", Some(n));
+                        }
+                        Err(e) => {
+                            self.out.note(&format!("could not write {file}: {e}; ran once"));
+                            return self.verdict(c, "yes", None);
+                        }
+                    }
                 }
                 _ => return self.verdict(c, "no", None),
-            }
-            self.out.reset();
-            self.out.line(&format!("a rule allows whatever this command does in {root}, including the files and config it reads"));
-            if !matches!(self.typed(&format!("save rule for {root}: {cmd} ? [y/N] "))?.as_str(), "y" | "yes") {
-                continue;
-            }
-            self.tripwire()?;
-            match self.cfg.allow.append(&self.cfg.root, cmd) {
-                Ok(n) => {
-                    self.rearm();
-                    self.out.line(&format!("added to {file} as rule {n} for {root}; /allow lists and removes rules"));
-                    return self.verdict(c, "always", Some(n));
-                }
-                Err(e) => {
-                    self.out.note(&format!("could not write {file}: {e}; ran once"));
-                    return self.verdict(c, "yes", None);
-                }
             }
         }
     }
 
     /// The answer to `prompt`, trimmed and in lower case; INT and QUIT give "". A paste is never an answer: it gives "", a
     /// no, with a note, so no call ever runs on pasted text and the turn goes on as after any other no. EOF (Ctrl-D) ends
-    /// the turn, and the REPL then quits. After Ctrl-D or Ctrl-C, which leave the cursor after the question, what follows
-    /// starts on its own row.
+    /// the turn, and the REPL then quits. After Ctrl-C, which leaves the cursor after the question, what follows starts
+    /// on its own row.
     fn typed(&mut self, prompt: &str) -> Result<String, Outcome> {
         match self.line(prompt) {
             Ok(Some((a, true))) => Ok(a.trim().to_ascii_lowercase()),
             Ok(Some(_)) => Ok(String::new()).inspect(|_| self.out.note("a paste is not an answer; taken as no")),
-            Ok(None) => Err(Outcome::Interrupted).inspect_err(|_| self.out.line("")),
+            Ok(None) => Err(Outcome::Interrupted),
             Err(Stop::Signal(libc::SIGINT | libc::SIGQUIT)) => Ok(String::new()).inspect(|_| self.out.line("")),
             Err(s) => Err(s.into()),
         }
