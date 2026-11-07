@@ -243,6 +243,25 @@ fn contracts_wire_errors_and_retries() {
     assert_eq!(m.log().len(), 2, "an error as the first event is retried");
 }
 
+/// An error inside a 200 stream, after a data event that carries no part of the reply: anthropic retries it (no text,
+/// reasoning or call came), openai does not (any data event came first, a role-only chunk too).
+#[test]
+fn contracts_wire_error_after_an_empty_start() {
+    let sse = |body: &str| Step::Raw(format!("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n{body}").into_bytes());
+    let err = r#"{"type":"error","error":{"type":"overloaded_error","message":"busy"}}"#;
+    let role = r#"{"choices":[{"index":0,"delta":{"role":"assistant"}}]}"#;
+    let m = Mock::start(vec![sse(&format!("data: {role}\n\ndata: {err}\n\n")), say("second")]);
+    let d = Run::new(&m.url()).json("openai");
+    d.finish();
+    let e = &d.result()["error"];
+    assert_eq!((d.code, &e["kind"], &e["message"], m.log().len()), (Some(2), &json!("provider"), &json!("busy"), 1), "{}", d.diag());
+    let start = json!({"type": "message_start", "message": {"id": "m1", "type": "message", "role": "assistant", "content": [], "usage": {"input_tokens": 1, "output_tokens": 0}}});
+    let m = Mock::start_api(Api::Anthropic, vec![sse(&format!("event: message_start\ndata: {start}\n\nevent: error\ndata: {err}\n\n")), say("second")]);
+    let d = anthropic(&m).json("anthropic");
+    ok(&d);
+    assert_eq!(m.log().len(), 2, "message_start is no part of the reply: retried");
+}
+
 /// HTTP: an interim 1xx head is skipped and a body that ends at the close is read; a compressed body is refused.
 #[test]
 fn contracts_wire_http() {

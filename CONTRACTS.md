@@ -5,9 +5,11 @@ wire to a model server, the extension layout, and the module manager's files. Ea
 (`journal/1`), and this file is its specification. A module's manifest names the contracts it needs
 (`contracts = ["ext/1"]`), and `henki-mods` refuses a module that needs one this henki does not ship.
 
-The tests in `tests/contracts.rs`, with the fixtures in `tests/fixtures/contracts/`, hold henki to this file: they read
-the field tables below and fail when a record henki writes has a field that is not listed, lacks a required one, or a
-listed field or rule stops showing up. A change to a contract is made here and in the code in the same commit.
+The tests in `tests/contracts.rs`, with the fixtures in `tests/fixtures/contracts/`, hold henki to this file. They read
+the index, the field tables and the exit table from it, and fail when a record henki writes has a field that is not
+listed or lacks a required one, or when a listed field or exit code stops showing up. The rules in prose are pinned by
+tests written from them, not read from here: a change to one fails a test only when henki's behaviour changes too.
+A change to a contract is made here, in the code and in its test in the same commit.
 
 ## Stability
 
@@ -96,8 +98,9 @@ values of `args` and `blocks` are opaque JSON.
   argument text as sent, only when it did not parse). `finish` is the server's finish reason (`stop`, `tool_calls`,
   `length`, or what the server sent), or `interrupted` or `error` for the partial text of a reply that never ended:
   such a record has no calls. `usage.in` counts every prompt token (cache reads and writes included), `usage.cached` the
-  cache reads, `usage.out` the output tokens. `blocks` (anthropic only) is the reply's content as received, replayed
-  exactly.
+  cache reads, `usage.out` the output tokens. `blocks` (anthropic only) is the reply's content blocks as henki assembled
+  them from the stream: a `tool_use` block's `input` the parsed arguments (`{}` when they are not a JSON object), its
+  `id` the call's id as journaled, text blocks with only whitespace left out. They are replayed exactly as journaled.
 - `ask`: the call `id` needs a human; `target` is the file a `read`, `write` or `edit` call resolves to, as shown.
   In `henki run` an `ask` ends the turn with `needs_approval`.
 - `approval`: who let call `id` run, or not: `verdict` is `auto` (no approval needed), `rule` (allow rule number
@@ -142,7 +145,9 @@ values of `args` and `blocks` are opaque JSON.
 ### Call ids
 
 A call keeps the id the model gave it, unless that id is empty or already used in the session; then henki names it
-`hN`, N one more than the highest `hN` id so far (1 when none). Results and approvals refer to calls by that id.
+`hN`. N starts at one more than the highest `hN` id in the history the session (or the resumed segment) started with,
+1 when none, and goes up by one per name given, skipping ids already used; an `hN` id the model sends meanwhile does
+not move it. Results and approvals refer to calls by that id.
 
 ## json/1
 
@@ -258,7 +263,7 @@ Headers: `anthropic-version: 2023-06-01`, and `x-api-key: KEY` when `api_key` is
 
 - `messages` alternate `user` and `assistant`, each `{"content":[blocks],"role"}`. A `user` record is a
   `{"text","type":"text"}` block; a `tool_result` record a `{"content","is_error","tool_use_id","type":"tool_result"}`
-  block; an `assistant` record its `blocks` exactly as received, or (a reply cut short, journaled without them) its
+  block; an `assistant` record its `blocks` exactly as journaled, or (a reply cut short, journaled without them) its
   text block and a `{"id","input","name","type":"tool_use"}` block per call. Adjacent messages of one role are merged
   (results first, then the next task), text blocks with only whitespace are dropped, and empty messages left out.
 - `tools`: `{"description","input_schema","name"}` per offered tool; `input_schema` is the openai `parameters`.
@@ -283,7 +288,9 @@ Headers: `anthropic-version: 2023-06-01`, and `x-api-key: KEY` when `api_key` is
   `api_error` are retryable `provider` errors; anything else is a `provider` error. The message is the body's
   `error.message` when it has one.
 - Retryable too: no address connected, and a connection reset before the response. An error inside a 200 stream is
-  retried only when it came before any part of the reply.
+  retried only when nothing came before it that counts as the reply's start: in anthropic a text, reasoning or call
+  part (a `message_start` or `ping` does not count); in openai any data event (a chunk with only a `role` or only
+  `usage` counts, so after the usual role chunk an error is not retried).
 - At most 5 attempts. Before attempt N+1 henki waits `Retry-After` (seconds, decimal allowed, at most 60), else
   min(2^(N-1), 30) s, with the notice `CAUSE; retry N/4 in S s`. After the last attempt the message ends
   `(gave up after 5 attempts)`.

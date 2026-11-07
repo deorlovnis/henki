@@ -92,6 +92,24 @@ fn contracts_journal_golden_replay() {
     assert_eq!(m.log()[1].messages()[1..want.len() + 1], want[..]);
 }
 
+/// Call ids: a model's own id is kept, an empty one renamed `hN`; N counts on from the history the session started
+/// with, and an `hN` the model sends during the session does not move it.
+#[test]
+fn contracts_journal_call_ids() {
+    let with_id = |id: &str| Step::Call {
+        form: Form::Native { fragments: 1, index: Some(0), id: id.into() },
+        name: "shell".into(),
+        args: json!({"command": "echo x"}).to_string(),
+        finish: "tool_calls".into(),
+    };
+    let m = Mock::start(vec![with_id("h9"), with_id(""), say("done")]);
+    let d = Run::new(&m.url()).json("ids");
+    d.finish();
+    assert_eq!(d.code, Some(0), "{}", d.diag());
+    let ids: Vec<Value> = d.of("assistant").iter().filter_map(|a| a["msg"]["tool_calls"].get(0)).map(|c| c["id"].clone()).collect();
+    assert_eq!(ids, [json!("h9"), json!("h1")], "h1, not h10: the model's h9 does not move N");
+}
+
 /// `--resume=ID` finds a session in any scope; `--resume` alone looks only in this working directory's scope, where
 /// an empty file is no session.
 #[test]
