@@ -1,8 +1,8 @@
 //! What the model sees before its first call (the core prompt and the tool schemas), and what decides a call before it
 //! runs: validation, the target it would touch, and whether it needs a human.
-use crate::{config, term, types::Call, types::End, types::ToolOutput};
+use crate::{config, sys, term, types::Call, types::End, types::ToolOutput};
 use serde_json::{Value, json};
-use std::{ffi::OsString, fs, io, os::unix::fs::FileTypeExt, os::unix::fs::MetadataExt, path::Path, path::PathBuf};
+use std::{ffi::OsString, fs, io, os::unix::fs::MetadataExt, path::Path, path::PathBuf};
 
 pub const ALL: [&str; 4] = ["shell", "read", "write", "edit"];
 /// System part 1, byte-exact (563 B).
@@ -116,7 +116,7 @@ pub fn target(path: &str, write: bool, cx: &Ctx) -> Result<Target, String> {
     }
     let meta = fs::metadata(&real).map_err(fail)?;
     if write && missing.is_empty() && !meta.is_file() {
-        return Err(not_regular(path, meta.file_type()));
+        return Err(sys::not_regular(path, meta.file_type()));
     }
     // Each protected path is resolved as a target is (realpath of its nearest existing ancestor, then the rest), so one
     // that does not exist yet still matches when it is named through a symlink.
@@ -135,12 +135,6 @@ pub fn target(path: &str, write: bool, cx: &Ctx) -> Result<Target, String> {
     let tags = [(found.is_symlink(), "symlink"), (outside, "outside project")].iter().filter(|t| t.0).map(|t| t.1).collect::<Vec<_>>().join(", ");
     let shown = if tags.is_empty() { format!("{path}{arrow}") } else { format!("{path}{arrow} ({tags})") };
     Ok(Target { path: resolved, shown, base, missing, name, dir_id: (b.dev(), b.ino()), mode, outside })
-}
-
-/// `not a regular file: PATH (fifo)`; the kind is one of directory, fifo, socket, char device, block device.
-pub fn not_regular(path: &str, t: fs::FileType) -> String {
-    let kinds = [(t.is_dir(), "directory"), (t.is_fifo(), "fifo"), (t.is_socket(), "socket"), (t.is_char_device(), "char device"), (t.is_block_device(), "block device")];
-    format!("not a regular file: {path} ({})", kinds.iter().find(|k| k.0).map_or("unknown kind", |k| k.1))
 }
 
 /// `PATH: No such file or directory`: an OS error with the path it concerns, without `(os error 2)`.

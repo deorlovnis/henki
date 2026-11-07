@@ -142,7 +142,7 @@ fn out_json_record_line() {
     let (tx, rx) = mpsc::channel();
     let log = Log::new();
     let out = Out::with(true, tx, log.on(1, None), log.on(2, None));
-    assert!(out.json());
+    assert!(out.json);
     out.record(&json!({"t": "text", "text": "a\u{202e}"}));
     out.answer("never in --json");
     out.line("never in --json");
@@ -157,7 +157,7 @@ fn out_plain_answer_escaped() {
     let (tx, _rx) = mpsc::channel();
     let log = Log::new();
     let out = Out::with(false, tx, log.on(1, None), log.on(2, None));
-    assert!(!out.json());
+    assert!(!out.json);
     out.record(&json!({"t": "result"}));
     out.answer("done \x1b[2J\tok");
     out.flush(soon());

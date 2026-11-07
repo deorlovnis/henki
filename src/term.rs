@@ -104,10 +104,6 @@ impl Out {
         }
     }
 
-    pub fn json(&self) -> bool {
-        self.json
-    }
-
     /// `--json` only: one `json_line` + "\n" to stdout. Plain mode: nothing.
     pub fn record(&self, rec: &Value) {
         self.send(1, self.json, || json_line(rec) + "\n");

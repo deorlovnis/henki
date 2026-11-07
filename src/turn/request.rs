@@ -23,9 +23,7 @@ impl Session {
                 Ok(_) => Err(http::perr("provider", format!("request took over {} s", term::num(self.lim.request.as_secs())))),
                 Err(s) => return Err(self.partial_reply("interrupted", s.into())), // FINISHING shuts the socket
             };
-            if let Some(slot) = self.conn.take() {
-                http::cancel(&slot);
-            }
+            self.conn.take().iter().for_each(http::cancel);
             match r {
                 Ok(mut rep) => {
                     let u = &mut rep.usage; // the server's counts, capped so that no sum of them overflows
@@ -42,10 +40,7 @@ impl Session {
                     attempt += 1;
                 }
                 Err(e) if e.kind == "context_exceeded" && !elided && self.elide()? => elided = true,
-                Err(e) => {
-                    let o = self.gave_up(e, attempt);
-                    return Err(self.partial_reply("error", o));
-                }
+                Err(e) => return Err(self.partial_reply("error", self.gave_up(e, attempt))),
             }
         }
     }
@@ -99,10 +94,7 @@ impl Session {
         if text.is_empty() {
             return o;
         }
-        match self.record(rec::assistant(&text, &[], finish, Usage::default())) {
-            Err(e) if !matches!(o, Outcome::Error { .. }) => e,
-            _ => o,
-        }
+        self.record(rec::assistant(&text, &[], finish, Usage::default())).err().filter(|_| !matches!(o, Outcome::Error { .. })).unwrap_or(o)
     }
 
     /// The error as the turn's outcome. After the last retry it says so, and a loopback server that refused every
@@ -124,10 +116,7 @@ impl Session {
     /// Elides the old tool results and journals which; false when there was nothing to elide.
     fn elide(&mut self) -> Result<bool, Outcome> {
         let ids = journal::elide(&mut self.hist);
-        if !ids.is_empty() {
-            self.record(rec::elide(&ids))?;
-        }
-        Ok(!ids.is_empty())
+        Ok(!ids.is_empty() && self.record(rec::elide(&ids)).map(|()| true)?)
     }
 
     fn body(&self) -> Vec<u8> {

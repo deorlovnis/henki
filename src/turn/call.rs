@@ -76,9 +76,7 @@ impl Session {
             sys::kill(-pgid, libc::SIGTERM);
             ev = self.wait(tag, Some(Instant::now() + GRACE))?;
             supervise::kill_call(pgid);
-            if ev.is_none() {
-                ev = self.wait(tag, Some(Instant::now() + LATE))?;
-            }
+            ev = if ev.is_none() { self.wait(tag, Some(Instant::now() + LATE))? } else { ev };
         }
         self.live = None;
         match ev {
@@ -133,9 +131,7 @@ impl Session {
         if tag != 0 && got.is_none() && !self.hurry {
             self.hold(tag, GRACE + Duration::from_millis(100), &mut got);
         }
-        if swept > 0 {
-            let _ = self.notice(&format!("{} processes survived the kill sweep", term::num(swept as u64)));
-        }
+        let _ = (swept > 0).then(|| self.notice(&format!("{} processes survived the kill sweep", term::num(swept as u64))));
         (got, n)
     }
 

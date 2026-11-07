@@ -164,13 +164,13 @@ pub fn open_read(path: &Path) -> io::Result<(File, fs::Metadata)> {
 /// `open_read`, refusing anything but a regular file: Err("not a regular file: PATH (KIND)"); Ok carries the length.
 pub fn open_regular(path: &Path) -> Result<(File, u64), String> {
     let (f, m) = open_read(path).map_err(|e| format!("{}: {e}", path.display()))?;
-    if m.is_file() {
-        return Ok((f, m.len()));
-    }
-    let t = m.file_type();
+    if m.is_file() { Ok((f, m.len())) } else { Err(not_regular(path.display(), m.file_type())) }
+}
+
+/// `not a regular file: PATH (fifo)`; the kind is one of directory, fifo, socket, char device, block device.
+pub fn not_regular(path: impl std::fmt::Display, t: fs::FileType) -> String {
     let kinds = [(t.is_dir(), "directory"), (t.is_fifo(), "fifo"), (t.is_socket(), "socket"), (t.is_char_device(), "char device"), (t.is_block_device(), "block device")];
-    let kind = kinds.iter().find(|k| k.0).map_or("unknown kind", |k| k.1);
-    Err(format!("not a regular file: {} ({kind})", path.display()))
+    format!("not a regular file: {path} ({})", kinds.iter().find(|k| k.0).map_or("unknown kind", |k| k.1))
 }
 
 /// O_WRONLY|O_CREAT|O_EXCL|O_NOFOLLOW|O_CLOEXEC (| O_APPEND when `append`) with an explicit mode: the only way henki
@@ -219,8 +219,7 @@ impl Dir {
 
     /// (dev, ino)
     pub fn id(&self) -> io::Result<(u64, u64)> {
-        let m = self.0.metadata()?;
-        Ok((m.dev(), m.ino()))
+        self.0.metadata().map(|m| (m.dev(), m.ino()))
     }
 
     /// mkdirat 0o777 when `create` (EEXIST ok), then openat, no symlink follow.

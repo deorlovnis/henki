@@ -114,14 +114,12 @@ pub fn load(f: &Flags, env: &Env, cwd: &Path) -> Result<Config, String> {
     layers.extend(late.into_iter().filter_map(|(at, k, v)| Some((at.to_string(), k.to_string(), v?))));
     for (at, k, v) in &layers {
         set(&mut c, k, v).map_err(|e| format!("{at}: {e}"))?;
-        if k == "approve" {
-            c.approve_from.clone_from(at);
-        }
         if at == "HENKI_BASE_URL" && !http::loopback_literal(&c.url.host) {
             return Err(format!("HENKI_BASE_URL: {} is not a loopback host; fix: use localhost, 127.0.0.1 or [::1], or set base_url in the config", c.url.host));
         }
     }
     let at = |key: &str| layers.iter().rfind(|l| l.1 == key);
+    c.approve_from = at("approve").map_or_else(|| "default".into(), |l| l.0.clone());
     c.url_from = if at("base_url").is_some_and(|l| l.0 == "HENKI_BASE_URL") { "HENKI_BASE_URL" } else { "config" };
     if c.model.is_empty() || c.url.host.is_empty() {
         let key = if c.model.is_empty() { "model" } else { "base_url" };
@@ -233,10 +231,8 @@ fn ext(p: &Path, optional: bool) -> Result<(), String> {
         Err(e) if optional && e.kind() == ErrorKind::NotFound => return Ok(()),
         r => r.map_err(|e| format!("ext {d}: {e}; fix: make it a readable directory, or set ext to readable ones"))?,
     };
-    match names.filter_map(|e| Some(e.ok()?.file_name())).find(|n| !n.as_bytes().starts_with(b".")) {
-        Some(n) => Err(format!("ext {d}: {0}: extensions are not supported by this build; fix: move {0} out of {d}", n.to_string_lossy())),
-        None => Ok(()),
-    }
+    let found = names.filter_map(|e| Some(e.ok()?.file_name())).find(|n| !n.as_bytes().starts_with(b"."));
+    found.map_or(Ok(()), |n| Err(format!("ext {d}: {0}: extensions are not supported by this build; fix: move {0} out of {d}", n.to_string_lossy())))
 }
 
 /// A UTF-8 regular file of at most `max` bytes, opened without blocking on a FIFO, that no other user can write (the

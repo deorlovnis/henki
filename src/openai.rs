@@ -259,12 +259,9 @@ fn incomplete(s: &str) -> Call {
 /// `args` = the arguments' text in `raw` (if any), parsed; over 1 MiB or not JSON: `{}`, and `raw` stays for validation.
 fn set_args(c: &mut Call) {
     let Some(a) = c.raw.take() else { return };
-    if a.len() <= ARGS_MAX
-        && let Ok(v) = serde_json::from_str(&a)
-    {
-        c.args = v;
-    } else {
-        (c.args, c.raw) = (json!({}), Some(a));
+    match (a.len() <= ARGS_MAX).then(|| serde_json::from_str(&a).ok()).flatten() {
+        Some(v) => c.args = v,
+        None => (c.args, c.raw) = (json!({}), Some(a)),
     }
 }
 

@@ -55,38 +55,13 @@ pub struct Session {
 
 impl Session {
     /// Takes the child environment from `cfg.env`, `cfg.pass_env`, `cfg.user_path` and `j.id()`; the cwd is `cfg.cwd`.
+    #[rustfmt::skip]
     pub fn new(cfg: Config, j: Journal, hist: Vec<Value>, out: Out, tx: Sender<Ev>, rx: Receiver<Ev>, deadline: Option<Instant>) -> Session {
         let env = supervise::child_env(&cfg.env, &cfg.pass_env, &cfg.user_path, j.id());
         let (system, tools, next_h) = (tools::system(cfg.agents.as_deref()), tools::schema(&cfg.tools), journal::next_h(&hist));
-        Session {
-            cfg,
-            j,
-            out,
-            hist,
-            tx,
-            rx,
-            deadline,
-            lim: http::LIMITS,
-            env,
-            system,
-            tools,
-            next_h,
-            tag: 0,
-            conn: None,
-            partial: String::new(),
-            opened: Vec::new(),
-            open: Vec::new(),
-            live: None,
-            steps: 0,
-            usage_turn: Usage::default(),
-            usage_proc: Usage::default(),
-            text: String::new(),
-            stuck: Stuck::default(),
-            ctx: (0, 0),
-            bg: 0,
-            finishing: false,
-            hurry: false,
-        }
+        Session { cfg, j, out, hist, tx, rx, deadline, lim: http::LIMITS, env, system, tools, next_h, tag: 0, conn: None, partial: String::new(),
+            opened: Vec::new(), open: Vec::new(), live: None, steps: 0, usage_turn: Usage::default(), usage_proc: Usage::default(), text: String::new(),
+            stuck: Stuck::default(), ctx: (0, 0), bg: 0, finishing: false, hurry: false }
     }
 
     /// One turn: the `user` record (none for `run --resume` without TASK), then steps until an outcome. Every call of the
@@ -119,22 +94,16 @@ impl Session {
             Ok(r) => (r, Ok(())),
             Err(e) => {
                 let ms = |r: &Value| (r["duration_s"].as_f64().unwrap_or_default() * 1e3) as u64;
-                let failed = |r: Value| if r["status"] == "error" { r } else { rec::result(&e, &self.text, self.usage_proc, Some(self.j.id()), self.steps, ms(&r)) };
+                let failed = |r: Value| if r["status"] == "error" { r } else { self.result(&e, ms(&r)) };
                 (result.map(failed), Err(e))
             }
         };
-        if let Some(r) = r {
-            if self.out.json() {
-                self.out.record(&r);
-            } else if r["status"] == "ok" {
-                self.out.answer(&self.text);
-            }
+        // Each writes in its own mode only: the record on `--json` stdout, the answer in plain mode.
+        r.iter().for_each(|r| self.out.record(r));
+        if r.is_some_and(|r| r["status"] == "ok") {
+            self.out.answer(&self.text);
         }
         end
-    }
-
-    pub fn id(&self) -> &str {
-        self.j.id()
     }
 
     /// The terminal, for `main`'s outcome line.
@@ -142,19 +111,9 @@ impl Session {
         &self.out
     }
 
-    /// The last assistant text, or "".
-    pub fn text(&self) -> &str {
-        &self.text
-    }
-
-    /// This turn's successful replies.
-    pub fn steps(&self) -> u32 {
-        self.steps
-    }
-
-    /// This process's requests.
-    pub fn usage(&self) -> Usage {
-        self.usage_proc
+    /// The run's `result` record: the last assistant text (or ""), this turn's successful replies, this process's usage.
+    pub fn result(&self, o: &Outcome, duration_ms: u64) -> Value {
+        rec::result(o, &self.text, self.usage_proc, Some(self.j.id()), self.steps, duration_ms)
     }
 
     /// For the bounded flush before exit.
@@ -165,9 +124,7 @@ impl Session {
     /// Requests and calls until an outcome; `Err` is the only way out.
     fn step_loop(&mut self, task: Option<String>) -> Result<Infallible, Outcome> {
         (self.steps, self.usage_turn, self.stuck) = (0, Usage::default(), Stuck::default());
-        for n in std::mem::take(&mut self.cfg.notices) {
-            self.notice(&n)?;
-        }
+        std::mem::take(&mut self.cfg.notices).iter().try_for_each(|n| self.notice(n))?;
         match task {
             Some(t) => self.record(rec::user(&(head(&self.cfg.cwd) + &t)))?,
             // Only a task or a tool result leaves something for the model to continue.
@@ -184,9 +141,7 @@ impl Session {
             self.usage_turn.add(r.usage);
             self.usage_proc.add(r.usage);
             if calls.is_empty() {
-                if r.finish == "length" {
-                    self.notice("answer cut at max_tokens")?;
-                }
+                (r.finish == "length").then(|| self.notice("answer cut at max_tokens")).transpose()?;
                 if !self.text.trim().is_empty() {
                     return Err(Outcome::Ok);
                 }
@@ -200,12 +155,8 @@ impl Session {
                 self.poll()?; // calls that never wait still end at the deadline or a signal
                 self.dispatch(c)?;
             }
-            if self.stuck.run >= STUCK_RUN {
-                return Err(Outcome::GaveUp("stuck"));
-            }
-            if self.steps >= self.cfg.max_steps {
-                return Err(Outcome::GaveUp("max_steps"));
-            }
+            let why = if self.stuck.run >= STUCK_RUN { Some("stuck") } else { (self.steps >= self.cfg.max_steps).then_some("max_steps") };
+            why.map_or(Ok(()), |w| Err(Outcome::GaveUp(w)))?;
         }
     }
 
@@ -213,17 +164,12 @@ impl Session {
     /// call is live, give every call of the step a result, then `turn_end`. A journal failure here wins unless the
     /// outcome is already an error.
     fn finish(&mut self, o: Outcome) -> Outcome {
-        if let Some(slot) = self.conn.take() {
-            http::cancel(&slot);
-        }
+        self.conn.take().iter().for_each(http::cancel);
         self.finishing = true;
         let got = if o.stops() || self.live.is_some() { self.stop_all().0 } else { None };
         let r = self.settle(&o, got);
         self.finishing = false;
-        match r {
-            Err(e) if !matches!(o, Outcome::Error { .. }) => e,
-            _ => o,
-        }
+        r.err().filter(|_| !matches!(o, Outcome::Error { .. })).unwrap_or(o)
     }
 
     /// The live call keeps its output if it reported in time; another started call gets the repair text, the rest
@@ -260,10 +206,7 @@ impl Session {
                 return Ok(None);
             }
             // The session holds a sender, so the channel never disconnects.
-            let ev = match until.into_iter().chain(deadline).min() {
-                Some(e) => self.rx.recv_timeout(e - now).ok(),
-                None => self.rx.recv().ok(),
-            };
+            let ev = if let Some(e) = until.into_iter().chain(deadline).min() { self.rx.recv_timeout(e - now).ok() } else { self.rx.recv().ok() };
             match ev {
                 Some(Ev::Signal(s)) => {
                     self.hurry |= self.finishing;
@@ -283,11 +226,7 @@ impl Session {
         if self.deadline.is_some_and(|d| Instant::now() >= d) {
             return Err(Stop::Budget);
         }
-        let stop = |ev| match ev {
-            Ev::Signal(s) => Some(Stop::Signal(s)),
-            Ev::OutputClosed => Some(Stop::Closed),
-            _ => None,
-        };
+        let stop = |ev| if let Ev::Signal(s) = ev { Some(Stop::Signal(s)) } else { matches!(ev, Ev::OutputClosed).then_some(Stop::Closed) };
         self.rx.try_iter().find_map(stop).map_or(Ok(()), Err)
     }
 
@@ -321,11 +260,7 @@ fn head(cwd: &Path) -> String {
 
 /// The last `n` bytes of `s` at most, starting on a character.
 fn tail(s: &str, n: usize) -> &str {
-    let mut i = s.len().saturating_sub(n);
-    while !s.is_char_boundary(i) {
-        i += 1;
-    }
-    s.get(i..).unwrap_or_default()
+    s.get(s.ceil_char_boundary(s.len().saturating_sub(n))..).unwrap_or_default()
 }
 
 #[cfg(test)]

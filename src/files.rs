@@ -49,7 +49,7 @@ fn read(p: &str, t: &Target, offset: u64, limit: u64, max: usize) -> Result<Stri
     } else if m.is_file() {
         Box::new(BufReader::with_capacity(64 << 10, f))
     } else {
-        return Err(tools::not_regular(p, m.file_type()));
+        return Err(sys::not_regular(p, m.file_type()));
     };
     if r.fill_buf().map_err(fail)?.iter().take(8 << 10).any(|&b| b == 0) {
         return Err(format!("binary file ({} bytes); use the shell", num(total)));
@@ -134,7 +134,7 @@ fn edit(p: &str, t: &Target, old: &str, new: &str) -> Result<String, String> {
     let f = fs::OpenOptions::new().read(true).custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_NOCTTY).open(&t.path).map_err(fail)?;
     let m = f.metadata().map_err(fail)?;
     if !m.is_file() {
-        return Err(tools::not_regular(p, m.file_type()));
+        return Err(sys::not_regular(p, m.file_type()));
     }
     let mut data = Vec::new();
     // One byte past the limit is read, so a file that grew since the stat is refused too, never cut short.

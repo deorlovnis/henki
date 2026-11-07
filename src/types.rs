@@ -66,9 +66,7 @@ pub struct Usage {
 
 impl Usage {
     pub fn add(&mut self, o: Usage) {
-        self.input += o.input;
-        self.output += o.output;
-        self.cached += o.cached;
+        *self = Usage { input: self.input + o.input, output: self.output + o.output, cached: self.cached + o.cached };
     }
 }
 
@@ -121,36 +119,30 @@ pub enum Outcome {
 impl Outcome {
     /// The `status` word of the `turn_end` and `result` records.
     pub fn status(&self) -> &'static str {
-        match self {
-            Outcome::Ok => "ok",
-            Outcome::GaveUp(_) => "gave_up",
-            Outcome::Error { .. } => "error",
-            Outcome::NeedsApproval(_) => "needs_approval",
-            Outcome::Budget => "budget",
-            Outcome::Interrupted => "interrupted",
-            Outcome::OutputClosed => "output_closed",
-        }
+        self.row().0
     }
 
     /// The process exit code.
     pub fn exit(&self) -> i32 {
+        self.row().1
+    }
+
+    /// The exit table: each end's status word and exit code.
+    fn row(&self) -> (&'static str, i32) {
         match self {
-            Outcome::Ok => 0,
-            Outcome::GaveUp(_) => 1,
-            Outcome::Error { .. } => 2,
-            Outcome::NeedsApproval(_) => 3,
-            Outcome::Budget => 124,
-            Outcome::Interrupted => 130,
-            Outcome::OutputClosed => 141,
+            Outcome::Ok => ("ok", 0),
+            Outcome::GaveUp(_) => ("gave_up", 1),
+            Outcome::Error { .. } => ("error", 2),
+            Outcome::NeedsApproval(_) => ("needs_approval", 3),
+            Outcome::Budget => ("budget", 124),
+            Outcome::Interrupted => ("interrupted", 130),
+            Outcome::OutputClosed => ("output_closed", 141),
         }
     }
 
     /// `GaveUp`'s reason: `max_steps`, `stuck` or `empty_answer`.
     pub fn reason(&self) -> Option<&'static str> {
-        match self {
-            Outcome::GaveUp(r) => Some(r),
-            _ => None,
-        }
+        if let Outcome::GaveUp(r) = self { Some(r) } else { None }
     }
 
     /// REASON of `not run: REASON` for the calls this end leaves unstarted.

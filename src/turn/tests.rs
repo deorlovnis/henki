@@ -211,7 +211,7 @@ fn turn_plain_answer() {
     let port = serve(vec![sse(&[delta(serde_json::json!({"content": "Hi"}), None), delta(serde_json::json!({}), Some("stop"))])]);
     let (mut s, buf) = session(&d, port);
     assert_eq!(s.turn(Some("say hi".into())), Outcome::Ok);
-    assert_eq!((s.text(), s.steps()), ("Hi", 1));
+    assert_eq!((s.text.as_str(), s.steps), ("Hi", 1));
     assert_eq!(kinds(&s.hist), ["user", "assistant"]);
     assert!(s.hist[0]["msg"]["content"].as_str().unwrap().ends_with("\n\nsay hi"));
     s.into_out().flush(Instant::now() + Duration::from_secs(1));
@@ -295,7 +295,7 @@ fn end_writes_result_then_close() {
     let d = dir("end");
     let (mut s, buf) = session(&d, 9);
     s.text = "the answer".into();
-    let id = s.id().to_string();
+    let id = s.j.id().to_string();
     s.end(0, Some(rec::result(&Outcome::Ok, "the answer", Usage::default(), Some(&id), 1, 1_234))).unwrap();
     s.into_out().flush(Instant::now() + Duration::from_secs(1));
     let out = lines(&buf);
@@ -311,7 +311,7 @@ fn end_writes_result_then_close() {
 fn end_journal_failure_json_result() {
     let d = dir("endfail");
     let (mut s, buf) = session(&d, 9);
-    let id = s.id().to_string();
+    let id = s.j.id().to_string();
     // The file changes behind henki's back: every later write fails the size check.
     std::fs::OpenOptions::new().append(true).open(journal_file(&d)).unwrap().write_all(b"{\"t\":\"x\"}\n").unwrap();
     let e = s.end(2, Some(rec::result(&Outcome::Ok, "", Usage { input: 7, output: 3, cached: 0 }, Some(&id), 4, 2_500))).unwrap_err();
@@ -329,7 +329,7 @@ fn end_journal_failure_json_result() {
 fn end_journal_failure_keeps_turn_error() {
     let d = dir("endfail2");
     let (mut s, buf) = session(&d, 9);
-    let id = s.id().to_string();
+    let id = s.j.id().to_string();
     std::fs::OpenOptions::new().append(true).open(journal_file(&d)).unwrap().write_all(b"{\"t\":\"x\"}\n").unwrap();
     let auth = Outcome::error("auth", "bad key");
     let given = rec::result(&auth, "", Usage::default(), Some(&id), 0, 100);
@@ -348,7 +348,7 @@ fn end_journal_failure_plain_no_answer() {
     s.out = Out::with(false, tx, Box::new(out.clone()), Box::new(err.clone()));
     drop(rx);
     s.text = "an answer".into();
-    let id = s.id().to_string();
+    let id = s.j.id().to_string();
     std::fs::OpenOptions::new().append(true).open(journal_file(&d)).unwrap().write_all(b"{\"t\":\"x\"}\n").unwrap();
     assert!(s.end(0, Some(rec::result(&Outcome::Ok, "an answer", Usage::default(), Some(&id), 1, 0))).is_err());
     s.into_out().flush(Instant::now() + Duration::from_secs(1));
@@ -403,7 +403,7 @@ fn usage_overflow_no_panic() {
     let answer = sse(&[delta(serde_json::json!({"content": "done"}), None), serde_json::json!({"choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}], "usage": max})]);
     let (mut s, _) = session(&d, serve(vec![calls_reply(vec![read_missing(0)], max.clone()), answer]));
     assert_eq!(s.turn(Some("count".into())), Outcome::Ok);
-    assert_eq!(s.usage(), Usage { input: 2 << 32, output: 10, cached: 0 }, "each reply's counts are capped at 2^32");
+    assert_eq!(s.usage_proc, Usage { input: 2 << 32, output: 10, cached: 0 }, "each reply's counts are capped at 2^32");
     assert_eq!(s.ctx.0, (1 << 32) + 5);
     assert_eq!(s.hist[1]["usage"]["in"], 1u64 << 32, "the journal holds the capped count");
     std::fs::remove_dir_all(d).unwrap();

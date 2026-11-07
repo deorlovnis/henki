@@ -111,23 +111,16 @@ fn run(a: Args, out: Out, tx: Sender<Ev>, rx: Receiver<Ev>, t0: Instant, early: 
     out.record(&session);
     let mut s = Session::new(cfg, j, hist, out, tx, rx, deadline);
     // A finished turn whose stdout reader went away never gave the reader what it waited for.
-    let o = match s.turn(task) {
-        Outcome::Ok | Outcome::GaveUp(_) | Outcome::NeedsApproval(_) if s.out().closed() => Outcome::OutputClosed,
-        o => o,
-    };
-    let result = rec::result(&o, s.text(), s.usage(), Some(s.id()), s.steps(), ms(t0));
+    let o = s.turn(task);
+    let o = if matches!(o, Outcome::Ok | Outcome::GaveUp(_) | Outcome::NeedsApproval(_)) && s.out().closed() { Outcome::OutputClosed } else { o };
+    let result = s.result(&o, ms(t0));
     if o != Outcome::Ok {
         s.out().line(&outcome_line(&o));
     }
     // A journal failure at the end is the run's end, unless the turn already failed.
-    let o = match s.close(Some(result)) {
-        Err(e) if !matches!(o, Outcome::Error { .. }) => {
-            s.out().line(&outcome_line(&e));
-            e
-        }
-        _ => o,
-    };
-    code(s.into_out(), &o, deadline)
+    let failed = s.close(Some(result)).err().filter(|_| !matches!(o, Outcome::Error { .. }));
+    failed.iter().for_each(|e| s.out().line(&outcome_line(e)));
+    code(s.into_out(), &failed.unwrap_or(o), deadline)
 }
 
 /// What startup hands to the session: the config, the journal, the history, the task and the `session` record.
@@ -146,12 +139,8 @@ fn start(a: Args, tx: &Sender<Ev>, rx: &Receiver<Ev>, t0: Instant, early: io::Re
     let mut cfg = config::load(&a.flags, &env, &cwd).map_err(bad)?;
     *deadline = (cfg.max_seconds > 0).then(|| t0 + Duration::from_secs(cfg.max_seconds));
     let state = journal::state_dir(&cfg.env, &cfg.home).map_err(bad)?;
-    cfg.protected.extend(state.canonicalize().ok());
-    cfg.protected.push(state.clone());
-    let task = match a.task {
-        Some(t) if t == "-" => Some(stdin_task(tx, rx, *deadline)?),
-        t => t,
-    };
+    cfg.protected.extend([Some(state.clone()), state.canonicalize().ok()].into_iter().flatten());
+    let task = if a.task.as_deref() == Some("-") { Some(stdin_task(tx, rx, *deadline)?) } else { a.task };
     if task.as_deref().is_some_and(|t| t.trim().is_empty()) {
         return Err(bad("task is empty".into()));
     }
@@ -197,10 +186,7 @@ fn stdin_task(tx: &Sender<Ev>, rx: &Receiver<Ev>, deadline: Option<Instant>) -> 
 /// An end before any session exists: the `--json` result with `session: null`, or plain text on stderr.
 fn refuse(out: &Out, o: &Outcome, t0: Instant) {
     out.record(&rec::result(o, "", Usage::default(), None, 0, ms(t0)));
-    match o {
-        Outcome::Error { message, .. } => out.note(message),
-        o => out.line(&outcome_line(o)),
-    }
+    if let Outcome::Error { message, .. } = o { out.note(message) } else { out.line(&outcome_line(o)) }
 }
 
 /// The plain-mode line for an end other than `ok`: `(gave up: stuck)`, `(error auth: MSG)`, `(budget)`.
