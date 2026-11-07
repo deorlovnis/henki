@@ -260,9 +260,8 @@ pub mod rec {
 
     pub fn session(cfg: &Config, id: &str, cwd: &Path, resumed: Option<u64>) -> Value {
         let u = &cfg.url;
-        let host = if u.host.contains(':') && !u.host.starts_with('[') { format!("[{}]", u.host) } else { u.host.clone() };
         json!({"t": "session", "v": 1, "henki": env!("CARGO_PKG_VERSION"), "id": id, "cwd": cwd.to_string_lossy(), "model": cfg.model,
-            "dialect": "openai", "base_url": format!("http://{host}:{}{}", u.port, u.path), "base_url_from": cfg.url_from,
+            "dialect": "openai", "base_url": format!("http://{}{}", crate::http::host_port(u), u.path), "base_url_from": cfg.url_from,
             "approve": if cfg.auto { "auto" } else { "ask" }, "approve_from": cfg.approve_from, "config": cfg.file.as_ref().map(|f| f.to_string_lossy()),
             "tools": cfg.tools, "shell": cfg.bash.to_string_lossy(), "exts": [], "pass_env": cfg.pass_env, "ctx": cfg.window,
             "config_hash": cfg.hash, "allow_hash": null, "agents_hash": cfg.agents_hash, "project_agents_hash": null,

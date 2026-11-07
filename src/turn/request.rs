@@ -69,8 +69,7 @@ impl Session {
                     }
                 }
             };
-            let reply = attempt();
-            let _ = tx.send(Ev::Reply { tag, reply });
+            let _ = tx.send(Ev::Reply { tag, reply: attempt() });
         })?;
         Ok(slot)
     }
@@ -106,8 +105,7 @@ impl Session {
             let (u, file) = (&self.cfg.url, self.cfg.file.as_ref().filter(|_| self.cfg.url_from == "config"));
             if cause.starts_with("could not connect") && http::loopback_literal(&u.host) {
                 let set = if let Some(f) = file { format!("base_url in {}", f.display()) } else { "HENKI_BASE_URL".into() };
-                let host = if u.host.contains(':') { format!("[{}]", u.host) } else { u.host.clone() };
-                m += &format!("; fix: start the model server on {host}:{} or set {set}", u.port);
+                m += &format!("; fix: start the model server on {} or set {set}", http::host_port(u));
             }
         }
         Outcome::error(e.kind, m)

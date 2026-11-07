@@ -92,10 +92,7 @@ fn parse(a: &mut Args) -> Result<Option<String>, lexopt::Error> {
             arg => return Err(arg.unexpected()),
         }
     }
-    if a.task.is_none() && a.resume.is_none() {
-        return Err("missing TASK".into());
-    }
-    Ok(None)
+    if a.task.is_none() && a.resume.is_none() { Err("missing TASK".into()) } else { Ok(None) }
 }
 
 /// `henki run`: startup, one turn, the `result`, the session end.

@@ -60,17 +60,14 @@ fn read(p: &str, t: &Target, offset: u64, limit: u64, max: usize) -> Result<Stri
         (true, false) => return Ok("(empty file)".into()),
         _ => {}
     }
-    let mut text = String::from_utf8_lossy(&out).into_owned();
-    match (more, dir) {
-        (true, false) => text += &format!("[lines {offset}-{last} shown; file is {} bytes; continue with offset={}]\n", num(total), last + 1),
-        (true, true) => text += &format!("[entries {offset}-{last} shown of {}; continue with offset={}]\n", num(total), last + 1),
-        (false, true) => text += &format!("[directory, {} entries]\n", num(total)),
-        (false, false) => {}
-    }
-    if std::str::from_utf8(&out).is_err() {
-        text += "[invalid UTF-8 replaced with U+FFFD]\n";
-    }
-    Ok(text)
+    let foot = match (more, dir) {
+        (true, false) => format!("[lines {offset}-{last} shown; file is {} bytes; continue with offset={}]\n", num(total), last + 1),
+        (true, true) => format!("[entries {offset}-{last} shown of {}; continue with offset={}]\n", num(total), last + 1),
+        (false, true) => format!("[directory, {} entries]\n", num(total)),
+        (false, false) => String::new(),
+    };
+    let bad = if std::str::from_utf8(&out).is_err() { "[invalid UTF-8 replaced with U+FFFD]\n" } else { "" };
+    Ok(String::from_utf8_lossy(&out).into_owned() + &foot + bad)
 }
 
 /// From line `offset`, at most `limit` lines and `max` bytes of `r`. Returns the lines, the number of the last line
@@ -86,10 +83,7 @@ fn page(r: &mut dyn BufRead, offset: u64, limit: u64, max: usize) -> io::Result<
         n += 1;
         match (skip, len < room, out.is_empty()) {
             (true, ..) => {}
-            (false, true, _) => {
-                out.extend_from_slice(&buf);
-                out.push(b'\n');
-            }
+            (false, true, _) => out.extend(buf.iter().chain(b"\n")),
             (false, false, false) => return Ok((out, n - 1, true)),
             (false, false, true) => {
                 // Cut on a character boundary, so the cut alone never reads as invalid UTF-8.
@@ -197,10 +191,7 @@ fn put(p: &str, t: &Target, data: &[u8]) -> Result<(), String> {
         }
         dir.rename(&tmp, &t.name)
     })();
-    if r.is_err() {
-        dir.unlink(&tmp);
-    }
-    r.map_err(fail)
+    r.inspect_err(|_| dir.unlink(&tmp)).map_err(fail)
 }
 
 /// The temp's mode: private while it replaces a file (the old mode is applied after the write), 0644 for a new file so

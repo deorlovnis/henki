@@ -218,7 +218,8 @@ fn loopback(host: &str, addrs: &[SocketAddr]) -> bool {
     loopback_literal(host) && addrs.iter().all(|a| a.ip().is_loopback())
 }
 
-fn host_port(url: &Url) -> String {
+/// `HOST:PORT`, an IPv6 host in brackets.
+pub fn host_port(url: &Url) -> String {
     if url.host.contains(':') { format!("[{}]:{}", url.host, url.port) } else { format!("{}:{}", url.host, url.port) }
 }
 
@@ -240,10 +241,8 @@ pub fn classify(status: u16, body: &[u8], url: &Url, retry_after: Option<Duratio
 
 /// The same rules for an `error` object found inside a 200 stream or completion; `first` = it was the first event.
 pub fn error_object(v: &Value, first: bool) -> ProviderError {
-    let text = v.to_string();
-    let mut e = rules(0, v, &text, "the model sent an error: ".into(), None);
-    e.retry = e.retry.filter(|_| first);
-    e
+    let e = rules(0, v, &v.to_string(), "the model sent an error: ".into(), None);
+    ProviderError { retry: e.retry.filter(|_| first), ..e }
 }
 
 /// The rules over an error body or event (`status` 0: inside a 200 reply), first match wins: context exceeded (its
