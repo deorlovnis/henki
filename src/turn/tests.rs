@@ -161,12 +161,12 @@ fn stuck_reset_by_other_call() {
 fn stuck_reset_per_turn() {
     let d = dir("stuck");
     let (mut s, _) = session(&d, 9);
-    s.stuck.feed(key("read", "{}"), true);
-    s.stuck.feed(key("read", "{}"), true);
-    assert_eq!(s.stuck.run, 2);
+    s.t.stuck.feed(key("read", "{}"), true);
+    s.t.stuck.feed(key("read", "{}"), true);
+    assert_eq!(s.t.stuck.run, 2);
     // An empty history has nothing to continue, so the turn ends before any request; the stuck run is gone anyway.
     assert_eq!(s.turn(None), Outcome::error("config", "nothing to continue; give a TASK"));
-    assert_eq!(s.stuck.run, 0);
+    assert_eq!(s.t.stuck.run, 0);
     std::fs::remove_dir_all(d).unwrap();
 }
 
@@ -206,7 +206,7 @@ fn turn_request_timeout_cancels() {
     let (mut s, _) = session(&d, l.local_addr().unwrap().port());
     s.lim.request = Duration::from_millis(200);
     assert_eq!(s.turn(Some("hi".into())), Outcome::error("provider", "request took over 0 s"));
-    assert!(s.live.is_none() && s.conn.is_none() && s.open.is_empty());
+    assert!(s.t.live.is_none() && s.t.conn.is_none() && s.t.open.is_empty());
     let (mut c, _) = l.accept().unwrap();
     c.set_read_timeout(Some(Duration::from_secs(1))).unwrap();
     let mut req = Vec::new();
@@ -221,7 +221,7 @@ fn turn_plain_answer() {
     let port = serve(vec![sse(&[delta(json!({"content": "Hi"}), None), delta(json!({}), Some("stop"))])]);
     let (mut s, buf) = session(&d, port);
     assert_eq!(s.turn(Some("say hi".into())), Outcome::Ok);
-    assert_eq!((s.text.as_str(), s.steps), ("Hi", 1));
+    assert_eq!((s.t.text.as_str(), s.t.steps), ("Hi", 1));
     assert_eq!(kinds(&s.hist), ["user", "assistant"]);
     assert!(s.hist[0]["msg"]["content"].as_str().unwrap().ends_with("\n\nsay hi"));
     s.into_out().flush(Instant::now() + Duration::from_secs(1));
@@ -314,7 +314,7 @@ fn journal_file(d: &Path) -> PathBuf {
 fn end_writes_result_then_close() {
     let d = dir("end");
     let (mut s, buf) = session(&d, 9);
-    s.text = "the answer".into();
+    s.t.text = "the answer".into();
     let id = s.j.id().to_string();
     s.end(0, Some(rec::result(&Outcome::Ok, "the answer", Usage::default(), Some(&id), 1, 1_234))).unwrap();
     s.into_out().flush(Instant::now() + Duration::from_secs(1));
@@ -367,7 +367,7 @@ fn end_journal_failure_plain_no_answer() {
     let (out, err) = (Buf::default(), Buf::default());
     s.out = Out::with(Mode::Plain, tx, Box::new(out.clone()), Box::new(err.clone()), false);
     drop(rx);
-    s.text = "an answer".into();
+    s.t.text = "an answer".into();
     let id = s.j.id().to_string();
     std::fs::OpenOptions::new().append(true).open(journal_file(&d)).unwrap().write_all(b"{\"t\":\"x\"}\n").unwrap();
     assert!(s.end(0, Some(rec::result(&Outcome::Ok, "an answer", Usage::default(), Some(&id), 1, 0))).is_err());
@@ -410,9 +410,9 @@ fn stuck_reset_per_turn_across_requests() {
     let fail = |i| calls_reply(vec![read_missing(i)], Value::Null);
     let (mut s, _) = session(&d, serve(vec![fail(0), fail(1), say("no"), fail(2), say("still no")]));
     assert_eq!(s.turn(Some("read it".into())), Outcome::Ok);
-    assert_eq!(s.stuck.run, 2, "two failed identical calls");
+    assert_eq!(s.t.stuck.run, 2, "two failed identical calls");
     assert_eq!(s.turn(Some("again".into())), Outcome::Ok, "a third identical failure in a new turn starts a new run");
-    assert_eq!(s.stuck.run, 1);
+    assert_eq!(s.t.stuck.run, 1);
     std::fs::remove_dir_all(d).unwrap();
 }
 
@@ -507,7 +507,7 @@ fn request_timeout_cancels_every_attempt() {
     s.lim.request = Duration::from_millis(200);
     s.hist.push(rec::user("hi"));
     assert_eq!(s.request().unwrap_err(), Outcome::error("provider", "request took over 0 s"));
-    assert!(s.conn.is_none(), "the timed-out attempt's slot was taken");
+    assert!(s.t.conn.is_none(), "the timed-out attempt's slot was taken");
     busy.join().unwrap();
     let (mut c, _) = l.accept().unwrap();
     c.set_read_timeout(Some(Duration::from_secs(1))).unwrap();
@@ -554,13 +554,13 @@ fn stuck_denied_resets() {
     let (mut s, _) = session(&d, 9);
     let c = shell_call("h1");
     let k = key("shell", &c.args.to_string());
-    s.stuck.feed(k.clone(), true);
-    s.stuck.feed(k.clone(), true);
-    assert_eq!(s.stuck.run, 2);
+    s.t.stuck.feed(k.clone(), true);
+    s.t.stuck.feed(k.clone(), true);
+    assert_eq!(s.t.stuck.run, 2);
     s.answer(&c, DENIED, true, None, None).unwrap();
-    assert_eq!((s.stuck.run, s.hist[0]["content"].as_str(), s.hist[0]["is_error"].as_bool()), (0, Some(DENIED), Some(true)), "a denied call is in no run");
-    s.stuck.feed(k, true);
-    assert_eq!(s.stuck.run, 1, "the next failure starts a new run");
+    assert_eq!((s.t.stuck.run, s.hist[0]["content"].as_str(), s.hist[0]["is_error"].as_bool()), (0, Some(DENIED), Some(true)), "a denied call is in no run");
+    s.t.stuck.feed(k, true);
+    assert_eq!(s.t.stuck.run, 1, "the next failure starts a new run");
     std::fs::remove_dir_all(d).unwrap();
 }
 
@@ -824,7 +824,7 @@ fn turn_anthropic_seam() {
     (c.dialect, c.url.path, c.api_key) = ("anthropic", "/model".into(), "cred-managed".into());
     let (mut s, _, _) = open(c, Mode::Json, None);
     assert_eq!(s.turn(Some("say hi".into())), Outcome::Ok);
-    assert_eq!(s.text, "Hi");
+    assert_eq!(s.t.text, "Hi");
     assert_eq!(s.hist[1]["blocks"], json!([{"text": "Hi", "type": "text"}]), "the blocks are journaled for replay");
     let req = String::from_utf8_lossy(&log.lock().unwrap()[0]).to_ascii_lowercase();
     assert!(req.starts_with("post /model/v1/messages http/1.1\r\n"), "{req}");

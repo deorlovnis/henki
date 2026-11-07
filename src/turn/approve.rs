@@ -11,11 +11,11 @@ impl Session {
     /// `Error changed`.
     pub(super) fn ask(&mut self, c: &Call, t: Option<&Target>) -> Result<bool, Outcome> {
         self.record(rec::ask(c, t.map(|t| t.shown.as_str())))?;
-        let cmd = c.args["command"].as_str().filter(|_| c.name == "shell");
+        let (shell, cmd) = (c.name == "shell", c.args["command"].as_str().unwrap_or_default());
         // A rule saves an exact command; none while a process started earlier still runs, since it may be what the
         // command talks to.
         let bg = supervise::reap();
-        let offer = cmd.is_some_and(|cmd| bg == 0 && allow::fits(cmd, &self.cfg.root));
+        let offer = shell && bg == 0 && allow::fits(cmd, &self.cfg.root);
         let ((rows, cols), lines) = (sys::winsize(0).unwrap_or((24, 80)), tools::display(c, t));
         sys::flush_input();
         self.out.reset();
@@ -24,7 +24,7 @@ impl Session {
         if n > usize::from(rows) {
             self.out.line(&format!("{} rows: taller than the screen; scroll up or answer n", term::num(n as u64)));
         }
-        if cmd.is_some() && bg > 0 {
+        if shell && bg > 0 {
             self.notice(&format!("{} background processes still run; always is off until they end", term::num(bg as u64)))?;
         }
         let (root, file) = (allow::shown(&self.cfg.root, &self.cfg.home), allow::shown(&self.cfg.allow.file, &self.cfg.home));
@@ -39,7 +39,6 @@ impl Session {
                 }
                 _ => return self.verdict(c, "no", None),
             }
-            let cmd = cmd.unwrap_or_default();
             sys::flush_input();
             self.out.reset();
             self.out.line(&format!("a rule allows whatever this command does in {root}, including the files and config it reads"));

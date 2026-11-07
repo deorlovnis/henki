@@ -68,8 +68,7 @@ impl Session {
     pub(super) fn tripwire(&mut self) -> Result<(), Outcome> {
         let Some(p) = self.changed().into_iter().next() else { return Ok(()) };
         let m = format!("trust file changed: {}", p.display());
-        self.notice(&m)?;
-        Err(Outcome::error("changed", m))
+        self.notice(&m).and(Err(Outcome::error("changed", m)))
     }
 
     /// Runs an approved call and waits for its output; the REPL shows its head line as it starts (a rule's line is one).
@@ -91,8 +90,8 @@ impl Session {
                 Err(e) => return self.answer(c, &tools::not_started(&e), true, None, None),
             }
         }
-        self.open.iter_mut().filter(|o| o.0.id == c.id).for_each(|o| o.1 = true);
-        self.live = Some((tag, c.id.clone()));
+        self.t.open.iter_mut().filter(|o| o.0.id == c.id).for_each(|o| o.1 = true);
+        self.t.live = Some((tag, c.id.clone()));
         let mut ev = self.wait(tag, pgid.map(|_| t0 + Duration::from_secs(secs)))?;
         let killed = ev.is_none().then_some(Killed::Timeout(secs));
         if let (None, Some(pgid)) = (&ev, pgid) {
@@ -101,7 +100,7 @@ impl Session {
             supervise::kill_call(pgid);
             ev = if ev.is_none() { self.wait(tag, Some(Instant::now() + LATE))? } else { ev };
         }
-        self.live = None;
+        self.t.live = None;
         match ev {
             Some(Ev::Tool { out, .. }) => {
                 let (text, is_error) = tools::result_text(&c.name, &out, killed.as_ref());
@@ -120,14 +119,14 @@ impl Session {
     pub(super) fn answer(&mut self, c: &Call, text: &str, is_error: bool, out: Option<&ToolOutput>, killed: Option<&Killed>) -> Result<(), Outcome> {
         let (ms, bytes) = out.map_or((0, text.len() as u64), |o| (o.ms, o.bytes));
         self.record(rec::tool_result(&c.id, &c.name, text, is_error, ms, bytes))?;
-        self.open.retain(|o| o.0.id != c.id);
+        self.t.open.retain(|o| o.0.id != c.id);
         self.out.line(&tools::call_line(c, out, killed, is_error));
         let bg = if out.is_some() { supervise::reap() } else { self.bg };
         if bg != self.bg {
             self.bg = bg;
             self.notice(&format!("{} background processes from earlier calls still run", term::num(bg as u64)))?;
         }
-        self.stuck.feed(format!("{}\0{}", c.name, c.raw.clone().unwrap_or_else(|| c.args.to_string())), is_error && text != DENIED);
+        self.t.stuck.feed(format!("{}\0{}", c.name, c.raw.clone().unwrap_or_else(|| c.args.to_string())), is_error && text != DENIED);
         Ok(())
     }
 
@@ -136,7 +135,7 @@ impl Session {
     /// five sweeps of what is left; with nothing live, no wait at all. Returns the live call's output if it reported, and
     /// how many processes there were to stop (macOS: process groups).
     pub(super) fn stop_all(&mut self, int: bool) -> (Option<ToolOutput>, usize) {
-        let (tag, mut got, n) = (self.live.as_ref().map_or(0, |l| l.0), None, supervise::reap());
+        let (tag, mut got, n) = (self.t.live.as_ref().map_or(0, |l| l.0), None, supervise::reap());
         for sig in [libc::SIGINT, libc::SIGTERM].into_iter().skip(usize::from(!int)) {
             let (mut left, end) = (supervise::signal_groups(sig), Instant::now() + GRACE);
             while left > 0 && !self.hurry && Instant::now() < end {

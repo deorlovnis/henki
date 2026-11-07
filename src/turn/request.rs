@@ -20,19 +20,19 @@ impl Session {
                 (elided, body) = (true, self.body());
             }
             let (tag, len) = (self.next_tag(), body.len());
-            (self.partial, self.opened) = (String::new(), Vec::new());
-            self.conn = Some(self.provider(tag, body).map_err(|e| Outcome::error("internal", format!("cannot start a thread: {e}")))?);
+            (self.t.partial, self.t.opened) = (String::new(), Vec::new());
+            self.t.conn = Some(self.provider(tag, body).map_err(|e| Outcome::error("internal", format!("cannot start a thread: {e}")))?);
             let r = match self.wait(tag, Some(Instant::now() + self.lim.request)) {
                 Ok(Some(Ev::Reply { reply, .. })) => reply,
                 Ok(_) => Err(http::perr("provider", format!("request took over {} s", term::num(self.lim.request.as_secs())))),
                 Err(s) => return Err(self.partial_reply("interrupted", s.into())), // FINISHING shuts the socket
             };
-            self.conn.take().iter().for_each(http::cancel);
+            self.t.conn.take().iter().for_each(http::cancel);
             match r {
                 Ok(mut rep) => {
                     let u = &mut rep.usage; // the server's counts, capped so that no sum of them overflows
                     (u.input, u.output, u.cached) = (u.input.min(1 << 32), u.output.min(1 << 32), u.cached.min(1 << 32));
-                    (self.ctx, self.opened) = ((u.input + u.output, len), Vec::new());
+                    (self.ctx, self.t.opened) = ((u.input + u.output, len), Vec::new());
                     return Ok(rep);
                 }
                 Err(e) if e.retry.is_some() && attempt < ATTEMPTS => {
@@ -74,17 +74,17 @@ impl Session {
             Part::Text(t) => {
                 self.out.record(&rec::delta(false, &t));
                 self.out.delta(&t);
-                self.partial += &t;
+                self.t.partial += &t;
             }
             Part::Reasoning(t) => self.out.record(&rec::delta(true, &t)),
-            Part::Call(name) => self.opened.push(name),
+            Part::Call(name) => self.t.opened.push(name),
         }
     }
 
     /// A request that ends without a reply journals its streamed text, if any, as an assistant record without calls
     /// (`finish` is `interrupted` or `error`); FINISHING names the calls it opened.
     fn partial_reply(&mut self, finish: &str, o: Outcome) -> Outcome {
-        let text = std::mem::take(&mut self.partial);
+        let text = std::mem::take(&mut self.t.partial);
         if text.is_empty() {
             return o;
         }

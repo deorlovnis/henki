@@ -39,6 +39,24 @@ pub struct Session {
     snap: Vec<(PathBuf, (Stamp, Stamp))>,
     next_h: u32,
     tag: u32,
+    t: Turn,
+    usage_proc: Usage,
+    /// The last reply's input + output tokens and the size of the request that got it.
+    ctx: (u64, usize),
+    /// Live background processes after the last call.
+    bg: usize,
+    /// FINISHING or `close`: `wait` ignores the deadline, and a signal only hurries the kill.
+    finishing: bool,
+    hurry: bool,
+}
+
+/// The turn in progress, new at its start: its counts, its last text, the stuck rule, and what is in flight.
+#[derive(Default)]
+struct Turn {
+    steps: u32,
+    usage: Usage,
+    text: String,
+    stuck: Stuck,
     /// The attempt in flight: its cancel slot, its streamed text and the names of the calls it opened.
     conn: Option<http::Slot>,
     partial: String,
@@ -47,18 +65,6 @@ pub struct Session {
     open: Vec<(Call, bool)>,
     /// The running call's tag and id: MAIN waits on the tag, and FINISHING gives the call its output.
     live: Option<(u32, String)>,
-    steps: u32,
-    usage_turn: Usage,
-    usage_proc: Usage,
-    text: String,
-    stuck: Stuck,
-    /// The last reply's input + output tokens and the size of the request that got it.
-    ctx: (u64, usize),
-    /// Live background processes after the last call.
-    bg: usize,
-    /// FINISHING or `close`: `wait` ignores the deadline, and a signal only hurries the kill.
-    finishing: bool,
-    hurry: bool,
 }
 
 impl Session {
@@ -87,16 +93,8 @@ impl Session {
             snap,
             next_h,
             tag: 0,
-            conn: None,
-            partial: String::new(),
-            opened: Vec::new(),
-            open: Vec::new(),
-            live: None,
-            steps: 0,
-            usage_turn: Usage::default(),
+            t: Turn::default(),
             usage_proc: Usage::default(),
-            text: String::new(),
-            stuck: Stuck::default(),
             ctx: (0, 0),
             bg: 0,
             finishing: false,
@@ -146,7 +144,7 @@ impl Session {
         // Each writes in its own mode only: the record on `--json` stdout, the answer in plain mode.
         r.iter().for_each(|r| self.out.record(r));
         if r.is_some_and(|r| r["status"] == "ok") {
-            self.out.answer(&self.text);
+            self.out.answer(&self.t.text);
         }
         end
     }
@@ -158,7 +156,7 @@ impl Session {
 
     /// The run's `result` record: the last assistant text (or ""), this turn's successful replies, this process's usage.
     pub fn result(&self, o: &Outcome, duration_ms: u64) -> Value {
-        rec::result(o, &self.text, self.usage_proc, Some(self.j.id()), self.steps, duration_ms)
+        rec::result(o, &self.t.text, self.usage_proc, Some(self.j.id()), self.t.steps, duration_ms)
     }
 
     /// For the bounded flush before exit.
@@ -181,8 +179,7 @@ impl Session {
     /// command alone (it runs in henki's process group); TERM, HUP and a closed stdout SIGKILL it and return Err.
     pub fn bang(&mut self, cmd: &str) -> Result<Option<i32>, Stop> {
         let (tag, env) = (self.next_tag(), supervise::bang_env(&self.cfg.env));
-        let pid = supervise::bang(&self.cfg.bash, cmd, &self.cfg.cwd, &env, tag, &self.tx).map_err(|e| self.out.note(&tools::not_started(&e)));
-        let Ok(pid) = pid else { return Ok(None) };
+        let Ok(pid) = supervise::bang(&self.cfg.bash, cmd, &self.cfg.cwd, &env, tag, &self.tx).map_err(|e| self.out.note(&tools::not_started(&e))) else { return Ok(None) };
         let mut got = self.wait(tag, None);
         while let Err(Stop::Signal(libc::SIGINT | libc::SIGQUIT)) = got {
             got = self.wait(tag, None); // the command got it too
@@ -204,7 +201,7 @@ impl Session {
 
     /// Requests and calls until an outcome; `Err` is the only way out.
     fn step_loop(&mut self, task: Option<String>) -> Result<Infallible, Outcome> {
-        (self.steps, self.usage_turn, self.stuck, self.sig) = (0, Usage::default(), Stuck::default(), None);
+        (self.t, self.sig) = (Turn::default(), None);
         // The REPL's banner printed them already.
         std::mem::take(&mut self.cfg.notices).iter().try_for_each(|n| if self.reader.is_some() { self.record(rec::notice(n)) } else { self.notice(n) })?;
         match task {
@@ -225,23 +222,23 @@ impl Session {
             let mut r = self.request()?;
             let calls = self.prepare(std::mem::take(&mut r.calls));
             self.record(rec::assistant(&r.text, &calls, &r.finish, r.usage, r.blocks.as_ref()))?;
-            (self.steps, self.text) = (self.steps + 1, r.text);
-            self.usage_turn.add(r.usage);
+            (self.t.steps, self.t.text) = (self.t.steps + 1, r.text);
+            self.t.usage.add(r.usage);
             self.usage_proc.add(r.usage);
             if calls.is_empty() {
                 (r.finish == "length").then(|| self.notice("answer cut at max_tokens")).transpose()?;
-                if !self.text.trim().is_empty() {
+                if !self.t.text.trim().is_empty() {
                     return Err(Outcome::Ok);
                 }
                 self.notice("the model ended without an answer")?;
                 return Err(Outcome::GaveUp("empty_answer"));
             }
-            self.open = calls.iter().map(|c| (c.clone(), false)).collect();
+            self.t.open = calls.iter().map(|c| (c.clone(), false)).collect();
             for c in &calls {
                 self.poll()?; // calls that never wait still end at the deadline or a signal
                 self.dispatch(c)?;
             }
-            let why = if self.stuck.run >= STUCK_RUN { Some("stuck") } else { (self.steps >= self.cfg.max_steps).then_some("max_steps") };
+            let why = if self.t.stuck.run >= STUCK_RUN { Some("stuck") } else { (self.t.steps >= self.cfg.max_steps).then_some("max_steps") };
             why.map_or(Ok(()), |w| Err(Outcome::GaveUp(w)))?;
         }
     }
@@ -250,10 +247,10 @@ impl Session {
     /// call is live, give every call of the step a result, then `turn_end`. A journal failure here wins unless the
     /// outcome is already an error. A Ctrl-C that cancels a REPL turn sends the tools SIGINT first, as a shell would.
     fn finish(&mut self, o: Outcome) -> Outcome {
-        self.conn.take().iter().for_each(http::cancel);
+        self.t.conn.take().iter().for_each(http::cancel);
         self.finishing = true;
         let int = self.reader.is_some() && o == Outcome::Interrupted && matches!(self.sig, Some(libc::SIGINT | libc::SIGQUIT));
-        let got = if o.stops() || self.live.is_some() { self.stop_all(int).0 } else { None };
+        let got = if o.stops() || self.t.live.is_some() { self.stop_all(int).0 } else { None };
         let r = self.settle(&o, got);
         // A second signal hurries this kill only; the next turn's cancel gets its grace again.
         (self.finishing, self.hurry) = (false, false);
@@ -263,12 +260,12 @@ impl Session {
     /// The live call keeps its output if it reported in time; another started call gets the repair text, the rest
     /// `not run: REASON`.
     fn settle(&mut self, o: &Outcome, got: Option<ToolOutput>) -> Result<(), Outcome> {
-        if !self.opened.is_empty() {
-            let names = std::mem::take(&mut self.opened).join(", ");
+        if !self.t.opened.is_empty() {
+            let names = std::mem::take(&mut self.t.opened).join(", ");
             self.notice(&format!("stream ended; dropped calls: {names}"))?;
         }
-        let live = self.live.take();
-        for (c, started) in std::mem::take(&mut self.open) {
+        let live = self.t.live.take();
+        for (c, started) in std::mem::take(&mut self.t.open) {
             let (text, ms, bytes) = match (&got, &live) {
                 (Some(out), Some(l)) if l.1 == c.id => (tools::result_text(&c.name, out, Some(&Killed::Interrupted)).0, out.ms, out.bytes),
                 _ if started => (tools::REPAIR.to_string(), 0, 0),
@@ -276,7 +273,7 @@ impl Session {
             };
             self.record(rec::tool_result(&c.id, &c.name, &text, true, ms, bytes))?;
         }
-        self.record(rec::turn_end(o, self.steps, self.usage_turn))
+        self.record(rec::turn_end(o, self.t.steps, self.t.usage))
     }
 
     /// The only place MAIN waits in a session. Ok(Some): the tagged event with `tag` (its `Part`s are handled on the
