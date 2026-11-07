@@ -1,6 +1,6 @@
 # henki on a Mac with a local model server. Copy it to ~/.config/henki/config.toml, then set model and base_url to what
 # your server serves.
-model = "qwen-27b"                      # the model name your server serves
+model = "qwen3.5-2b"                    # set it to the name your server serves; tested with Qwen3.5 2B instruct (a 2 GB GGUF) on llama-server
 base_url = "http://127.0.0.1:8080/v1"   # llama-server's port varies by version (8080, 9931); Ollama :11434/v1
 approve = "ask"                         # shell, write and edit ask first; henki run ends with exit 3 instead
 context_window = 32768                  # match the server (llama-server -c 32768; Ollama OLLAMA_CONTEXT_LENGTH=32768)
