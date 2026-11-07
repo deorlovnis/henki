@@ -1,6 +1,6 @@
 # halti: the user's workspaces (WS), their keys and boxes (VMs). Never handle secret values.
 
-Use `halti VERB WS`; WS is a name from `halti ls`. Never run bare `halti`.
+Use `halti VERB WS`; WS is a name from `halti ls`; bare `halti` shows their status.
 - `halti ls`: workspaces, running boxes. `halti ls WS`: rules file, keys (where each is sent), readable hosts, refused today.
 - `halti log WS [--refused]`: WS's door log.
 - `halti sh WS -- CMD`: run CMD inside WS's box (starts it); its folder is /work.

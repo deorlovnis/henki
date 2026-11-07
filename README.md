@@ -6,7 +6,7 @@ henki is a small terminal agent in early development. It gives your task to a mo
 
 ```sh
 mkdir -p ~/.config/henki && cp profiles/config.mac.toml ~/.config/henki/config.toml   # then set model and base_url
-cp profiles/halti-card.md ~/.config/henki/AGENTS.md   # if you use halti: its card goes into every request (1.1 KB)
+henki-mods add halti                    # if you use halti: its doc, wrappers and card (1.1 KB into every request)
 henki                                   # the REPL
 henki run "why does the build fail?"    # one task, headless
 henki run --json --approve auto --max-seconds 600 "fix the failing test"
@@ -73,6 +73,12 @@ The config file, the allow file, `AGENTS.md` in the config dir, the bash henki r
 ### Extensions
 
 An extension is a directory that teaches the model a command-line tool: `NAME/doc.md`, whose first line goes into the system prompt (the model reads the rest of it when it needs to, without asking), and an optional `NAME/bin/`, whose executables come first on the PATH of the calls. Besides those it may hold only `README*`, `LICENSE*`, `CHANGELOG*` and dot files. Extensions live in `~/.config/henki/ext`, or in the directories the `ext` key lists. An extension command with the name of a command on your PATH loads only when the `shadow` key lists it as `EXT/NAME`; the calls see your own PATH in `HENKI_USER_PATH`. Every entry of `bin/` must be a file you can run, or henki does not start; only a dot file that cannot run (Finder's `.DS_Store`, the `._NAME` files a copy from a Mac leaves) is no command there, and it is a trust file like the rest. henki does not check who owns the extension files or who may write them, so keep them writable only by you.
+
+The official modules are extensions in this repository's `mods/`, off until you add one with `henki-mods add NAME` (from a checkout, `manager/henki-mods`), which shows what it installs and asks first. `halti` teaches the model halti's verbs, puts its card into `AGENTS.md`, and wraps `halti`, `pbpaste` and `security` so the calls cannot reach secret values through them (a seatbelt: a command named by its full path gets past it). On a Mac, where all three are on your PATH, henki starts with it on only once `config.toml` has `shadow = ["halti/halti", "halti/pbpaste", "halti/security"]`, as `profiles/config.mac.toml` does; the install screen prints that line when it is missing. `itse` is a doc only: itse's verbs and exit codes, run through its CLI.
+
+### Writing a module
+
+A module is an extension with an optional manifest, `.henki/module.toml`, that `henki-mods` shows on its install screen and checks first. The module template, `github.com/deorlovnis/henki-module-template` (to be published), is a working module with a guide from copying it to sharing your own. `henki-mods verify --dir DIR` checks a module as an install would, `henki-mods add ./DIR` installs it from a directory, and `henki-mods add URL[@REF]#DIR` from a git repository, which is how you share one: henki-mods pins the commit and runs nothing from the repository, and its install screen marks such a module unreviewed.
 
 ### In an isolated environment
 
