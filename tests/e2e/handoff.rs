@@ -333,3 +333,37 @@ fn handoff_official_mods() {
     assert_eq!(user.len(), 2, "the first session, resumed: {user:?}");
     assert!(user[1].starts_with("Review the uncommitted changes") && user[1].ends_with("\n\nthe parser\n"), "{user:?}");
 }
+
+/// A `restart` after the history link changed (as `/mods swap history ...` does) starts a new session on the new
+/// binding: a resume there would be refused, since the session stays in the store it was kept in, which a note names.
+#[test]
+fn handoff_restart_after_history_swap() {
+    let m = Mock::start(vec![say("one"), say("two")]);
+    let r = Run::new(&m.url());
+    let w = r.dir.join("bindings/history");
+    fs::create_dir_all(w.parent().unwrap()).unwrap();
+    fs::set_permissions(w.parent().unwrap(), fs::Permissions::from_mode(0o700)).unwrap();
+    let toy = Path::new(env!("CARGO_BIN_EXE_henki")).parent().unwrap().join("examples/port_toy");
+    fs::write(&w, format!("#!/bin/sh\nexec {} history --name {}\n", toy.display(), r.marker)).unwrap();
+    fs::set_permissions(&w, fs::Permissions::from_mode(0o700)).unwrap();
+    let swap = format!("mkdir -p \"$HENKI_CONFIG/port\" && ln -s {} \"$HENKI_CONFIG/port/history\" && echo restart >\"$HENKI_NEXT\"", w.display());
+    module(&r, "kit", &[("swap", &swap)]);
+    let mut p = start(&r, &[]);
+    message(&p, "first", "one");
+    let first = r.journals()[0].file_stem().unwrap().to_string_lossy().into_owned();
+    p.line("/swap");
+    p.expect("henki: changed while /swap ran: ~/.config/henki/port/history\r\nrestart on these changes? [y/N] ", W);
+    p.line("y");
+    p.expect(&format!("henki: session {first} stays in henki's own history; resume it with that bound (std: henki --port history=std --resume={first})\r\n"), W);
+    p.expect(&format!("henki: history: {} (port/1, {} 0.1.0)", w.display(), r.marker), W);
+    p.prompt(W);
+    p.renew(&r);
+    message(&p, "second", "two");
+    exit(&r, p);
+    // The first session stays in std; the second is the only one in the binding's store.
+    let text: Vec<String> = r.journals().iter().map(|j| fs::read_to_string(j).unwrap()).collect();
+    let store = r.state().join("port/history");
+    assert_eq!(r.journals().iter().map(|j| j.starts_with(&store)).collect::<Vec<_>>(), [true, false]);
+    assert!(text[0].contains("second") && !text[0].contains("first") && text[1].contains("first") && !text[1].contains("second"), "{text:?}");
+    assert_eq!(m.log()[1].contents("user").len(), 1, "the new session holds only the second message");
+}

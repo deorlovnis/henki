@@ -1,7 +1,8 @@
 //! `handoff/1`: a typed command, `/NAME REST` (a module's `cmd/NAME`) or `/mods ARGS` (the shipped manager), run on the
 //! terminal, and what it hands back in the file `HENKI_NEXT` names: nothing, `send` + TEXT, `resume ID`, `new` or
 //! `restart`. No text is sent once a trust file changed; a new henki (new, resume, restart) on trust files the command
-//! changed is asked for, naming them; after a change from before the command there is no one-key restart.
+//! changed is asked for, naming them; after a change from before the command there is no one-key restart. A `restart`
+//! after a change to the history link starts a new session: the old one stays in the store it was kept in.
 use crate::{allow, port, sys, term, turn::Session, types::Stop};
 use std::{ffi::OsString, fs, io::Read, os::unix::fs::MetadataExt, path::Path, path::PathBuf};
 
@@ -45,7 +46,12 @@ pub fn run(s: &mut Session, name: &str, prog: &Path, module: Option<&Path>, args
     let (verb, arg) = line.trim().split_once(' ').map_or((line.trim(), ""), |(v, a)| (v, a.trim()));
     let (stale, to) = (pre || !changed.is_empty(), if changed.is_empty() { "" } else { " on these changes" });
     let stay = if stale { Next::Tripped } else { Next::Stay };
-    let id = if verb == "resume" { Some(arg.to_string()) } else { s.resumable().filter(|_| verb == "restart") };
+    // A history binding keeps its own sessions: after a change to the history link `restart` starts a new session (a
+    // resume there is refused) and says where this one stays.
+    let moved = verb == "restart" && changed.contains(&s.cfg.dir.join("port").join("history"));
+    let id = if verb == "resume" { Some(arg.to_string()) } else { s.resumable().filter(|_| verb == "restart" && !moved) };
+    let old = s.cfg.links.iter().find(|l| l.0 == "history").map_or_else(|| "henki's own history".into(), |l| format!("history binding {}", l.2));
+    let kept = |i: &String| format!("session {i} stays in {old}; resume it with that bound (std: henki --port history=std --resume={i})");
     Ok(match verb {
         "" => stay,
         "send" if stale => (s.out().note(&format!("/{name}: a trust file changed; nothing is sent")), Next::Tripped).1,
@@ -56,6 +62,7 @@ pub fn run(s: &mut Session, name: &str, prog: &Path, module: Option<&Path>, args
         "resume" if !port::session_id(arg) => (s.out().note(&format!("/{name}: cannot resume {:?}", term::escape(arg))), stay).1,
         "resume" if !s.yes(&format!("switch to session {arg}{to}? [y/N] "))? => stay,
         "new" | "restart" if !changed.is_empty() && !s.yes("restart on these changes? [y/N] ")? => stay,
+        "restart" if moved => (s.resumable().iter().for_each(|i| s.out().note(&kept(i))), Next::Exec(again(None))).1,
         "new" | "resume" | "restart" => Next::Exec(again(id)),
         v => (s.out().note(&format!("/{name} handed back {:?}, which henki does not know", term::escape(&v.chars().take(40).collect::<String>()))), stay).1,
     })
