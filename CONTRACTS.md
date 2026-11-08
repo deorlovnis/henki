@@ -838,17 +838,22 @@ Dot files are ignored anywhere, and so are `README*` and `LICENSE*` next to the 
 (its links, as every link in a module, stay inside the module).
 
 - **A run.** Each run of a task has a fresh root dir of its own holding `home/` (the run's `HOME`),
-  `xdg/{config,data,state,cache}` (the four `XDG_*_HOME`), `work/` (the cwd) and a copy of the task and of the suite's
-  `lib/`; nothing of the person's own home, config, state or data is read or written in it. `setup` runs in `work/`
-  with stdin empty; then `henki run --json --approve auto [--model M] --max-seconds S [--max-steps N] -` with
-  prompt.txt on stdin and `fake-bin/` first on PATH; then `check` in `work/` with, on stdin, the `text` of henki's
-  `result` record (json/1), byte for byte, with no newline added. Its exit status is the result. All three get
+  `xdg/{config,data,state,cache}` (the four `XDG_*_HOME`) and `work/` (the cwd); nothing of the person's own home,
+  config, state or data is read or written in it. `setup` runs in `work/` with stdin empty, on a copy of the task and
+  of the suite's `lib/` in the root; then `henki run --json --approve auto [--model M] --max-seconds S [--max-steps N]
+  -` with prompt.txt on stdin and plain copies of `fake-bin/`'s programs first on PATH, while the root holds no other
+  file of the suite; then `check` in `work/`, on a fresh copy of the task and `lib/` (the root as henki left it, but
+  no dir the run's commands made), without `fake-bin/` on PATH, with, on stdin, the `text` of henki's `result`
+  record (json/1), byte for byte, with no newline added. Its exit status is the result. Setup and check get
   `EVAL_DIR` (the task's copy), `EVAL_LIB` (the copy of `lib/`), `EVAL_HOME` (= `HOME`) and `EVAL_ROOT` (the root);
-  henki's records of the run (its `--json` stdout) are `EVAL_ROOT/henki.jsonl` when `check` runs. A setup or a check
-  is stopped after 60 seconds. A setup that fails stops the eval, and its run is VOID (evalrun/1).
+  henki does not. henki's records of the run (its `--json` stdout) go to the run dir, out of the root, and are copied
+  to `EVAL_ROOT/henki.jsonl` for `check`. A setup or a check is stopped after 60 seconds. A setup that fails stops
+  the eval, and its run is VOID (evalrun/1).
 - **The sandbox.** Each of the three runs inside the official `sandbox` module's program (`port/exec`, run directly,
   not as an exec binding, so henki keeps all four tools), started in the root with the person's own `HOME`, which it
-  hides. Where it does not run, `eval` refuses unless `--unsandboxed` is given; then only `HOME` and the XDG dirs are
+  hides, as it hides henki's own dirs (the run dir among them). It hides nothing else: a suite kept elsewhere on the
+  machine, such as an official module's `eval/` or the general suite in henki's share dir, is in the model's reach.
+  Where it does not run, `eval` refuses unless `--unsandboxed` is given; then only `HOME` and the XDG dirs are
   scratch dirs.
 - **The arms.** The module on and the module off: in each run's home the person's `config.toml` without its `ext` and
   `shadow` keys and their `AGENTS.md` without the mods cards block; in the on arm the module is then added there as a
@@ -912,3 +917,5 @@ evalrun/1 RUN PKG VERSION HD1 MODEL SUITE ARM REPEAT TASK PASS STATUS STEPS SECO
   `eval_effect` and `eval_general` as the statistics give them, `eval_model_sha256` and `eval_server` from the run,
   and `eval_by` (who ran it, and when); the rows behind it are `evals/NAME/VERSION.tsv`, byte for byte the run's
   `runs.tsv`. `henki-mods-dev eval badge --check ROWS FILE` passes when the rows give a PASS whose keys equal FILE's.
+  henki-mods recomputes the badge from those rows the same way; a reviewed version whose badge recomputes is
+  `measured` when `eval_by`'s login is its `reviewer` (the reviewer reran it), and otherwise shows it as the author's.

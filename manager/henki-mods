@@ -1578,8 +1578,9 @@ screen_review() {
       x=$(hd1_hits "$I_hd1" | HM_D="$INDEX_DEFAULT" awk -F '\t' '$1 == ENVIRON["HM_D"]' | head -n 1)
       if [ -n "$x" ]; then
         index_again "$INDEX_DEFAULT"
-        ! badge_of "$INDEX_DEFAULT" "$STAGE/ix/$INDEX_DEFAULT/r/$(printf '%s' "$x" | cut -f 2)@${x##*"$tab"}" ||
-          say "  badge    $B_text (signed index $(cut -f 1 "$STAGE/ix/$INDEX_DEFAULT/who"))"
+        x="$STAGE/ix/$INDEX_DEFAULT/r/$(printf '%s' "$x" | cut -f 2)@${x##*"$tab"}"
+        ! badge_of "$INDEX_DEFAULT" "$x" ||
+          say "  badge    $B_text; its rows recompute, run by $(rget "$x" eval_by) (signed index $(cut -f 1 "$STAGE/ix/$INDEX_DEFAULT/who"))"
       fi
       ;;
     index:*)
@@ -4644,11 +4645,11 @@ index_find() {
 
 # The badge of index I's version record REC (STAGE/ix/I/r/NAME@VERSION; index_again I first), recomputed here from the
 # rows the index holds for it (evals/NAME/VERSION.tsv at the verified commit) with evalrun/1's statistics: 0 when they
-# give a PASS whose keys are REC's, for REC's own hd1, with B_text the badge in a few words; else 1 with B_text why
-# not ("" when REC has no badge).
+# give a PASS whose keys are REC's, for REC's own hd1, with B_text the badge in a few words and B_by who ran it
+# (eval_by's login); else 1 with B_text why not ("" when REC has no badge).
 badge_of() { # I REC
   local n=${2##*/} v out k want got
-  v=${n#*@} n=${n%@*} B_text=""
+  v=${n#*@} n=${n%@*} B_text="" B_by=""
   rget "$2" eval_suite >/dev/null || return 1
   _ix cat-file blob "$X_V:evals/$n/$v.tsv" 2>/dev/null | head -c 4194305 >"$STAGE/badge.tsv"
   [ -s "$STAGE/badge.tsv" ] || {
@@ -4671,14 +4672,15 @@ badge_of() { # I REC
     B_text="it was measured on other files"
     return 1
   }
-  B_text="measured on $(rget "$2" eval_model): $(HM_A="$(rget "$2" eval_on)" HM_B="$(rget "$2" eval_off)" awk 'BEGIN {
+  B_by=$(rget "$2" eval_by | cut -d ' ' -f 1)
+  B_text="on $(rget "$2" eval_model): $(HM_A="$(rget "$2" eval_on)" HM_B="$(rget "$2" eval_off)" awk 'BEGIN {
     split(ENVIRON["HM_A"], a, "/"); split(ENVIRON["HM_B"], b, "/"); d = a[1] - b[1]
     printf "%s%d of %d on its tasks, general suite not worse", (d >= 0 ? "+" : ""), d, a[2] }')"
 }
 
 # The review line of index I's version record REC into T_kind (reviewed, source, measured or listed) and T_text: who
 # reviewed it and when, inside the signed index; "source only" when the asset for this machine was not rebuilt;
-# "measured" when its badge recomputes here.
+# "measured" when its badge recomputes here and its reviewer ran it (a reproduction); else the badge is the author's.
 tier_of() { # INDEX REC
   local who day t a p
   p=$(cut -f 1 "$STAGE/ix/$1/who")
@@ -4694,7 +4696,12 @@ tier_of() { # INDEX REC
     [ "$a" != none ] || T_kind=source T_text="$T_text · source only: the binary $(rget "$2" "asset_$t" | cut -f 1) was NOT reproduced"
     break
   done
-  [ "$T_kind" = reviewed ] && badge_of "$1" "$2" && T_kind=measured T_text="$T_text · $B_text"
+  [ "$T_kind" = reviewed ] && badge_of "$1" "$2" || return 0
+  if [ "$B_by" = "$who" ]; then
+    T_kind=measured T_text="$T_text · measured $B_text"
+  else
+    T_text="$T_text · the author's badge $B_text (its rows recompute; its reviewer has not rerun it)"
+  fi
   return 0
 }
 
@@ -5511,17 +5518,18 @@ watch_run() { # SECS IN OUT CMD...
 }
 
 # CMD... as one run of an arm has it, from watch_run: in R/work, with HOME and the four XDG dirs under R (nothing of
-# the person's own config, state or data), EVAL_DIR (E_tdir), EVAL_LIB, EVAL_HOME and EVAL_ROOT, none of henki's own
-# variables, and FB (a task's fake-bin/ and a colon, or nothing) first on PATH. With a sandbox program (E_sbx), CMD
-# runs inside it, started from R: it hides the person's HOME (this process's) and keeps R writable.
-in_arm() { # R FB CMD...
-  local r=$1 fb=$2
-  shift 2
+# the person's own config, state or data), none of henki's own variables, and FB (a task's fake-bin/ and a colon, or
+# nothing) first on PATH. With a task's copy T (setup and check; henki gets "") also EVAL_DIR (T), EVAL_LIB (T's
+# lib/ beside it), EVAL_HOME and EVAL_ROOT. With a sandbox program (E_sbx), CMD runs inside it, started from R: it
+# hides the person's HOME and state dir (this process's) and keeps R writable.
+in_arm() { # R FB T CMD...
+  local r=$1 fb=$2 t=$3
+  shift 3
   unset HENKI_CONFIG HENKI_NEXT HENKI_SESSION HENKI_MODS_TTY HENKI_BIN HENKI_DEPTH
   [ -z "$E_server" ] || export HENKI_BASE_URL="$E_server"
+  [ -z "$t" ] || set -- EVAL_HOME="$r/home" EVAL_ROOT="$r" EVAL_LIB="${t%/*}/lib" EVAL_DIR="$t" "$@"
   set -- env HOME="$r/home" XDG_CONFIG_HOME="$r/xdg/config" XDG_DATA_HOME="$r/xdg/data" XDG_STATE_HOME="$r/xdg/state" \
-    XDG_CACHE_HOME="$r/xdg/cache" EVAL_HOME="$r/home" EVAL_ROOT="$r" EVAL_LIB="$r/suite/lib" EVAL_DIR="$E_tdir" \
-    PATH="$fb$PATH" "$@"
+    XDG_CACHE_HOME="$r/xdg/cache" PATH="$fb$PATH" "$@"
   if [ -n "$E_sbx" ]; then
     cd "$r" && exec "$E_sbx" /bin/sh -c 'cd work && exec "$@"' sh "$@"
   fi
@@ -5530,12 +5538,12 @@ in_arm() { # R FB CMD...
 
 # A fresh root R for one run of ARM: home/ (HOME, its .config/henki holding the person's config.toml without its ext
 # and shadow keys, and their AGENTS.md without the mods cards block), xdg/{config,data,state,cache}, work/ (the cwd),
-# suite/, and henki itself when a sandbox may hide where it lives. In the on arm the module is then added there as a
+# and henki itself when a sandbox may hide where it lives. In the on arm the module is then added there as a
 # person adds one (`henki-mods add DIR --yes` in that home): its store copy, link, card and the shadow line add names.
-# DIR is the module without its eval/ (E_armdir), so no task's check or expected answer is in the model's reach.
+# DIR is the module without its eval/ (E_armdir), so no task's check or expected answer is in the run's root.
 eval_root() { # R ARM
   local r=$1 c="$1/home/.config/henki" out rc=0 line
-  mkdir -p "$c" "$r/xdg/config" "$r/xdg/data" "$r/xdg/state" "$r/xdg/cache" "$r/work" "$r/suite" &&
+  mkdir -p "$c" "$r/xdg/config" "$r/xdg/data" "$r/xdg/state" "$r/xdg/cache" "$r/work" &&
     chmod 700 "$r" "$r/home" "$c" || die "cannot make $r; fix: check TMPDIR"
   if [ -f "$CONF/config.toml" ]; then
     awk '{ l = $0; sub(/^[ \t]+/, "", l) } l !~ /^(ext|shadow)[ \t]*=/' "$CONF/config.toml" >"$c/config.toml"
@@ -5567,20 +5575,18 @@ eval_root() { # R ARM
   [ -z "$line" ] || printf '%s\n' "$line" >>"$c/config.toml"
 }
 
-# The journal and henki's records of the run in R, and what setup and check printed, into the run dir as D.
+# The journal of the run in R into the run dir D (henki's records and the logs are written there as the run goes).
 eval_keep() { # R D
   local j
-  mkdir -p "$2" || return 0
-  for j in henki.jsonl err setup.log check.log; do [ ! -f "$1/$j" ] || cp "$1/$j" "$2/$j"; done
-  for j in "$1"/xdg/state/henki/sessions/*/*.jsonl; do [ ! -f "$j" ] || cat "$j" >>"$2/journal.jsonl"; done
+  for j in "$1"/xdg/state/henki/sessions/*/*.jsonl; do [ ! -f "$j" ] || [ -h "$j" ] || cat "$j" >>"$2/journal.jsonl"; done
 }
 
-# henki run in R with prompt file P and the run's limits (max seconds S, max steps N or ""), its records into
-# R/henki.jsonl; sets E_line (the result record, or none).
-eval_henki() { # R FB P S N
-  watch_run $(($4 + 30)) "$3" "$1/henki.jsonl" in_arm "$1" "$2" "$E_h" run --json --approve auto ${E_model:+--model "$E_model"} \
+# henki run in R with prompt file P and the run's limits (max seconds S, max steps N or ""), its records into OUT;
+# sets E_line (the result record, or none).
+eval_henki() { # R FB P S N OUT
+  watch_run $(($4 + 30)) "$3" "$6" in_arm "$1" "$2" "" "$E_h" run --json --approve auto ${E_model:+--model "$E_model"} \
     --max-seconds "$4" ${5:+--max-steps "$5"} - || :
-  E_line=$(awk 'END { print }' "$1/henki.jsonl")
+  E_line=$(awk 'END { print }' "$6")
   case "$E_line" in *',"t":"result",'*) ;; *) E_line=none ;; esac
 }
 
@@ -5589,8 +5595,7 @@ eval_ready() { # ARM
   local r="$STAGE/run/ready-$1" st
   eval_root "$r" "$1"
   printf '%s\n' "$EVAL_READY" >"$STAGE/ready.txt"
-  E_tdir=$r/work
-  eval_henki "$r" "" "$STAGE/ready.txt" 60 ""
+  eval_henki "$r" "" "$STAGE/ready.txt" 60 "" "$r/henki.jsonl"
   st=$(eval_status "$E_line")
   if [ "$st" != ok ]; then
     sed 's/^/  | /' "$r/henki.jsonl" | tail -n 3 >&2
@@ -5600,50 +5605,63 @@ eval_ready() { # ARM
   rm -rf "$r"
 }
 
+# A fresh copy of task T and its suite's lib/ in a new dir under R (one no command of the run made); sets E_tdir.
+eval_copy() { # R T
+  local c
+  c=$(mktemp -d "$1/suite.XXXXXX") && cp -RP "$2" "$c/${2##*/}" && { [ ! -d "${2%/*}/lib" ] || cp -RP "${2%/*}/lib" "$c/lib"; } ||
+    die "cannot copy $2 into $1; fix: check TMPDIR"
+  E_tdir="$c/${2##*/}"
+}
+
 # Run REP of task T of suite I in ARM: a fresh root (eval_root), the task (and the suite's lib/) copied into it, setup
-# in work/, henki run with prompt.txt, then check with the answer on stdin. One evalrun/1 row into the run's
-# runs.tsv; the records, journal and logs into the run dir; the counts of suite I and ARM.
+# in work/, henki run with prompt.txt, then check, on a fresh copy, with the answer on stdin. One evalrun/1 row into
+# the run's runs.tsv; henki's records, the journal and the logs into the run dir D, out of the run's reach (the
+# sandbox hides the person's state dir); the counts of suite I and ARM.
 eval_run() { # I T ARM REP
   local i=$1 t=$2 arm=$3 rep=$4 x r st text steps secs pass=0 fb="" max_steps="" max_secs=$EVAL_SECONDS rc=0 d
   RUN_N=$((RUN_N + 1))
   r="$STAGE/run/$RUN_N"
   x=${t##*/}
   eval_root "$r" "$arm"
-  cp -RP "$t" "$r/suite/$x" || die "cannot copy $t into $r; fix: check TMPDIR"
-  [ ! -d "${t%/*}/lib" ] || cp -RP "${t%/*}/lib" "$r/suite/lib" || die "cannot copy ${t%/*}/lib into $r; fix: check TMPDIR"
-  E_tdir="$r/suite/$x"
-  [ ! -d "$E_tdir/fake-bin" ] || fb="$E_tdir/fake-bin:"
+  eval_copy "$r" "$t"
   if [ -f "$t/task.toml" ]; then
     max_steps=$(toml max_steps <"$t/task.toml" | cut -f 3)
     max_secs=$(toml max_seconds <"$t/task.toml" | cut -f 3)
     max_secs=${max_secs:-$EVAL_SECONDS}
   fi
   d="$E_rundir/$(printf '%04d' "$RUN_N")-$arm-$rep-$x"
-  watch_run "$EVAL_WATCH" /dev/null "$r/setup.log" in_arm "$r" "" "$E_tdir/setup" || rc=$?
+  mkdir "$d" || die "cannot make $d; fix: check that the state dir is writable"
+  watch_run "$EVAL_WATCH" /dev/null "$d/setup.log" in_arm "$r" "" "$E_tdir" "$E_tdir/setup" || rc=$?
   if [ "$rc" != 0 ]; then
     printf 'evalrun/1\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t0\tsetup\t0\t0\t%s\n' "$E_run" "$E_name" "$E_ver" "$E_hd1" \
       "$E_mlabel" "$(eval "printf '%s' \"\$E_label_$i\"")" "$arm" "$rep" "$x" "$(eval "printf '%s' \"\$E_bytes_$arm\"")" >>"$E_rundir/runs.tsv"
     eval_keep "$r" "$d"
     : >"$E_rundir/VOID"
-    tail -n 20 "$r/setup.log" | sed 's/^/  | /' >&2
+    tail -n 20 "$d/setup.log" | sed 's/^/  | /' >&2
     die "$x: setup exited $rc (its last lines above), so this run is VOID; fix: run $t/setup in an empty dir to see why"
   fi
   # While henki runs, the suite's files (the checks, what they expect, the other tasks) are not in the run's root: only
-  # the task's fake-bin programs, as plain copies (henki reads the prompt from the task itself, on stdin).
-  mkdir -p "$r/fake-bin" || die "cannot write $r; fix: check TMPDIR"
-  for x in "$E_tdir"/fake-bin/*; do [ ! -f "$x" ] || cp -L "$x" "$r/fake-bin/${x##*/}" || die "cannot copy $x; fix: check TMPDIR"; done
-  [ -z "$fb" ] || fb="$r/fake-bin:"
-  chmod -R u+w "$r/suite" && rm -rf "$r/suite" && mkdir "$r/suite" || die "cannot clear $r/suite; fix: check TMPDIR"
-  eval_henki "$r" "$fb" "$t/prompt.txt" "$max_secs" "$max_steps"
+  # the task's fake-bin programs, as plain copies (henki reads the prompt from the task itself, on stdin). Check runs
+  # on a fresh copy, without them on PATH (the model could change them), and reads henki's records from D.
+  if [ -d "$E_tdir/fake-bin" ]; then
+    fb="$r/fake-bin:"
+    mkdir "$r/fake-bin" || die "cannot write $r; fix: check TMPDIR"
+    for x in "$E_tdir"/fake-bin/*; do [ ! -f "$x" ] || cp -L "$x" "$r/fake-bin/${x##*/}" || die "cannot copy $x; fix: check TMPDIR"; done
+  fi
+  chmod -R u+w "${E_tdir%/*}" && rm -rf "${E_tdir%/*}" || die "cannot clear ${E_tdir%/*}; fix: check TMPDIR"
+  eval_henki "$r" "$fb" "$t/prompt.txt" "$max_secs" "$max_steps" "$d/henki.jsonl"
   x=${t##*/}
-  cp -RP "$t" "$r/suite/$x" || die "cannot copy $t into $r; fix: check TMPDIR"
-  [ ! -d "${t%/*}/lib" ] || cp -RP "${t%/*}/lib" "$r/suite/lib" || die "cannot copy ${t%/*}/lib into $r; fix: check TMPDIR"
+  eval_copy "$r" "$t"
+  [ -h "$r/henki.jsonl" ] || chmod -R u+w "$r/henki.jsonl" 2>/dev/null
+  rm -rf "$r/henki.jsonl"
+  [ ! -e "$r/henki.jsonl" ] && cp "$d/henki.jsonl" "$r/henki.jsonl" ||
+    die "$x: the run left $r/henki.jsonl so that henki's records cannot go there for check; fix: rerun the eval"
   st=$(eval_status "$E_line")
   steps=$(json_num steps "$E_line")
   secs=$(json_num duration_s "$E_line")
   text=$(json_str text "$E_line") || text=""
-  printf '%b' "$text" >"$r/text"
-  watch_run "$EVAL_WATCH" "$r/text" "$r/check.log" in_arm "$r" "$fb" "$E_tdir/check" && pass=1
+  printf '%b' "$text" >"$d/answer"
+  watch_run "$EVAL_WATCH" "$d/answer" "$d/check.log" in_arm "$r" "" "$E_tdir" "$E_tdir/check" && pass=1
   printf 'evalrun/1\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$E_run" "$E_name" "$E_ver" "$E_hd1" "$E_mlabel" \
     "$(eval "printf '%s' \"\$E_label_$i\"")" "$arm" "$rep" "$x" "$pass" "$st" "${steps:-0}" "${secs:-0}" \
     "$(eval "printf '%s' \"\$E_bytes_$arm\"")" >>"$E_rundir/runs.tsv"

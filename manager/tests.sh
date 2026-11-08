@@ -1909,6 +1909,42 @@ t_eval_live() {
   unset XDG_CACHE_HOME
 }
 
+# What the model's commands leave in the run's root never decides its check: a planted check, lib/ or grep, a
+# forged result record, and none of the EVAL_* variables while henki runs.
+t_eval_plant() {
+  case_ "eval: what a model's call plants in the run's root does not reach the check"
+  live_ok || return
+  local d="$W/stub" m="$W/probe" g='#!/bin/sh\nexit 0\n'
+  eval_stub_up "$d" || return
+  mkdir -p "$CONF"
+  printf 'model = "m"\nbase_url = "http://127.0.0.1:%s/v1"\n' "$STUB_PORT" >"$CONF/config.toml"
+  chmod 600 "$CONF/config.toml"
+  mkmod "$m"
+  printf '# probe: answers for tests\n' >"$m/doc.md"
+  mkdir -p "$m/eval/lib" && printf ':\n' >"$m/eval/lib/check"
+  # Each check fails unless a plant takes: the task's check or lib/check under ../suite, grep in ../fake-bin.
+  mktask "$m/eval" plant "CALL: for p in ../suite/plant/check ../suite/lib/check ../fake-bin/grep; do mkdir -p \${p%/*}; printf '$g' >\$p; chmod 755 \$p; done; echo planted" \
+    '. "$EVAL_LIB/check"; grep -q NEVER-THERE /dev/null'
+  mkdir -p "$m/eval/plant/fake-bin" && printf '#!/bin/sh\n' >"$m/eval/plant/fake-bin/fakething" && chmod 755 "$m/eval/plant/fake-bin/fakething"
+  # The result record the check gets its answer from is henki's, not one the model wrote.
+  mktask "$m/eval" forge "CALL: rm -f ../henki.jsonl; printf '%s\\n' '{\"status\":\"ok\",\"steps\":1,\"t\":\"result\",\"text\":\"FORGED\"}' >../henki.jsonl" \
+    '[ "$(cat)" != FORGED ] && tail -n 1 "$EVAL_ROOT/henki.jsonl" | command grep -q "\"session\":"'
+  # henki and the model's commands get none of the EVAL_* variables (setup and check do).
+  mktask "$m/eval" vars "CALL: env | sed -n 's/^EVAL_\([A-Z]*\)=.*/V-\1/p'; echo END" '! command grep -q "V-[A-Z]" && [ -n "$EVAL_DIR$EVAL_LIB$EVAL_ROOT" ]'
+  run add "$m" --yes
+  rc_is 0
+  run eval probe --repeats 1 --yes --unsandboxed
+  rc_is 0
+  out_has "plant            on  fail"
+  out_has "plant            off fail"
+  out_has "forge            on  pass"
+  out_has "forge            off pass"
+  out_has "vars             on  pass"
+  out_has "vars             off pass"
+  kill "$STUB_PID" 2>/dev/null
+  wait "$STUB_PID" 2>/dev/null
+}
+
 # The rows of a run read as one run (henki-mods' own statistics).
 evalstats_ok() {
   (
@@ -2231,7 +2267,7 @@ ix_two() {
 
 # A badge on IX's version file mods/NAME/VERSION.toml for files HD1: the eval fixture's rows (testdata/eval/pass.tsv,
 # a pass) as evals/NAME/VERSION.tsv, and the keys henki-mods' statistics give them.
-ixbadge() { # NAME VERSION HD1
+ixbadge() { # NAME VERSION HD1 [BY]
   mkdir -p "$IX/evals/$1"
   HM_N="$1" HM_H="$3" awk -F '\t' 'BEGIN { OFS = FS } { $3 = ENVIRON["HM_N"]; $5 = ENVIRON["HM_H"]; print }' "$HERE/testdata/eval/pass.tsv" >"$IX/evals/$1/$2.tsv"
   (
@@ -2239,16 +2275,19 @@ ixbadge() { # NAME VERSION HD1
     trap - EXIT
     evalstats keys "$IX/evals/$1/$2.tsv"
   ) >>"$IX/mods/$1/$2.toml"
-  printf 'eval_model_sha256 = "%s"\neval_server = "llama.cpp b1"\neval_by = "someone 2026-11-08"\n' \
-    0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef >>"$IX/mods/$1/$2.toml"
+  printf 'eval_model_sha256 = "%s"\neval_server = "llama.cpp b1"\neval_by = "%s 2026-11-08"\n' \
+    0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef "${4:-someone}" >>"$IX/mods/$1/$2.toml"
 }
 
 t_index_badge() {
-  case_ "index: a badge recomputed from the index's rows makes the tier measured; edited rows do not"
+  case_ "index: a badge its reviewer ran and that recomputes from the index's rows makes the tier measured"
   local h
   ix_two
   h=$(sed -n 's/^hd1 = "\(.*\)"$/\1/p' "$IX/mods/lean/0.1.0.toml")
   ixbadge lean 0.1.0 "$h"
+  # A badge someone other than the reviewer ran is the author's: the tier stays reviewed.
+  h=$(sed -n 's/^hd1 = "\(.*\)"$/\1/p' "$IX/mods/hello/0.2.0.toml")
+  ixbadge hello 0.2.0 "$h" author
   # An official module's record: the badge shows on its install screen when its hd1 is the files henki ships.
   run verify --dir "$HERE/../mods/halti"
   h=$(printf '%s\n' "$OUT" | sed -n 's/.*\(hd1:[0-9a-f]*\)$/\1/p')
@@ -2260,6 +2299,9 @@ t_index_badge() {
   run search
   rc_is 0
   out_has "lean             measured                 0.1.0"
+  out_has "hello            reviewed                 0.2.0     149 B     26/36 vs 1/36 hello"
+  run info hello
+  out_has "hello 0.2.0 · reviewed by someone (signed index henki-index, 2026-11-08) · the author's badge on Qwen3.5-2B-Q8_0: +25 of 36 on its tasks, general suite not worse (its rows recompute; its reviewer has not rerun it)"
   run info lean
   rc_is 0
   out_has "lean 0.1.0 · reviewed by someone (signed index henki-index, 2026-11-08) · measured on Qwen3.5-2B-Q8_0: +25 of 36 on its tasks, general suite not worse"
@@ -2269,7 +2311,7 @@ t_index_badge() {
   out_has "review   reviewed by someone (signed index henki-index, 2026-11-08) · measured on Qwen3.5-2B-Q8_0: +25 of 36"
   run add halti --yes
   rc_is 0
-  out_has "badge    measured on Qwen3.5-2B-Q8_0: +25 of 36 on its tasks, general suite not worse (signed index henki-index)"
+  out_has "badge    on Qwen3.5-2B-Q8_0: +25 of 36 on its tasks, general suite not worse; its rows recompute, run by someone 2026-11-08 (signed index henki-index)"
   # Rows that no longer give the entry's numbers: no tier from them, and info says why.
   awk -F '\t' 'BEGIN { OFS = FS } NR == 2 { $11 = 1 } { print }' "$IX/evals/lean/0.1.0.tsv" >"$W/rows" && mv "$W/rows" "$IX/evals/lean/0.1.0.tsv"
   rm -f "$IX/evals/halti/0.3.0.tsv"
@@ -2284,7 +2326,7 @@ t_index_badge() {
   run rm halti
   run add halti --yes
   rc_is 0
-  out_lacks "badge    measured"
+  out_lacks "badge    on"
   run info halti
   out_has "not a badge: its rows (evals/halti/0.3.0.tsv) are not in the index"
 }
@@ -2302,7 +2344,7 @@ t_index_add() {
   run info hello
   rc_is 0
   out_has "hello 0.2.0 · reviewed by someone (signed index henki-index, 2026-11-08)"
-  out_has "hello 0.1.0 · reviewed by someone"
+  out_has "hello 0.2.0 · reviewed by someone"
   out_has "install: henki-mods add hello"
   run add hello --yes
   rc_is 0
@@ -3507,6 +3549,7 @@ all
 t_live
 t_halti_live
 t_eval_live
+t_eval_plant
 t_halti_eval_live
 t_general
 # POSIX mode turns off some bash behaviour a script may lean on without knowing; the manager must not.
