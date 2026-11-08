@@ -2318,7 +2318,7 @@ cmd_allow() {
   n=$(printf '%s' "$2" | sed 's/^0*//')
   [ -e "$file" ] || die "no rule ${n:-0} in $file; fix: henki-mods allow lists the rules"
   why=$(allow_unreadable "$file") && die "$file: $why; fix: make it a regular file of at most $(num "$ALLOW_MAX") bytes you can read"
-  hit=$(allow_rules "$file" | while IFS= read -r why; do case "$why" in "$n "*) printf '%s\n' "$why" && break ;; esac; done)
+  hit=$(allow_rules "$file" | while IFS= read -r why; do case "$why" in ("$n "*) printf '%s\n' "$why" && break ;; esac; done)
   [ -n "$hit" ] || die "no rule ${n:-0} in $file; fix: henki-mods allow lists the rules"
   set -- ${hit%%"$tab"*}
   dir=$(cd -P "$(dirname "$file")" && pwd) || die "cannot reach the dir of $file; fix: check its permissions"

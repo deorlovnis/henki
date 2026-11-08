@@ -123,6 +123,13 @@ static_bash32() {
   hits=$(command grep -nE '^[^#]*(^|[^[:alnum:]_])awk([[:space:]]+-F[[:space:]]*[^[:space:]]+)*[[:space:]]+-v' "$MODS" || true)
   [ -z "$hits" ] || fail "henki-mods passes data to awk with -v (use ENVIRON):$(printf '\n%s' "$hits")"
   bash -n "$MODS" || fail "bash -n henki-mods"
+  # A bash 3.2 built for tests (HENKI_TEST_BASH32) parses what this bash cannot judge: a case pattern inside $(...)
+  # without its opening parenthesis is a syntax error there.
+  if [ -n "${HENKI_TEST_BASH32:-}" ]; then
+    for f in "$MODS" "$HERE/tests.sh" "$HERE/mods-tests.sh"; do
+      "$HENKI_TEST_BASH32" -n "$f" || fail "bash 3.2 cannot parse $f"
+    done
+  fi
 }
 
 # The contracts henki-mods accepts in a manifest are the rows of CONTRACTS.md's index, no more and no fewer: a
