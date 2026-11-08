@@ -331,8 +331,9 @@ fn journal_record_shapes() {
         s(rec::assistant("done", &[], "interrupted", Usage::default(), None)),
         r#"{"finish":"interrupted","msg":{"content":"done","role":"assistant","tool_calls":[]},"t":"assistant","usage":{"cached":0,"in":0,"out":0}}"#
     );
-    assert_eq!(s(rec::ask(&call("h1"), None)), r#"{"args":{"command":"ls"},"id":"h1","name":"shell","t":"ask"}"#);
-    assert_eq!(s(rec::ask(&call("h1"), Some("/p/a"))), r#"{"args":{"command":"ls"},"id":"h1","name":"shell","t":"ask","target":"/p/a"}"#);
+    assert_eq!(s(rec::ask(&call("h1"), None, None)), r#"{"args":{"command":"ls"},"id":"h1","name":"shell","t":"ask"}"#);
+    assert_eq!(s(rec::ask(&call("h1"), Some("/p/a"), None)), r#"{"args":{"command":"ls"},"id":"h1","name":"shell","t":"ask","target":"/p/a"}"#);
+    assert_eq!(s(rec::ask(&call("h1"), None, Some("/p"))), r#"{"always":true,"args":{"command":"ls"},"id":"h1","name":"shell","root":"/p","t":"ask"}"#);
     assert_eq!(s(rec::approval("h1", "auto", None, None)), r#"{"id":"h1","t":"approval","verdict":"auto"}"#);
     assert_eq!(
         s(rec::tool_result("call_7", "shell", "ws1 open\n[exit 0, 0.3 s]", false, 312, 402)),
@@ -423,7 +424,7 @@ fn journal_sync_table() {
         (rec::session(&f.cfg, j.id(), &f.cwd, false, &[]), true),
         (rec::user("u"), true),
         (asst(&["h1"]), true),
-        (rec::ask(&c, None), false),
+        (rec::ask(&c, None, None), false),
         (rec::approval("h1", "auto", None, None), false),
         (res("h1"), true),
         (rec::notice("n"), false),
@@ -765,7 +766,7 @@ fn record_hist_kinds() {
     let recs = [
         rec::user("u"),
         rec::assistant("", std::slice::from_ref(&c), "tool_calls", Usage::default(), None),
-        rec::ask(&c, Some("/x")),
+        rec::ask(&c, Some("/x"), None),
         rec::approval("h1", "auto", None, None),
         rec::notice("n"),
         res("h1"),
@@ -938,7 +939,7 @@ fn pairing_ignores_non_message_kinds() {
     let recs = [
         rec::user("u"),
         asst(&["h1"]),
-        rec::ask(&c, None),
+        rec::ask(&c, None, None),
         rec::approval("h1", "auto", None, None),
         rec::notice("n"),
         res("h1"),

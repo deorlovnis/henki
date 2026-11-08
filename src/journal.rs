@@ -405,8 +405,9 @@ pub mod rec {
         let calls: Vec<Value> = calls.iter().map(|c| with(json!({"args": c.args, "id": c.id, "name": c.name}), "raw", c.raw.as_deref())).collect();
         with(json!({"t": "assistant", "msg": {"content": text, "role": "assistant", "tool_calls": calls}, "finish": finish, "usage": usage(u)}), "blocks", blocks.cloned())
     }
-    pub fn ask(c: &Call, target: Option<&str>) -> Value {
-        with(json!({"t": "ask", "id": c.id, "name": c.name, "args": c.args}), "target", target)
+    /// `root`: `always` is offered, for a rule in this project root.
+    pub fn ask(c: &Call, target: Option<&str>, root: Option<&str>) -> Value {
+        with(with(with(json!({"t": "ask", "id": c.id, "name": c.name, "args": c.args}), "target", target), "always", root.map(|_| true)), "root", root)
     }
     /// `verdict`: yes, no, always, rule, auto, policy or deny; `rule`: the allow rule's number; `extra`: `by` (the policy
     /// binding that allowed it) or `reason` (a deny's text).

@@ -40,6 +40,7 @@ A program reads the contracts this henki ships from the rows of this table: each
 | `policy/1` | henki | the policy port's methods over port/1: who may run a call |
 | `context/1` | henki | the context port's methods over port/1: what the model sees of the history |
 | `exec/1` | henki | the exec port: a program henki puts in front of every shell call |
+| `front/1` | henki | `henki serve`: a REPL session a frontend program drives over stdin and stdout |
 | `conform/1` | henki | the conformance suite files a binding is held to |
 | `module/1` | henki-mods | the module manifest, `.henki/module.toml` |
 | `lock/1` | henki-mods | the module lock, `mods.lock` |
@@ -85,7 +86,7 @@ values of `args` and `blocks` are opaque JSON.
 | `session` | `t` `ts` `v` `henki` `id` `cwd` `model` `dialect` `base_url` `base_url_from` `approve` `approve_from` `config` `tools` `shell` `exts` `pass_env` `ctx` `config_hash` `allow_hash` `agents_hash` `project_agents_hash` `resumed` `resumed.from_bytes?` `ports?` `ports.history?` `ports.policy?` `sources?` `sources[].name?` `sources[].bytes?` `sources[].hash?` `parent?` `parent.id?` `parent.line?` |
 | `user` | `t` `ts` `msg` `msg.content` `msg.role` |
 | `assistant` | `t` `ts` `msg` `msg.content` `msg.role` `msg.tool_calls` `msg.tool_calls[].args` `msg.tool_calls[].id` `msg.tool_calls[].name` `msg.tool_calls[].raw?` `finish` `usage` `usage.cached` `usage.in` `usage.out` `blocks?` |
-| `ask` | `t` `ts` `id` `name` `args` `target?` |
+| `ask` | `t` `ts` `id` `name` `args` `target?` `always?` `root?` |
 | `approval` | `t` `ts` `id` `verdict` `rule?` `by?` `reason?` |
 | `tool_result` | `t` `ts` `id` `name` `content` `is_error` `ms` `bytes` |
 | `notice` | `t` `ts` `text` |
@@ -120,7 +121,8 @@ values of `args` and `blocks` are opaque JSON.
   them from the stream: a `tool_use` block's `input` the parsed arguments (`{}` when they are not a JSON object), its
   `id` the call's id as journaled, text blocks with only whitespace left out. They are replayed exactly as journaled.
 - `ask`: the call `id` needs a human; `target` is the file a `read`, `write` or `edit` call resolves to, as shown.
-  In `henki run` an `ask` ends the turn with `needs_approval`.
+  `always` (`true`) and `root` are there when the answer `always` is offered: it would save the command as an allow
+  rule for the project root `root`. In `henki run` an `ask` ends the turn with `needs_approval`.
 - `approval`: who let call `id` run, or not: `verdict` is `auto` (no approval needed), `rule` (allow rule number
   `rule`), `policy` (a policy binding allowed it; `by` names it as the binding notice does), `yes`, `always` (the user
   saved rule number `rule`, or a policy binding kept it), `no`, or `deny` (a policy binding refused it; `reason` is the
@@ -452,7 +454,9 @@ or else on the user's PATH (never a module's), with ARGS split at spaces. A past
   verb starts a new henki: `restart henki yourself`.
 - **The new henki** is `henki` (its realpath) with this henki's arguments without `--resume` and `--resume=ID`, so
   `--config`, `--approve`, `--model`, `--nested` and every `--port` stay, then `--resume=ID`; it gets the environment
-  henki started with. `henki run` has no hand-off.
+  henki started with. `henki run` has no hand-off. In `henki serve` (front/1) the command runs with no terminal, its
+  output is a `command_output` record, henki asks none of these questions, and `send` TEXT and a new henki's argv are
+  `next` records for the frontend; what henki refuses is a `reject`.
 - **The manager** writes `restart` into `HENKI_NEXT` after every change (add, on, off, rm, swap, allow rm), and without
   `HENKI_NEXT` prints `restart henki (or /exit and start again) to load the change`. `HENKI_CONFIG`, when set, is the
   config dir it changes.
@@ -782,6 +786,67 @@ against a program, each as `PROGRAM BASH --noprofile --norc -c COMMAND`: R01 `ec
 `exit 7` exits 7; R03 the arguments after COMMAND arrive intact; R04 stdin is at EOF at once; R05 stdout and stderr
 both arrive; R06 a SIGTERM to the group ends `sleep 30` within 1 s, and after a SIGKILL to the group (Linux: also its
 session) no process of the run is left within 1 s; R07 the environment arrives (a warning only).
+
+## front/1
+
+`henki serve [--approve ask|auto] [--config FILE] [--model NAME] [--resume[=ID[@N]]] [--port PORT=std] [--nested]`: a
+REPL session driven by a frontend program, which talks to the person. henki keeps the session, its approvals, its
+protected paths, its tripwire and its journal; the frontend gets only what henki writes to stdout (no API key, no
+environment). A frontend should start henki in a session of its own, without a controlling terminal, and turn the
+person's interrupt into `cancel`. The frontend is the approver: it answers questions, decides what a command hands back
+and can save `always` rules for the person. Anything that exposes `henki serve` beyond the person's own processes (a
+socket, a network) must authenticate the other side itself.
+
+### Out (stdout)
+
+The json/1 records, as `henki run --json` writes them: a resume's repairs, the `session` record, then every record the
+session journals (without `close`), with the `text` and `reasoning` records as replies stream; no `result`. Startup
+notices come with the first turn, journaled then. A start henki refuses writes one `result` record with `session`
+`null`, then henki exits (as `run --json`). stderr is empty unless henki crashes. Three more kinds are on stdout only,
+never in the journal, with no `ts`:
+
+| Kind | Fields |
+|---|---|
+| `reject` | `t` `why` |
+| `command_output` | `t` `text` `exit` |
+| `next` | `t` `send?` `argv?` |
+
+- `reject`: a line henki did not take now, or why a command did nothing (an unknown command, a trust file changed);
+  `why` may change.
+- `command_output`: what a `command` printed, stdout and stderr as one stream (over 1 MiB: its first and last 512 KiB
+  around a cut marker), and its exit code, `null` when a signal ended it.
+- `next`: what a command handed back (handoff/1). `send`: the text, shown to the person; the frontend sends it as a
+  `send` if the person wants it. `argv`: a new henki to start (`resume`, `new`, `restart`; the REPL's question is the
+  frontend's to ask); henki then closes the session and exits 0, and the frontend starts the argv after that exit.
+
+### In (stdin)
+
+One JSON object per line, at most 1 MiB; fields henki does not know are ignored. A longer line is read to its end,
+dropped, and answered with one `reject` (asking, it is also a no).
+
+| Command | When | What henki does |
+|---|---|---|
+| `{"c":"send","text":TEXT}` | idle | TEXT is the next message. It is never a command: `/exit` or `!ls` is text for the model |
+| `{"c":"answer","id":ID,"verdict":V}` | at the question about call ID | V is `yes`, `no` or `always`. `always` only when the `ask` record has `always: true`: it saves the call's command as an allow rule for the project root `ask.root`, used by every later session there, the REPL's included. henki asks no second question, so the frontend must show the person what the REPL shows ("a rule allows whatever this command does in ROOT, including the files and config it reads") and get a separate confirmation before it sends `always`. `always` where it is not offered is a `reject`, and the question stays open |
+| `{"c":"command","name":NAME,"args":ARGS}` | idle | as the line `/NAME ARGS` typed at the REPL's prompt (handoff/1): the module command `cmd/NAME` with ARGS (trimmed) as one argument, or `mods` and `allow` with ARGS split at spaces (`exit` and `help` are a `reject`: EOF ends the session). It runs with no terminal (a session of its own, stdin `/dev/null`), so it cannot ask the person anything; its output is the `command_output` record, and what it hands back is a `next` record. `cancel` sends it SIGINT |
+| `{"c":"cancel"}` | any time | as Ctrl-C in the REPL: during a turn it ends the turn `interrupted` (the tools get SIGINT, then the kill); at a question it is a no; idle, nothing |
+
+henki is *idle* after the `session` record, after each `turn_end`, and after a command's `command_output` (or its
+`reject` when it did not run; a line sent then is read after what the command handed back), *asking* from an `ask`
+record to its `approval`, and *busy* otherwise. Lines written
+before the `session` record are read after it. Idle or asking, a line henki does not take gets a `reject` (asking, it
+is also a no). Busy, henki reads only `cancel`; any other line is dropped without a reply, so a frontend sends `send`,
+`command` and `answer` only when idle or asking.
+
+After a trust file changed (a `turn_end` with status `error` after the notice `trust file changed: PATH`), every
+`send` gets a `reject`: start `henki serve --resume` again.
+
+### End
+
+EOF on stdin while idle closes the session: exit 0; like a hangup, it kills background processes at once, without the
+grace `/exit` gives. EOF during a turn is a hangup: the turn is interrupted, the session closes, exit 130. SIGTERM and
+SIGHUP: 130. stdout closed: 141. A journal failure: 2. `henki serve --resume` continues the session. `!cmd` is not in
+this version.
 
 ## conform/1
 

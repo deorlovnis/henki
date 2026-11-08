@@ -1,5 +1,6 @@
 //! henki: a small terminal agent. `henki` is a line REPL on the terminal it was started from; `henki run [--json] TASK`
-//! does one task headless. Both drive a model through a shell and three file tools.
+//! does one task headless; `henki serve` is the REPL's session for a frontend program. All drive a model through a
+//! shell and three file tools.
 
 mod allow;
 mod anthropic;
@@ -14,6 +15,7 @@ mod openai;
 mod port;
 mod remote;
 mod repl;
+mod serve;
 mod supervise;
 mod sys;
 mod term;
@@ -23,18 +25,20 @@ mod types;
 
 use crate::types::{Ev, Outcome, Usage};
 use crate::{config::Config, config::Env, config::Flags, journal::rec, port::Ports, term::Mode, term::Out, term::Reader, turn::Session, turn::outcome_line};
-use serde_json::Value;
+use serde_json::{Value, json};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::{ffi::OsString, io, io::Read, path::PathBuf, process::ExitCode, time::Duration, time::Instant};
 
 const USAGE: &str = "usage: henki [--config FILE] [--approve ask|auto] [--model NAME] [--resume[=ID[@N]]] [--port PORT=std] [--nested]
        henki run [--json] [--max-steps N] [--max-seconds N] [--approve ask|auto] [--config FILE] [--model NAME] [--resume[=ID[@N]]] [--port PORT=std] [--nested] [TASK | -]
+       henki serve [--approve ask|auto] [--config FILE] [--model NAME] [--resume[=ID[@N]]] [--port PORT=std] [--nested]
        henki mods [ARGS] | henki allow [rm N]
        henki --version | --help";
 
-/// The arguments of the REPL (`mode` Repl), `run` (Plain or Json) and `mods`.
+/// The arguments of the REPL (`mode` Repl), `run` (Plain or Json), `serve` (Plain, its output Json) and `mods`.
 struct Args {
     mode: Mode,
+    serve: bool,
     flags: Flags,
     resume: Option<Option<String>>,
     nested: bool,
@@ -55,9 +59,9 @@ fn main() -> ExitCode {
         sys::raw(false); // the terminal modes the REPL started with
         term::panic_line(&info.to_string());
     }));
-    let mut a = Args { mode: Mode::Plain, flags: Flags::default(), resume: None, nested: false, task: None, mods: None, port: None };
+    let mut a = Args { mode: Mode::Plain, serve: false, flags: Flags::default(), resume: None, nested: false, task: None, mods: None, port: None };
     let cmd = parse(&mut a);
-    let out = Out::start(a.mode, tx.clone());
+    let out = Out::start(if a.serve { Mode::Json } else { a.mode }, tx.clone());
     ExitCode::from(match cmd {
         Ok(None) => match (a.mods.take(), a.port.take()) {
             (Some(args), _) => mods(args, out),
@@ -104,7 +108,7 @@ fn parse(a: &mut Args) -> Result<Option<String>, lexopt::Error> {
             a.port = Some((port, if offer.is_empty() { vec![1] } else { offer }, exe.ok_or("henki port needs -- PROGRAM")?));
             return Ok(None);
         }
-        Some(Value(v)) if v == "run" => String::new(),
+        Some(Value(v)) if v == "run" || v == "serve" => (String::new(), a.serve = v == "serve").0,
         // The REPL, whose flags start at the first argument.
         _ => {
             (p, a.mode) = (lexopt::Parser::from_env(), Mode::Repl);
@@ -114,7 +118,7 @@ fn parse(a: &mut Args) -> Result<Option<String>, lexopt::Error> {
     if !text.is_empty() {
         return p.next()?.map_or(Ok(Some(text)), |arg| Err(arg.unexpected()));
     }
-    let run = a.mode != Mode::Repl;
+    let run = a.mode != Mode::Repl && !a.serve;
     while let Some(arg) = p.next()? {
         match arg {
             Long("config") => a.flags.config = Some(p.value()?.into()),
@@ -162,9 +166,9 @@ fn pipe((port, offer, exe): (&'static str, Vec<u64>, PathBuf), out: Out, ch: (Se
     code(out, &o, None)
 }
 
-/// `henki run` (startup, one turn, the `result`, the session end) and the REPL (startup, then `repl::run`).
+/// `henki run` (startup, one turn, the `result`, the session end) and the REPL and `serve` (startup, then `repl::run`).
 fn run(a: Args, out: Out, tx: Sender<Ev>, rx: Receiver<Ev>, t0: Instant, early: io::Result<()>) -> u8 {
-    let (mut deadline, repl) = (None, a.mode == Mode::Repl);
+    let (mut deadline, repl, serve) = (None, a.mode == Mode::Repl || a.serve, a.serve);
     let (cfg, ports, sid, hist, task, mut head, reader) = match start(a, &tx, &rx, t0, early, &mut deadline) {
         Ok(r) => r,
         Err(o) => {
@@ -175,13 +179,18 @@ fn run(a: Args, out: Out, tx: Sender<Ev>, rx: Receiver<Ev>, t0: Instant, early: 
         }
     };
     head.iter().for_each(|r| out.record(r));
+    // serve's command reader starts once the `session` record is out, so a line sent early is read after it.
+    let reader = if serve { serve::reader(tx.clone()) } else { reader };
     let mut s = Session::new(cfg, ports, sid, hist, out, (tx, rx), deadline, reader);
     s.opened = head.pop(); // the `session` record, for `session_start`
     if repl {
         let (code, next) = repl::run(&mut s);
-        s.into_out().flush(Instant::now() + Duration::from_secs(5));
+        let out = s.into_out();
+        // serve hands a new henki's argv to its frontend, which starts it once this one exits.
+        next.iter().filter(|_| serve).for_each(|n| out.record(&json!({"t": "next", "argv": n.iter().map(|a| a.to_string_lossy()).collect::<Vec<_>>()})));
+        out.flush(Instant::now() + Duration::from_secs(5));
         // A command handed back a new henki (`handoff`): this one is closed, its bindings ended, so it becomes that one.
-        let Some((exe, args)) = next.as_deref().and_then(<[OsString]>::split_first) else { return code };
+        let Some((exe, args)) = next.as_deref().filter(|_| !serve).and_then(<[OsString]>::split_first) else { return code };
         let e = supervise::exec(exe.as_ref(), args, &Env::os().0);
         term::panic_line(&format!("cannot start {}: {e}", exe.to_string_lossy()));
         return 2;
@@ -221,8 +230,8 @@ fn start(a: Args, tx: &Sender<Ev>, rx: &Receiver<Ev>, t0: Instant, early: io::Re
     let reader = (a.mode == Mode::Repl).then(|| Reader::with(io::stdin(), tx.clone())).transpose().map_err(no_thread)?;
     let cwd = std::env::current_dir().map_err(|e| bad(format!("cannot read the working directory: {e}")))?;
     let mut cfg = config::load(&a.flags, &env, &cwd).map_err(bad)?;
-    // The REPL has no time budget: Ctrl-C ends a turn, and `max_steps` bounds it.
-    *deadline = (a.mode != Mode::Repl && cfg.max_seconds > 0).then(|| t0 + Duration::from_secs(cfg.max_seconds));
+    // The REPL and serve have no time budget: Ctrl-C ends a turn, and `max_steps` bounds it.
+    *deadline = (a.mode != Mode::Repl && !a.serve && cfg.max_seconds > 0).then(|| t0 + Duration::from_secs(cfg.max_seconds));
     journal::state_dir(&cfg.state).map_err(bad)?;
     let task = if a.task.as_deref() == Some("-") { Some(stdin_task(tx, rx, *deadline)?) } else { a.task };
     if task.as_deref().is_some_and(|t| t.trim().is_empty()) {

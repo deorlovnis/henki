@@ -3,7 +3,7 @@
 //! ID@N`: a fork), `new` or `restart`. No text is sent once a trust file changed; a new henki (new, resume, restart) on
 //! trust files the command changed is asked for, naming them; after a change from before the command there is no
 //! one-key restart. A `restart` after a change to the history link starts a new session: the old one stays in the store
-//! it was kept in.
+//! it was kept in. In `henki serve` what henki refuses is a `reject` record (front/1).
 use crate::{allow, port, sys, term, turn::Session, types::Stop};
 use std::{ffi::OsString, fs, io::Read, os::unix::fs::MetadataExt, path::Path, path::PathBuf};
 
@@ -25,7 +25,7 @@ pub fn run(s: &mut Session, name: &str, prog: &Path, module: Option<&Path>, args
     // In the spill dir, so the 24 h sweep takes one a crash left; a dot name never matches a session's spill file.
     let next = s.cfg.state.join("spill").join(format!(".next-{}-{}", std::process::id(), sys::random4().unwrap_or_default()));
     let made = sys::create_excl(&next, 0o600, false).and_then(|f| f.metadata());
-    let Ok(made) = made.map_err(|e| s.out().note(&format!("/{name}: cannot make {}: {e}", next.display()))) else { return Ok(Next::Stay) };
+    let Ok(made) = made.map_err(|e| s.reject(&format!("/{name}: cannot make {}: {e}", next.display()))) else { return Ok(Next::Stay) };
     let before = s.changed();
     // A trust file that differed before the command: named once, and never blamed on it.
     before.iter().filter(|_| !tripped).for_each(|p| s.out().note(&format!("trust file changed: {}", p.display())));
@@ -56,16 +56,16 @@ pub fn run(s: &mut Session, name: &str, prog: &Path, module: Option<&Path>, args
     let kept = |i: &String| format!("session {i} stays in {old}; resume it with that bound (std: henki --port history=std --resume={i})");
     Ok(match verb {
         "" => stay,
-        "send" if stale => (s.out().note(&format!("/{name}: a trust file changed; nothing is sent")), Next::Tripped).1,
-        "send" if body.contains(term::escaped) => (s.out().note(&format!("/{name} handed back invisible characters; nothing is sent")), stay).1,
+        "send" if stale => (s.reject(&format!("/{name}: a trust file changed; nothing is sent")), Next::Tripped).1,
+        "send" if body.contains(term::escaped) => (s.reject(&format!("/{name} handed back invisible characters; nothing is sent")), stay).1,
         "send" => Next::Send(body.to_string()),
-        "new" | "resume" | "restart" if pre => (s.out().note("a trust file changed before; restart henki yourself (henki --resume continues this session)"), Next::Tripped).1,
-        "resume" if !port::session_id(p) || n.is_some_and(|n| n.parse::<u64>().is_err()) => (s.out().note(&format!("/{name}: cannot resume {:?}", term::escape(arg))), stay).1,
+        "new" | "resume" | "restart" if pre => (s.reject("a trust file changed before; restart henki yourself (henki --resume continues this session)"), Next::Tripped).1,
+        "resume" if !port::session_id(p) || n.is_some_and(|n| n.parse::<u64>().is_err()) => (s.reject(&format!("/{name}: cannot resume {:?}", term::escape(arg))), stay).1,
         "resume" if !s.yes(&n.map_or(format!("switch to session {arg}{to}? [y/N] "), |n| format!("fork session {p} at line {n}{to}? [y/N] ")))? => stay,
         "new" | "restart" if !changed.is_empty() && !s.yes("restart on these changes? [y/N] ")? => stay,
         "restart" if moved => (s.resumable().iter().for_each(|i| s.out().note(&kept(i))), Next::Exec(again(None))).1,
         "new" | "resume" | "restart" => Next::Exec(again(id)),
-        v => (s.out().note(&format!("/{name} handed back {:?}, which henki does not know", term::escape(&v.chars().take(40).collect::<String>()))), stay).1,
+        v => (s.reject(&format!("/{name} handed back {:?}, which henki does not know", term::escape(&v.chars().take(40).collect::<String>()))), stay).1,
     })
 }
 

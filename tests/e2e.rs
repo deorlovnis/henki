@@ -47,6 +47,8 @@ mod pty;
 mod repl;
 #[path = "e2e/request.rs"]
 mod request;
+#[path = "e2e/serve.rs"]
+mod serve;
 #[path = "e2e/signals.rs"]
 mod signals;
 #[path = "e2e/stops.rs"]

@@ -47,6 +47,12 @@ pub fn kinds() -> Kinds {
     rows.map(|(k, fields)| (k, fields.iter().map(|f| f.strip_suffix('?').map_or((f.clone(), true), |o| (o.to_string(), false))).collect())).collect()
 }
 
+/// front/1's stdout-only kinds.
+pub fn front_kinds() -> Kinds {
+    let rows = table(&section(&text(), "front/1"), "Out (stdout)");
+    rows.into_iter().map(|(k, fields)| (k, fields.iter().map(|f| f.strip_suffix('?').map_or((f.clone(), true), |o| (o.to_string(), false))).collect())).collect()
+}
+
 /// Every field path of a record, in the notation of the tables: `a`, `a.b`, `a[].b`. `args` and `blocks` are opaque.
 pub fn paths(v: &Value) -> BTreeSet<String> {
     fn walk(v: &Value, at: &str, out: &mut BTreeSet<String>) {
@@ -116,6 +122,7 @@ fn contracts_index() {
         ("policy/1", "henki"),
         ("context/1", "henki"),
         ("exec/1", "henki"),
+        ("front/1", "henki"),
         ("conform/1", "henki"),
         ("module/1", "henki-mods"),
         ("lock/1", "henki-mods"),

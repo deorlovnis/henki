@@ -6,6 +6,7 @@ use crate::doc::{self, Seen};
 use crate::harness::*;
 use crate::mock::*;
 use serde_json::{Value, json};
+use std::time::Duration;
 
 /// A 503 that asks for no wait: one retry notice, at once.
 fn busy() -> Step {
@@ -77,11 +78,41 @@ fn contracts_json_stream_order() {
     assert_eq!(d.journal.as_ref().unwrap().file_stem().unwrap().to_str(), Some(d.id().as_str()), "the session id is the file stem");
 }
 
+/// A `henki serve` session that shows every front/1 kind and field: a question offering `always`, a line henki does not
+/// take, a command's output and both `next` forms.
+fn serve_session() -> Done {
+    let m = Mock::start(vec![shell("echo asked"), say("done")]);
+    let mut r = Run::new(&m.url());
+    r.set("approve", "\"ask\"");
+    let cmd = r.config_dir().join("ext/kit/cmd");
+    std::fs::create_dir_all(&cmd).unwrap();
+    std::fs::write(r.config_dir().join("ext/kit/doc.md"), "kit: commands for the user\n").unwrap();
+    for (name, next) in [("hand", "send\\ntext"), ("again", "restart")] {
+        std::fs::write(cmd.join(name), format!("#!/bin/sh\necho {name}; printf '{next}\\n' > \"$HENKI_NEXT\"\n")).unwrap();
+        std::fs::set_permissions(cmd.join(name), std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+    }
+    let mut l = r.cmd::<&str>(&[]).serve().stdin(In::Open).spawn();
+    let count = |l: &Live, t: &str| l.stdout_records().iter().filter(|x| x["t"] == t).count();
+    l.until("the session record", Duration::from_secs(15), |l| count(l, "session") == 1);
+    l.write_stdin(b"{\"c\":\"send\",\"text\":\"go\"}\n");
+    let ask = l.wait_record(Duration::from_secs(15), |x| x["t"] == "ask");
+    l.write_stdin(format!("{}\n", json!({"c": "answer", "id": ask["id"], "verdict": "always"})).as_bytes());
+    l.until("the turn's end", Duration::from_secs(15), |l| count(l, "turn_end") == 1);
+    l.write_stdin(b"{\"c\":\"nothing\"}\n{\"c\":\"command\",\"name\":\"hand\"}\n");
+    l.until("the send hand-off", Duration::from_secs(15), |l| count(l, "next") == 1);
+    l.write_stdin(b"{\"c\":\"command\",\"name\":\"again\"}\n");
+    let d = l.wait();
+    d.finish();
+    assert_eq!((d.code, d.records().iter().filter(|x| x["t"] == "next").count()), (Some(0), 2), "{}", d.diag());
+    d
+}
+
 /// Every record of the runs below fits its table in CONTRACTS.md, and together they show every documented kind and
-/// field.
+/// field: journal/1's and json/1's, and front/1's stdout-only kinds.
 #[test]
 fn contracts_record_fields() {
-    let kinds = doc::kinds();
+    let mut kinds = doc::kinds();
+    kinds.extend(doc::front_kinds());
     let mut seen = Seen::default();
     let mut runs: Vec<(&str, Done)> = Vec::new();
     runs.push(("full", full_run().2));
@@ -166,6 +197,10 @@ fn contracts_record_fields() {
         d.journal_all().iter().for_each(|x| seen.check(&kinds, x, &format!("{name} journal")));
         d.records().iter().for_each(|x| seen.check(&kinds, x, &format!("{name} stdout")));
     }
+    // `henki serve` (front/1): its own stdout-only kinds, and `ask` with `always` and `root`.
+    let d = serve_session();
+    d.journal_all().iter().for_each(|x| seen.check(&kinds, x, "serve journal"));
+    d.records().iter().for_each(|x| seen.check(&kinds, x, "serve stdout"));
     seen.covers(&kinds);
     let (_, ask) = &runs[1];
     let call = &ask.result()["call"];
@@ -181,5 +216,26 @@ fn contracts_exit_table() {
     let s = doc::section(&doc::text(), "json/1").split_whitespace().collect::<Vec<_>>().join(" ");
     for status in ["ok", "gave_up", "error", "needs_approval", "budget", "interrupted", "output_closed"] {
         assert!(s.contains(&format!("`{status}` {}", code_of(status))), "json/1 does not give {status} exit {}", code_of(status));
+    }
+}
+
+/// front/1's commands are the four henki takes, and its ends are the exit codes json/1 gives them.
+#[test]
+fn contracts_front_commands() {
+    let sec = doc::section(&doc::text(), "front/1");
+    let rows = doc::table(&sec, "In (stdin)");
+    let names: Vec<String> = rows
+        .iter()
+        .map(|(k, _)| {
+            serde_json::from_str::<Value>(&k.replace(":TEXT", ":0").replace(":ID", ":0").replace(":V", ":0").replace(":NAME", ":0").replace(":ARGS", ":0")).unwrap()["c"]
+                .as_str()
+                .unwrap()
+                .to_string()
+        })
+        .collect();
+    assert_eq!(names, ["send", "answer", "command", "cancel"]);
+    let end = sec.split_whitespace().collect::<Vec<_>>().join(" ");
+    for words in ["EOF on stdin while idle closes the session: exit 0", "the session closes, exit 130", "stdout closed: 141", "A journal failure: 2"] {
+        assert!(end.contains(words), "front/1 lost {words:?}");
     }
 }

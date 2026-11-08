@@ -1,5 +1,5 @@
 //! One session: the step loop of a turn, the only place the main thread waits, and the single way a turn and a session end.
-use crate::{anthropic, config::Config, ext, http, journal, journal::rec, observe, observe::Observers, port, port::Ports, supervise, sys, term, term::Out, term::Reader};
+use crate::{anthropic, config::Config, ext, http, journal, journal::rec, observe, observe::Observers, port, port::Ports, serve, supervise, sys, term, term::Out, term::Reader};
 use crate::{tools, tools::Killed, types::*};
 use call::Stuck;
 use serde_json::{Value, json};
@@ -179,6 +179,11 @@ impl Session {
         &self.out
     }
 
+    /// A line henki does not take now: a `reject` record on `henki serve`'s stdout (never journaled), else a note.
+    pub fn reject(&self, why: &str) {
+        if self.out.json() { self.out.record(&json!({"t": "reject", "why": why})) } else { self.out.note(why) }
+    }
+
     /// The run's `result` record: the last assistant text (or ""), this turn's successful replies, this process's usage.
     pub fn result(&self, o: &Outcome, duration_ms: u64) -> Value {
         rec::result(o, &self.t.text, self.usage_proc, Some(&self.sid), self.t.steps, duration_ms)
@@ -200,9 +205,14 @@ impl Session {
     /// Some((text, typed)): `typed` is false for a line that holds a paste or came with more input pending, which is
     /// never a command or an answer. None at EOF (Ctrl-D on an empty line, and every line after it) or without a reader.
     /// No deadline applies (the REPL has none). Err: a signal (also in `sig`) or a closed stdout. On every way out the
-    /// terminal has its modes back, and bracketed paste off is queued.
+    /// terminal has its modes back, and bracketed paste off is queued. `henki serve`: the frontend's next command line as
+    /// `serve::take` reads it, at the question about the first call that has no result, else idle; None at its EOF.
     pub fn line(&mut self, prompt: &str) -> Result<Option<(String, bool)>, Stop> {
         let Some(fd) = self.reader.as_ref().filter(|_| !self.eof).map(|r| r.1) else { return Ok(None) };
+        if self.out.json() {
+            let Some(Ev::Input { bytes: Some(b), .. }) = self.wait(serve::FRONT, None)? else { return Ok(None) };
+            return Ok(Some(serve::take(self, &b, self.t.open.first().map(|o| o.0.id.as_str()))));
+        }
         self.sync()?;
         sys::raw(true).filter(|&n| n > 0).iter().for_each(|&n| self.out.note(&format!("dropped {} bytes typed before this prompt", term::num(n as u64))));
         self.out.control(term::PASTE_MODE[1]);
@@ -228,19 +238,25 @@ impl Session {
 
     /// `prog ARGS` on the terminal with exactly `env` (`!CMD`, `/mods`): its exit code, None when it did not start (a
     /// notice says why). INT and QUIT reach the command alone (it runs in henki's process group); TERM, HUP and a closed
-    /// stdout SIGKILL it and return Err.
+    /// stdout SIGKILL it and return Err. `henki serve` has no terminal: the command runs as a call does (supervise::bang),
+    /// a `cancel` is its Ctrl-C, and its output and exit code (null when a signal ended it) are the `command_output`
+    /// record, never journaled; it returns None.
     pub fn bang(&mut self, prog: &Path, args: &[OsString], env: &[(OsString, OsString)]) -> Result<Option<i32>, Stop> {
         // The line's end and bracketed paste off reach the terminal before the command writes to it.
         self.sync().or_else(|s| if matches!(s, Stop::Signal(libc::SIGINT | libc::SIGQUIT)) { Ok(()) } else { Err(s) })?;
-        let tag = self.next_tag();
-        let Ok(pid) = supervise::bang(prog, args, &self.cfg.cwd, env, tag, &self.tx).map_err(|e| self.out.note(&format!("cannot start {}: {e}", prog.display()))) else {
+        let (tag, json) = (self.next_tag(), self.out.json());
+        let Ok(pid) = supervise::bang(prog, args, &self.cfg.cwd, env, tag, &self.tx, json).map_err(|e| self.reject(&format!("cannot start {}: {e}", prog.display()))) else {
             return Ok(None);
         };
         let mut got = self.wait(tag, None);
         while let Err(Stop::Signal(libc::SIGINT | libc::SIGQUIT)) = got {
-            got = self.wait(tag, None); // the command got it too
+            json.then(|| sys::kill(-pid, libc::SIGINT)); // on a terminal the command got it too
+            got = self.wait(tag, None);
         }
         let done = got.inspect_err(|_| _ = sys::kill(pid, libc::SIGKILL))?;
+        if let Some(Ev::Tool { out, .. }) = &done {
+            self.out.record(&json!({"t": "command_output", "text": out.text, "exit": if let End::Exit(c) = out.end { Some(c) } else { None }}));
+        }
         Ok(done.and_then(|ev| if let Ev::BangDone { code, .. } = ev { Some(code) } else { None }))
     }
 

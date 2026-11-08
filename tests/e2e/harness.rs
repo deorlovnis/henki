@@ -198,6 +198,7 @@ impl Run {
             unread: false,
             ignore: Vec::new(),
             launch: None,
+            serve: false,
         }
     }
 
@@ -258,6 +259,7 @@ pub struct Cmd<'a> {
     unread: bool,
     ignore: Vec<i32>,
     launch: Option<String>,
+    serve: bool,
 }
 
 impl<'a> Cmd<'a> {
@@ -273,6 +275,12 @@ impl<'a> Cmd<'a> {
     #[cfg(target_os = "linux")]
     pub fn launch(mut self, prefix: &str) -> Cmd<'a> {
         self.launch = Some(prefix.into());
+        self
+    }
+
+    /// `henki serve ARGS` instead of `henki run ARGS`: its Done is held to a REPL session's postconditions.
+    pub fn serve(mut self) -> Cmd<'a> {
+        self.serve = true;
         self
     }
 
@@ -318,7 +326,7 @@ impl<'a> Cmd<'a> {
             }
             None => {
                 let mut c = Command::new(bin());
-                c.arg("run");
+                c.arg(if self.serve { "serve" } else { "run" });
                 c
             }
         };
@@ -365,8 +373,9 @@ impl<'a> Cmd<'a> {
             reader(OwnedFd::from(so), out.clone(), self.close_first);
         }
         reader(OwnedFd::from(child.stderr.take().unwrap()), err.clone(), false);
-        let json = self.args.iter().any(|a| a == "--json");
+        let json = self.serve || self.args.iter().any(|a| a == "--json");
         Live {
+            serve: self.serve,
             pid: child.id() as i32,
             child,
             stdin,
@@ -462,6 +471,7 @@ pub struct Live {
     marker: String,
     state: PathBuf,
     stdin_file: Option<fs::File>,
+    serve: bool,
 }
 
 impl Live {
@@ -525,7 +535,7 @@ impl Live {
         lines(&self.stdout())
     }
 
-    fn diag(&self) -> String {
+    pub fn diag(&self) -> String {
         format!("stdout:\n{}\nstderr:\n{}", self.stdout(), String::from_utf8_lossy(&self.err.buf.lock().unwrap()))
     }
 
@@ -650,7 +660,7 @@ impl Live {
             stdout_complete,
             marker: self.marker.clone(),
             stdin_file: self.stdin_file.take(),
-            repl: false,
+            repl: self.serve,
         }
     }
 }

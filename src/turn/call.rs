@@ -74,7 +74,7 @@ impl Session {
             Decision::Ask { always, note } => {
                 note.iter().try_for_each(|n| self.notice(n))?;
                 if self.reader.is_none() {
-                    self.record(rec::ask(c, t.as_ref().map(|t| t.shown.as_str())))?;
+                    self.record(rec::ask(c, t.as_ref().map(|t| t.shown.as_str()), None))?;
                     return Err(Outcome::NeedsApproval(c.clone()));
                 }
                 match self.ask(c, t.as_ref(), always)? {

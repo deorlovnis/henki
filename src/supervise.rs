@@ -85,8 +85,13 @@ pub fn spawn(argv: &[&OsStr], cwd: &Path, env: &[(OsString, OsString)], cap: usi
 /// MAIN thread only. The user's own command, `prog ARGS` (`!cmd`: `bash --noprofile --norc -c CMD`; `/mods`: the
 /// manager), in henki's own process group on the terminal (stdin, stdout and stderr inherited), exactly `env`; not in the
 /// ledger, though a `!cmd &` job it leaves is counted and swept like a call's. A waiter thread reaps it and sends one
-/// `Ev::BangDone { tag, code }` (128 + N when signal N ended it). Returns the pid.
-pub fn bang(prog: &Path, args: &[OsString], cwd: &Path, env: &[(OsString, OsString)], tag: u32, tx: &Sender<Ev>) -> io::Result<i32> {
+/// `Ev::BangDone { tag, code }` (128 + N when signal N ended it). Returns the pid. `capture` (`henki serve`, which has no
+/// terminal): as a call is run instead (`spawn`), its output up to 1 MiB never spilled; the pid is its group's.
+pub fn bang(prog: &Path, args: &[OsString], cwd: &Path, env: &[(OsString, OsString)], tag: u32, tx: &Sender<Ev>, capture: bool) -> io::Result<i32> {
+    let argv: Vec<&OsStr> = [prog.as_os_str()].into_iter().chain(args.iter().map(OsString::as_os_str)).collect();
+    if capture {
+        return spawn(&argv, cwd, env, term::LINE_MAX, Spill { path: "/dev/null".into(), shown: String::new() }, tag, tx);
+    }
     let (tx, (give, take)) = (tx.clone(), mpsc::channel::<Child>());
     // The waiter starts before the fork, so nothing can fail once the command runs.
     thread::Builder::new().spawn(move || {

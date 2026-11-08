@@ -58,7 +58,8 @@ fn lines(s: &mut Session) -> (u8, Option<Vec<OsString>>) {
         let (line, typed) = match s.line("> ") {
             Ok(Some(l)) => l,
             // A terminal that went away ends the input too, maybe before its SIGHUP arrives: a hangup all the same.
-            Ok(None) => return (if sys::isatty(0) { 0 } else { 130 }, None),
+            // `henki serve`'s EOF while idle is the end of the session.
+            Ok(None) => return (if sys::isatty(0) || s.out().json() { 0 } else { 130 }, None),
             Err(Stop::Signal(libc::SIGINT | libc::SIGQUIT)) => {
                 s.out().line("\n(Ctrl-C does not quit; /exit or Ctrl-D quits)");
                 continue;
@@ -76,7 +77,7 @@ fn lines(s: &mut Session) -> (u8, Option<Vec<OsString>>) {
         // `/NAME REST`: a module's cmd/NAME, REST as one argument.
         let module = s.cfg.exts.iter().find(|x| x.user.iter().any(|u| u == name)).map(|x| x.dir.clone());
         let one: Vec<OsString> = Some(rest.trim()).filter(|r| !r.is_empty()).map(OsString::from).into_iter().collect();
-        let note = |s: &Session, m: &str| Ok((s.out().note(m), Next::Stay).1);
+        let note = |s: &Session, m: &str| Ok((s.reject(m), Next::Stay).1);
         let next = match (cmd, mods, module, cmd.strip_prefix('!')) {
             _ if t.is_empty() || cmd == "!" => continue,
             ("/exit", ..) => return (0, None),
@@ -109,7 +110,7 @@ fn lines(s: &mut Session) -> (u8, Option<Vec<OsString>>) {
             _ if s.out().closed() => return (141, None),
             Outcome::Error { kind: "journal" | "tampered", .. } => return (2, None),
             Outcome::Error { kind: "changed", .. } => {
-                s.out().note(TRIPPED);
+                s.reject(TRIPPED);
                 tripped = true;
             }
             _ => {}
@@ -118,7 +119,8 @@ fn lines(s: &mut Session) -> (u8, Option<Vec<OsString>>) {
 }
 
 /// What a command handed back, as the REPL's next step: Ok(Some(TEXT)) a message to send, Ok(None) the next prompt,
-/// Err the REPL's end (a new henki's argv for Exec). A typed message is a `Send` too, sent without a question.
+/// Err the REPL's end (a new henki's argv for Exec). A typed message is a `Send` too, sent without a question. In
+/// `henki serve` a command's text is a `next` record instead, which its frontend sends or not.
 fn after(s: &mut Session, name: &str, next: Result<Next, Stop>, tripped: &mut bool) -> Result<Option<String>, (u8, Option<Vec<OsString>>)> {
     let end = |e: Stop| (Outcome::from(e).exit() as u8, None);
     match next.map_err(end)? {
@@ -126,6 +128,7 @@ fn after(s: &mut Session, name: &str, next: Result<Next, Stop>, tripped: &mut bo
         Next::Tripped => Ok(None).inspect(|_| *tripped = true),
         Next::Exec(argv) => Err((0, Some(argv))),
         Next::Send(text) if name.is_empty() => Ok(Some(text)),
+        Next::Send(text) if s.out().json() => Ok(None).inspect(|_| s.out().record(&serde_json::json!({"t": "next", "send": text}))),
         Next::Send(text) => {
             s.out().line(&format!("[from /{name}]\n{text}"));
             Ok(s.reply("send? [Y/n] ").map_err(end)?.filter(|a| matches!(a.as_str(), "" | "y" | "yes")).map(|_| text))

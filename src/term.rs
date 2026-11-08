@@ -235,7 +235,7 @@ fn width(s: &str) -> usize {
 /// The REPL's terminal reader. It reads only while MAIN waits for input, so what the user types into a `!cmd` reaches
 /// the command. Each read goes out as `Ev::Input { tag, bytes }` (None: EOF or an error) with the tag MAIN asked with
 /// when it returned: 0 when MAIN no longer waits, and MAIN drops it as stale. `.1` is the descriptor it reads.
-pub struct Reader(Arc<(Mutex<u32>, Condvar)>, pub i32);
+pub struct Reader(pub Arc<(Mutex<u32>, Condvar)>, pub i32);
 
 impl Reader {
     /// The thread over `input`: stdin, or a pipe in tests. Reads of 64 KiB go past std's buffer for stdin, which stays
