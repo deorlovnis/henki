@@ -114,6 +114,15 @@ fn contracts_record_fields() {
     std::fs::create_dir_all(r.config_dir().join("port")).unwrap();
     std::os::unix::fs::symlink(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/ports/toy-history"), r.config_dir().join("port/history")).unwrap();
     runs.push(("bound", r.json("hello")));
+    // Policy bound to the bash binding of its suite, with rules: an allow (`by`), a deny (`reason`), `session.ports`.
+    let m = Mock::start(vec![shell("echo allowed"), shell("rm -rf nothing"), say("decided")]);
+    let mut r = Run::new(&m.url());
+    r.set("approve", "\"ask\"");
+    std::fs::create_dir_all(r.config_dir().join("port")).unwrap();
+    std::os::unix::fs::symlink(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/ports/toy-policy"), r.config_dir().join("port/policy")).unwrap();
+    std::fs::create_dir_all(r.state().join("port/policy")).unwrap();
+    std::fs::write(r.state().join("port/policy/rules"), "allow\t\"command\":\"echo allowed\"\ndeny\t\"command\":\"rm \n").unwrap();
+    runs.push(("policy", r.json("decide")));
     // An end before a session: the result alone, `session` null, no `ts`.
     let r = Run::new("http://127.0.0.1:9/v1");
     let d = r.cmd(&["--json", "--max-steps", "0", "x"]).go();

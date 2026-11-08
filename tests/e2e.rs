@@ -23,6 +23,8 @@ mod journal;
 mod observe;
 #[path = "e2e/outcomes.rs"]
 mod outcomes;
+#[path = "e2e/policy.rs"]
+mod policy;
 #[path = "e2e/ports.rs"]
 mod ports;
 #[path = "e2e/processes.rs"]

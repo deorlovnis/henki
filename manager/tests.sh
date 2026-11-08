@@ -437,15 +437,15 @@ t_refusals() {
   rm -rf "$m" && mkmod "$m" 'ports = ["history"]\n'
   run add "$m" --yes
   refused "ports must name exactly the programs in port/"
-  rm -rf "$m" && mkmod "$m" 'ports = ["policy"]\n'
+  rm -rf "$m" && mkmod "$m" 'ports = ["context"]\n'
   run add "$m" --yes
-  refused "port policy is not one this henki binds (history)"
+  refused "port context is not one this henki binds (history policy)"
   rm -rf "$m" && mkmod "$m" && mkdir "$m/port" && printf '#!/bin/sh\n' >"$m/port/history"
   run add "$m" --yes
   refused "port/history: port/ holds a program you can run per port"
   chmod 755 "$m/port/history" && mv "$m/port/history" "$m/port/context"
   run add "$m" --yes
-  refused "port/context: port/ holds a program you can run per port, named history"
+  refused "port/context: port/ holds a program you can run per port, named history policy"
   rm -rf "$m" && mkmod "$m" 'contracts = ["ext/1", "context/1"]\n'
   run add "$m" --yes
   refused "contract context/1 is not one this henki ships"
@@ -1369,8 +1369,8 @@ t_ports() {
   run test --port history std
   rc_is 0
   out_has "std passes this suite in henki's own tests"
-  run test --port policy std
-  refused "policy is not a port this henki binds (history)"
+  run test --port context std
+  refused "context is not a port this henki binds (history policy)"
   mkport tree
   run add "$W/tree" --yes
   rc_is 0
@@ -1455,6 +1455,60 @@ t_port_toy() {
   done
 }
 
+# A module NAME in W that binds policy: the bash binding of the policy suite as port/policy.
+mkpolicy() {
+  mkmod "$W/$1" 'ports = ["policy"]\ncontracts = ["policy/1"]\n'
+  mkdir -p "$W/$1/port"
+  cp "$HERE/../tests/fixtures/ports/toy-policy" "$W/$1/port/policy"
+  chmod 755 "$W/$1/port/policy"
+}
+
+t_policy() {
+  case_ "policy: test --port, swap with approve = auto, port_toy's faults"
+  run test --port policy std
+  rc_is 0
+  mkpolicy rules
+  run add "$W/rules" --yes
+  rc_is 0
+  if [ -z "${HENKI_BIN:-}" ]; then return 0; fi
+  run test --port policy rules
+  rc_is 0
+  out_has "ok Q12"
+  out_has "policy/1: 13 checks, 13 passed"
+  printf 'approve = "auto"\n' >"$CONF/config.toml"
+  run swap policy rules --yes
+  rc_is 0
+  out_has "policy: std -> rules 0.1.0 ("
+  out_has "conformance: passed (policy/1, 13 checks) · it runs with your rights and decides every call before it runs; protected paths stay refused"
+  out_has "henki refuses approve = auto with a policy binding; set approve = \"ask\" in ~/.config/henki/config.toml"
+  check "the link to the store copy's port/policy" [ "$(readlink "$CONF/port/policy")" = "$(readlink "$CONF/ext/rules")/port/policy" ]
+  run list
+  out_has "policy: rules 0.1.0 (bound)"
+  run rm rules
+  refused "rules holds the policy binding; fix: henki-mods swap policy std"
+  run swap policy std
+  rc_is 0
+  rm -f "$CONF/config.toml"
+  local toy f want
+  toy="$(dirname "$HENKI_BIN")/examples/port_toy"
+  [ -x "$toy" ] || return 0
+  for f in allow ask ask-always deny; do
+    printf '#!/bin/sh\nexec %s policy %s\n' "$toy" "$f" >"$W/toy-$f"
+    chmod 755 "$W/toy-$f"
+    run test --port policy "$W/toy-$f"
+    rc_is 0
+    out_has "policy/1: 13 checks, 13 passed"
+  done
+  for f in "maybe:Q04" "allow --exit-at decide:Q04" "allow --hang-at decide#2:Q05" "allow --garbage-at record:Q12" "allow --chatty:Q01"; do
+    want=${f##*:}
+    printf '#!/bin/sh\nexec %s policy %s\n' "$toy" "${f%:*}" >"$W/faulty"
+    chmod 755 "$W/faulty"
+    run test --port policy "$W/faulty"
+    rc_is 1
+    out_has "FAIL $want: got"
+  done
+}
+
 all() {
   t_add_path
   t_ask
@@ -1480,6 +1534,7 @@ all() {
   t_restart
   t_ports
   t_port_toy
+  t_policy
 }
 
 static_bash32

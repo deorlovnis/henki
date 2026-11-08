@@ -203,7 +203,7 @@ fn ctx_use_estimate() {
 fn record_hist_kinds() {
     let d = dir("hist");
     let (mut s, buf) = session(&d, 9);
-    s.record(rec::approval("h1", "auto", None)).unwrap();
+    s.record(rec::approval("h1", "auto", None, None)).unwrap();
     s.notice("a notice").unwrap();
     s.record(rec::tool_result("h1", "shell", "ok", false, 1, 2)).unwrap();
     assert_eq!(kinds(&s.hist), ["tool_result"]);

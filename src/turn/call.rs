@@ -1,9 +1,12 @@
-//! The calls of a step: ids and validation, who approves each (auto, an allow rule, the user), one call with its timeout
-//! and escalation, its result, the stuck rule and the kill path.
+//! The calls of a step: ids and validation, who approves each (auto, an allow rule, a policy binding, the user), one
+//! call with its timeout and escalation, its result, the stuck rule and the kill path.
 use super::{CALL_MAX_S, LATE, SLICE, Session, approve::DENIED};
-use crate::{files, journal, journal::rec, port::Decision, supervise, supervise::GRACE, sys, term, tools, tools::Killed, tools::Target, types::*};
+use crate::{allow, files, journal, journal::rec, port::Decision, supervise, supervise::GRACE, sys, term, tools, tools::Killed, tools::Target, types::*};
 use serde_json::json;
-use std::{time::Duration, time::Instant};
+use std::{path::PathBuf, time::Duration, time::Instant};
+
+/// Why a policy binding's allow was asked instead.
+const FLOOR: &str = "asked: the call touches henki's own files";
 
 /// A call extends the run when it repeats the previous call (name and arguments) and both failed; another failure
 /// starts a run of 1, a success ends it. Identical successes never count.
@@ -36,9 +39,9 @@ impl Session {
         calls
     }
 
-    /// One call of the step and its result: its error; else the tripwire, then who approves it (the policy binding
-    /// allows it, or the user decides: `run` ends the turn, the REPL asks), `call_start` with the verdict, the tripwire
-    /// right before the run, the run, and the tripwire again.
+    /// One call of the step and its result: its error; else the tripwire, then who approves it (the policy allows or
+    /// denies it, under the kernel's floor, or the user decides: `run` ends the turn, the REPL asks), `call_start` with the
+    /// verdict, the tripwire right before the run, the run, and the tripwire again.
     pub(super) fn dispatch(&mut self, c: &Call) -> Result<(), Outcome> {
         if let Some(e) = &c.error {
             return self.answer(c, e, true, None, None);
@@ -49,20 +52,36 @@ impl Session {
             t => t.and_then(Result::ok),
         };
         self.tripwire()?;
-        let (verdict, rule, head) = match self.ports.policy.decide(c, t.as_ref(), &self.cfg, &self.sid) {
+        let (bound, seen) = (self.ports.bound.iter().find(|b| b.0 == "policy").map(|b| b.1.clone()), sys::seen());
+        let d = match self.ports.policy.decide(c, t.as_ref(), &self.cfg, &self.sid) {
+            Decision::Allow { verdict: "policy", .. } if self.floor(c, t.as_ref()) => Decision::Ask { always: false, note: Some(FLOOR.into()) },
+            d => d,
+        };
+        // A signal or the deadline that came while a binding decided ends the turn here (std decides at once); the signal's
+        // event may still be on its way from the signal thread.
+        let slice = if seen == sys::seen() { Duration::ZERO } else { SLICE };
+        bound.is_some().then(|| self.wait(0, Some(Instant::now() + slice))).transpose()?;
+        let (verdict, rule, head) = match d {
             Decision::Allow { verdict, rule, line } => {
                 line.iter().for_each(|l| self.out.line(l));
-                self.record(rec::approval(&c.id, verdict, rule))?;
+                self.record(rec::approval(&c.id, verdict, rule, bound.as_deref().filter(|_| verdict == "policy").map(|b| ("by", b))))?;
                 (verdict, rule, line.is_none())
             }
-            Decision::Ask { .. } if self.reader.is_none() => {
-                self.record(rec::ask(c, t.as_ref().map(|t| t.shown.as_str())))?;
-                return Err(Outcome::NeedsApproval(c.clone()));
+            Decision::Deny(why) => {
+                self.record(rec::approval(&c.id, "deny", None, Some(("reason", &why))))?;
+                return self.answer(c, &why, true, None, None);
             }
-            Decision::Ask { always } => match self.ask(c, t.as_ref(), always)? {
-                Some((verdict, rule)) => (verdict, rule, true),
-                None => return self.answer(c, DENIED, true, None, None),
-            },
+            Decision::Ask { always, note } => {
+                note.iter().try_for_each(|n| self.notice(n))?;
+                if self.reader.is_none() {
+                    self.record(rec::ask(c, t.as_ref().map(|t| t.shown.as_str())))?;
+                    return Err(Outcome::NeedsApproval(c.clone()));
+                }
+                match self.ask(c, t.as_ref(), always)? {
+                    Some((verdict, rule)) => (verdict, rule, true),
+                    None => return self.answer(c, DENIED, true, None, None),
+                }
+            }
         };
         let target = t.as_ref().and_then(|t| t.path.to_str()); // null for a path JSON cannot hold (not UTF-8)
         self.observe("call_start", &json!({"call": {"args": c.args, "id": c.id, "name": c.name}, "rule": rule, "target": target, "verdict": verdict}))?;
@@ -70,6 +89,15 @@ impl Session {
         self.tripwire()?;
         self.call(c, t, head)?;
         self.tripwire()
+    }
+
+    /// The kernel's floor under a policy binding's allow (std's rules and `auto` are the user's own): the call's target is
+    /// protected, a read too (henki's own files it points the model at aside), or a shell command's text names a
+    /// protected path (a seatbelt: the tripwire is the floor). Then the call is asked.
+    fn floor(&self, c: &Call, t: Option<&Target>) -> bool {
+        let (cfg, cmd) = (&self.cfg, c.args["command"].as_str().unwrap_or_default());
+        let named = |p: &PathBuf| p.to_str().is_some_and(|p| cmd.contains(p)) || cmd.contains(&allow::shown(p, &cfg.home));
+        cfg.protected.iter().any(named) || t.is_some_and(|t| t.prot && !(c.name == "read" && tools::pointed(t, cfg, &self.sid)))
     }
 
     /// The tripwire: a changed trust file ends the turn, naming the first.

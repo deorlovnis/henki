@@ -37,6 +37,7 @@ A program reads the contracts this henki ships from the rows of this table: each
 | `observe/1` | henki | a module's observers: the session's events, how henki runs them, and what it waits for |
 | `port/1` | henki | how henki talks to a port binding: a program it starts, JSON lines both ways |
 | `history/1` | henki | the history port's methods over port/1: where sessions are kept |
+| `policy/1` | henki | the policy port's methods over port/1: who may run a call |
 | `conform/1` | henki | the conformance suite files a binding is held to |
 | `module/1` | henki-mods | the module manifest, `.henki/module.toml` |
 | `lock/1` | henki-mods | the module lock, `mods.lock` |
@@ -78,11 +79,11 @@ values of `args` and `blocks` are opaque JSON.
 
 | Kind | Fields |
 |---|---|
-| `session` | `t` `ts` `v` `henki` `id` `cwd` `model` `dialect` `base_url` `base_url_from` `approve` `approve_from` `config` `tools` `shell` `exts` `pass_env` `ctx` `config_hash` `allow_hash` `agents_hash` `project_agents_hash` `resumed` `resumed.from_bytes?` `ports?` `ports.history?` |
+| `session` | `t` `ts` `v` `henki` `id` `cwd` `model` `dialect` `base_url` `base_url_from` `approve` `approve_from` `config` `tools` `shell` `exts` `pass_env` `ctx` `config_hash` `allow_hash` `agents_hash` `project_agents_hash` `resumed` `resumed.from_bytes?` `ports?` `ports.history?` `ports.policy?` |
 | `user` | `t` `ts` `msg` `msg.content` `msg.role` |
 | `assistant` | `t` `ts` `msg` `msg.content` `msg.role` `msg.tool_calls` `msg.tool_calls[].args` `msg.tool_calls[].id` `msg.tool_calls[].name` `msg.tool_calls[].raw?` `finish` `usage` `usage.cached` `usage.in` `usage.out` `blocks?` |
 | `ask` | `t` `ts` `id` `name` `args` `target?` |
-| `approval` | `t` `ts` `id` `verdict` `rule?` |
+| `approval` | `t` `ts` `id` `verdict` `rule?` `by?` `reason?` |
 | `tool_result` | `t` `ts` `id` `name` `content` `is_error` `ms` `bytes` |
 | `notice` | `t` `ts` `text` |
 | `elide` | `t` `ts` `ids` |
@@ -112,7 +113,9 @@ values of `args` and `blocks` are opaque JSON.
 - `ask`: the call `id` needs a human; `target` is the file a `read`, `write` or `edit` call resolves to, as shown.
   In `henki run` an `ask` ends the turn with `needs_approval`.
 - `approval`: who let call `id` run, or not: `verdict` is `auto` (no approval needed), `rule` (allow rule number
-  `rule`), `yes`, `always` (the user saved rule number `rule`) or `no`.
+  `rule`), `policy` (a policy binding allowed it; `by` names it as the binding notice does), `yes`, `always` (the user
+  saved rule number `rule`, or a policy binding kept it), `no`, or `deny` (a policy binding refused it; `reason` is the
+  call's result text).
 - `tool_result`: the result of call `id`; `content` is what the model sees (its wording may change), `is_error` whether
   it failed, `ms` how long it ran, `bytes` the output's full size before any cut.
 - `notice`: something henki told the user (`text` may change).
@@ -427,7 +430,7 @@ NAME/on/EVENT.wait       turn_start and call_start only: henki waits for it, up 
 | `session_end` | the `close` record | the record |
 | `record` | every record a turn journals, after the record's own event; not observer notices | the record |
 
-`call_start`'s `verdict` is the `approval` record's (`auto`, `rule`, `yes`, `always`), `rule` the rule's number or
+`call_start`'s `verdict` is the `approval` record's (`auto`, `rule`, `policy`, `yes`, `always`), `rule` the rule's number or
 null, `target` the resolved path of a file tool's target, or null (a shell call, or a path that is not UTF-8, which
 JSON cannot hold). No event comes before `session_start`.
 
@@ -530,7 +533,7 @@ symbolic link, `MODE SHA256 PATH\n`, sorted bytewise (`LC_ALL=C`) by PATH:
 
 A port is a part without which there is no agent: `model`, `history`, `context`, `exec`, `policy`, `frontend`. Each
 has one binding: the std one built into henki, or a program that `CONFIG_DIR/port/PORT` links to. This henki binds
-`history` that way; `--port PORT=std` (repeatable, all six names) runs a session on std whatever the links say.
+`history` and `policy` that way; `--port PORT=std` (repeatable, all six names) runs a session on std whatever the links say.
 
 - **The link.** henki reads `CONFIG_DIR/port/` at start: names starting with `.` are skipped; any other name must be a
   port this henki binds, and a link to a regular file its owner can run, that file and its directory owned by the user
@@ -558,8 +561,8 @@ has one binding: the std one built into henki, or a program that `CONFIG_DIR/por
   `exists`, `tampered`, `corrupt`, `version`; anything else arrives as `other`. henki adds `timeout`, `crashed`,
   `protocol` and `interrupted`.
 - **Timeouts.** `hello` 5 s, `create` 2 s, `open` 5 s, `read` 10 s per page, `list` 5 s, `append` 2 s, `discard` 2 s,
-  `bye` 300 ms. A signal or the session deadline ends a wait for `hello`, `create`, `open`, `read` or `list` within 50
-  ms, never one for a method that changes state.
+  `decide` 5 s, `record` 2 s, `bye` 300 ms. A signal or the session deadline ends a wait for `hello`, `create`, `open`,
+  `read`, `list` or `decide` within 50 ms, never one for a method that changes state.
 - **The dead rule.** A timeout, a closed stdout, a line over the cap or cut at EOF, a non-object line, or an answer with
   both or neither of `result` and `error` kills the binding for the rest of the session: every later call fails at once.
   An error answer is one failed call; the binding lives on.
@@ -593,6 +596,37 @@ henki checks every answer as it checks its own journal: the id rule, `read` reco
 the pairing of calls and results at start. A history failure in a session ends the turn `error journal` (exit 2) with
 the fix `henki --port history=std for this session, or henki mods swap history std`; henki never falls back to std in
 a session. `list` is for tools (henki-mods, an import); henki itself does not call it. The cap `fork` is reserved.
+
+## policy/1
+
+The policy port over port/1: who may run a call. henki asks it about every call that passed henki's own checks (the
+call's arguments, its target, the tripwire) and before the call runs.
+
+| Method | Params | Result |
+|---|---|---|
+| `decide` | `call` (`args`, `id`, `name`), `cwd`, `root` (the project root), `session`, `target` (a file tool's: `outside`, `path` as resolved, `protected`, `shown`; null for a shell call) | `{"decision":"allow","reason"?:S}`, `{"decision":"ask","always"?:B}` or `{"decision":"deny","reason":S}` |
+| `record` (cap `record`) | `call`, `verdict` (`always`) | `null` or `{"shown":S}`, once it is kept |
+| `bye` | `{}` | `null`, then exit |
+
+- **allow** runs the call and shows `HEAD  (allowed by policy NAME ID: REASON)`; the `approval` record has verdict
+  `policy` and `by`. **deny** does not run it: its result is `denied by policy NAME ID: REASON`, journaled with verdict
+  `deny` and that `reason`, and it counts for the stuck rule. **ask** asks the user in the REPL, and ends `henki run`'s
+  turn `needs_approval`. `always` is offered only when the binding has cap `record` and asked with `always: true`, for a
+  shell call while no earlier process still runs; the user's `always` then calls `record`. A `reason` is shown escaped
+  and cut at 200 characters.
+- **henki's floor**, which no binding changes. A write or edit under a protected path is refused before `decide`. An
+  allow is asked instead, with the notice `asked: the call touches henki's own files`, when the call's target is
+  protected (the config file and dir, AGENTS.md, the state and data dirs, the module paths, the port links and their
+  programs), a read too, except the files henki points the model at (a module's `doc.md`, this session's spill files),
+  or when a shell command's text names a protected path, absolute or with `~/`. That text match is a seatbelt only: a
+  command can name a path in ways no match sees, as with `approve = "auto"`; the tripwire stays the floor for the
+  trust files.
+- **Failure asks.** A binding that does not start or answer `hello` stops the start. In a session a timeout, an exit, a
+  broken line or a decision that is none of the three asks, with one notice naming the binding; the binding is then
+  dead for the session and every later call is asked at once. A signal or the session deadline ends a `decide` within
+  50 ms and the turn with it.
+- **Std.** `approve = "auto"` is a mode of the std policy: henki refuses to start with it while a policy binding is
+  linked (`error config`). While one is linked henki reads no allow rules; `--port policy=std` runs a session on std.
 
 ## conform/1
 

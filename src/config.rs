@@ -187,11 +187,17 @@ pub fn load(f: &Flags, env: &Env, cwd: &Path) -> Result<Config, String> {
         let text = text(&agents, 4 << 10)?;
         (c.agents_hash, c.agents) = (Some(sys::fnv(text.as_bytes())), Some(text.trim_end_matches('\n').to_string()).filter(|a| !a.is_empty()));
     }
+    c.links = port::links(&c.dir, &f.ports, &home)?;
+    // A policy binding decides every call: `auto` is a mode of the std policy, and the std rules are not read.
+    let std = !c.links.iter().any(|l| l.0 == "policy");
+    if c.auto && !std {
+        return Err(format!("{}: approve = auto with a policy binding; fix: set approve = \"ask\", or start with --port policy=std", c.approve_from));
+    }
     let allow = c.dir.join("allow");
-    if !c.auto && allow.exists() && inside(&allow) {
+    if !c.auto && std && allow.exists() && inside(&allow) {
         return Err(format!("{} is inside the project {} or named through it; fix: use a config dir outside the project", allow.display(), root.display()));
     }
-    c.allow = allow::load(&allow, !c.auto)?;
+    c.allow = allow::load(&allow, !c.auto && std)?;
     let n = c.allow.rules.iter().filter(|r| allow::applies(r, &root)).count() as u64;
     if n > 0 {
         c.notices.push(format!("allow: {} rules apply to this root ({}; /allow lists them)", term::num(n), allow::shown(&allow, &home)));
@@ -201,7 +207,6 @@ pub fn load(f: &Flags, env: &Env, cwd: &Path) -> Result<Config, String> {
         c.notices.push("context_window is unknown; using 32,768 tokens".into());
     }
     // The data dir holds the module store, which the ext links point into.
-    c.links = port::links(&c.dir, &f.ports, &home)?;
     let data = xdg(env, &home, "XDG_DATA_HOME", ".local/share");
     let own = c.file.iter().chain([&c.dir, &agents, &c.state, &data]).chain(&paths).chain(c.exts.iter().flat_map(|e| &e.targets));
     c.protected = own.chain(c.links.iter().map(|l| &l.1)).flat_map(|p| [Some(p.clone()), fs::canonicalize(p).ok().filter(|r| r != p)]).flatten().collect();

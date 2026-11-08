@@ -388,7 +388,8 @@ fn std_decide_table() {
     let call = |name: &str, args: serde_json::Value| Call { id: "h1".into(), name: name.into(), args, ..Default::default() };
     let shown = |d: Decision| match d {
         Decision::Allow { verdict, rule, line } => format!("{verdict} {rule:?} {line:?}"),
-        Decision::Ask { always } => format!("ask {always}"),
+        Decision::Ask { always, .. } => format!("ask {always}"),
+        Decision::Deny(why) => format!("deny {why}"),
     };
     let decide = |cfg: &Config, c: &Call| shown(Std.decide(c, None, cfg, "s"));
     let ls = r#"rule Some(1) Some("$ ls  (allowed by rule 1 for *, ~/allow)")"#;
@@ -416,4 +417,46 @@ fn std_record() {
     assert_eq!(load(&t.p("allow"), true).unwrap().rules, [Rule { n: 1, root: t.0.to_string_lossy().into(), cmd: "make test".into() }]);
     cfg.allow.file = t.p("missing/allow");
     assert_eq!(Std.record(&c, &mut cfg), Err("could not write ~/missing/allow: No such file or directory (os error 2)".to_string()));
+}
+
+/// conform/1's policy suite (manager/conform/policy.tsv), the file every outside binding is held to, run against the
+/// std policy in ask mode: each view as the call and its target (resolved as the kernel resolves it), the answers
+/// rendered as `henki port` renders them. Std speaks no protocol, so the hello and version steps are skipped.
+#[test]
+fn conform_policy_std() {
+    let t = T::new();
+    fs::write(t.p("a.txt"), "x").unwrap();
+    let mut cfg = Config::test(&t.0);
+    let saved = [("@SCOPE@".to_string(), t.0.display().to_string()), ("@BIG@".into(), "x".repeat(1 << 20))];
+    let (mut checks, mut steps) = (0, 0);
+    for line in include_str!("../../manager/conform/policy.tsv").lines().filter(|l| !l.starts_with('#') && !l.is_empty()) {
+        let f: Vec<&str> = line.split('\t').collect();
+        let sub = |s: &str| saved.iter().fold(s.to_string(), |s, (k, v)| s.replace(k.as_str(), v));
+        if f[1].starts_with('+') || f[2] == "hello" {
+            continue;
+        }
+        let q: serde_json::Value = serde_json::from_str(&sub(f[2])).unwrap_or_else(|e| panic!("{}: {e}", f[0]));
+        let p = &q["params"];
+        let c = Call {
+            id: p["call"]["id"].as_str().unwrap_or_default().into(),
+            name: p["call"]["name"].as_str().unwrap_or_default().into(),
+            args: p["call"]["args"].clone(),
+            ..Default::default()
+        };
+        let target = p["target"]["path"].as_str().and_then(|path| tools::target(path, c.name != "read", &cfg).ok());
+        let a = match q["method"].as_str().unwrap() {
+            "decide" => Ok(match Std.decide(&c, target.as_ref(), &cfg, "conform-1") {
+                Decision::Allow { .. } => serde_json::json!({"decision": "allow"}),
+                Decision::Ask { always, .. } => serde_json::json!({"decision": "ask", "always": always}),
+                Decision::Deny(why) => serde_json::json!({"decision": "deny", "reason": why}),
+            }),
+            "record" => Std.record(&c, &mut cfg).map(|(shown, _)| serde_json::json!({"shown": shown})).map_err(|e| ("io", e)),
+            m => Err(("unsupported", format!("no method {m}"))),
+        };
+        let got = term::json_line(&a.map_or_else(|(code, message)| serde_json::json!({"error": {"code": code, "message": message}}), |r| serde_json::json!({"result": r})));
+        assert!(crate::journal::tests::conform_match(&sub(f[3]), &got), "{}: got {}", f[0], got.chars().take(400).collect::<String>());
+        steps += 1;
+        checks += usize::from(!f[0].ends_with(|c: char| c.is_ascii_lowercase()));
+    }
+    assert_eq!((steps, checks), (10, 10), "the suite changed: say so here (std skips Q01 and Q02)");
 }

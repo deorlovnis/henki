@@ -39,10 +39,11 @@ nl='
 # ext::prompt's header line; henki joins it to the rest of the system prompt with a blank line ("\n\n").
 HEADER='Extensions are commands on PATH; read the doc in brackets before first use.'
 # The named formats this henki ships (CONTRACTS.md); a module's `contracts` must all be here.
-CONTRACTS_KNOWN='journal/1 json/1 wire/1 ext/1 ext/2 handoff/1 observe/1 module/1 lock/1 hd1 port/1 history/1 conform/1 bind/1'
+CONTRACTS_KNOWN='journal/1 json/1 wire/1 ext/1 ext/2 handoff/1 observe/1 module/1 lock/1 hd1 port/1 history/1 policy/1 conform/1 bind/1'
 # The ports a package may bind (henki's port::LINKED), and what each one gets to see, for the swap screen.
-PORTS_KNOWN='history'
+PORTS_KNOWN='history policy'
 PORT_SEES_history='stores every session record'
+PORT_SEES_policy='decides every call before it runs; protected paths stay refused'
 AGENTS_MAX=4096 # henki refuses to start with a bigger AGENTS.md
 CARDS_BEGIN='# >>> mods cards'
 CARDS_END='# <<< mods cards'
@@ -1805,6 +1806,8 @@ cmd_swap() {
   id=${store##*/}
   say "$port: $was -> $n ${L_version} ($id) · conformance: passed ($port/1, $C_checks checks) · it runs with your rights and $(eval "printf '%s' \"\$PORT_SEES_$port\"")"
   [ "$port" != history ] || say "  your sessions in the std store stay there; henki --port history=std --resume reaches them; import comes with a later henki"
+  [ "$port" != policy ] || [ "$(toml approve <"$CONF/config.toml" 2>/dev/null)" != "approve${tab}S${tab}auto" ] ||
+    say "  henki refuses approve = auto with a policy binding; set approve = \"ask\" in $(shown "$CONF/config.toml")"
   if [ "$yes" = 1 ]; then
     how=yes
   else

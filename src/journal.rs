@@ -370,9 +370,11 @@ pub mod rec {
     pub fn ask(c: &Call, target: Option<&str>) -> Value {
         with(json!({"t": "ask", "id": c.id, "name": c.name, "args": c.args}), "target", target)
     }
-    /// `verdict`: yes, no, always, rule or auto; `rule`: the allow rule's number.
-    pub fn approval(id: &str, verdict: &str, rule: Option<usize>) -> Value {
-        with(json!({"t": "approval", "id": id, "verdict": verdict}), "rule", rule)
+    /// `verdict`: yes, no, always, rule, auto, policy or deny; `rule`: the allow rule's number; `extra`: `by` (the policy
+    /// binding that allowed it) or `reason` (a deny's text).
+    pub fn approval(id: &str, verdict: &str, rule: Option<usize>, extra: Option<(&str, &str)>) -> Value {
+        let (k, x) = extra.unzip();
+        with(with(json!({"t": "approval", "id": id, "verdict": verdict}), "rule", rule), k.unwrap_or("by"), x)
     }
     pub fn tool_result(id: &str, name: &str, content: &str, is_error: bool, ms: u64, bytes: u64) -> Value {
         json!({"t": "tool_result", "id": id, "name": name, "content": content, "is_error": is_error, "ms": ms, "bytes": bytes})
@@ -415,4 +417,4 @@ pub mod rec {
 }
 
 #[cfg(test)]
-mod tests;
+pub mod tests;

@@ -85,7 +85,7 @@ impl Policy for Std {
         if !tools::needs_approval(&c.name, t, cfg, session) {
             return Decision::Allow { verdict: "auto", rule: None, line: None };
         }
-        let Some(r) = cmd.and_then(|cmd| cfg.allow.find(cmd, &cfg.root)) else { return Decision::Ask { always: cmd.is_some_and(|cmd| fits(cmd, &cfg.root)) } };
+        let Some(r) = cmd.and_then(|cmd| cfg.allow.find(cmd, &cfg.root)) else { return Decision::Ask { always: cmd.is_some_and(|cmd| fits(cmd, &cfg.root)), note: None } };
         let line = format!("$ {}  (allowed by rule {} for {}, {})", r.cmd, r.n, shown(Path::new(&r.root), &cfg.home), shown(&cfg.allow.file, &cfg.home));
         Decision::Allow { verdict: "rule", rule: Some(r.n), line: Some(line) }
     }

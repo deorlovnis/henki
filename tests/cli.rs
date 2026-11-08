@@ -316,7 +316,7 @@ fn port_pipe() {
     let out = h.run(&["port", "history", "--offer", "99", "--", b.to_str().unwrap()], &[]);
     assert_eq!(out.status.code(), Some(2));
     assert_eq!(text(&out.stdout), format!("{{\"error\":{{\"code\":\"version\",\"message\":\"history binding {}: version: history/1 only\"}}}}\n", b.display()));
-    for (args, says) in [(&["port", "policy", "--", "/x"][..], "henki port takes history, not policy"), (&["port", "history"][..], "henki port needs -- PROGRAM")] {
+    for (args, says) in [(&["port", "context", "--", "/x"][..], "henki port takes history or policy, not context"), (&["port", "history"][..], "henki port needs -- PROGRAM")] {
         let out = h.run(args, &[]);
         assert_eq!(out.status.code(), Some(2), "{args:?}");
         assert!(text(&out.stderr).starts_with(&format!("henki: {says}\n")), "{args:?}: {}", text(&out.stderr));

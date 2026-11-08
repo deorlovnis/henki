@@ -333,7 +333,7 @@ fn journal_record_shapes() {
     );
     assert_eq!(s(rec::ask(&call("h1"), None)), r#"{"args":{"command":"ls"},"id":"h1","name":"shell","t":"ask"}"#);
     assert_eq!(s(rec::ask(&call("h1"), Some("/p/a"))), r#"{"args":{"command":"ls"},"id":"h1","name":"shell","t":"ask","target":"/p/a"}"#);
-    assert_eq!(s(rec::approval("h1", "auto", None)), r#"{"id":"h1","t":"approval","verdict":"auto"}"#);
+    assert_eq!(s(rec::approval("h1", "auto", None, None)), r#"{"id":"h1","t":"approval","verdict":"auto"}"#);
     assert_eq!(
         s(rec::tool_result("call_7", "shell", "ws1 open\n[exit 0, 0.3 s]", false, 312, 402)),
         r#"{"bytes":402,"content":"ws1 open\n[exit 0, 0.3 s]","id":"call_7","is_error":false,"ms":312,"name":"shell","t":"tool_result"}"#
@@ -406,10 +406,10 @@ fn journal_assistant_blocks() {
 #[test]
 fn journal_approval_rule() {
     let s = |v: Value| serde_json::to_string(&v).unwrap();
-    assert_eq!(s(rec::approval("call_7", "rule", Some(3))), r#"{"id":"call_7","rule":3,"t":"approval","verdict":"rule"}"#);
-    assert_eq!(s(rec::approval("h1", "always", Some(1))), r#"{"id":"h1","rule":1,"t":"approval","verdict":"always"}"#);
+    assert_eq!(s(rec::approval("call_7", "rule", Some(3), None)), r#"{"id":"call_7","rule":3,"t":"approval","verdict":"rule"}"#);
+    assert_eq!(s(rec::approval("h1", "always", Some(1), None)), r#"{"id":"h1","rule":1,"t":"approval","verdict":"always"}"#);
     for v in ["yes", "no", "auto"] {
-        assert_eq!(s(rec::approval("h1", v, None)), format!(r#"{{"id":"h1","t":"approval","verdict":"{v}"}}"#));
+        assert_eq!(s(rec::approval("h1", v, None, None)), format!(r#"{{"id":"h1","t":"approval","verdict":"{v}"}}"#));
     }
 }
 
@@ -423,7 +423,7 @@ fn journal_sync_table() {
         (rec::user("u"), true),
         (asst(&["h1"]), true),
         (rec::ask(&c, None), false),
-        (rec::approval("h1", "auto", None), false),
+        (rec::approval("h1", "auto", None, None), false),
         (res("h1"), true),
         (rec::notice("n"), false),
         (rec::elide(&["h1".into()]), true),
@@ -765,7 +765,7 @@ fn record_hist_kinds() {
         rec::user("u"),
         rec::assistant("", std::slice::from_ref(&c), "tool_calls", Usage::default(), None),
         rec::ask(&c, Some("/x")),
-        rec::approval("h1", "auto", None),
+        rec::approval("h1", "auto", None, None),
         rec::notice("n"),
         res("h1"),
         rec::elide(&[]),
@@ -938,7 +938,7 @@ fn pairing_ignores_non_message_kinds() {
         rec::user("u"),
         asst(&["h1"]),
         rec::ask(&c, None),
-        rec::approval("h1", "auto", None),
+        rec::approval("h1", "auto", None, None),
         rec::notice("n"),
         res("h1"),
         rec::elide(&["h1".into()]),

@@ -188,3 +188,32 @@ fn remote_append_overhead() {
     eprintln!("append ms p50/p95: std {:.3}/{:.3}, port_toy over port/1 {:.3}/{:.3}", std.0, std.1, remote.0, remote.1);
     assert!(remote.0 - std.0 < 1.0 && remote.1 - std.1 < 5.0, "over std: p50 {:.3} ms, p95 {:.3} ms", remote.0 - std.0, remote.1 - std.1);
 }
+
+/// The cost of policy over port/1: 1,000 `decide`s of a typical shell call through `Remote` to port_toy, each the
+/// round trip a call waits for before it runs or is asked. p95 under 50 ms.
+#[test]
+#[ignore = "release gate"]
+fn remote_decide_cost() {
+    let _timed = crate::types::lock(&crate::types::TIMED);
+    let t = Tmp(std::env::temp_dir().join(format!("henki-remote-decide-{}", std::process::id())));
+    let _ = fs::remove_dir_all(&t.0);
+    fs::create_dir_all(&t.0).unwrap();
+    let w = t.0.join("toy");
+    fs::write(&w, format!("#!/bin/sh\nexec {} policy allow\n", port_toy().display())).unwrap();
+    fs::set_permissions(&w, fs::Permissions::from_mode(0o700)).unwrap();
+    let env = vec![("PATH".into(), "/usr/bin:/bin".into())];
+    let mut r = Remote::start("policy", &w, ("toy".into(), String::new()), &t.0, &env, Stdio::null()).unwrap();
+    r.hello(&t.0, &t.0, &[1]).unwrap();
+    let cfg = Config::test(&t.0);
+    let c = Call { id: "h1".into(), name: "shell".into(), args: json!({"command": "cargo test --locked"}), ..Default::default() };
+    let ms: Vec<f64> = (0..1_000)
+        .map(|_| {
+            let t0 = Instant::now();
+            assert!(matches!(r.decide(&c, None, &cfg, "s"), Decision::Allow { verdict: "policy", .. }));
+            t0.elapsed().as_secs_f64() * 1e3
+        })
+        .collect();
+    let (p50, p95) = p50_p95(ms);
+    eprintln!("decide ms through Remote to port_toy: p50 {p50:.3}, p95 {p95:.3}");
+    assert!(p95 < 50.0, "p95 {p95:.3} ms");
+}

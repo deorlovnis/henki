@@ -16,7 +16,7 @@ impl Session {
         // A rule saves an exact command; none while a process started earlier still runs, since it may be what the
         // command talks to.
         let bg = supervise::reap();
-        let offer = always && bg == 0;
+        let offer = always && shell && bg == 0;
         let ((rows, cols), lines) = (sys::winsize(0).unwrap_or((24, 80)), tools::display(c, t));
         self.out.control(term::RESET);
         lines.iter().for_each(|l| self.out.line(l));
@@ -37,7 +37,8 @@ impl Session {
                     self.tripwire()?;
                     match self.ports.policy.record(c, &mut self.cfg) {
                         Ok((line, n)) => {
-                            self.rearm();
+                            // Only std writes a rule (a number): an outside binding's keeping absorbs no change.
+                            n.is_some().then(|| self.rearm());
                             self.out.line(&line);
                             return self.verdict(c, "always", n);
                         }
@@ -80,7 +81,7 @@ impl Session {
 
     /// Journals the verdict; it and the rule unless it is `no`.
     fn verdict(&mut self, c: &Call, verdict: &'static str, rule: Option<usize>) -> Result<Option<(&'static str, Option<usize>)>, Outcome> {
-        self.record(rec::approval(&c.id, verdict, rule))?;
+        self.record(rec::approval(&c.id, verdict, rule, None))?;
         Ok((verdict != "no").then_some((verdict, rule)))
     }
 }

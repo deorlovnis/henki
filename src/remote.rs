@@ -5,9 +5,10 @@
 //! timeout; for the methods that change nothing a signal or the session deadline cuts the wait short (`interrupted`,
 //! `budget`).
 //! A timeout, an exit or a broken line kills the binding for the rest of the session: every later call fails at once
-//! with that error, and the kernel's floor takes over (history: the turn ends `error journal`).
-use crate::port::{self, History, PortError, Record, Taken, err};
-use crate::{supervise, sys, term, term::Out, types::Ev, types::Outcome};
+//! with that error, and the kernel's floor takes over (history: the turn ends `error journal`; policy: every call is
+//! asked).
+use crate::port::{self, Decision, History, Policy, PortError, Record, Taken, err};
+use crate::{config::Config, supervise, sys, term, term::Out, tools, tools::Target, types::Call, types::Ev, types::Outcome};
 use serde_json::{Value, json};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
@@ -19,8 +20,8 @@ pub const LINE_MAX: usize = 16 << 20;
 const READ_MAX: usize = 256 << 20;
 /// The contract timeout of each method in ms, and whether a signal or the deadline ends the wait (side-effect free only).
 #[rustfmt::skip]
-const METHODS: [(&str, u64, bool); 8] = [("hello", 5_000, true), ("create", 2_000, true), ("open", 5_000, true), ("read", 10_000, true), ("list", 5_000, true),
-    ("append", 2_000, false), ("discard", 2_000, false), ("bye", 300, false)];
+const METHODS: [(&str, u64, bool); 10] = [("hello", 5_000, true), ("create", 2_000, true), ("open", 5_000, true), ("read", 10_000, true), ("list", 5_000, true),
+    ("append", 2_000, false), ("discard", 2_000, false), ("decide", 5_000, true), ("record", 2_000, false), ("bye", 300, false)];
 
 /// One line from the binding: the object and its length, or why the binding is broken.
 type Line = Result<(Value, usize), String>;
@@ -44,6 +45,8 @@ pub struct Remote {
     next: u64,
     got: usize,
     dead: Option<PortError>,
+    /// The policy's failure was said (once: every later call is asked without it).
+    noted: bool,
 }
 
 impl Remote {
@@ -51,7 +54,7 @@ impl Remote {
     /// ends every failure's message.
     pub fn start(port: &'static str, exe: &Path, (name, fix): (String, String), cwd: &Path, env: &[(OsString, OsString)], stderr: Stdio) -> Result<Remote, PortError> {
         let ((tx, wrx), (rtx, rx)) = (mpsc::channel::<String>(), mpsc::channel());
-        let mut r = Remote { port, name, said: String::new(), caps: Vec::new(), deadline: None, fix, child: None, tx, rx, next: 0, got: 0, dead: None };
+        let mut r = Remote { port, name, said: String::new(), caps: Vec::new(), deadline: None, fix, child: None, tx, rx, next: 0, got: 0, dead: None, noted: false };
         let mut c = supervise::kernel_child(exe, cwd, env, [Stdio::piped(), Stdio::piped(), stderr]).map_err(|e| r.named("crashed", &format!("not started: {e}")))?;
         let (stdin, stdout) = (c.stdin.take(), c.stdout.take());
         r.child = Some(c);
@@ -213,6 +216,36 @@ impl History for Remote {
 
     fn discard(&mut self, session: &str) -> Result<bool, PortError> {
         Ok(self.call("discard", json!({"session": session}))?["removed"] == true)
+    }
+}
+
+impl Policy for Remote {
+    /// The binding's verdict on the call's view. A failure, an interruption or an answer that is not allow, ask or deny
+    /// asks (fail closed); a failure is said once, and a broken answer kills the binding. The caller's `poll` ends the
+    /// turn on the signal or the deadline that interrupted it.
+    fn decide(&mut self, c: &Call, t: Option<&Target>, cfg: &Config, session: &str) -> Decision {
+        let target = t.map(|t| json!({"outside": t.outside, "path": t.path, "protected": t.prot, "shown": t.shown}));
+        let view = json!({"call": {"args": c.args, "id": c.id, "name": c.name}, "cwd": cfg.cwd, "root": cfg.root, "session": session, "target": target});
+        let known = |a: &Value| matches!(a["decision"].as_str(), Some("allow" | "ask" | "deny"));
+        let a = match self.call("decide", view).and_then(|a| if known(&a) { Ok(a) } else { Err(self.fail(err("protocol", "decide: the decision is not allow, ask or deny"))) }) {
+            Ok(a) => a,
+            Err(e) => {
+                let said = matches!(e.code, "interrupted" | "budget") || std::mem::replace(&mut self.noted, true);
+                return Decision::Ask { always: false, note: (!said).then(|| format!("{}; every call is asked", e.message)) };
+            }
+        };
+        let why = a["reason"].as_str().filter(|r| !r.is_empty()).map_or(String::new(), |r| format!(": {}", term::escape(&r.chars().take(200).collect::<String>())));
+        match a["decision"].as_str() {
+            Some("allow") => Decision::Allow { verdict: "policy", rule: None, line: Some(format!("{}  (allowed by policy {}{why})", tools::head(c), self.name)) },
+            Some("deny") => Decision::Deny(format!("denied by policy {}{why}", self.name)),
+            _ => Decision::Ask { always: a["always"] == true && self.caps.iter().any(|k| k == "record"), note: None },
+        }
+    }
+
+    /// The person said `always` to a call the binding asked about with `always`: the binding keeps it.
+    fn record(&mut self, c: &Call, _: &mut Config) -> Result<(String, Option<usize>), String> {
+        let a = self.call("record", json!({"call": {"args": c.args, "id": c.id, "name": c.name}, "verdict": "always"})).map_err(|e| e.message)?;
+        Ok((a["shown"].as_str().map_or_else(|| format!("kept by policy {}", self.name), |s| term::escape(s).into_owned()), None))
     }
 }
 

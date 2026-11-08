@@ -1,9 +1,9 @@
 //! The ports: the parts without which there is no agent. Each always has one binding: the std one built in, or a program
-//! that `CONFIG/port/NAME` links to (written by `henki mods swap`, never by henki). The kernel calls `history` and `policy` through these traits and checks every answer the same way, whoever
-//! gave it; the other four ports keep their typed seams (model: `types::Wire`; context: `Session::elide`; exec:
-//! `supervise::spawn` and `files::start`; frontend: `repl::run` and the headless branch of `main::run`). Each trait
-//! mirrors its protocol's method set (`port/1`, `history/1` in CONTRACTS.md), one method each, and only henki
-//! implements them.
+//! that `CONFIG/port/NAME` links to (written by `henki mods swap`, never by henki). The kernel calls `history` and
+//! `policy` through these traits and checks every answer the same way, whoever gave it; the other four ports keep their
+//! typed seams (model: `types::Wire`; context: `Session::elide`; exec: `supervise::spawn` and `files::start`; frontend:
+//! `repl::run` and the headless branch of `main::run`). Each trait mirrors its protocol's method set (`port/1`,
+//! `history/1`, `policy/1` in CONTRACTS.md), one method each, and only henki implements them.
 use crate::{allow, allow::Std, config, config::Config, journal::Journal, remote::Remote, supervise, sys, tools::Target, types::Call, types::Outcome};
 use serde_json::Value;
 use std::path::{Path, PathBuf};
@@ -14,7 +14,7 @@ pub type Record = Value;
 
 /// What `--port NAME=std` accepts (all six, so a script stays valid as more ports open), then what a link can bind now.
 pub const PORTS: [&str; 6] = ["model", "history", "context", "exec", "policy", "frontend"];
-pub const LINKED: [&str; 1] = ["history"];
+pub const LINKED: [&str; 2] = ["history", "policy"];
 /// The codes a binding may send; henki itself adds timeout, crashed, protocol, interrupted and budget.
 const CODES: [&str; 10] = ["invalid", "unsupported", "io", "not_found", "busy", "exists", "tampered", "corrupt", "version", "other"];
 
@@ -78,11 +78,14 @@ pub trait History {
 
 /// The policy port's answer for one call.
 pub enum Decision {
-    /// Runs without a question: the journal verdict (`auto`, `rule`), the rule's number, and the line shown in place of
-    /// the call's head (None: the head, as for auto).
+    /// Runs without a question: the journal verdict (`auto`, `rule`, `policy`), the rule's number, and the line shown in
+    /// place of the call's head (None: the head, as for auto).
     Allow { verdict: &'static str, rule: Option<usize>, line: Option<String> },
-    /// The person decides (`run`: the turn ends needs_approval); `always`: a saved rule may be offered.
-    Ask { always: bool },
+    /// The person decides (`run`: the turn ends needs_approval); `always`: a saved rule may be offered; `note`: why
+    /// henki asks, shown and journaled first.
+    Ask { always: bool, note: Option<String> },
+    /// Not run: the call's result text, which counts for the stuck rule.
+    Deny(String),
 }
 
 /// `policy/1`: who may run a call. Asked after the kernel's floor: validation, the target and its protected-write
@@ -149,7 +152,7 @@ pub fn bind(cfg: &mut Config, deadline: Option<Instant>) -> Result<Ports, Outcom
         let r = greeted.map_err(|e| if matches!(e.code, "interrupted" | "budget") { outcome(e) } else { bad(e.message) })?;
         cfg.notices.push(format!("{p}: {name} (port/1, {}); henki --port {p}=std runs a session without it", r.said));
         ports.bound.push((p, name));
-        ports.history = Box::new(r);
+        if p == "history" { ports.history = Box::new(r) } else { ports.policy = Box::new(r) }
     }
     Ok(ports)
 }

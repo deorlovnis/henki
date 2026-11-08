@@ -5,6 +5,10 @@
 //! lock on its file (`File::try_lock`), which the system drops when the process ends, SIGKILL included. Its pid goes
 //! into `STATE/pid`.
 //!
+//! `port_toy policy MODE [FAULT...]` is a `policy/1` binding with cap `record` that answers every `decide` the same
+//! way: MODE `allow`, `ask`, `ask-always` (ask, offering always), `deny`, or `maybe` (a decision no contract has). Each
+//! `decide`'s params go as one line into `STATE/decide.log`, each `record`'s into `STATE/record.log`.
+//!
 //! Faults (each one is how a broken binding behaves; tests run them through a wrapper script, because henki starts a
 //! binding with no arguments):
 //!   --exit-at M     exits (status 3) when request M comes        --hang-at M     never answers M (M#K: the Kth M)
@@ -30,6 +34,7 @@ struct Opts {
     no_durable: bool,
     bad_id: bool,
     name: Option<String>,
+    policy: Option<String>, // the MODE of a policy binding
 }
 
 struct Held {
@@ -48,11 +53,12 @@ struct Toy {
 
 fn main() {
     // henki runs a binding with no arguments: then it is a plain history binding.
-    let mut args = std::env::args().skip(1).peekable();
-    if args.peek().is_some() {
-        assert_eq!(args.next().as_deref(), Some("history"), "usage: port_toy [history [FAULT...]]");
+    let (mut args, mut o) = (std::env::args().skip(1).peekable(), Opts::default());
+    match args.next().as_deref() {
+        None | Some("history") => {}
+        Some("policy") => o.policy = args.next(),
+        Some(_) => panic!("usage: port_toy [history [FAULT...] | policy MODE [FAULT...]]"),
     }
-    let mut o = Opts::default();
     while let Some(a) = args.next() {
         match a.as_str() {
             "--exit-at" | "--hang-at" | "--garbage-at" | "--huge-at" | "--error-at" => _ = o.at.insert(a, args.next().unwrap()),
@@ -127,12 +133,42 @@ impl Toy {
         json!({"session": if self.o.bad_id { "../x" } else { id }})
     }
 
-    fn answer(&mut self, method: &str, p: &Value) -> Answer {
+    /// A policy binding's answer: the same decision every time, each request logged.
+    fn policy(&mut self, mode: &str, method: &str, p: &Value) -> Answer {
+        let log = |f: &str| OpenOptions::new().create(true).append(true).open(self.state.join(f)).unwrap().write_all(format!("{p}\n").as_bytes()).unwrap();
         match method {
             "hello" => {
-                if !p["versions"].as_array().is_some_and(|v| v.contains(&json!(1))) {
-                    return Err(("version", "port_toy speaks history/1 only".into()));
-                }
+                self.state = PathBuf::from(p["state"].as_str().unwrap_or("."));
+                fs::create_dir_all(&self.state).map_err(|e| ("io", e.to_string()))?;
+                fs::write(self.state.join("pid"), std::process::id().to_string()).map_err(|e| ("io", e.to_string()))?;
+                let name = self.o.name.clone().unwrap_or("port_toy".into());
+                Ok(json!({"caps": ["record"], "impl": "0.1.0", "name": name, "protocol": 1, "version": 1}))
+            }
+            "decide" => {
+                log("decide.log");
+                Ok(match mode {
+                    "allow" => json!({"decision": "allow", "reason": "port_toy allows every call"}),
+                    "ask" => json!({"decision": "ask"}),
+                    "ask-always" => json!({"decision": "ask", "always": true}),
+                    "deny" => json!({"decision": "deny", "reason": "port_toy denies every call"}),
+                    m => json!({"decision": m}),
+                })
+            }
+            "record" => Ok((log("record.log"), json!({"shown": "kept by port_toy"})).1),
+            "bye" => Ok(Value::Null),
+            m => Err(("unsupported", format!("no method {m}"))),
+        }
+    }
+
+    fn answer(&mut self, method: &str, p: &Value) -> Answer {
+        if !p["versions"].as_array().is_none_or(|v| v.contains(&json!(1))) {
+            return Err(("version", "port_toy speaks version 1 only".into()));
+        }
+        if let Some(mode) = self.o.policy.clone() {
+            return self.policy(&mode, method, p);
+        }
+        match method {
+            "hello" => {
                 self.state = PathBuf::from(p["state"].as_str().unwrap_or("."));
                 fs::create_dir_all(&self.state).map_err(|e| ("io", e.to_string()))?;
                 fs::write(self.state.join("pid"), std::process::id().to_string()).map_err(|e| ("io", e.to_string()))?;

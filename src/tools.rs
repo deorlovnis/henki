@@ -76,10 +76,11 @@ pub struct Target {
     pub dir_id: (u64, u64),     // (dev, ino) of `base`
     pub mode: Option<u32>,      // an existing file's mode
     pub outside: bool,          // outside the project root
+    pub prot: bool,             // under a protected path: a write is refused here, and a policy binding cannot allow a read
 }
 
-/// Resolve a file tool's path before anything is shown or run: against `cfg.cwd`, with `~/` as `cfg.home`, refused under
-/// `cfg.protected` (write), `outside` of `cfg.root`.
+/// Resolve a file tool's path before anything is shown or run: against `cfg.cwd`, with `~/` as `cfg.home`, `prot` under
+/// `cfg.protected` (a write there is refused), `outside` of `cfg.root`.
 pub fn target(path: &str, write: bool, cfg: &Config) -> Result<Target, String> {
     let fail = io_error(path);
     if write && matches!(path.rsplit('/').next(), Some("" | "." | "..")) {
@@ -114,7 +115,8 @@ pub fn target(path: &str, write: bool, cfg: &Config) -> Result<Target, String> {
     // Each protected path is resolved as a target is (realpath of its nearest existing ancestor, then the rest), so one
     // that does not exist yet still matches when it is named through a symlink.
     let resolve = |p: &Path| p.ancestors().find_map(|a| Some(fs::canonicalize(a).ok()?.join(p.strip_prefix(a).ok()?)));
-    if write && cfg.protected.iter().filter_map(|p| resolve(p)).any(|p| resolved.starts_with(p)) {
+    let prot = cfg.protected.iter().filter_map(|p| resolve(p)).any(|p| resolved.starts_with(p));
+    if write && prot {
         return Err(format!("protected: {path} is henki's own file; change it through shell so the user sees it"));
     }
     let root = fs::canonicalize(&cfg.root).unwrap_or_else(|_| cfg.root.clone());
@@ -127,7 +129,7 @@ pub fn target(path: &str, write: bool, cfg: &Config) -> Result<Target, String> {
     let arrow = if resolved == given { String::new() } else { format!(" -> {}", resolved.display()) };
     let tags = [(found.is_symlink(), "symlink"), (outside, "outside project")].iter().filter(|t| t.0).map(|t| t.1).collect::<Vec<_>>().join(", ");
     let shown = if tags.is_empty() { format!("{path}{arrow}") } else { format!("{path}{arrow} ({tags})") };
-    Ok(Target { path: resolved, shown, base, missing, name, dir_id: (b.dev(), b.ino()), mode, outside })
+    Ok(Target { path: resolved, shown, base, missing, name, dir_id: (b.dev(), b.ino()), mode, outside, prot })
 }
 
 /// `PATH: No such file or directory`: an OS error with the path it concerns, without `(os error 2)`.
@@ -135,16 +137,19 @@ pub fn io_error(path: &str) -> impl Fn(io::Error) -> String + Copy + '_ {
     move |e| format!("{path}: {}", e.to_string().split(" (os error").next().unwrap_or_default())
 }
 
-/// `ask` mode: shell, write and edit always; read only outside the project root, except henki's own files the model is
-/// pointed at: an extension's `doc.md` and this session's spill files (`<state>/spill/<session>-N.log`). `auto`: never.
+/// `ask` mode: shell, write and edit always; read only outside the project root, except the files henki points the
+/// model at (`pointed`). `auto`: never.
 pub fn needs_approval(name: &str, t: Option<&Target>, cfg: &Config, session: &str) -> bool {
+    !cfg.auto && (name != "read" || !t.is_some_and(|t| !t.outside || pointed(t, cfg, session)))
+}
+
+/// henki's own files the model is pointed at: an extension's `doc.md` and this session's spill files
+/// (`<state>/spill/<session>-N.log`).
+pub fn pointed(t: &Target, cfg: &Config, session: &str) -> bool {
     let real = |p: &Path| fs::canonicalize(p).ok();
-    let spill = |t: &Target| {
-        let n = t.name.to_str().and_then(|n| n.strip_prefix(session)?.strip_prefix('-')?.strip_suffix(".log"));
-        n.is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit())) && t.path.parent() == real(&cfg.state.join("spill")).as_deref()
-    };
-    let free = |t: &Target| !t.outside || spill(t) || cfg.exts.iter().any(|e| real(&e.doc).as_ref() == Some(&t.path));
-    !cfg.auto && (name != "read" || !t.is_some_and(free))
+    let n = t.name.to_str().and_then(|n| n.strip_prefix(session)?.strip_prefix('-')?.strip_suffix(".log"));
+    let spill = n.is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit())) && t.path.parent() == real(&cfg.state.join("spill")).as_deref();
+    spill || cfg.exts.iter().any(|e| real(&e.doc).as_ref() == Some(&t.path))
 }
 
 /// The approval display, without the reset and the question: a header rule (the tool, a file tool's target, and for a
