@@ -22,8 +22,10 @@ die() {
 # The repo's config can name programs git runs as it reads the work tree (core.fsmonitor, a filter driver's clean,
 # smudge or process command, in write-tree too) or updates a ref (a hook): a model's write to .git/config would have
 # them run unasked at the next snapshot, before henki's trust check. Every git call here turns them off, so a snapshot
-# holds the files' bytes as they are and a restore puts those bytes back.
+# holds the files' bytes as they are and a restore puts those bytes back. git -c splits at the first "=", so a driver
+# whose name holds one ([filter "a=b"]) cannot be turned off so: no git call runs in such a repo (`eq`).
 drivers=$(git config --name-only --get-regexp '^filter\..*\.(clean|smudge|process|required)$' 2>/dev/null)
+case "$drivers" in *=*) eq="the repo's config names a filter driver with \"=\" in its name, which this mod cannot turn off" ;; *) eq="" ;; esac
 g() {
   while IFS= read -r k; do
     [ -z "$k" ] || set -- -c "$k=" "$@"
@@ -35,15 +37,28 @@ EOF
 
 # The work tree as a git tree object: every file git does not ignore, tracked or not, through a temporary index that
 # starts as a copy of the real one (so unchanged files are known by their stat data and not read again). The ignore
-# rules are the work tree's of now: once an edit drops one, the files it hid are in the snapshots after it.
+# rules are the work tree's of now: once an edit drops one, the files it hid are in the snapshots after it. A file or
+# directory git cannot read (mode 000, a root-owned volume, a nested repo with no commit) would fail the whole add, and
+# every snapshot after it, unseen: it is left out instead, and git's reasons follow the tree id, each after "; ".
 tree() {
   t_dir=$(mktemp -d "${TMPDIR:-/tmp}/henki-checkpoint.XXXXXX") || return 1
   t_real=$(g rev-parse --path-format=absolute --git-path index 2>/dev/null || g rev-parse --git-path index)
   [ ! -f "$t_real" ] || cp "$t_real" "$t_dir/index"
-  (cd "$top" && export GIT_INDEX_FILE="$t_dir/index" && g add -A && g write-tree)
+  t_id=$(cd "$top" && export GIT_INDEX_FILE="$t_dir/index" && { g add -A --ignore-errors 2>"$t_dir/err" || echo "error: git add failed" >>"$t_dir/err"; } && g write-tree)
   t_rc=$?
+  cat "$t_dir/err" >&2
+  [ "$t_rc" != 0 ] || printf '%s%s\n' "$t_id" "$(sed -n -e 's/^error: /; /p' -e 's/^fatal: /; /p' -e 's/^warning: \(could not open\)/; \1/p' "$t_dir/err" | tr -d '\n')"
   rm -rf "$t_dir"
   return $t_rc
+}
+
+# A snapshot that failed or lacks files, as a line in $kept/missed: an observer's exit status and output reach only
+# henki's log, so /checkpoints, /undo and /rewind show these lines (`missed`).
+miss() {
+  mkdir -p "$kept" 2>/dev/null && printf '%s  %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$*" >>"$kept/missed"
+}
+missed() {
+  [ ! -s "$kept/missed" ] || { echo "calls with no checkpoint or a partial one:" && sed 's/^/  /' "$kept/missed"; }
 }
 
 # The snapshot numbers of this session, in order.
@@ -61,26 +76,35 @@ snapshot() {
   name=$(printf '%s\n' "$ev" | sed -n 's/.*"name":"\([^"]*\)"},"rule":.*/\1/p')
   case "$name" in write | edit | shell) ;; *) exit 0 ;; esac
   path=$(printf '%s\n' "$ev" | sed -n 's/.*,"target":"\(.*\)","verdict":"[a-z]*"},"event":.*/\1/p')
+  no() {
+    miss "no checkpoint before $name${path:+ $path}: $*"
+    die "$*"
+  }
   n=$(($(numbers | tail -n 1) + 1))
   if [ -n "$top" ]; then
-    t=$(tree) || die "cannot read the work tree"
+    [ -z "$eq" ] || no "$eq"
+    t=$(tree) || no "cannot read the work tree"
+    why=""
+    case "$t" in *\;*) why=${t#*;} t=${t%%;*} ;; esac
     head=$(g rev-parse -q --verify HEAD)
-    c=$(g -c user.name=henki -c user.email=henki@localhost -c commit.gpgsign=false commit-tree "$t" ${head:+-p "$head"} -m "before $name${path:+ $path}") ||
-      die "cannot make a commit"
+    c=$(g -c user.name=henki -c user.email=henki@localhost -c commit.gpgsign=false commit-tree "$t" ${head:+-p "$head"} -m "before $name${path:+ $path}${why:+ (partial)}") ||
+      no "cannot make a commit"
     # Another snapshot may have taken the number (a run that was not waited for): the next free one.
     tries=0
     until g update-ref "$refs/$n" "$c" "" 2>/dev/null; do
       n=$((n + 1)) tries=$((tries + 1))
-      [ "$tries" -lt 100 ] || die "cannot keep the snapshot in $refs"
+      [ "$tries" -lt 100 ] || no "cannot keep the snapshot in $refs"
     done
+    [ -z "$why" ] || miss "checkpoint $n, before $name${path:+ $path}, lacks what git could not read:${why#;}"
     exit 0
   fi
   [ "$name" != shell ] || exit 0
-  case "$path" in '' | *\\*) die "cannot keep ${path:-the target}: no plain path in the event" ;; esac
-  mkdir -p "$kept" || die "cannot make $kept"
+  case "$path" in '' | *\\*) no "cannot keep ${path:-the target}: no plain path in the event" ;; esac
+  mkdir -p "$kept" || no "cannot make $kept"
   until mkdir "$kept/$n" 2>/dev/null; do n=$((n + 1)); done
-  printf '%s\n' "$path" >"$kept/$n/path"
-  if [ -f "$path" ]; then cp -p "$path" "$kept/$n/file"; else : >"$kept/$n/absent"; fi
+  # A target that cannot be copied leaves no snapshot that /undo would fail on.
+  printf '%s\n' "$path" >"$kept/$n/path" && if [ -f "$path" ]; then cp -p "$path" "$kept/$n/file"; else : >"$kept/$n/absent"; fi ||
+    { rm -rf "${kept:?}/$n" && no "cannot copy $path"; }
 }
 
 # y or yes on stdin (the terminal henki runs a command on).
@@ -95,8 +119,10 @@ yes_() {
 restore() {
   n=$1
   if [ -n "$top" ]; then
+    [ -z "$eq" ] || die "$eq"
     g rev-parse -q --verify "$refs/$n^{tree}" >/dev/null || die "no checkpoint $n; fix: /checkpoints lists them"
     cur=$(tree) || die "cannot read the work tree"
+    cur=${cur%%;*}
     gd=$(g rev-parse --absolute-git-dir) || die "cannot find the git dir"
     d=$(mktemp -d "${TMPDIR:-/tmp}/henki-checkpoint.XXXXXX") || exit 1
     trap 'rm -rf "$d"' EXIT
@@ -141,15 +167,18 @@ restore() {
 case "$me" in
   call_start.wait) snapshot ;;
   undo)
+    missed
     n=$(numbers | tail -n 1)
     [ -n "$n" ] || die "no checkpoints in this session"
     restore "$n"
     ;;
   rewind)
     case "${1:-}" in '' | *[!0-9]*) die "usage: /rewind N; fix: /checkpoints lists them" ;; esac
+    missed
     restore "$1"
     ;;
   *)
+    missed
     [ -n "$(numbers)" ] || {
       echo "no checkpoints in this session"
       exit 0

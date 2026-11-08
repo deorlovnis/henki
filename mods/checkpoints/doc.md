@@ -18,7 +18,11 @@ An observer and commands for you, not for the model (they cost no prompt bytes):
 Ignored files (`.gitignore`, under the rules as they are when the snapshot is made) are not in a snapshot. So once an
 edit drops a rule, the files it hid are in the snapshots after it, kept by refs: a `git push --mirror` would publish
 them. The mod's git calls run no program your git config names (no `core.fsmonitor`, hook, pager or filter driver such
-as Git LFS): a snapshot holds the files' bytes as they are, and `/undo` puts those bytes back. A snapshot that takes
-over 2 s (a very large work tree) still finishes, but henki stops waiting for it, says so, and runs the calls after it
-without waiting. The model is not told about an `/undo`: say so in your next message. Old snapshots stay until you
-remove them: `git for-each-ref --format='%(refname)' refs/henki/ | xargs -n 1 git update-ref -d`.
+as Git LFS): a snapshot holds the files' bytes as they are, and `/undo` puts those bytes back. A filter driver whose
+name holds `=` cannot be turned off so: in such a repo no snapshot is made and `/undo` refuses. A file or directory
+git cannot read (mode 000, a nested repo with no commit) is left out of the snapshot, marked `(partial)`. henki shows
+an observer's output to no one, so `/checkpoints`, `/undo` and `/rewind` first list the calls that got no snapshot or
+a partial one, with git's reasons. A snapshot that takes over 2 s (a very large work tree) still finishes, but henki
+stops waiting for it, says so, and runs the calls after it without waiting. The model is not told about an `/undo`:
+say so in your next message. Old snapshots stay until you remove them:
+`git for-each-ref --format='%(refname)' refs/henki/ | xargs -n 1 git update-ref -d`.

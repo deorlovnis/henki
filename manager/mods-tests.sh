@@ -251,10 +251,63 @@ t_checkpoints() {
   run "$m/on/call_start.wait" <"$D/ev"
   rc_is 1
   err_has "cannot keep the target"
-  [ -z "$(ls "$HENKI_STATE/checkpoints/$HENKI_SESSION")" ] || fail "a null target was kept"
+  [ "$(ls "$HENKI_STATE/checkpoints/$HENKI_SESSION")" = missed ] || fail "a null target was kept"
+  run "$m/cmd/checkpoints"
+  out_has "no checkpoint before write: cannot keep the target: no plain path"
   HENKI_SESSION="" run env "$m/cmd/checkpoints"
   rc_is 1
   err_has "no session (HENKI_SESSION)"
+  cd "$here" || exit 1
+  unset GIT_CEILING_DIRECTORIES
+}
+
+t_checkpoints_missed() {
+  case_ "checkpoints: what git cannot read is left out and said; a filter git -c cannot turn off"
+  local m="$MODS_DIR/checkpoints" here
+  here=$(pwd)
+  export GIT_CEILING_DIRECTORIES="$D" HENKI_MODULE="$m"
+  mkdir -p "$D/repo/shut" && cd "$D/repo" || return
+  # A nested repo with no commit fails git add for anyone; mode 000 does for all but root.
+  git init -q . && git init -q dep && printf 'one\n' >a.txt && printf 'x\n' >locked && printf 'x\n' >shut/f && chmod 000 locked shut
+  event write "$D/repo/a.txt" >"$D/ev"
+  run "$m/on/call_start.wait" <"$D/ev"
+  rc_is 0
+  [ "$(git show "refs/henki/checkpoints/$HENKI_SESSION/1:a.txt")" = one ] || fail "the snapshot lacks a.txt"
+  run "$m/on/call_start.wait" <"$D/ev"
+  [ "$(git for-each-ref "refs/henki/checkpoints/$HENKI_SESSION/" | wc -l | tr -d ' ')" = 2 ] || fail "not one snapshot per call"
+  run "$m/cmd/checkpoints"
+  out_has "before write $D/repo/a.txt (partial)"
+  out_has "  checkpoint 2, before write $D/repo/a.txt, lacks what git could not read: "
+  out_has "'dep/' does not have a commit checked out;"
+  [ -r locked ] || { out_has "could not open directory 'shut/': Permission denied;" && out_has "unable to index file 'locked'"; }
+  printf 'two\n' >a.txt
+  run "$m/cmd/undo" <<<y
+  rc_is 0
+  out_has "a partial one"
+  [ "$(cat a.txt)" = one ] && [ -d dep/.git ] || fail "/undo did not put a.txt back, or removed what git could not read"
+  chmod 755 locked shut
+  # [filter "a=b"]: git -c would read filter.a=b.clean= as filter.a, so the clean program would run.
+  printf '#!/bin/sh\necho >>"%s/ran"; cat\n' "$D" >"$D/prog" && chmod 755 "$D/prog"
+  git config 'filter.a=b.clean' "$D/prog" && printf '* filter=a=b\n' >.gitattributes
+  run "$m/on/call_start.wait" <"$D/ev"
+  rc_is 1
+  err_has "a filter driver with \"=\" in its name"
+  run "$m/cmd/undo" <<<y
+  rc_is 1
+  out_has "no checkpoint before write $D/repo/a.txt: the repo's config names a filter driver"
+  [ ! -e "$D/ran" ] || fail "the filter's program ran"
+  # Outside git, a target that cannot be copied leaves no snapshot for /undo to fail on.
+  mkdir -p "$D/plain" && cd "$D/plain" && printf 'x\n' >x.txt && chmod 000 x.txt || return
+  event edit "$D/plain/x.txt" >"$D/ev"
+  if [ ! -r x.txt ]; then
+    run "$m/on/call_start.wait" <"$D/ev"
+    rc_is 1
+    err_has "cannot copy $D/plain/x.txt"
+    [ "$(ls "$HENKI_STATE/checkpoints/$HENKI_SESSION")" = missed ] || fail "a copy that failed left a snapshot"
+    run "$m/cmd/checkpoints"
+    out_has "no checkpoint before edit $D/plain/x.txt: cannot copy"
+  fi
+  chmod 644 x.txt
   cd "$here" || exit 1
   unset GIT_CEILING_DIRECTORIES
 }
@@ -282,6 +335,7 @@ t_sessions
 t_prompts
 t_clip
 t_checkpoints
+t_checkpoints_missed
 t_notify
 if [ "$FAILS" != 0 ]; then
   echo "mods-tests.sh: $FAILS checks failed in $CASES cases" >&2
