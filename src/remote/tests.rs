@@ -143,7 +143,13 @@ fn remote_drop_says_bye_then_kills() {
         let took = t0.elapsed();
         assert!(took < Duration::from_millis(450) && (!stay || took >= Duration::from_millis(300)), "stay {stay}: {took:?}");
         if cfg!(target_os = "linux") {
+            // The binding is reaped by the drop; its child, SIGKILLed with it but not henki's to reap, may take a moment
+            // to die on a loaded machine (kill(2) returns before the signal is acted on).
             let gone = |p: i32| !sys::procs().iter().any(|q| q.pid == p && !q.zombie);
+            let until = Instant::now() + Duration::from_secs(2);
+            while !gone(child) && Instant::now() < until {
+                std::thread::sleep(Duration::from_millis(5));
+            }
             assert!(gone(pid) && gone(child), "stay {stay}: the binding or its child outlived the drop");
         }
     }
