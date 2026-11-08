@@ -7,13 +7,19 @@ An observer and commands for you, not for the model (they cost no prompt bytes):
   `refs/henki/checkpoints/SESSION/N`. It goes through a temporary index: your work tree, your index and HEAD are not
   touched, and `git log` does not show it. Outside git it copies the target of a `write` or `edit` to
   `$XDG_STATE_HOME/henki/checkpoints/SESSION/N/` (or notes that it did not exist); a `shell` call there has no
-  snapshot, nor has a target whose path is not UTF-8 (henki sends no path for it).
+  snapshot, nor has a target whose path is not UTF-8 (henki sends no path for it). In a git work tree it copies so,
+  next to the commit, a target the commit cannot hold: outside the work tree, in a repo nested in it, or ignored;
+  `/checkpoints` marks such a snapshot `(target kept by path)`. A file a `shell` call changes outside the work tree is
+  in no snapshot.
 - `/checkpoints`: this session's snapshots, oldest first.
-- `/undo`: shows what changed since the newest snapshot (`git diff --stat`) and the files made since then, asks, puts
-  the changed files back, removes the made ones, and drops the snapshot, so the next `/undo` goes one call further back.
+- `/undo`: shows what changed since the newest snapshot (`git diff --stat`), the files made since then and the targets
+  kept by path, asks, puts the changed files and the kept targets back, removes the made ones, and drops the snapshot,
+  so the next `/undo` goes one call further back. Names are shown as git quotes them: a control character never
+  reaches your terminal.
   A made file that the snapshot's own ignore rules ignore stays: it was there then (a `.env` that an edit to
   `.gitignore` uncovered), and no snapshot holds it.
-- `/rewind N`: the same for snapshot N; it drops N and every later one.
+- `/rewind N`: the same for snapshot N, with the targets every later snapshot kept by path; it drops N and every later
+  one.
 
 Ignored files (`.gitignore`, under the rules as they are when the snapshot is made) are not in a snapshot. So once an
 edit drops a rule, the files it hid are in the snapshots after it, kept by refs: a `git push --mirror` would publish

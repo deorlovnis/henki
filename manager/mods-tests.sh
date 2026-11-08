@@ -319,6 +319,51 @@ t_checkpoints_missed() {
   unset GIT_CEILING_DIRECTORIES
 }
 
+t_checkpoints_kept() {
+  case_ "checkpoints: a target the commit cannot hold is kept by path; names are shown quoted"
+  local m="$MODS_DIR/checkpoints" here out
+  here=$(pwd)
+  export GIT_CEILING_DIRECTORIES="$D" HENKI_MODULE="$m"
+  mkdir -p "$D/repo" "$D/outside" && cd "$D/repo" || return
+  git init -q . && printf '*.log\n' >.gitignore && printf 'log\n' >c.log && printf 'one\n' >a.txt && git init -q nested &&
+    git -C nested -c user.name=t -c user.email=t@t -c commit.gpgsign=false commit -q --allow-empty -m first
+  printf 'orig\n' >"$D/outside/o.txt"
+  # Outside the work tree, a file to be made there, an ignored file in it, a file in a repo nested in it.
+  for t in "$D/outside/o.txt" "$D/outside/new.txt" "$D/repo/c.log" "$D/repo/nested/n.txt"; do
+    event write "$t" >"$D/ev"
+    run "$m/on/call_start.wait" <"$D/ev"
+    rc_is 0
+  done
+  event edit "$D/repo/a.txt" >"$D/ev"
+  run "$m/on/call_start.wait" <"$D/ev"
+  [ "$(ls "$HENKI_STATE/checkpoints/$HENKI_SESSION" | tr '\n' ' ')" = "1 2 3 4 " ] || fail "not one kept target per call the commit cannot hold"
+  printf 'clobbered\n' >"$D/outside/o.txt" && printf 'made\n' >"$D/outside/new.txt" && printf 'x\n' >c.log && printf 'n\n' >nested/n.txt
+  run "$m/cmd/checkpoints"
+  out_has "  1  "
+  out_has "before write $D/outside/o.txt (target kept by path)"
+  case "$OUT" in *"a.txt (target kept"*) fail "a target the commit holds was kept by path" ;; esac
+  run "$m/cmd/undo" <<<y
+  out_has "nothing changed since checkpoint 5"
+  run "$m/cmd/rewind" 1 <<<y
+  rc_is 0
+  out_has "kept by path, to be put back as before the call:$nl  $D/outside/o.txt$nl  $D/outside/new.txt (absent then: to be removed)$nl  $D/repo/c.log$nl"
+  out_has "back at checkpoint 1"
+  [ "$(cat "$D/outside/o.txt")" = orig ] && [ ! -e "$D/outside/new.txt" ] && [ "$(cat c.log)" = log ] && [ ! -e nested/n.txt ] ||
+    fail "/rewind did not put the kept targets back"
+  [ ! -e "$HENKI_STATE/checkpoints/$HENKI_SESSION/1" ] || fail "/rewind did not drop the kept targets"
+  # A made file whose name holds terminal controls (OSC 52, cursor moves) is listed as git quotes it, never raw.
+  event shell "" >"$D/ev"
+  run "$m/on/call_start.wait" <"$D/ev"
+  touch "$(printf 'x\033]52;c;ZWNobw==\007\033[2K\033[1Ay')"
+  run "$m/cmd/undo" <<<n
+  out_has 'made since then, to be removed:'
+  out_has '  "x\033]52;c;ZWNobw==\a\033[2K\033[1Ay"'
+  out=$(printf '%s' "$OUT" | tr -d '\033\007')
+  [ "$out" = "$OUT" ] || fail "a control character reached the terminal raw"
+  cd "$here" || exit 1
+  unset GIT_CEILING_DIRECTORIES
+}
+
 t_notify() {
   case_ "notify: turn_end and question through the first notifier on PATH"
   local b="$D/bin"
@@ -343,6 +388,7 @@ t_prompts
 t_clip
 t_checkpoints
 t_checkpoints_missed
+t_checkpoints_kept
 t_notify
 if [ "$FAILS" != 0 ]; then
   echo "mods-tests.sh: $FAILS checks failed in $CASES cases" >&2
