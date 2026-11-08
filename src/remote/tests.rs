@@ -171,6 +171,7 @@ fn p50_p95(mut ms: Vec<f64>) -> (f64, f64) {
 #[test]
 #[ignore = "release gate"]
 fn remote_append_overhead() {
+    let _timed = crate::types::lock(&crate::types::TIMED);
     let t = Tmp(std::env::temp_dir().join(format!("henki-remote-gate-{}", std::process::id())));
     let _ = fs::remove_dir_all(&t.0);
     fs::create_dir_all(t.0.join("toy")).unwrap();

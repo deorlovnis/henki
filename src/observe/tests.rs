@@ -129,6 +129,7 @@ fn observe_slow_runs() {
 #[test]
 #[ignore = "release gate"]
 fn observe_spawn_cost() {
+    let _timed = crate::types::lock(&crate::types::TIMED);
     let (d, x) = setup("cost", &[("record", "exit 0")]);
     let (mut o, _rx) = observers(&d, &x);
     let rec = json!({"t": "tool_result", "id": "h1", "name": "shell", "content": "x".repeat(2_000)});

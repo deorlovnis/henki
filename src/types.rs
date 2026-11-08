@@ -7,6 +7,10 @@ pub fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
+/// Held by the release gates that time something, so no two of them run at once and skew each other.
+#[cfg(test)]
+pub static TIMED: Mutex<()> = Mutex::new(());
+
 /// A call's name as notes and errors show it: `unknown` when the model sent none.
 pub fn call_name(name: &str) -> &str {
     if name.is_empty() { "unknown" } else { name }
