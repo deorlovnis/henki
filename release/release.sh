@@ -5,6 +5,7 @@
 #   bin/henki                    the static binary (musl on Linux)
 #   bin/henki-mods               the module manager; it finds the official modules at ../share/henki/official
 #   share/henki/official/NAME/   every module in mods/, as git tracks it (off until `henki-mods add NAME`)
+#   share/henki/conform/         the conformance suites of manager/conform/ (henki-mods test --port, swap)
 #   share/henki/config.*.toml    the config profiles in profiles/ (henki's no-config message names config.mac.toml)
 #   LICENSE README.md CONTRACTS.md
 #
@@ -152,12 +153,13 @@ hd1_of() {
 stage() {
   local dir="$1/henki-$2-$3" bin=$4 m n
   rm -rf "$dir"
-  mkdir -p "$dir/bin" "$dir/share/henki/official"
+  mkdir -p "$dir/bin" "$dir/share/henki/official" "$dir/share/henki/conform"
   cp "$bin" "$dir/bin/henki" && chmod 755 "$dir/bin/henki"
   cp manager/henki-mods "$dir/bin/henki-mods" && chmod 755 "$dir/bin/henki-mods"
   for n in LICENSE README.md CONTRACTS.md; do cp "$n" "$dir/$n" && chmod 644 "$dir/$n"; done
   # The profiles, where henki's no-config message sends a Homebrew user: $(brew --prefix)/share/henki/.
   for n in $(git ls-files 'profiles/config.*.toml'); do cp "$n" "$dir/share/henki/${n#profiles/}" && chmod 644 "$dir/share/henki/${n#profiles/}"; done
+  for n in $(git ls-files 'manager/conform/*.tsv'); do cp "$n" "$dir/share/henki/conform/" && chmod 644 "$dir/share/henki/conform/${n##*/}"; done
   for m in mods/*/; do
     n=$(basename "$m")
     copy_mod "$n" "$dir/share/henki/official"
@@ -337,10 +339,11 @@ selftest() {
   got=$(tar -tzf "$DIST/$name.tar.gz" | sed 's,/$,,' | sort)
   want=$(
     {
-      for x in "" /bin /bin/henki /bin/henki-mods /share /share/henki /share/henki/official /LICENSE /README.md /CONTRACTS.md; do
+      for x in "" /bin /bin/henki /bin/henki-mods /share /share/henki /share/henki/official /share/henki/conform /LICENSE /README.md /CONTRACTS.md; do
         echo "$name$x"
       done
       git ls-files 'profiles/config.*.toml' | sed "s,^profiles/,$name/share/henki/,"
+      git ls-files 'manager/conform/*.tsv' | sed "s,^manager/conform/,$name/share/henki/conform/,"
       git ls-files mods | sed "s,^mods/,$name/share/henki/official/," | while read -r x; do
         while [ "$x" != "$name/share/henki/official" ]; do
           echo "$x"
@@ -373,6 +376,8 @@ selftest() {
   got=$(env -i HOME="$t/home" PATH=/usr/bin:/bin "$x/bin/henki-mods" add itse --yes 2>&1 &&
     env -i HOME="$t/home" PATH=/usr/bin:/bin "$x/bin/henki-mods" verify 2>&1) || { say "selftest: add itse, verify: $got"; bad=1; }
   [ -L "$t/home/.config/henki/ext/itse" ] || { say "selftest: add itse --yes made no link"; bad=1; }
+  # The conformance suites are found in the tarball's share/ too.
+  got=$(env -i HOME="$t/home" PATH=/usr/bin:/bin "$x/bin/henki-mods" test --port history std 2>&1) || { say "selftest: test --port history std: $got"; bad=1; }
 
   # Unpacked and packed again, it is the same bytes: the packing depends on nothing but the files and the commit.
   pack "$t/x" "$name" "$t/again.tar.gz" "$(git log -1 --format=%ct HEAD)"

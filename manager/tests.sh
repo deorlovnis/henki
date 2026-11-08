@@ -15,6 +15,8 @@ cd "$(dirname "$0")" || exit 1
 HERE=$(pwd -P)
 MODS="$HERE/henki-mods"
 HENKI_BIN=${MODS_TEST_HENKI:-}
+# The manager's `henki port` for the conformance suites (test --port, swap); none without MODS_TEST_HENKI.
+[ -z "$HENKI_BIN" ] || export HENKI_BIN
 unset MODS_TEST_HENKI HENKI_SHARE HENKI_MODS_TTY HENKI_CONFIG GIT_DIR GIT_WORK_TREE
 export GIT_CONFIG_NOSYSTEM=1 GIT_AUTHOR_NAME=fixture GIT_AUTHOR_EMAIL=fixture@example.invalid
 export GIT_COMMITTER_NAME=fixture GIT_COMMITTER_EMAIL=fixture@example.invalid
@@ -434,7 +436,16 @@ t_refusals() {
 
   rm -rf "$m" && mkmod "$m" 'ports = ["history"]\n'
   run add "$m" --yes
-  refused "ports must be empty"
+  refused "ports must name exactly the programs in port/"
+  rm -rf "$m" && mkmod "$m" 'ports = ["policy"]\n'
+  run add "$m" --yes
+  refused "port policy is not one this henki binds (history)"
+  rm -rf "$m" && mkmod "$m" && mkdir "$m/port" && printf '#!/bin/sh\n' >"$m/port/history"
+  run add "$m" --yes
+  refused "port/history: port/ holds a program you can run per port"
+  chmod 755 "$m/port/history" && mv "$m/port/history" "$m/port/context"
+  run add "$m" --yes
+  refused "port/context: port/ holds a program you can run per port, named history"
   rm -rf "$m" && mkmod "$m" 'contracts = ["ext/1", "observe/1"]\n'
   run add "$m" --yes
   refused "contract observe/1 is not one this henki ships"
@@ -1215,6 +1226,105 @@ t_allow() {
   check "no temp file left" [ "$(ls -A "$W/real")" = allow ]
 }
 
+# A module NAME in W that binds history: the bash binding of the conformance suite as port/history.
+mkport() {
+  mkmod "$W/$1" 'ports = ["history"]\ncontracts = ["history/1"]\n'
+  mkdir -p "$W/$1/port"
+  cp "$HERE/../tests/fixtures/ports/toy-history" "$W/$1/port/history"
+  chmod 755 "$W/$1/port/history"
+}
+
+t_ports() {
+  case_ "test --port, swap, bind/1, rm refused, verify, list"
+  run test --port history std
+  rc_is 0
+  out_has "std passes this suite in henki's own tests"
+  run test --port policy std
+  refused "policy is not a port this henki binds (history)"
+  mkport tree
+  run add "$W/tree" --yes
+  rc_is 0
+  run list
+  out_has "history: std"
+  if [ -z "${HENKI_BIN:-}" ]; then return 0; fi
+  run test --port history tree
+  rc_is 0
+  out_has "ok H01"
+  out_has "ok eof"
+  out_has "history/1: 25 checks, 25 passed"
+  HENKI_MODS_TTY=/nonexistent/tty run swap history tree
+  refused "no terminal to ask on"
+  check "no link without a yes" [ ! -L "$CONF/port/history" ]
+  run swap history tree --yes
+  rc_is 0
+  out_has "history: std -> tree 0.1.0 ("
+  out_has "conformance: passed (history/1, 25 checks) · it runs with your rights and stores every session record"
+  out_has "henki --port history=std --resume reaches them"
+  local store id
+  store=$(readlink "$CONF/ext/tree")
+  id=${store##*/}
+  check "the link to the store copy's port/history" [ "$(readlink "$CONF/port/history")" = "$store/port/history" ]
+  check "a bind/1 line after the lock/1 lines" [ "$(tail -n 1 "$CONF/mods.lock" | cut -f 1-4)" = "$(printf 'bind/1\thistory\ttree\t%s' "$id")" ]
+  check "how: yes" [ "$(tail -n 1 "$CONF/mods.lock" | cut -f 6)" = yes ]
+  check "no temp link left" [ "$(ls -A "$CONF/port")" = history ]
+  run list
+  out_has "history: tree 0.1.0 (bound)"
+  run verify
+  rc_is 0
+  mkmod "$W/other"
+  run add "$W/other" --yes
+  check "lock/1 lines stay sorted before bind/1" [ "$(cut -f 1,2 "$CONF/mods.lock" | tr '\t\n' ': ')" = "lock/1:other lock/1:tree bind/1:history " ]
+  run rm tree
+  refused "tree holds the history binding; fix: henki-mods swap history std"
+  run off tree
+  rc_is 0
+  check "off keeps the binding" [ -L "$CONF/port/history" ]
+  ln -sfn "$W/tree/port/history" "$CONF/port/history"
+  run verify
+  refused "is not the link to $store/port/history; fix: henki-mods swap history tree"
+  run swap history std
+  rc_is 0
+  out_has "history: std"
+  check "std: no link, no bind/1 line" [ ! -L "$CONF/port/history" ] && [ -z "$(command grep '^bind/1' "$CONF/mods.lock")" ]
+  run rm tree
+  rc_is 0
+  # A binding that fails the suite is not swapped to; one that has no port/history neither.
+  mkport bad
+  printf '#!/bin/sh\nexit 0\n' >"$W/bad/port/history"
+  run add "$W/bad" --yes
+  run swap history bad --yes
+  refused "bad does not pass the history/1 suite (above)"
+  out_has "FAIL H01"
+  check "no link after a failed suite" [ ! -L "$CONF/port/history" ]
+  run swap history other --yes
+  refused "other has no port/history"
+  printf 'bind/1\thistory\tx\n' >>"$CONF/mods.lock"
+  run list
+  refused "not a bind/1 line; fix: henki-mods swap history std"
+  run swap history std
+  refused "not a bind/1 line"
+}
+
+# port_toy (examples/, built beside the henki under test) through test --port: it passes, and each fault fails the
+# check named for it.
+t_port_toy() {
+  case_ "test --port: port_toy and its faults"
+  local toy f want
+  toy="$(dirname "${HENKI_BIN:-/nonexistent/henki}")/examples/port_toy"
+  [ -x "$toy" ] || return 0
+  run test --port history "$toy"
+  rc_is 0
+  out_has "history/1: 25 checks, 25 passed"
+  for f in "--exit-at create:H04" "--garbage-at read:H10" "--huge-at list:H15" "--error-at discard:H22" "--no-durable:H20" "--chatty:H01"; do
+    want=${f##*:}
+    printf '#!/bin/sh\nexec %s history %s\n' "$toy" "${f%:*}" >"$W/faulty"
+    chmod 755 "$W/faulty"
+    run test --port history "$W/faulty"
+    rc_is 1
+    out_has "FAIL $want: got"
+  done
+}
+
 all() {
   t_add_path
   t_ask
@@ -1235,6 +1345,8 @@ all() {
   t_official
   t_halti
   t_allow
+  t_ports
+  t_port_toy
 }
 
 static_bash32

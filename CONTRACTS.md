@@ -37,6 +37,7 @@ A program reads the contracts this henki ships from the rows of this table: each
 | `conform/1` | henki | the conformance suite files a binding is held to |
 | `module/1` | henki-mods | the module manifest, `.henki/module.toml` |
 | `lock/1` | henki-mods | the module lock, `mods.lock` |
+| `bind/1` | henki-mods | the lock lines of bound ports, in `mods.lock` |
 | `hd1` | henki-mods | the tree hash that pins a module's files |
 
 ## journal/1
@@ -349,12 +350,13 @@ needs = ["git"]                  # optional; looked for on PATH, never installed
 shadow = ["halti/pbpaste"]       # optional; the NAME/COMMAND entries the user must add to the config's shadow
 caps_net = "none"                # optional: none | loopback | any (declared, NOT enforced)
 maintainer = "..."               # optional
-ports = []                       # reserved for port bindings; must be empty in this version
+ports = ["history"]              # optional; exactly the programs in port/ (port/1), each a port henki can bind
 ```
 
-A module without a manifest is unmanaged (allowed for path and URL installs, and listed as such). The directories
-`cmd/`, `ctx/`, `on/` and `port/` are reserved for later layouts: henki-mods refuses them unless `requires` names a
-henki that has them (`needs henki >= X`).
+A module without a manifest is unmanaged (allowed for path and URL installs, and listed as such). `port/PORT` is a
+program its owner can run (a file, or a link inside the module), PORT one that henki binds (`history`). The directories
+`cmd/`, `ctx/` and `on/` are reserved for later layouts: henki-mods refuses them unless `requires` names a henki that
+has them (`needs henki >= X`).
 
 A git source (`URL[@REF][#SUBDIR]`) is cloned only over `https`, `http`, `ssh`, `git` or `file` URLs, or scp's
 `USER@HOST:PATH`; a remote helper (`ext::`, `fd::`, any other `SCHEME::` or unknown `SCHEME://`) is refused before
@@ -375,8 +377,24 @@ lock/1 NAME STATE VERSION SOURCE_KIND SOURCE COMMIT HD1 ADDED HOW MASK
 - STATE `on` or `off`; SOURCE_KIND `official`, `path` or `url`; SOURCE the module's name (official), the path, or
   `URL` or `URL#SUBDIR`; COMMIT 40 hex digits or `-`; HD1 the module's `hd1:` hash; ADDED the UTC time,
   `YYYY-MM-DDTHH:MMZ`; HOW `tty` (answered on the terminal) or `yes` (`--yes`); MASK empty in this version.
-- A line whose first field is not `lock/1` is refused: `this lock is newer than this henki-mods; upgrade henki`.
+- A line whose first field is not `lock/1` (or `bind/1`, after them) is refused: `this lock is newer than this
+  henki-mods; upgrade henki`.
 - On means the link `CONFIG_DIR/ext/NAME` points at the module's store copy; off means no link.
+
+## bind/1
+
+Owned by henki-mods. After the lock/1 lines, `mods.lock` holds one line per port bound to a module, sorted by port:
+
+```
+bind/1 PORT NAME ID ADDED HOW
+```
+
+- NAME is the module, ID the first 12 hex digits of its store copy's name (its commit, else its hd1), ADDED and HOW
+  as in lock/1. The binding is the link `CONFIG_DIR/port/PORT` -> `DATA/henki/mods/NAME/ID/port/PORT`, which
+  `henki-mods swap PORT NAME` writes (after the conformance suite passes and the user says yes) and `swap PORT std`
+  removes. henki reads the link only, never this line.
+- `henki-mods rm NAME` is refused while a link in `CONFIG_DIR/port/` leads into NAME's store copies. A henki-mods that
+  does not know `bind/1` refuses the lock, so it never drops a binding it cannot see.
 
 ## hd1
 
@@ -458,8 +476,9 @@ a session. `list` is for tools (henki-mods, an import); henki itself does not ca
 
 ## conform/1
 
-A conformance suite is a file of steps, `PORT.tsv` (`manager/conform/` in the repository), run through `henki port`.
-One step per line, TAB-separated, `#` comments:
+A conformance suite is a file of steps, `PORT.tsv`, shipped with henki-mods (`manager/conform/` in the repository),
+and `henki-mods test --port PORT NAME|/PROGRAM` runs it through `henki port`. One step per line, TAB-separated,
+`#` comments:
 
 ```
 NAME INST REQUEST EXPECT [SAVE]

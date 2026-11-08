@@ -7,6 +7,7 @@
 #   ~/.config/henki/ext/NAME -> ${XDG_DATA_HOME:-~/.local/share}/henki/mods/NAME/ID/   on = the link exists
 #   ~/.config/henki/mods.lock                                                          lock/1, one line per module
 #   ~/.config/henki/AGENTS.md                         only its "# >>> mods cards" block is written here
+#   ~/.config/henki/port/PORT -> .../mods/NAME/ID/port/PORT                            a port binding (swap); bind/1
 #
 # The config dir is ~/.config/henki whatever XDG_CONFIG_HOME says, because that is the dir henki reads (it takes no
 # XDG variable for it); under /mods it is the dir of henki's config, in HENKI_CONFIG. Bash 3.2 (macOS) compatible: no
@@ -15,7 +16,7 @@
 #
 # Environment: HOME (required), XDG_DATA_HOME, HENKI_SHARE (the dir holding official/NAME, the official modules),
 # HENKI_MODS_TTY (the terminal the question is asked on; default /dev/tty), HENKI_CONFIG (the config dir; henki sets
-# it for /mods).
+# it for /mods), HENKI_BIN (the henki whose `henki port` runs the conformance suites; henki sets it).
 set -u
 export LC_ALL=C
 umask 022
@@ -37,7 +38,10 @@ nl='
 # ext::prompt's header line; henki joins it to the rest of the system prompt with a blank line ("\n\n").
 HEADER='Extensions are commands on PATH; read the doc in brackets before first use.'
 # The named formats this henki ships (CONTRACTS.md); a module's `contracts` must all be here.
-CONTRACTS_KNOWN='journal/1 json/1 wire/1 ext/1 module/1 lock/1 hd1 port/1 history/1 conform/1'
+CONTRACTS_KNOWN='journal/1 json/1 wire/1 ext/1 module/1 lock/1 hd1 port/1 history/1 conform/1 bind/1'
+# The ports a package may bind (henki's port::LINKED), and what each one gets to see, for the swap screen.
+PORTS_KNOWN='history'
+PORT_SEES_history='stores every session record'
 AGENTS_MAX=4096 # henki refuses to start with a bigger AGENTS.md
 CARDS_BEGIN='# >>> mods cards'
 CARDS_END='# <<< mods cards'
@@ -62,6 +66,8 @@ usage: henki-mods [list]              modules: state, version, source, prompt by
        henki-mods lock                print the lock
        henki-mods verify [NAME]       store copies against the lock, the links, the layout
        henki-mods verify --dir DIR    one module directory: layout and manifest
+       henki-mods swap PORT NAME|std [--yes]   bind henki's PORT to module NAME's port/PORT, or back to std
+       henki-mods test --port PORT NAME|std|/PROGRAM   the conformance suite of PORT against a binding
        henki-mods allow [--config FILE] [rm N]   henki's allow rules: list them, or remove rule N
        henki-mods help | --version
 EOF
@@ -419,10 +425,16 @@ EOF
     return 1
     ;;
   esac
-  if [ -n "$M_ports" ]; then
-    ERR="$f: ports must be empty in module/1 (port bindings come with a later henki); fix: set ports = []"
-    return 1
-  fi
+  while IFS= read -r x; do
+    [ -n "$x" ] || continue
+    case " $PORTS_KNOWN " in *" $x "*) ;; *)
+      ERR="$f: port $x is not one this henki binds ($PORTS_KNOWN); fix: upgrade henki, or drop it"
+      return 1
+      ;;
+    esac
+  done <<EOF
+$M_ports
+EOF
   while IFS= read -r x; do
     [ -n "$x" ] || continue
     case " $CONTRACTS_KNOWN " in *" $x "*) ;; *)
@@ -510,8 +522,8 @@ docline() {
 # A top-level NAME henki takes (anything but doc.md and bin, which inspect checks itself); else 1 with ERR.
 top_ok() {
   case "$2" in
-    cmd | ctx | on | port)
-      ERR="$1/$2/: a later module layout (commands, context, observers, ports) that this henki does not load; fix: remove it, or set henki_module and requires for the henki that loads it"
+    cmd | ctx | on)
+      ERR="$1/$2/: a later module layout (commands, context, observers) that this henki does not load; fix: remove it, or set henki_module and requires for the henki that loads it"
       return 1
       ;;
     README* | LICENSE* | CHANGELOG* | .*) ;;
@@ -526,7 +538,7 @@ top_ok() {
 # name (the source dir's), HOST 1 to check this machine too. Exit 1 with ERR at the first problem.
 inspect() {
   local dir="$1" fallback="$2" host="$3" p kind top rest x why
-  I_hd1="" I_line="" I_cmds="" I_links=0 I_files=0 I_card=0 I_name=""
+  I_hd1="" I_line="" I_cmds="" I_links=0 I_files=0 I_card=0 I_name="" I_ports=""
   listing "$dir" || return 1
   [ -s "$STAGE_LIST" ] || {
     ERR="$dir: empty; fix: a module holds doc.md"
@@ -542,14 +554,14 @@ inspect() {
   while IFS= read -r p; do
     [ -n "$p" ] || continue
     p=${p#"$dir"/}
-    case "$p" in bin/.* | doc.md | bin) ;; bin/*) p="$p/x" ;; *) top_ok "$dir" "$p" || return 1 ;; esac
-    case "$p" in bin/*/x)
-      ERR="$dir/${p%/x}: a directory; fix: a command is a file you can run, so move it out of bin/"
+    case "$p" in bin/.* | doc.md | bin | port) ;; bin/* | port/*) p="$p/x" ;; *) top_ok "$dir" "$p" || return 1 ;; esac
+    case "$p" in bin/*/x | port/*/x)
+      ERR="$dir/${p%/x}: a directory; fix: a command or a port binding is a file you can run, so move it out of ${p%%/*}/"
       return 1
       ;;
     esac
   done <<EOF
-$(find "$dir" -mindepth 1 -maxdepth 1 -print; [ ! -d "$dir/bin" ] || [ -L "$dir/bin" ] || find "$dir/bin" -mindepth 1 -maxdepth 1 -type d -print)
+$(find "$dir" -mindepth 1 -maxdepth 1 -print; for x in bin port; do [ ! -d "$dir/$x" ] || [ -L "$dir/$x" ] || find "$dir/$x" -mindepth 1 -maxdepth 1 -type d -print; done)
 EOF
   while IFS= read -r p; do
     kind=${p##*"$tab"}
@@ -598,6 +610,18 @@ EOF
             ;;
         esac
         ;;
+      port)
+        # port/PORT: a program henki runs as that port's binding, once a swap links it (henki's test, as for bin/).
+        x=0
+        [ -n "$(find -L "$dir/$p" -prune -type f -perm -100 -print 2>/dev/null)" ] && x=1
+        case " $PORTS_KNOWN :$x" in
+          *" ${rest:-/} "*:1) I_ports="$I_ports$rest$nl" ;;
+          *)
+            ERR="$dir/$p: port/ holds a program you can run per port, named $PORTS_KNOWN; fix: rename it or chmod u+x it, or move it out"
+            return 1
+            ;;
+        esac
+        ;;
       .henki)
         case "$rest:$kind" in
           module.toml:644 | module.toml:755 | card.md:644 | card.md:755) ;;
@@ -621,6 +645,10 @@ EOF
     ERR="$dir: no doc.md; fix: write doc.md with a summary of the module on line 1"
     return 1
   }
+  if [ "$M_has" = 1 ] && [ "$(printf '%s\n' "$M_ports" | awk 'NF' | sort)" != "$(printf '%s' "$I_ports" | sort)" ]; then
+    ERR="$dir/.henki/module.toml: ports must name exactly the programs in port/ ($(printf '%s' "$I_ports" | tr '\n' ' ')); fix: correct ports"
+    return 1
+  fi
   I_line=$(docline "$dir/doc.md")
   printf '%s' "$I_line" >"$STAGE_LIST.line"
   why=$(invisible_check "$STAGE_LIST.line") || {
@@ -824,11 +852,15 @@ copy_git() {
 
 # --- the lock ----------------------------------------------------------------------------------------------------------
 
-# Validates the lock; exit 1 on a line this version cannot read.
+# Validates the lock; exit 1 on a line this version cannot read. The lock/1 lines come first, then the bind/1 lines,
+# bind/1<TAB>PORT<TAB>NAME<TAB>ID<TAB>ADDED<TAB>HOW: one per port bound to a module (swap).
 lock_check() {
   [ -f "$LOCK" ] || return 0
-  HM_F="$LOCK" awk -F '\t' '
+  HM_F="$LOCK" HM_P=" $PORTS_KNOWN " awk -F '\t' '
     BEGIN { f = ENVIRON["HM_F"] }
+    $1 == "bind/1" && (NF != 6 || index(ENVIRON["HM_P"], " " $2 " ") == 0 || $3 !~ /^[a-z0-9][a-z0-9_-]*$/ || $4 !~ /^[0-9a-f]+$/ || ($6 != "yes" && $6 != "tty")) {
+      printf "henki-mods: %s:%d: not a bind/1 line; fix: henki-mods swap %s std\n", f, NR, $2; exit 1 }
+    $1 == "bind/1" { next }
     $1 != "lock/1" { printf "henki-mods: %s:%d: this lock is newer than this henki-mods; fix: upgrade henki\n", f, NR; exit 1 }
     NF != 11 || $2 !~ /^[a-z0-9][a-z0-9_-]*$/ || ($3 != "on" && $3 != "off") || $5 !~ /^(official|path|url)$/ {
       printf "henki-mods: %s:%d: not a lock/1 line; fix: henki-mods rm the module named on it, or remove the line\n", f, NR; exit 1 }
@@ -840,7 +872,7 @@ lock_get() {
   local line
   L_name="" L_state="" L_version="" L_kind="" L_source="" L_commit="" L_hd1="" L_added="" L_how=""
   [ -f "$LOCK" ] || return 1
-  line=$(HM_N="$1" awk -F '\t' '$2 == ENVIRON["HM_N"] { print; exit }' "$LOCK")
+  line=$(HM_N="$1" awk -F '\t' '$1 == "lock/1" && $2 == ENVIRON["HM_N"] { print; exit }' "$LOCK")
   [ -n "$line" ] || return 1
   # No field but the last (MASK, empty) is ever empty, so read's collapsing of tabs changes nothing.
   IFS="$tab" read -r _ L_name L_state L_version L_kind L_source L_commit L_hd1 L_added L_how _ <<EOF
@@ -855,13 +887,17 @@ store_of() {
   printf '%s/%s/%s\n' "$STORE" "$L_name" "${id%"${id#????????????}"}"
 }
 
-# Replaces NAME's line by LINE (or drops it when LINE is empty), sorted by name, written atomically.
-lock_put() {
-  local name="$1" line="$2" tmp="$LOCK.tmp.$$"
+# Replaces NAME's line by LINE (or drops it when LINE is empty), written atomically.
+lock_put() { lock_write lock/1 "$1" "$2"; }
+
+# Replaces the KIND line of KEY (a lock/1 NAME, a bind/1 PORT) by LINE, or drops it; the lock/1 lines first, then the
+# bind/1 lines, each sorted by their second field.
+lock_write() {
+  local tmp="$LOCK.tmp.$$"
   {
-    [ ! -f "$LOCK" ] || HM_N="$name" awk -F '\t' '$2 != ENVIRON["HM_N"]' "$LOCK"
-    [ -z "$line" ] || printf '%s\n' "$line"
-  } | sort -t "$tab" -k2,2 >"$tmp" && mv -f "$tmp" "$LOCK" || {
+    [ ! -f "$LOCK" ] || HM_K="$1" HM_N="$2" awk -F '\t' '$1 != ENVIRON["HM_K"] || $2 != ENVIRON["HM_N"]' "$LOCK"
+    [ -z "$3" ] || printf '%s\n' "$3"
+  } | sort -t "$tab" -k1,1r -k2,2 >"$tmp" && mv -f "$tmp" "$LOCK" || {
     rm -f "$tmp"
     die "cannot write $LOCK; fix: make $CONF writable"
   }
@@ -872,7 +908,17 @@ lock_line() { # STATE (the rest from L_*)
   printf 'lock/1\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t' "$L_name" "$1" "$L_version" "$L_kind" "$L_source" "$L_commit" "$L_hd1" "$L_added" "$L_how"
 }
 
-lock_names() { [ ! -f "$LOCK" ] || awk -F '\t' '{ print $2 }' "$LOCK"; }
+lock_names() { [ ! -f "$LOCK" ] || awk -F '\t' '$1 == "lock/1" { print $2 }' "$LOCK"; }
+
+# The bind/1 line of PORT into B_name and B_id (exit 1 when PORT is std).
+bind_get() {
+  local line
+  B_name="" B_id=""
+  [ -f "$LOCK" ] || return 1
+  line=$(HM_P="$1" awk -F '\t' '$1 == "bind/1" && $2 == ENVIRON["HM_P"] { print $3 "\t" $4; exit }' "$LOCK")
+  [ -n "$line" ] || return 1
+  B_name=${line%"$tab"*} B_id=${line#*"$tab"}
+}
 
 # --- prompt bytes and cards --------------------------------------------------------------------------------------------
 
@@ -912,7 +958,7 @@ cards_block() {
   rm -f "$out.cards"
 }
 
-lock_names_on() { [ ! -f "$LOCK" ] || awk -F '\t' '$3 == "on" { print $2 }' "$LOCK"; }
+lock_names_on() { [ ! -f "$LOCK" ] || awk -F '\t' '$1 == "lock/1" && $3 == "on" { print $2 }' "$LOCK"; }
 
 # AGENTS.md with its cards block replaced by BLOCK (a file; empty removes the block), into OUT; the lines outside the
 # block stay as they are. A new block goes at the end after a blank line, and that blank line goes with it again.
@@ -1280,13 +1326,15 @@ cmd_onoff() { # on|off NAME
 }
 
 cmd_rm() {
-  local n="${1:-}" store
+  local n="${1:-}" store a
   [ -n "$n" ] && [ $# = 1 ] || usage
   busy
   lock_check
   STAGE=$(mktemp -d "${TMPDIR:-/tmp}/henki-mods.XXXXXX") || die "cannot make a scratch dir; fix: check TMPDIR"
   STAGE_LIST="$STAGE/list"
   lock_get "$n" || die "$n is not added; fix: henki-mods list shows what is"
+  a=$(bound_to "$n" | head -n 1)
+  [ -z "$a" ] || die "$n holds the $a binding; fix: henki-mods swap $a std"
   cards_ok
   store=$(store_of)
   if [ -L "$EXT/$n" ]; then
@@ -1351,6 +1399,15 @@ cmd_list() {
     break
   done
   [ -z "$off_names" ] || say "official, not added:$off_names (henki-mods add NAME)"
+  for n in $PORTS_KNOWN; do
+    if bind_get "$n"; then
+      x=-
+      ! lock_get "$B_name" || x=$L_version
+      say "$n: $B_name $x (bound)"
+    else
+      say "$n: std"
+    fi
+  done
   # The cards' share of the prompt: AGENTS.md as it is, against AGENTS.md without the block.
   agents_now=$(agents_bytes "$AGENTS")
   if [ -f "$AGENTS" ]; then
@@ -1428,6 +1485,20 @@ cmd_verify() {
       problem "$n is off in the lock, but $(shown "$EXT/$n") exists; fix: henki-mods off $n"
     fi
   done
+  # Each port is std (no link, no bind/1 line) or bound: its link points at the locked copy's port/PORT.
+  for n in $PORTS_KNOWN; do
+    if bind_get "$n"; then
+      if ! lock_get "$B_name"; then
+        problem "$n is bound to $B_name, which is not added; fix: henki-mods swap $n std"
+      elif [ "$(store_of)" != "$STORE/$B_name/$B_id" ]; then
+        problem "$n is bound to $B_name $B_id, but the lock has another copy; fix: henki-mods swap $n $B_name"
+      elif [ ! -L "$CONF/port/$n" ] || [ "$(target "$CONF/port/$n")" != "$STORE/$B_name/$B_id/port/$n" ]; then
+        problem "$(shown "$CONF/port/$n") is not the link to $STORE/$B_name/$B_id/port/$n; fix: henki-mods swap $n $B_name"
+      fi
+    elif [ -e "$CONF/port/$n" ] || [ -L "$CONF/port/$n" ]; then
+      problem "$(shown "$CONF/port/$n") exists without a bind/1 line; fix: henki-mods swap $n std"
+    fi
+  done
   # The cards block must be the cards of the modules on.
   if [ -z "${1:-}" ]; then
     if cards_write 1; then
@@ -1442,6 +1513,232 @@ cmd_verify() {
   ext_path_warning
   [ "$BAD" = 0 ] || die "verify: $BAD problems (above); fix: as each one says"
   say "verify: ok ($(printf '%s\n' "$names" | awk 'NF' | wc -l | tr -d ' ') modules)"
+}
+
+# --- port bindings: conformance, swap ---------------------------------------------------------------------------------
+
+# The dir holding the conformance suites (conform/1): beside the official modules in a release, manager/conform/ in
+# the repository.
+conform_dir() {
+  local d
+  for d in ${HENKI_SHARE:+"$HENKI_SHARE/conform"} "$SELF/../share/henki/conform" "$SELF/conform"; do
+    [ ! -f "$d/history.tsv" ] || { (cd -P "$d" && pwd) && return 0; }
+  done
+  return 1
+}
+
+# The henki whose hidden `henki port` runs the suites: HENKI_BIN (henki sets it), else beside this program, else PATH.
+henki_bin() {
+  local h
+  for h in ${HENKI_BIN:-} "$SELF/henki" "$(command -v henki 2>/dev/null)"; do
+    [ -n "$h" ] && [ -x "$h" ] && [ ! -d "$h" ] && printf '%s\n' "$h" && return 0
+  done
+  die "no henki to run the conformance suite with; fix: run it as henki mods, or put henki on PATH"
+}
+
+# An EXPECT of conform/1 as a bash pattern: `*` any text, `@(A|B)` A or B, every other character itself.
+conform_pat() {
+  printf '%s' "$1" | awk '{
+    o = ""; g = 0
+    for (i = 1; i <= length($0); i++) {
+      c = substr($0, i, 1)
+      if (!g && c == "@" && substr($0, i + 1, 1) == "(") { o = o "@("; g = 1; i++ }
+      else if (g && (c == ")" || c == "|")) { o = o c; if (c == ")") g = 0 }
+      else if (c == "*") o = o c
+      else if (index("\\[]?+!()|", c)) o = o "\\" c
+      else o = o c
+    }
+    printf "%s", o }'
+}
+
+# conform/1 instance X (a, b, or v for a +V step): `henki port PORT [--offer V] -- PROGRAM` in the scope dir, fed
+# through two FIFOs (bash 3.2 has no coproc) on fixed fds; its hello line goes into H_LINE.
+inst_start() { # X [V]
+  local x="$1" w r
+  case "$x" in a) w=7 r=8 ;; b) w=5 r=6 ;; *) w=3 r=4 ;; esac
+  rm -f "$CT/$x.in" "$CT/$x.out" && mkfifo "$CT/$x.in" "$CT/$x.out" || die "cannot make a FIFO in $CT; fix: check TMPDIR"
+  # A home of its own, so the binding keeps its state in the scratch dir (hello names it).
+  # The other instances' FIFO ends stay out of it, or their EOF would never come.
+  (cd "$CT/scope" && exec 3>&- 4>&- 5>&- 6>&- 7>&- 8>&- && HOME="$CT/home" XDG_STATE_HOME="$CT/home/state" exec "$C_henki" port "$C_port" ${2:+--offer "$2"} -- "$C_exe" <"$CT/$x.in" >"$CT/$x.out" 2>>"$CT/stderr") &
+  eval "P_$x=\$! && exec $w>\"\$CT/\$x.in\" $r<\"\$CT/\$x.out\""
+  IFS= read -r -t 30 -u "$r" H_LINE || H_LINE="(no hello line)"
+  eval "U_$x=1 H_$x=\$H_LINE"
+}
+
+# Ends instance X: its stdin closes, and `henki port` (its bye, then the kill) must be gone within 1 s. With KILL,
+# SIGKILL first, without bye.
+inst_end() { # X [kill]
+  local x="$1" w r pid i
+  case "$x" in a) w=7 r=8 ;; b) w=5 r=6 ;; *) w=3 r=4 ;; esac
+  eval "[ \"\${U_$x:-0}\" = 1 ] && pid=\$P_$x" || return 0
+  [ -z "${2:-}" ] || printf '{"kill":true}\n' >&"$w"
+  eval "exec $w>&- $r<&-; U_$x=0"
+  for i in 1 2 3 4 5 6 7 8 9 10; do kill -0 "$pid" 2>/dev/null || break; sleep 0.1; done
+  if kill -0 "$pid" 2>/dev/null; then
+    kill -9 "$pid" 2>/dev/null
+    C_fail="$C_fail end-$x"
+    say "FAIL end of instance $x: henki port did not end within 1 s of its stdin closing"
+  fi
+  wait "$pid" 2>/dev/null
+}
+
+# Runs SUITE (a conform/1 file) for PORT against PROGRAM through HENKI: "ok NAME" or "FAIL NAME: got LINE" per check,
+# then "PORT/1: N checks, N passed"; exit 1 on any failure. A step whose name ends in a lowercase letter prepares a
+# check: it counts only when it fails. Last, PROGRAM run on its own must exit within 1 s of reading EOF on stdin.
+conform_run() { # PORT PROGRAM HENKI
+  local name inst req want save got n=0 ok=0 v w r pid big i x
+  C_port=$1 C_exe=$2 C_henki=$3 C_fail="" U_a=0 U_b=0 U_v=0
+  CT=$(mktemp -d "${TMPDIR:-/tmp}/henki-conform.XXXXXX") || die "cannot make a scratch dir; fix: check TMPDIR"
+  mkdir -p "$CT/scope" "$CT/scope2" "$CT/home"
+  SAVED="SCOPE=$(cd -P "$CT/scope" && pwd)$nl""SCOPE2=$(cd -P "$CT/scope2" && pwd)"
+  big=$(head -c 1048576 /dev/zero | tr '\000' x)
+  shopt -s extglob
+  # An instance that ended (a failed hello) must not end the run when the next request goes to its FIFO.
+  trap '' PIPE
+  while IFS="$tab" read -r name inst req want save; do
+    case "$name" in '' | '#'*) continue ;; esac
+    case "$inst" in
+      *!)
+        inst_end "${inst%!}" kill
+        continue
+        ;;
+      +*)
+        inst_start v "${inst#+}"
+        inst=v
+        ;;
+      *) eval "[ \"\${U_$inst:-0}\" = 1 ]" || inst_start "$inst" ;;
+    esac
+    case "$inst" in a) w=7 r=8 ;; b) w=5 r=6 ;; *) w=3 r=4 ;; esac
+    # Saved values go into the request as they are, and into the pattern with every pattern character escaped.
+    want=$(conform_pat "$want")
+    while IFS='=' read -r v x; do
+      [ -n "$v" ] || continue
+      req=${req//@$v@/$x}
+      x=$(printf '%s' "$x" | sed 's/[][\\?*+!()|@]/\\&/g')
+      want=${want//@$v@/$x}
+    done <<EOF
+$SAVED
+EOF
+    req=${req//@BIG@/$big} want=${want//@BIG@/$big}
+    if [ "$req" = hello ]; then
+      eval "got=\$H_$inst"
+    else
+      printf '%s\n' "$req" >&"$w"
+      IFS= read -r -t 30 -u "$r" got || got="(no answer: the instance ended, or 30 s passed)"
+    fi
+    [ "$inst" != v ] || inst_end v
+    if [[ $got == $want ]]; then
+      case "$name" in *[a-z]) ;; *) n=$((n + 1)) ok=$((ok + 1)) && say "ok $name" ;; esac
+      [ -z "$save" ] || { x=${got#*\"${save#*=}\":\"} && SAVED="$SAVED$nl${save%%=*}=${x%%\"*}"; }
+    else
+      case "$name" in *[a-z]) ;; *) n=$((n + 1)) ;; esac
+      C_fail="$C_fail $name"
+      say "FAIL $name: got $(printf '%s' "$got" | cut -c 1-300)"
+    fi
+  done <"$C_suite"
+  inst_end a
+  inst_end b
+  # The binding alone, its stdin at EOF: it must end (on macOS nothing else stops it when henki is killed).
+  n=$((n + 1))
+  (cd "$CT/scope" && exec 3>&- 4>&- 5>&- 6>&- 7>&- 8>&- && HOME="$CT/home" exec "$C_exe" </dev/null >/dev/null 2>&1) &
+  pid=$!
+  for i in 1 2 3 4 5 6 7 8 9 10; do kill -0 "$pid" 2>/dev/null || break; sleep 0.1; done
+  if kill -0 "$pid" 2>/dev/null; then
+    kill -9 "$pid" 2>/dev/null
+    C_fail="$C_fail eof"
+    say "FAIL eof: the binding did not exit within 1 s of EOF on its stdin"
+  else
+    ok=$((ok + 1)) && say "ok eof"
+  fi
+  wait "$pid" 2>/dev/null
+  [ ! -s "$CT/stderr" ] || say "(the binding's stderr: $(head -c 300 "$CT/stderr" | tr '\n' ' '))"
+  rm -rf "$CT"
+  C_checks=$n C_passed=$ok
+  say "$C_port/1: $n checks, $ok passed"
+  [ -z "$C_fail" ]
+}
+
+# test --port PORT NAME|std|/PROGRAM: the suite of PORT against module NAME's port/PORT (its store copy), a program
+# by path (while writing one), or std.
+cmd_test() {
+  local port="${2:-}" what="${3:-}" exe
+  [ "${1:-}" = --port ] && [ $# = 3 ] || usage
+  case " $PORTS_KNOWN " in *" $port "*) ;; *) die "$port is not a port this henki binds ($PORTS_KNOWN); fix: name one of them" ;; esac
+  C_suite="$(conform_dir)/$port.tsv" || die "no conformance suites found; fix: reinstall henki"
+  case "$what" in
+    std) say "std passes this suite in henki's own tests" && return 0 ;;
+    /*) exe=$what ;;
+    *)
+      lock_check
+      lock_get "$what" || die "$what is not added; fix: henki-mods add SRC first, or name a program by its absolute path"
+      exe="$(store_of)/port/$port"
+      ;;
+  esac
+  [ -f "$exe" ] && [ -x "$exe" ] || die "$exe is not a program; fix: name a module with port/$port"
+  conform_run "$port" "$exe" "$(henki_bin)" || exit 1
+}
+
+# swap PORT NAME|std [--yes]: binds henki's PORT to module NAME's port/PORT (its store copy, after the suite passes and
+# the person says yes), or back to std, which always works: the link CONFIG/port/PORT and the bind/1 line.
+cmd_swap() {
+  local port="${1:-}" n="${2:-}" yes=0 a store exe was tty answer how id
+  [ $# -ge 2 ] || usage
+  for a in "${3:-}" "${4:-}"; do case "$a" in '') ;; --yes | -y) yes=1 ;; *) usage ;; esac; done
+  case " $PORTS_KNOWN " in *" $port "*) ;; *) die "$port is not a port this henki binds ($PORTS_KNOWN); fix: name one of them" ;; esac
+  busy
+  lock_check
+  if [ "$n" = std ]; then
+    rm -f "$CONF/port/$port" || die "cannot remove $(shown "$CONF/port/$port"); fix: make it writable"
+    lock_write bind/1 "$port" ""
+    say "$port: std"
+    say "$RESTART"
+    return 0
+  fi
+  lock_get "$n" || die "$n is not added; fix: henki-mods add SRC first (henki-mods list shows what is)"
+  store=$(store_of)
+  exe="$store/port/$port"
+  [ -f "$exe" ] && [ -x "$exe" ] || die "$n has no port/$port; fix: swap to a module that binds $port"
+  STAGE=$(mktemp -d "${TMPDIR:-/tmp}/henki-mods.XXXXXX") || die "cannot make a scratch dir; fix: check TMPDIR"
+  STAGE_LIST="$STAGE/list"
+  inspect "$store" "$n" 0 || die "$n: $ERR"
+  [ "$I_hd1" = "$L_hd1" ] || die "the store copy $store does not match the lock (it changed); fix: henki-mods rm $n and add it again"
+  printf '%s\n' "$M_ports" | command grep -qx "$port" || die "$n's manifest does not list $port in ports; fix: swap to a module that declares it"
+  C_suite="$(conform_dir)/$port.tsv" || die "no conformance suites found; fix: reinstall henki"
+  conform_run "$port" "$exe" "$(henki_bin)" >"$STAGE/conform" || {
+    cat "$STAGE/conform"
+    die "$n does not pass the $port/1 suite (above); fix: ask its author, or keep std"
+  }
+  was=std
+  ! bind_get "$port" || was="$B_name $B_id"
+  id=${store##*/}
+  say "$port: $was -> $n ${L_version} ($id) · conformance: passed ($port/1, $C_checks checks) · it runs with your rights and $(eval "printf '%s' \"\$PORT_SEES_$port\"")"
+  [ "$port" != history ] || say "  your sessions in the std store stay there; henki --port history=std --resume reaches them; import comes with a later henki"
+  if [ "$yes" = 1 ]; then
+    how=yes
+  else
+    tty=${HENKI_MODS_TTY:-/dev/tty}
+    (: <"$tty") 2>/dev/null || die "no terminal to ask on; fix: run it in a terminal, or add --yes once you have read the screen above"
+    if [ -c "$tty" ]; then printf 'swap? [y/N] ' >"$tty"; else printf 'swap? [y/N] \n' >&2; fi
+    read -r answer <"$tty" || answer=""
+    case "$answer" in y | Y | yes | YES) how=tty ;; *) die "not swapped (the answer was no); fix: run swap again and answer y" ;; esac
+  fi
+  mkdir -p "$CONF/port" && ln -s -- "$exe" "$CONF/port/.$port.$$" && mv -f "$CONF/port/.$port.$$" "$CONF/port/$port" || {
+    rm -f "$CONF/port/.$port.$$"
+    die "cannot link $(shown "$CONF/port/$port"); fix: make $(shown "$CONF") writable"
+  }
+  lock_write bind/1 "$port" "$(printf 'bind/1\t%s\t%s\t%s\t%s\t%s' "$port" "$n" "$id" "$(date -u +%Y-%m-%dT%H:%MZ)" "$how")"
+  say "$port: $n $id"
+  say "$RESTART"
+}
+
+# The ports linked into NAME's store copies, one per line (rm refuses while there is one).
+bound_to() {
+  local p t
+  for p in $PORTS_KNOWN; do
+    [ -L "$CONF/port/$p" ] || continue
+    t=$(target "$CONF/port/$p")
+    case "$t" in "$STORE/$1/"*) printf '%s\n' "$p" ;; esac
+  done
 }
 
 # --- allow rules -------------------------------------------------------------------------------------------------------
@@ -1588,6 +1885,8 @@ case "${1:-list}" in
   lock) shift && cmd_lock "$@" ;;
   verify) shift && cmd_verify "$@" ;;
   allow) shift && cmd_allow "$@" ;;
+  swap) shift && cmd_swap "$@" ;;
+  test) shift && cmd_test "$@" ;;
   help | -h | --help)
     usage 2>&1 | sed 's/^usage: //;s/^       //'
     exit 0
