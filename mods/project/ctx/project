@@ -1,0 +1,28 @@
+#!/bin/sh
+# The project's instructions for henki: AGENTS.md, else CLAUDE.md, at the git root of the working directory, cut to fit
+# a context source's 16 KiB, then the git line. Prints nothing outside a git work tree, or in one at or above HOME.
+# Reads only regular files, never a link: a link could name a secret outside the project.
+g() { git -c core.fsmonitor=false "$@" 2>/dev/null; } # rev-parse and symbolic-ref only: nothing reads the index
+root=$(g rev-parse --show-toplevel) || exit 0
+case $root in "" | /) exit 0 ;; esac
+case "$HOME/" in "$root"/*) exit 0 ;; esac # a repo at HOME or above it (dotfiles) is not a project
+branch=$(g symbolic-ref --short -q HEAD || g rev-parse --short HEAD)
+own="${HENKI_CONFIG:-$HOME/.config/henki}/AGENTS.md" # the global AGENTS.md: henki loads it already
+for f in "$root/AGENTS.md" "$root/CLAUDE.md"; do
+  if [ -L "$f" ]; then
+    printf '(%s is a link; not read)\n\n' "$f"
+    continue
+  fi
+  [ -f "$f" ] && ! [ "$f" -ef "$own" ] || continue
+  printf '# project instructions (%s)\n\n' "$f"
+  # CR line ends, NBSP and a leading byte order mark are formatting, not hidden text: CR and the mark go, NBSP becomes a
+  # space. Any other character henki escapes still makes henki skip the source, with a notice.
+  LC_ALL=C tr -d '\r' <"$f" | f="$f" LC_ALL=C awk -v max=15000 '
+    NR == 1 { sub(/^\357\273\277/, "") }
+    { gsub(/\302\240/, " "); n += length($0) + 1 }
+    n > max { printf "[cut here: %s is longer; read it for the rest]\n", ENVIRON["f"]; exit }
+    { print }'
+  printf '\n'
+  break
+done
+printf 'git: %s on %s\n' "$root" "${branch:-a detached HEAD}"

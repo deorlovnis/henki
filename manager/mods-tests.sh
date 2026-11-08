@@ -370,6 +370,76 @@ t_checkpoints_kept() {
   unset GIT_CEILING_DIRECTORIES
 }
 
+# The project mod's context source, run as henki runs it: in the working directory, stdin /dev/null, HENKI_CONFIG set.
+t_project() {
+  case_ "project: AGENTS.md or CLAUDE.md at the git root, cut, links, CRLF and NBSP, HOME, fsmonitor"
+  local src="$MODS_DIR/project/ctx/project" repo="$D/repo" here big i
+  here=$(pwd)
+  export GIT_CEILING_DIRECTORIES="$D" HENKI_CONFIG="$D/config"
+  mkdir -p "$repo/sub" "$D/config" "$D/plain" && cd "$repo/sub" || return
+  git init -q -b main "$repo"
+  run "$src" </dev/null
+  rc_is 0
+  [ "$OUT" = "git: $repo on main" ] || fail "no file: not the git line alone"
+  printf 'Use make.\n' >"$repo/CLAUDE.md"
+  run "$src" </dev/null
+  [ "$OUT" = "# project instructions ($repo/CLAUDE.md)$nl${nl}Use make.$nl${nl}git: $repo on main" ] || fail "CLAUDE.md alone"
+  printf 'Run the tests first.\n' >"$repo/AGENTS.md"
+  run "$src" </dev/null
+  [ "$OUT" = "# project instructions ($repo/AGENTS.md)$nl${nl}Run the tests first.$nl${nl}git: $repo on main" ] || fail "AGENTS.md wins"
+  # A link is never read, whatever it names (a secret outside the project): CLAUDE.md is used instead.
+  printf 'SECRET\n' >"$D/secret"
+  mv "$repo/AGENTS.md" "$repo/real.md" && ln -s "$D/secret" "$repo/AGENTS.md"
+  run "$src" </dev/null
+  out_has "($repo/AGENTS.md is a link; not read)$nl$nl# project instructions ($repo/CLAUDE.md)$nl${nl}Use make."
+  case "$OUT" in *SECRET*) fail "a linked AGENTS.md was read" ;; esac
+  rm "$repo/AGENTS.md" && ln -s real.md "$repo/AGENTS.md"
+  run "$src" </dev/null
+  case "$OUT" in *"Run the tests"*) fail "a link inside the project was read" ;; esac
+  rm "$repo/AGENTS.md" && mv "$repo/real.md" "$repo/AGENTS.md"
+  # CRLF ends, NBSP and a byte order mark are formatting: gone, a space, gone; the rest is the file.
+  printf '\357\273\277One\302\240two\r\nthree\r\n' >"$repo/AGENTS.md"
+  run "$src" </dev/null
+  out_has "$nl${nl}One two${nl}three$nl$nl"
+  [ "$(printf '%s' "$OUT" | LC_ALL=C tr -d '\r\240\273\277\357\302' | wc -c)" = "$(printf '%s' "$OUT" | wc -c)" ] || fail "a CR, NBSP or BOM byte is left"
+  # Over 15,000 bytes: cut at a line end, with a line saying so; the whole stays within a source's 16 KiB.
+  big=""
+  i=0
+  while [ $i -lt 400 ]; do
+    big="$big$(printf 'line %03d: %s' $i 'xxxxxxxxxxxxxxxxxxxxxxxxxxxxxx')$nl"
+    i=$((i + 1))
+  done
+  printf '%s' "$big" >"$repo/AGENTS.md"
+  run "$src" </dev/null
+  out_has "${nl}line 364: xxxxxxxxxxxxxxxxxxxxxxxxxxxxxx$nl[cut here: $repo/AGENTS.md is longer; read it for the rest]$nl${nl}git: $repo on main"
+  case "$OUT" in *"line 365"*) fail "past the cut" ;; esac
+  [ "$(printf '%s' "$OUT" | wc -c)" -le 16384 ] || fail "over 16 KiB"
+  # The global AGENTS.md (HENKI_CONFIG's) is never printed: henki loads it itself.
+  printf 'Be brief.\n' >"$repo/AGENTS.md"
+  HENKI_CONFIG="$repo" run "$src" </dev/null
+  case "$OUT" in *"Be brief"*) fail "the global AGENTS.md was printed" ;; esac
+  out_has "Use make."
+  # A detached HEAD; then a repository's fsmonitor hook never runs (nothing reads the index).
+  git -C "$repo" -c user.name=t -c user.email=t@t -c commit.gpgsign=false commit -q --allow-empty -m first
+  git -C "$repo" checkout -q --detach
+  printf '#!/bin/sh\ntouch %s/fsmonitor-ran\n' "$D" >"$D/fsmon" && chmod 755 "$D/fsmon"
+  git -C "$repo" config core.fsmonitor "$D/fsmon"
+  run "$src" </dev/null
+  out_has "git: $repo on $(git -C "$repo" rev-parse --short HEAD)"
+  [ ! -e "$D/fsmonitor-ran" ] || fail "the repository's core.fsmonitor ran"
+  # Nothing outside git, nor in a repository at or above HOME (a dotfiles repo).
+  cd "$D/plain" || return
+  run "$src" </dev/null
+  [ "$RC:$OUT" = "0:" ] || fail "outside git: $OUT"
+  cd "$repo/sub" || return
+  for h in "$repo" "$repo/sub"; do
+    HOME="$h" HENKI_CONFIG="" run "$src" </dev/null
+    [ "$RC:$OUT" = "0:" ] || fail "a repo at or above HOME=$h: $OUT"
+  done
+  cd "$here" || exit 1
+  unset GIT_CEILING_DIRECTORIES HENKI_CONFIG
+}
+
 t_notify() {
   case_ "notify: turn_end and question through the first notifier on PATH"
   local b="$D/bin"
@@ -391,6 +461,7 @@ t_notify() {
 
 t_sessions
 t_prompts
+t_project
 t_clip
 t_checkpoints
 t_checkpoints_missed

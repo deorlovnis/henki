@@ -288,7 +288,7 @@ EOF
     <<~TEXT
       henki reads ~/.config/henki/config.toml; start from a profile, then set model and base_url:
         mkdir -p ~/.config/henki && cp #{HOMEBREW_PREFIX}/share/henki/config.mac.toml ~/.config/henki/config.toml
-      The official modules (checkpoints, clip, halti, itse, notify, prompts, sessions) ship off. henki-mods
+      The official modules (checkpoints, clip, halti, itse, notify, project, prompts, sessions) ship off. henki-mods
       (also henki mods) manages modules:
         henki-mods list        what is added, on, and what each adds to the prompt
         henki-mods add halti   shows what it installs, then asks
@@ -383,7 +383,7 @@ selftest() {
   [ "$got" = "henki-mods $version" ] || { say "selftest: bin/henki-mods --version said \"$got\""; bad=1; }
   # The official modules are found in the tarball's share/ (no HENKI_SHARE, no repo checkout next to it).
   got=$(env -i HOME="$t/home" PATH=/usr/bin:/bin "$x/bin/henki-mods" list 2>&1) || got="(exit $?) $got"
-  case "$got" in *"official, not added: checkpoints clip halti itse notify prompts sessions "*) ;; *)
+  case "$got" in *"official, not added: checkpoints clip halti itse notify project prompts sessions "*) ;; *)
     say "selftest: bin/henki-mods list said: $got"
     bad=1
     ;;

@@ -240,3 +240,23 @@ fn ctx_rerun_on_resume() {
     assert!(m.log()[1].system().ends_with("\n\nsecond"), "{}", m.log()[1].system());
     assert_eq!(session(&d2)["sources"][0]["hash"], fnv(b"second"));
 }
+
+/// The official `project` mod through henki: the project's AGENTS.md with CRLF ends, NBSP and a byte order
+/// mark counts (henki skips nothing), under its header and before the git line, after the global AGENTS.md.
+#[test]
+fn ctx_project_mod() {
+    let m = Mock::start(vec![say("ok")]);
+    let r = Run::new(&m.url());
+    crate::observe::copy(&std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("mods/project"), &r.config_dir().join("ext/project"));
+    fs::write(r.config_dir().join("AGENTS.md"), "Be brief.\n").unwrap();
+    fs::write(r.cwd.join("AGENTS.md"), "\u{feff}Run the tests\u{a0}first.\r\nThen commit.\r\n").unwrap();
+    let d = r.json("hi");
+    d.finish();
+    assert_eq!(d.code, Some(0), "{}", d.diag());
+    let root = r.root();
+    let head = String::from_utf8(r.git(&["symbolic-ref", "--short", "-q", "HEAD"]).unwrap().stdout).unwrap();
+    let text = format!("# project instructions ({root}/AGENTS.md)\n\nRun the tests first.\nThen commit.\n\ngit: {root} on {}", head.trim());
+    let system = m.log()[0].system();
+    assert!(system.ends_with(&format!("\n\nBe brief.\n\n{text}")), "{system}");
+    assert!(d.notices().contains(&format!("context project/project: {} bytes", text.len())), "{:?}", d.notices());
+}
