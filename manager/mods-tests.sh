@@ -199,6 +199,17 @@ t_checkpoints() {
   run "$m/cmd/undo"
   rc_is 1
   err_has "no checkpoints in this session"
+  # An edit that drops an ignore rule: the file it hid was in no snapshot, so /undo keeps it, and says what goes.
+  mkdir -p secret && printf 'KEY\n' >secret/key && printf '*.log\nsecret/\n' >.gitignore
+  event shell "" >"$D/ev"
+  run "$m/on/call_start.wait" <"$D/ev"
+  : >.gitignore && printf 'new\n' >d.txt
+  run "$m/cmd/undo" <<<y
+  rc_is 0
+  out_has "to be removed:${nl}  d.txt${nl}put these"
+  case "$OUT" in *secret* | *c.log*) fail "/undo lists a file the snapshot's rules ignore" ;; esac
+  [ "$(cat secret/key)" = KEY ] && [ "$(cat c.log)" = log ] || fail "/undo removed a file the snapshot's rules ignore"
+  [ ! -e d.txt ] && [ "$(cat .gitignore)" = "*.log${nl}secret/" ] || fail "/undo did not put the files back"
   # A repo whose config names programs for git to run (a model can write .git/config): no snapshot or /undo runs one.
   mkdir -p "$D/trap/hooks" && cd "$D/trap" || return
   printf '#!/bin/sh\necho >>"%s/ran"; cat\n' "$D" >"$D/prog" && chmod 755 "$D/prog" && cp "$D/prog" hooks/reference-transaction

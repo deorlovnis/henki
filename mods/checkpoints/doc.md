@@ -9,13 +9,16 @@ An observer and commands for you, not for the model (they cost no prompt bytes):
   `$XDG_STATE_HOME/henki/checkpoints/SESSION/N/` (or notes that it did not exist); a `shell` call there has no
   snapshot, nor has a target whose path is not UTF-8 (henki sends no path for it).
 - `/checkpoints`: this session's snapshots, oldest first.
-- `/undo`: shows what changed since the newest snapshot (`git diff --stat`), asks, puts those files back, and drops the
-  snapshot, so the next `/undo` goes one call further back. Files made since then are removed.
+- `/undo`: shows what changed since the newest snapshot (`git diff --stat`) and the files made since then, asks, puts
+  the changed files back, removes the made ones, and drops the snapshot, so the next `/undo` goes one call further back.
+  A made file that the snapshot's own ignore rules ignore stays: it was there then (a `.env` that an edit to
+  `.gitignore` uncovered), and no snapshot holds it.
 - `/rewind N`: the same for snapshot N; it drops N and every later one.
 
-Ignored files (`.gitignore`) are never in a snapshot. Its git calls run no program your git config names (no
-`core.fsmonitor`, hook, pager or filter driver such as Git LFS): a snapshot holds the files' bytes as they are, and
-`/undo` puts those bytes back. A snapshot that takes over 2 s (a very large work tree) still finishes, but henki stops
-waiting for it, says so, and runs the calls after it without waiting. The model is not told about an `/undo`: say so
-in your next message. Old snapshots stay until you remove them:
-`git for-each-ref --format='%(refname)' refs/henki/ | xargs -n 1 git update-ref -d`.
+Ignored files (`.gitignore`, under the rules as they are when the snapshot is made) are not in a snapshot. So once an
+edit drops a rule, the files it hid are in the snapshots after it, kept by refs: a `git push --mirror` would publish
+them. The mod's git calls run no program your git config names (no `core.fsmonitor`, hook, pager or filter driver such
+as Git LFS): a snapshot holds the files' bytes as they are, and `/undo` puts those bytes back. A snapshot that takes
+over 2 s (a very large work tree) still finishes, but henki stops waiting for it, says so, and runs the calls after it
+without waiting. The model is not told about an `/undo`: say so in your next message. Old snapshots stay until you
+remove them: `git for-each-ref --format='%(refname)' refs/henki/ | xargs -n 1 git update-ref -d`.

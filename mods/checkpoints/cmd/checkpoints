@@ -34,7 +34,8 @@ EOF
 }
 
 # The work tree as a git tree object: every file git does not ignore, tracked or not, through a temporary index that
-# starts as a copy of the real one (so unchanged files are known by their stat data and not read again).
+# starts as a copy of the real one (so unchanged files are known by their stat data and not read again). The ignore
+# rules are the work tree's of now: once an edit drops one, the files it hid are in the snapshots after it.
 tree() {
   t_dir=$(mktemp -d "${TMPDIR:-/tmp}/henki-checkpoint.XXXXXX") || return 1
   t_real=$(g rev-parse --path-format=absolute --git-path index 2>/dev/null || g rev-parse --git-path index)
@@ -96,22 +97,30 @@ restore() {
   if [ -n "$top" ]; then
     g rev-parse -q --verify "$refs/$n^{tree}" >/dev/null || die "no checkpoint $n; fix: /checkpoints lists them"
     cur=$(tree) || die "cannot read the work tree"
-    changed=$(g diff --name-only --no-renames "$refs/$n" "$cur")
-    if [ -z "$changed" ]; then
+    gd=$(g rev-parse --absolute-git-dir) || die "cannot find the git dir"
+    d=$(mktemp -d "${TMPDIR:-/tmp}/henki-checkpoint.XXXXXX") || exit 1
+    trap 'rm -rf "$d"' EXIT
+    # The files made since N go, but only those N's own ignore rules do not ignore: a file the model's edit to a
+    # .gitignore uncovered (.env, secret/) was ignored then, so it is in no snapshot and must stay. So the files are
+    # made empty in a scratch tree that holds N's .gitignore files, and git lists those it does not ignore there.
+    (
+      cd "$top" && export GIT_INDEX_FILE="$d/index" && g read-tree "$refs/$n" && mkdir "$d/w" &&
+        g ls-files -z -- ':(glob)**/.gitignore' | g checkout-index -z --stdin --prefix="$d/w/" &&
+        g diff -z --name-only --no-renames --diff-filter=A "$refs/$n" "$cur" |
+        xargs -0 sh -c 'for p; do case $p in */*) mkdir -p "$0/${p%/*}" || exit 1 ;; esac; : >"$0/$p" || exit 1; done' "$d/w" &&
+        cd "$d/w" && GIT_DIR=$gd GIT_WORK_TREE=$d/w g ls-files -z -o --exclude-standard >"$d/gone"
+    ) || die "cannot read checkpoint $n"
+    if [ -z "$(g diff --name-only --no-renames --diff-filter=DMT "$refs/$n" "$cur")" ] && [ ! -s "$d/gone" ]; then
       echo "nothing changed since checkpoint $n"
     else
-      g diff --stat --no-renames "$refs/$n" "$cur"
+      g diff --stat --no-renames --diff-filter=DMT "$refs/$n" "$cur"
+      [ ! -s "$d/gone" ] || { echo "made since then, to be removed:" && tr '\0' '\n' <"$d/gone" | sed 's/^/  /'; }
       yes_ "put these files back as they were at checkpoint $n?" || exit 0
-      d=$(mktemp -d "${TMPDIR:-/tmp}/henki-checkpoint.XXXXXX") || exit 1
       (
         cd "$top" && export GIT_INDEX_FILE="$d/index" &&
-          g read-tree "$refs/$n" &&
           g diff -z --name-only --no-renames --diff-filter=DMT "$refs/$n" "$cur" | g checkout-index -f -z --stdin &&
-          g diff -z --name-only --no-renames --diff-filter=A "$refs/$n" "$cur" | xargs -0 rm -f --
-      )
-      rc=$?
-      rm -rf "$d"
-      [ "$rc" = 0 ] || die "could not put every file back"
+          xargs -0 rm -f -- <"$d/gone"
+      ) || die "could not put every file back"
     fi
     for m in $(numbers); do [ "$m" -lt "$n" ] || g update-ref -d "$refs/$m"; done
   else
