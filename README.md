@@ -96,6 +96,10 @@ The official modules are extensions in this repository's `mods/`, off until you 
 
 A module is an extension with an optional manifest, `.henki/module.toml`, that `henki-mods` shows on its install screen and checks first. The module template, `github.com/deorlovnis/henki-module-template` (to be published), is a working module with a guide from copying it to sharing your own. `henki-mods verify --dir DIR` checks a module as an install would (its `eval/` tasks too), `henki-mods eval ./DIR` measures it against the module off, `henki-mods add ./DIR` installs it from a directory, and `henki-mods add URL[@REF]#DIR` from a git repository, which is how you share one: henki-mods pins the commit and runs nothing from the repository, and its install screen marks such a module unreviewed.
 
+### henki serve
+
+`henki serve` is the REPL's session for a frontend program (a TUI, an editor) that talks to you in henki's place: it reads one JSON command per line on stdin (`send`, `answer`, `command`, `cancel`) and writes the session's records on stdout as `henki run --json` does, so henki keeps the approvals, the protected paths, the tripwire and the journal while the frontend draws them. The frontend answers the questions, so it must show you what the REPL shows before it sends `always` or starts the new henki a command hands back. It takes the REPL's options (`--resume[=ID[@N]]`, `--approve`, `--port`, ...); EOF on stdin ends the session. See CONTRACTS.md `front/1`.
+
 ### In an isolated environment
 
 `profiles/config.box.toml` runs `henki run` with `dialect = "anthropic"`: the Anthropic Messages API through the environment's model gateway, with a stand-in key that the gateway replaces. An Anthropic session cannot be resumed after its system prompt (the global `AGENTS.md`, an extension's first doc line) or its tools changed, because the API refuses the replayed history; start a new session instead. When the model declines a request (`stop_reason` `refusal`), the run ends with `error provider`, and the text that streamed before the refusal is not kept in the session.
@@ -118,7 +122,7 @@ cargo build --release
 ./check.sh install-hook  # check the commits of every git push
 ```
 
-`check.sh` holds henki to its budgets: at most 4,489 lines of non-test Rust (400 per file), at most 10 crates in the dependency tree, and a release binary of at most 1,065,536 bytes, including the static musl build on Linux when that target is installed. It also refuses a commit not yet pushed that has no `Signed-off-by:` line (`git commit -s`); [CONTRIBUTING.md](CONTRIBUTING.md) says why and lists the style rules.
+`check.sh` holds henki to its budgets: at most 4,544 lines of non-test Rust (400 per file), at most 10 crates in the dependency tree, and a release binary of at most 1,065,536 bytes, including the static musl build on Linux when that target is installed. It also refuses a commit not yet pushed that has no `Signed-off-by:` line (`git commit -s`); [CONTRIBUTING.md](CONTRIBUTING.md) says why and lists the style rules.
 
 `release/release.sh VERSION` builds, from a clean checkout, `dist/henki-VERSION-TARGET.tar.gz` for this host (static musl on Linux) and `dist/SHA256SUMS`. A tarball holds `bin/henki`, `bin/henki-mods`, the official modules in `share/henki/official` (off until added), the conformance suites in `share/henki/conform`, the general eval suite in `share/henki/eval/general`, the config profiles, LICENSE, README.md and CONTRACTS.md; unpack it anywhere and put its `bin/` on your PATH. `release/release.sh --formula VERSION TAP` writes the Homebrew formula from `SHA256SUMS`, and `release/release.sh --selftest` builds, unpacks and runs one tarball.
 

@@ -391,11 +391,13 @@ selftest() {
     bad=1
     ;;
   esac
-  # sessions needs this henki's version (requires), and its links into .henki/ and cmd/ survive the copy.
-  got=$(env -i HOME="$t/home" PATH=/usr/bin:/bin "$x/bin/henki-mods" add itse --yes 2>&1 &&
-    env -i HOME="$t/home" PATH=/usr/bin:/bin "$x/bin/henki-mods" add sessions --yes 2>&1 &&
-    env -i HOME="$t/home" PATH=/usr/bin:/bin "$x/bin/henki-mods" verify 2>&1) || { say "selftest: add itse and sessions, verify: $got"; bad=1; }
-  [ -L "$t/home/.config/henki/ext/itse" ] && [ -L "$t/home/.config/henki/ext/sessions" ] || { say "selftest: add --yes made no link"; bad=1; }
+  # sessions, project, compact and sandbox need this henki's version (requires), and the links into .henki/ and cmd/
+  # survive the copy.
+  for n in itse sessions project compact sandbox; do
+    got=$(env -i HOME="$t/home" PATH=/usr/bin:/bin "$x/bin/henki-mods" add "$n" --yes 2>&1) || { say "selftest: add $n: $got"; bad=1; }
+    [ -L "$t/home/.config/henki/ext/$n" ] || { say "selftest: add $n --yes made no link"; bad=1; }
+  done
+  got=$(env -i HOME="$t/home" PATH=/usr/bin:/bin "$x/bin/henki-mods" verify 2>&1) || { say "selftest: verify: $got"; bad=1; }
   # The conformance suites are found in the tarball's share/ too, and so is the general eval suite, whole.
   got=$(env -i HOME="$t/home" PATH=/usr/bin:/bin "$x/bin/henki-mods" test --port history std 2>&1) || { say "selftest: test --port history std: $got"; bad=1; }
   # compact, the official context binding, passes context.tsv with the fixtures from share/ (where python3 runs it).
@@ -403,11 +405,14 @@ selftest() {
     got=$(env -i HOME="$t/home" PATH=/usr/bin:/bin "$x/bin/henki-mods" test --port context "$x/share/henki/official/compact/port/context" 2>&1) ||
       { say "selftest: test --port context compact: $got"; bad=1; }
   fi
-  # sandbox, the official exec binding, passes exec/1's checks from the tarball where one of its backends runs.
+  # sandbox, the official exec binding, passes exec/1's checks and binds from the tarball where one of its backends
+  # runs.
   x_exec="$x/share/henki/official/sandbox/port/exec"
   if (cd "$t" && env -i HOME="$t/home" PATH=/usr/bin:/bin "$x_exec" /bin/sh -c true) >/dev/null 2>&1; then
-    got=$(env -i HOME="$t/home" PATH=/usr/bin:/bin "$x/bin/henki-mods" test --port exec "$x_exec" 2>&1) ||
-      { say "selftest: test --port exec sandbox: $got"; bad=1; }
+    got=$(env -i HOME="$t/home" PATH=/usr/bin:/bin "$x/bin/henki-mods" test --port exec "$x_exec" 2>&1 &&
+      env -i HOME="$t/home" PATH=/usr/bin:/bin "$x/bin/henki-mods" swap exec sandbox --yes 2>&1) ||
+      { say "selftest: test --port exec and swap exec sandbox: $got"; bad=1; }
+    [ -L "$t/home/.config/henki/port/exec" ] || { say "selftest: swap exec sandbox --yes made no link"; bad=1; }
   fi
   got=$(env -i HOME="$t/home" PATH=/usr/bin:/bin "$x/bin/henki-mods" eval --check "$x/share/henki/eval/general" 2>&1) || { say "selftest: eval --check: $got"; bad=1; }
   [ "$(cd "$x/share/henki/eval/general" && ls)" = "$(cd eval/general && ls)" ] || { say "selftest: share/henki/eval/general holds other tasks than eval/general"; bad=1; }
