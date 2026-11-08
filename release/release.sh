@@ -6,6 +6,7 @@
 #   bin/henki-mods               the module manager; it finds the official modules at ../share/henki/official
 #   share/henki/official/NAME/   every module in mods/, as git tracks it (off until `henki-mods add NAME`)
 #   share/henki/conform/         the conformance suites of manager/conform/ (henki-mods test --port, swap)
+#   share/henki/eval/general/    the general eval suite of eval/general/ (henki-mods eval --suite general)
 #   share/henki/config.*.toml    the config profiles in profiles/ (henki's no-config message names config.mac.toml)
 #   LICENSE README.md CONTRACTS.md
 #
@@ -153,13 +154,20 @@ hd1_of() {
 stage() {
   local dir="$1/henki-$2-$3" bin=$4 m n
   rm -rf "$dir"
-  mkdir -p "$dir/bin" "$dir/share/henki/official" "$dir/share/henki/conform"
+  mkdir -p "$dir/bin" "$dir/share/henki/official" "$dir/share/henki/conform" "$dir/share/henki/eval"
   cp "$bin" "$dir/bin/henki" && chmod 755 "$dir/bin/henki"
   cp manager/henki-mods "$dir/bin/henki-mods" && chmod 755 "$dir/bin/henki-mods"
   for n in LICENSE README.md CONTRACTS.md; do cp "$n" "$dir/$n" && chmod 644 "$dir/$n"; done
   # The profiles, where henki's no-config message sends a Homebrew user: $(brew --prefix)/share/henki/.
   for n in $(git ls-files 'profiles/config.*.toml'); do cp "$n" "$dir/share/henki/${n#profiles/}" && chmod 644 "$dir/share/henki/${n#profiles/}"; done
   for n in $(git ls-files 'manager/conform/*.tsv'); do cp "$n" "$dir/share/henki/conform/" && chmod 644 "$dir/share/henki/conform/${n##*/}"; done
+  # The general suite as git tracks it: its programs (setup, check, fake-bin/) 755, the rest 644.
+  git ls-files -s -z -- eval/general | while IFS= read -r -d '' m; do
+    n=${m#*$'\t'}
+    mkdir -p "$dir/share/henki/$(dirname "$n")"
+    cp "$n" "$dir/share/henki/$n" || die "cannot copy $n; fix: make it readable and check the free space in TMPDIR"
+    case "${m%% *}" in 100755) chmod 755 "$dir/share/henki/$n" ;; 100644) chmod 644 "$dir/share/henki/$n" ;; *) die "$n: git mode ${m%% *}; fix: the suite holds files only" ;; esac
+  done
   for m in mods/*/; do
     n=$(basename "$m")
     copy_mod "$n" "$dir/share/henki/official"
@@ -280,7 +288,8 @@ EOF
     <<~TEXT
       henki reads ~/.config/henki/config.toml; start from a profile, then set model and base_url:
         mkdir -p ~/.config/henki && cp #{HOMEBREW_PREFIX}/share/henki/config.mac.toml ~/.config/henki/config.toml
-      The official modules (clip, halti, itse, prompts, sessions) ship off. henki-mods manages modules:
+      The official modules (checkpoints, clip, halti, itse, notify, prompts, sessions) ship off. henki-mods
+      (also henki mods) manages modules:
         henki-mods list        what is added, on, and what each adds to the prompt
         henki-mods add halti   shows what it installs, then asks
     TEXT
@@ -339,11 +348,17 @@ selftest() {
   got=$(tar -tzf "$DIST/$name.tar.gz" | sed 's,/$,,' | sort)
   want=$(
     {
-      for x in "" /bin /bin/henki /bin/henki-mods /share /share/henki /share/henki/official /share/henki/conform /LICENSE /README.md /CONTRACTS.md; do
+      for x in "" /bin /bin/henki /bin/henki-mods /share /share/henki /share/henki/official /share/henki/conform /share/henki/eval /LICENSE /README.md /CONTRACTS.md; do
         echo "$name$x"
       done
       git ls-files 'profiles/config.*.toml' | sed "s,^profiles/,$name/share/henki/,"
       git ls-files 'manager/conform/*.tsv' | sed "s,^manager/conform/,$name/share/henki/conform/,"
+      git ls-files eval/general | sed "s,^,$name/share/henki/," | while read -r x; do
+        while [ "$x" != "$name/share/henki/eval" ]; do
+          echo "$x"
+          x=$(dirname "$x")
+        done
+      done
       git ls-files mods | sed "s,^mods/,$name/share/henki/official/," | while read -r x; do
         while [ "$x" != "$name/share/henki/official" ]; do
           echo "$x"
@@ -378,8 +393,17 @@ selftest() {
     env -i HOME="$t/home" PATH=/usr/bin:/bin "$x/bin/henki-mods" add sessions --yes 2>&1 &&
     env -i HOME="$t/home" PATH=/usr/bin:/bin "$x/bin/henki-mods" verify 2>&1) || { say "selftest: add itse and sessions, verify: $got"; bad=1; }
   [ -L "$t/home/.config/henki/ext/itse" ] && [ -L "$t/home/.config/henki/ext/sessions" ] || { say "selftest: add --yes made no link"; bad=1; }
-  # The conformance suites are found in the tarball's share/ too.
+  # The conformance suites are found in the tarball's share/ too, and so is the general eval suite, whole.
   got=$(env -i HOME="$t/home" PATH=/usr/bin:/bin "$x/bin/henki-mods" test --port history std 2>&1) || { say "selftest: test --port history std: $got"; bad=1; }
+  got=$(env -i HOME="$t/home" PATH=/usr/bin:/bin "$x/bin/henki-mods" eval --check "$x/share/henki/eval/general" 2>&1) || { say "selftest: eval --check: $got"; bad=1; }
+  [ "$(cd "$x/share/henki/eval/general" && ls)" = "$(cd eval/general && ls)" ] || { say "selftest: share/henki/eval/general holds other tasks than eval/general"; bad=1; }
+  # eval finds that suite: it gets as far as the screen (no terminal to ask on, so nothing runs).
+  got=$(env -i HOME="$t/home" PATH=/usr/bin:/bin HENKI_MODS_TTY="$t/no-tty" "$x/bin/henki-mods" eval sessions --suite general 2>&1) && got="(exit 0) $got"
+  case "$got" in *"on general, 12 tasks"*"no terminal to ask on"*) ;; *)
+    say "selftest: eval sessions --suite general said: $got"
+    bad=1
+    ;;
+  esac
 
   # Unpacked and packed again, it is the same bytes: the packing depends on nothing but the files and the commit.
   pack "$t/x" "$name" "$t/again.tar.gz" "$(git log -1 --format=%ct HEAD)"
