@@ -169,7 +169,8 @@ fn pty_port_history() {
 }
 
 /// A binding that fails to start, to greet, or to give a session stops the start: exit 2 (`config` before the session,
-/// `journal` at it), the reason named after the binding, the kernel log and the repair; nothing of it is left running.
+/// `journal` at it), the reason named after the binding, the kernel log and the repair; nothing of it is left running,
+/// not even (Linux) a daemon it started in a session of its own, which only the sweep after the refusal takes.
 #[test]
 fn e2e_port_refused_starts() {
     let cases = [
@@ -184,7 +185,8 @@ fn e2e_port_refused_starts() {
     for (faults, why) in cases {
         let m = Mock::start(vec![say("never")]);
         let r = Run::new(&m.url());
-        let w = toy(&r, faults);
+        let daemon = if cfg!(target_os = "linux") { format!("(setsid sleep {} </dev/null >/dev/null 2>&1 &)\n", r.marker) } else { String::new() };
+        let w = bind_at(&r, None, &format!("{daemon}exec {} history --name {} {faults}", port_toy().display(), r.marker));
         let d = r.json("hi");
         d.finish();
         let e = &d.result()["error"];

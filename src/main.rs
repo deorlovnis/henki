@@ -158,6 +158,7 @@ fn pipe((port, offer, exe): (&'static str, Vec<u64>, PathBuf), out: Out, ch: (Se
     let (env, home) = (Env::os(), std::env::var_os("HOME").map(PathBuf::from).unwrap_or_default());
     let (path, state) = (env.get("PATH").unwrap_or_default().to_string_lossy(), config::xdg(&env, &home, "XDG_STATE_HOME", ".local/state").join("port").join(port));
     let o = remote::pipe(port, &exe, &state, &supervise::child_env(&env, &[], &path, &path, ""), &offer, &out, ch);
+    _ = (0..5).all(|_| supervise::sweep_pass() > 0); // what the ended binding left (Linux: its orphans are henki's children)
     code(out, &o, None)
 }
 
@@ -167,6 +168,8 @@ fn run(a: Args, out: Out, tx: Sender<Ev>, rx: Receiver<Ev>, t0: Instant, early: 
     let (cfg, ports, sid, hist, task, mut head, reader) = match start(a, &tx, &rx, t0, early, &mut deadline) {
         Ok(r) => r,
         Err(o) => {
+            // The bindings started before the refusal are ended (bye, kill); then what they left, as at a session end.
+            _ = (0..5).all(|_| supervise::sweep_pass() > 0);
             refuse(&out, &o, t0);
             return code(out, &o, deadline);
         }

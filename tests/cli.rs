@@ -321,4 +321,18 @@ fn port_pipe() {
         assert_eq!(out.status.code(), Some(2), "{args:?}");
         assert!(text(&out.stderr).starts_with(&format!("henki: {says}\n")), "{args:?}: {}", text(&out.stderr));
     }
+    // Linux: a daemon the binding started in a session of its own is henki's child once its parent ends; the sweep after
+    // the binding's end takes it, as at a session's end.
+    if cfg!(target_os = "linux") {
+        let mark = format!("3133.8{:07}", std::process::id());
+        let w = h.0.join("daemon");
+        write(&w, &format!("#!/bin/sh\n(setsid sleep {mark} </dev/null >/dev/null 2>&1 &)\nexec {}\n", b.display()), 0o700);
+        assert_eq!(h.run(&["port", "history", "--", w.to_str().unwrap()], &[]).status.code(), Some(0));
+        let live = || fs::read_dir("/proc").unwrap().flatten().any(|p| fs::read(p.path().join("cmdline")).is_ok_and(|c| c.ends_with(format!("{mark}\0").as_bytes())));
+        let until = Instant::now() + Duration::from_secs(2);
+        while live() && Instant::now() < until {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(!live(), "the binding's daemon outlived henki port");
+    }
 }
