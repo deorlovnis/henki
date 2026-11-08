@@ -514,9 +514,13 @@ t_refusals() {
   run add "$m" --yes
   refused 'requires "itse >= 1" is not "henki >= VERSION"'
   rm -rf "$m" && mkmod "$m"
-  printf 'x\n' >"$m/.henki/notes"
+  # .henki holds data files too (the sandbox module has two), but neither a program nor a link.
+  printf 'x\n' >"$m/.henki/notes" && chmod 755 "$m/.henki/notes"
   run add "$m" --yes
-  refused ".henki holds module.toml, card.md and template"
+  refused ".henki holds module.toml, card.md, template (a program cmd/ links run) and data files of mode 644"
+  rm -f "$m/.henki/notes" && ln -s ../doc.md "$m/.henki/notes"
+  run add "$m" --yes
+  refused ".henki holds module.toml"
 
   # Nothing of a refused add stays behind.
   check "no link after refusals" [ ! -e "$CONF/ext" ] || [ -z "$(ls "$CONF/ext")" ]

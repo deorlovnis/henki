@@ -531,9 +531,12 @@ ports = ["history"]              # optional; exactly the programs in port/ (port
 ```
 
 A module without a manifest is unmanaged (allowed for path and URL installs, and listed as such). `port/PORT` is a
-program its owner can run (a file, or a link inside the module), PORT one that henki binds (`history` or `policy`).
-`cmd/`, `ctx/` and `eval/` are ext/2's (`ctx/` holds context sources, `eval/` eval/1 tasks), `on/` observe/1's;
-`.henki/template` may hold a program that `cmd/` links run. A module with `ctx/` says `requires = ["henki >= 0.3"]`.
+program its owner can run (a file, or a link inside the module), PORT one that henki binds (`history`, `policy`,
+`context` or `exec`). `cmd/`, `ctx/` and `eval/` are ext/2's (`ctx/` holds context sources, `eval/` eval/1 tasks),
+`on/` observe/1's; `.henki/template` may hold a program that `cmd/` links run. Any other file under `.henki/` is data
+the module's own programs read (a library, a setup script they run with `sh`): a regular file of mode 644, never a
+link or a program, which nothing puts on a PATH. A module with `ctx/` says `requires = ["henki >= 0.3"]`, and so does
+one with `port/context` or `port/exec`.
 
 A git source (`URL[@REF][#SUBDIR]`) is cloned only over `https`, `http`, `ssh`, `git` or `file` URLs, or scp's
 `USER@HOST:PATH`; a remote helper (`ext::`, `fd::`, any other `SCHEME::` or unknown `SCHEME://`) is refused before

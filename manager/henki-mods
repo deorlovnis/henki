@@ -746,10 +746,12 @@ EOF
         esac
         ;;
       .henki)
+        # Data (mode 644, no link) is what the module's own programs read: a library, a setup script run with sh. Nothing
+        # puts it on a PATH or runs it as a command, and henki ignores the whole dot dir.
         case "$rest:$kind" in
           module.toml:644 | module.toml:755 | card.md:644 | card.md:755 | template:755) ;;
-          *)
-            ERR="$dir/$p: .henki holds module.toml, card.md and template (a program cmd/ links run; regular files) only; fix: remove it"
+          module.toml:* | card.md:* | template:* | *:link | *:755)
+            ERR="$dir/$p: .henki holds module.toml, card.md, template (a program cmd/ links run) and data files of mode 644, all regular files; fix: make it a file (chmod 644 for data), or remove it"
             return 1
             ;;
         esac
