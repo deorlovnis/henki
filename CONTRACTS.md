@@ -919,3 +919,51 @@ evalrun/1 RUN PKG VERSION HD1 MODEL SUITE ARM REPEAT TASK PASS STATUS STEPS SECO
   `runs.tsv`. `henki-mods-dev eval badge --check ROWS FILE` passes when the rows give a PASS whose keys equal FILE's.
   henki-mods recomputes the badge from those rows the same way; a reviewed version whose badge recomputes is
   `measured` when `eval_by`'s login is its `reviewer` (the reviewer reran it), and otherwise shows it as the author's.
+
+## The module manager's programs and files
+
+Not a contract of its own: where the formats above that henki-mods owns live, which program reads and writes each, and
+what any program can rely on when it runs the manager.
+
+- **Two programs**, shipped side by side in `bin/`: `henki-mods`, the person's verbs (and `test --port PORT
+  NAME|DIR|PROGRAM`, which `swap` runs, and `eval`), and `henki-mods-dev`, the author's verbs (`new`, `test [DIR]`,
+  `try`, `publish`, `share`, `entry`, `eval report|badge`). `henki-mods VERB` and `henki mods VERB` reach both:
+  henki-mods runs henki-mods-dev for the author's verbs. henki-mods-dev reads a module with henki-mods's own code (it
+  sources it), so an author's `test` checks what an install checks.
+- **Messages.** A refusal is one line on stderr, `henki-mods: PROBLEM; fix: WHAT TO DO`, and exit 1; a warning is
+  `henki-mods: warning: ...`; a usage error is exit 2. `doctor` exits 1 when it found a problem, and `eval badge`
+  exits 0 only on PASS. Screens and texts may change.
+- **Questions.** A change shows a screen, then asks on `HENKI_MODS_TTY` (default `/dev/tty`); `--yes` answers yes for a
+  screen already read; without a terminal and without `--yes` it refuses. Inside a tool call (`HENKI_SESSION` set and
+  no `HENKI_NEXT`, which henki gives only to a command the person typed) `add`, `on`, `update`, `rollback`, `unpack`,
+  `init`, `index add` and `swap` refuse whatever `--yes` says: `run it at the prompt with /mods`. A model can change
+  its environment, so this only slows it down; the guard is henki asking before each shell call.
+- **A change made under henki** writes `restart` into `HENKI_NEXT` (handoff/1); run alone it prints how to restart.
+- **The share dir**, SHARE below, is looked for in `HENKI_SHARE` when it is set, then in `share/henki/` beside the
+  program's own dir (`bin/../share/henki`, as a release and Homebrew lay it out), then in the repository's layout
+  (`mods/`, `manager/`), per kind of file. Every index screen names the anchor's path when it is not the one beside
+  the program.
+- **`contracts`** in a manifest may name the contracts of this file's index; the manager's list of them is tested
+  against the index.
+
+| Path | Holds | Written by | Format |
+|---|---|---|---|
+| `CONFIG_DIR/mods.lock` | the modules and the bound ports | henki-mods | lock/1, bind/1 |
+| `CONFIG_DIR/mods.history` | the lock lines a change replaced or removed | henki-mods | hist/1 |
+| `CONFIG_DIR/mods.index`, `CONFIG_DIR/index/NAME.signers`, `NAME.checkpoint` | the indexes added with `index add`, their pinned anchors | henki-mods | index/1 |
+| `CONFIG_DIR/ext/NAME` | a link to the module's store copy: the module is on | henki-mods | lock/1 |
+| `CONFIG_DIR/port/PORT` | a link to a store copy's `port/PORT`, or to the missing `yanked` | henki-mods (`swap`, a yank) | bind/1, port/1 |
+| `CONFIG_DIR/AGENTS.md` | only the block between `# >>> mods cards` and `# <<< mods cards` | henki-mods | module/1 (`.henki/card.md`) |
+| `DATA/henki/mods/NAME/ID/` | read-only store copies (a masked copy is `ID.mHASH`) | henki-mods | hd1, lock/1 |
+| `DATA/henki/mods.users` | the config dirs that use the store | henki-mods | hist/1 |
+| `DATA/henki/index/NAME.git`, `NAME.synced` | an index's bare clone (`refs/henki/verified`) and its last good sync | henki-mods | index/1 |
+| `STATE/henki/eval.tsv`, `STATE/henki/eval/RUN/` | eval's lines and runs | henki-mods | eval/1, evalrun/1 |
+| `SHARE/official/NAME/` | the official modules | release | module/1, ext/2 |
+| `SHARE/index/` | the default index's `NAME.url`, `NAME.signers`, `NAME.checkpoint` and `refused.keys` | release | index/1 |
+| `SHARE/mod-profiles/NAME.lock` | the shipped module profiles | release | lock/1 |
+| `SHARE/conform/PORT.tsv`, `SHARE/conform/fixtures/` | the conformance suites | release | conform/1 |
+| `SHARE/eval/general/` | the general eval suite | release | eval/1 |
+
+CONFIG_DIR is `~/.config/henki` (or `HENKI_CONFIG`, which henki sets for `/mods`), DATA `$XDG_DATA_HOME` (else
+`~/.local/share`), STATE `$XDG_STATE_HOME` (else `~/.local/state`). henki itself reads only the links in `ext/` and
+`port/`, and `AGENTS.md`; every other file here is the manager's.
