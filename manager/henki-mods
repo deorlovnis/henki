@@ -41,7 +41,7 @@ nl='
 # ext::prompt's header line; henki joins it to the rest of the system prompt with a blank line ("\n\n").
 HEADER='Extensions are commands on PATH; read the doc in brackets before first use.'
 # The named formats this henki ships (CONTRACTS.md); a module's `contracts` must all be here.
-CONTRACTS_KNOWN='journal/1 json/1 wire/1 ext/1 ext/2 handoff/1 observe/1 module/1 lock/1 hd1 port/1 history/1 policy/1 conform/1 bind/1 eval/1 hist/1 index/1'
+CONTRACTS_KNOWN='journal/1 json/1 wire/1 ext/1 ext/2 handoff/1 observe/1 module/1 lock/1 hd1 port/1 history/1 policy/1 conform/1 bind/1 eval/1 hist/1 index/1 pack/1'
 # The ports a package may bind (henki's port::LINKED), and what each one gets to see, for the swap screen.
 PORTS_KNOWN='history policy'
 PORT_SEES_history='stores every session record'
@@ -61,6 +61,9 @@ EVENTS='session_start turn_start turn_start.wait call_start call_start.wait call
 LICENSE_BAD='*[!A-Za-z0-9.+ ()-]*' # an SPDX expression: ids, AND/OR/WITH, parentheses
 NAME_RULE='a name is 1 to 32 of a-z, 0-9, _ and -, starting with a-z or 0-9'
 INDEX_DEFAULT=deorlovnis # the index whose anchor ships with henki (SHARE/index/NAME.*)
+# The targets a module's prebuilt programs (asset_TARGET) are for; asset_targets picks this machine's.
+ASSET_TARGETS='aarch64_apple_darwin x86_64_apple_darwin aarch64_unknown_linux_musl x86_64_unknown_linux_musl aarch64_unknown_linux_gnu x86_64_unknown_linux_gnu'
+ASSET_MAX=67108864 # bytes: curl stops a download past it
 INDEX_AGE_MAX=30         # days: an older verified index is warned about (a frozen index shows no new yanks)
 
 die() {
@@ -82,6 +85,14 @@ usage: henki-mods [list]              modules: state, version, source, prompt by
        henki-mods search [TERM] | info NAME[@INDEX] | sync   the signed indexes: what they list, one package, yanks
        henki-mods doctor              everything henki-mods depends on, each problem with its fix
        henki-mods on NAME | off NAME | rm NAME
+       henki-mods on NAME/CMD | off NAME/CMD   a mask: NAME without its command /CMD (a clash), or with it again
+       henki-mods outdated            what each module's source holds now
+       henki-mods update NAME [--to VERSION|@REF] [--force] [--yes]   NAME from its source, after a screen of changes
+       henki-mods pin NAME | unpin NAME | rollback NAME [--yes]   keep a version; go back to the one before
+       henki-mods gc [--all] [--yes]  store copies nothing names (the history's two newest pins stay, but with --all)
+       henki-mods pack [NAME...] [--with-index] -o FILE | unpack FILE [--yes]   modules to a machine with no network
+       henki-mods init [PROFILE|FILE] [--yes] | profile list | profile show PROFILE | profile save FILE   module sets
+       henki-mods index list | index add NAME URL --signers FILE [--checkpoint COMMIT] [--yes] | index rm NAME [--yes]
        henki-mods lock                print the lock
        henki-mods verify [NAME]       store copies against the lock, the links, the layout
        henki-mods verify --dir DIR    one module directory: layout and manifest
@@ -343,7 +354,7 @@ target() {
   printf '%s' "${t%"$nl"}"
 }
 
-# hd1 of the listing in STAGE_LIST for DIR: sha256 of "MODE SHA256 PATH\n" per entry, in PATH order.
+# hd1 of the listing in LIST (STAGE_LIST by default) for DIR: sha256 of "MODE SHA256 PATH\n" per entry, in PATH order.
 hd1() {
   local dir="$1" p kind h
   while IFS= read -r p; do
@@ -351,7 +362,13 @@ hd1() {
     p=${p%"$tab"*}
     if [ "$kind" = link ]; then h=$(target "$dir/$p" | sha); else h=$(sha <"$dir/$p"); fi
     printf '%s %s %s\n' "$kind" "$h" "$p"
-  done <"$STAGE_LIST" | sha | sed 's/^/hd1:/'
+  done <"${2:-$STAGE_LIST}" | sha | sed 's/^/hd1:/'
+}
+
+# STAGE_LIST without the entries named in PATHS (one per line), into STAGE_LIST.less (printed).
+list_less() {
+  HM_P="$1" awk -F '\t' 'BEGIN { n = split(ENVIRON["HM_P"], a, "\n"); for (i = 1; i <= n; i++) if (a[i] != "") x[a[i]] = 1 } !($1 in x)' "$STAGE_LIST" >"$STAGE_LIST.less"
+  printf '%s\n' "$STAGE_LIST.less"
 }
 
 # A symlink at PATH in module DIR to TARGET stays inside the module: TARGET is relative, walked from PATH's
@@ -382,7 +399,7 @@ inside() { # DIR PATH TARGET
 manifest() {
   local dir="$1" host="$2" f="$1/.henki/module.toml" out rec key rest type val x
   M_module="" M_name="" M_version="" M_summary="" M_license="" M_requires="" M_contracts="" M_os="" M_needs=""
-  M_shadow="" M_caps="" M_maintainer="" M_ports="" M_has=0
+  M_shadow="" M_caps="" M_maintainer="" M_ports="" M_has=0 M_assets=""
   [ -e "$f" ] || [ -L "$f" ] || return 0
   M_has=1
   if [ -L "$f" ] || [ ! -f "$f" ]; then
@@ -414,12 +431,26 @@ manifest() {
           needs) M_needs=$val ;; shadow) M_shadow=$val ;; ports) M_ports=$val ;;
         esac
         ;;
-      henki_module:* | name:* | version:* | summary:* | license:* | caps_net:* | maintainer:* | requires:* | contracts:* | os:* | needs:* | shadow:* | ports:*)
+      asset_*:A)
+        # A prebuilt program for one target: ["bin/NAME", "https://...", "sha256:HEX"] (an asset, outside the hd1).
+        x=${key#asset_}
+        case " $ASSET_TARGETS " in *" $x "*) ;; *)
+          ERR="$f: $key: $x is not a target ($ASSET_TARGETS); fix: name one of them"
+          return 1
+          ;;
+        esac
+        printf '%s\n' "$val" | awk -F '\t' 'NF == 3 && $1 ~ /^bin\/[A-Za-z0-9._-]+$/ && $2 ~ /^https:\/\/[^ ]+$/ && $3 ~ /^sha256:[0-9a-f]+$/ && length($3) == 71 { ok = 1 } END { exit !ok }' || {
+          ERR="$f: $key must be [\"bin/NAME\", \"https://...\", \"sha256:HEX\"] (an https URL, 64 lowercase hex digits); fix: correct it"
+          return 1
+        }
+        M_assets="$M_assets$x$tab$val$nl"
+        ;;
+      henki_module:* | name:* | version:* | summary:* | license:* | caps_net:* | maintainer:* | requires:* | contracts:* | os:* | needs:* | shadow:* | ports:* | asset_*)
         ERR="$f: $key has the wrong type; fix: see the module/1 format in CONTRACTS.md"
         return 1
         ;;
       *)
-        ERR="$f: unknown key $key; fix: remove it (module/1 keys: henki_module, name, version, summary, license, requires, contracts, os, needs, shadow, caps_net, maintainer, ports)"
+        ERR="$f: unknown key $key; fix: remove it (module/1 keys: henki_module, name, version, summary, license, requires, contracts, os, needs, shadow, caps_net, maintainer, ports, asset_TARGET)"
         return 1
         ;;
     esac
@@ -576,17 +607,19 @@ top_ok() {
 }
 
 # Everything about module DIR into I_* and M_*: hd1, doc line, commands, links, card, manifest, and I_runs: what runs
-# (PATH<TAB>WHEN, one per line: bin/, cmd/, on/ and port/ entries); NAME the default name (the source dir's), HOST 1
-# to check this machine too. Exit 1 with ERR at the first problem.
+# (PATH<TAB>WHEN, one per line: bin/, cmd/, on/ and port/ entries); NAME the default name (the source dir's). HOW: 0 a
+# module directory, 1 one to install (this machine checked too; its asset's place must be free), 2 a store copy (its
+# asset for this machine must be in place), 3 a store copy to install (2, and this machine checked). The hd1 leaves the
+# asset out (asset_check). Exit 1 with ERR at the first problem.
 inspect() {
   local dir="$1" fallback="$2" host="$3" p kind top rest x why
-  I_hd1="" I_line="" I_cmds="" I_links=0 I_files=0 I_card=0 I_name="" I_ports="" I_runs=""
+  I_hd1="" I_line="" I_cmds="" I_links=0 I_files=0 I_card=0 I_name="" I_ports="" I_runs="" I_asset=""
   listing "$dir" || return 1
   [ -s "$STAGE_LIST" ] || {
     ERR="$dir: empty; fix: a module holds doc.md"
     return 1
   }
-  manifest "$dir" "$host" || return 1
+  manifest "$dir" "$((host % 2))" || return 1
   I_name=${M_name:-$fallback}
   if ! is_name "$I_name"; then
     ERR="$dir: the name \"$I_name\": $NAME_RULE; fix: rename the directory, or set name in .henki/module.toml"
@@ -784,7 +817,42 @@ EOF
       return 1
     fi
   fi
-  I_hd1=$(hd1 "$dir")
+  asset_check "$dir" "$host" || return 1
+}
+
+# This machine's asset of module DIR (manifest read) into I_asset (TARGET<TAB>DEST<TAB>URL<TAB>SHA, or empty), and
+# I_hd1 without it: an asset is checked by its sha256, so the hd1 stays the hd1 of the module's own files (an index's).
+# HOW as for inspect. Exit 1 with ERR when the module has assets but none for here, or the asset is not as named.
+asset_check() { # DIR HOW
+  local t d k
+  I_asset=""
+  for t in $(asset_targets); do
+    I_asset=$(printf '%s' "$M_assets" | HM_T="$t" awk -F '\t' '$1 == ENVIRON["HM_T"] { print; exit }')
+    [ -z "$I_asset" ] || break
+  done
+  if [ -z "$I_asset" ]; then
+    [ -z "$M_assets" ] || [ "$2" = 0 ] || [ "$2" = 2 ] || {
+      ERR="$M_name runs a prebuilt program made for $(printf '%s' "$M_assets" | cut -f 1 | tr '\n' ' ')only, none for this machine ($(asset_targets | cut -d ' ' -f 1)); fix: install it on one of those, or ask its author for a build"
+      return 1
+    }
+    I_hd1=$(hd1 "$1")
+    return 0
+  fi
+  d=$(printf '%s' "$I_asset" | cut -f 2)
+  k=$(HM_D="$d" awk -F '\t' '$1 == ENVIRON["HM_D"] { print $2; exit }' "$STAGE_LIST")
+  if [ -z "$k" ]; then
+    [ "$2" -lt 2 ] || {
+      ERR="$1/$d: the prebuilt program for $(printf '%s' "$I_asset" | cut -f 1) is missing; fix: henki-mods rm $M_name, then add it again"
+      return 1
+    }
+  elif [ "$2" = 1 ]; then
+    ERR="$1/$d: a file of the module where its asset_$(printf '%s' "$I_asset" | cut -f 1) goes; fix: remove one of them"
+    return 1
+  elif [ "$k" != 755 ] || [ "sha256:$(sha <"$1/$d")" != "$(printf '%s' "$I_asset" | cut -f 4)" ]; then
+    ERR="$1/$d: not the prebuilt program its manifest names (its sha256 differs, or it is not a program); fix: henki-mods rm $M_name, then add it again"
+    return 1
+  fi
+  I_hd1=$(hd1 "$1" "$(list_less "$d")")
 }
 
 # --- sources -----------------------------------------------------------------------------------------------------------
@@ -1263,30 +1331,13 @@ file_kind() {
 
 red() { if [ -t 1 ]; then printf '\033[1;31m%s\033[0m' "$1"; else printf '%s' "$1"; fi; }
 
-cmd_add() {
-  local src="" yes=0 want="" a kind source fallback dir id store how answer ref sub url bytes total n d x tty need line pkg=""
-  while [ $# -gt 0 ]; do
-    case "$1" in
-      --yes | -y) yes=1 ;;
-      --version)
-        [ $# -ge 2 ] || usage
-        want=$2
-        shift
-        ;;
-      -*) usage ;;
-      *) [ -z "$src" ] && src=$1 || usage ;;
-    esac
-    shift
-  done
-  [ -n "$src" ] || usage
-  case "$src" in *[[:cntrl:]]*) die "the source holds a control character; fix: name it without one" ;; esac
-  trust_guard
-  busy
-  lock_check
-  stage
-  STAGE_LIST="$STAGE/list"
+# Copies source SRC into $STAGE/m as add takes it (WANT: --version's value, for an index package), inspects it, and puts
+# this machine's prebuilt program in place. Sets the caller's kind, source, fallback, dir, url, sub, ref and pkg, and
+# COMMIT (or -), E_ver and E_rec (an index version), F_index. Dies with the reason when the copy cannot go in here.
+stage_src() { # SRC WANT
+  local src="$1" want="$2" x
   COMMIT=-
-  ref="" sub=""
+  ref="" sub="" pkg="" url="" dir=""
   case "$src" in
     /* | ./* | ../*)
       kind=path
@@ -1340,10 +1391,6 @@ cmd_add() {
         pkg=${src%@*}
         [ "$(rget "$STAGE/ix/$F_index/r/$pkg" kind)" = git ] || die "$pkg in index $F_index is a record about a module henki ships; fix: henki-mods add $pkg with the henki that ships it"
         pick_version "$F_index" "$pkg" "$want"
-        for x in $(asset_targets); do
-          ! rget "$E_rec" "asset_$x" >/dev/null ||
-            die "$pkg $E_ver has a prebuilt binary for this machine (asset_$x), which this henki-mods cannot fetch; fix: upgrade henki"
-        done
         kind="index:$F_index"
         url=$(rget "$STAGE/ix/$F_index/r/$pkg" repo)
         sub=$(rget "$STAGE/ix/$F_index/r/$pkg" path)
@@ -1355,7 +1402,6 @@ cmd_add() {
       ;;
   esac
   inspect "$STAGE/m" "$fallback" 1 || die "$(printf '%s' "$ERR" | sed "s|$STAGE/m|$source|g")"
-  n=$I_name
   case "$kind" in
     index:*)
       [ "$I_hd1" = "$(rget "$E_rec" hd1)" ] ||
@@ -1363,24 +1409,133 @@ cmd_add() {
       ;;
     url | path) index_local_all ;;
   esac
-  if lock_get "$n"; then
-    die "$n is already added (from $L_source); fix: henki-mods rm $n first, or turn it on with henki-mods on $n"
-  fi
-  if [ -e "$EXT/$n" ] || [ -L "$EXT/$n" ]; then
-    die "$(shown "$EXT/$n") exists and henki-mods did not make it; fix: move it out of $(shown "$EXT") first"
-  fi
+  [ -z "$I_asset" ] || {
+    asset_place "$STAGE/m"
+    inspect "$STAGE/m" "$fallback" 3 || die "$(printf '%s' "$ERR" | sed "s|$STAGE/m|$source|g")"
+  }
+}
+
+# Downloads this machine's prebuilt program (I_asset) over https and puts it at its place in module copy DIR, once its
+# sha256 is the one the manifest names (the hd1 holds the manifest, so the index's review covers the hash).
+asset_place() { # DIR
+  local t d u h got
+  IFS="$tab" read -r t d u h <<EOF
+$I_asset
+EOF
+  command -v curl >/dev/null 2>&1 || die "$M_name runs a prebuilt program ($d), and curl is not on PATH; fix: install curl"
+  curl --proto =https --proto-redir =https --tlsv1.2 --max-filesize "$ASSET_MAX" -fsSL -o "$STAGE/asset" -- "$u" </dev/null ||
+    die "cannot download $u (above); fix: check the network, or ask the module's author"
+  got=$(sha <"$STAGE/asset")
+  [ "sha256:$got" = "$h" ] || die "$u is not the program $M_name names (sha256 $got, its manifest has ${h#sha256:}); not installed; fix: report it to the module's author"
+  fresh "$1" "$d" "$u"
+  cp "$STAGE/asset" "$1/$d" && chmod 755 "$1/$d" || die "cannot write $1/$d; fix: check the disk"
+}
+
+# The store copy's name for the copy just inspected: its commit, else its hd1, 12 hex digits.
+store_id() {
+  local id
   if [ "$COMMIT" != - ]; then id=$COMMIT; else id=${I_hd1#hd1:}; fi
-  store="$STORE/$n/${id%"${id#????????????}"}"
-  cards_write 1 "$n" "$STAGE/m" || die "$ERR"
-  # The screen.
+  printf '%s\n' "${id%"${id#????????????}"}"
+}
+
+# Moves the copy FROM ($STAGE/m) into the store at DIR, read-only, or checks the copy already there (kept for a
+# rollback) is the one of hd1 HD1.
+store_put() { # DIR HD1 NAME [FROM]
+  if [ -d "$1" ]; then
+    inspect "$1" "$3" 2 && [ "$I_hd1" = "$2" ] ||
+      die "the store copy $1 is not what its name says; fix: chmod -R u+w $1 && rm -rf $1, then try again"
+  else
+    mkdir -p "${1%/*}" && mv "${4:-$STAGE/m}" "$1" || die "cannot move the copy into $1; fix: make $STORE writable"
+  fi
+  chmod -R a-w "$1"
+}
+
+# The question QUESTION on the terminal (HENKI_MODS_TTY, else /dev/tty), the answer into ANSWER. The terminal is opened
+# once per run (fd 9), so each question reads the next line. Exit 1 when there is no terminal.
+TTY_OPEN=""
+tty_ask() {
+  local tty=${HENKI_MODS_TTY:-/dev/tty}
+  if [ -z "$TTY_OPEN" ]; then
+    # A subshell tries the open: a failed redirection of `exec` would end a POSIX-mode shell on the spot.
+    (: <"$tty") 2>/dev/null || return 1
+    exec 9<"$tty"
+    TTY_OPEN=1
+  fi
+  if [ -c "$tty" ]; then printf '%s ' "$1" >"$tty"; else printf '%s \n' "$1" >&2; fi
+  read -r ANSWER <&9 || ANSWER=""
+}
+
+# A yes on the terminal to QUESTION, or the death NO; HOW then `tty` (or `yes` with YES 1, asking nothing).
+confirm() { # YES QUESTION NO
+  if [ "$1" = 1 ]; then
+    HOW=yes
+    return 0
+  fi
+  tty_ask "$2" || die "no terminal to ask on; fix: run it in a terminal, or add --yes once you have read the screen above"
+  case "$ANSWER" in y | Y | yes | YES) HOW=tty ;; *) die "$3" ;; esac
+}
+
+# The FLAGS a URL install follows: ref=REF for a branch or tag (ref=HEAD for the default branch); none for a commit.
+url_flags() { # REF
+  case "$1" in
+    '') printf 'ref=HEAD' ;;
+    *,* | *[[:space:]]* | *[[:cntrl:]]*) ;;
+    *[!0-9a-f]*) printf 'ref=%s' "$1" ;;
+    *) [ ${#1} = 40 ] || printf 'ref=%s' "$1" ;;
+  esac
+}
+
+# The install screen's lines about the copy just inspected at $STAGE/m (n, kind, source and the rest from the caller):
+# what it adds to every request, what runs, what it needs, its pin.
+screen_body() {
+  local a x d
+  [ "$M_has" = 1 ] || say "  manifest none (unmanaged: no license, os or needs declared)"
+  [ -z "$M_license" ] || say "  license  $M_license"
+  [ -z "$M_maintainer" ] || say "  by       $M_maintainer"
+  say "  summary  ${M_summary:-$I_line}"
+  say "  prompt   +$(num "$bytes") B on every request$extra (total on after: $(num $((total + bytes))) B)"
+  [ "$I_card" = 0 ] || say "  card     +$(num "$I_card") B into $(shown "$AGENTS") (henki's limit: $(num $AGENTS_MAX) B for the file)"
+  say "  files    $I_files ($I_links links)"
+  # Every program henki may run from it, a link with its target: on/ runs without anyone asking, so it is named too.
+  [ -z "$I_runs" ] || say "  runs as you, unsandboxed:"
+  while IFS="$tab" read -r a x; do
+    [ -n "$a" ] || continue
+    d=""
+    [ ! -L "$STAGE/m/$a" ] || d=" -> $(target "$STAGE/m/$a" | sed 's/[[:cntrl:]]/?/g')"
+    say "    $a$d ($(file_kind "$STAGE/m/$a")): $x"
+  done <<EOF
+$I_runs
+EOF
+  [ -z "$I_asset" ] || say "  asset    $(printf '%s' "$I_asset" | cut -f 2) for $(printf '%s' "$I_asset" | cut -f 1): $(printf '%s' "$I_asset" | cut -f 3), $(printf '%s' "$I_asset" | cut -f 4) (downloaded, sha256 checked)"
+  while IFS= read -r a; do
+    [ -n "$a" ] || continue
+    if command -v "$a" >/dev/null 2>&1; then say "  needs    $a (found)"; else say "  needs    $a: NOT on PATH; install it yourself (henki-mods installs nothing)"; fi
+  done <<EOF
+$M_needs
+EOF
+  need=$(shadows_needed "$n" "$I_cmds" "$M_shadow")
+  line=$(shadow_line "$need")
+  [ -z "$need" ] || say "  shadows  $(printf '%s' "$need" | tr '\n' ' ')"
+  [ -z "$line" ] || say "  config   henki starts only once $(shown "$CONF/config.toml") has: $line"
+  say "  network  ${M_caps:-not declared} (declared, NOT enforced)"
+  if [ "$COMMIT" != - ]; then say "  pin      commit $COMMIT, $I_hd1"; else say "  pin      $I_hd1"; fi
+}
+
+# The prompt bytes the copy at $STAGE/m adds (into the caller's bytes, total and extra).
+screen_bytes() {
   bytes=$(prompt_bytes "$n" "$STAGE/m")
   total=$(total_on)
-  x=""
+  extra=""
   if [ "$total" = 0 ] && [ "$bytes" != 0 ]; then
-    x=" with the $((${#HEADER} + 2)) B header, as the first module on"
+    extra=" with the $((${#HEADER} + 2)) B header, as the first module on"
     bytes=$((bytes + ${#HEADER} + 2))
   fi
-  say "$n ${M_version:-(no version)}"
+}
+
+# The review line of the copy just staged: an index version's tier, a URL or path copy whose hd1 an index lists, or
+# the red line for a URL nobody reviewed.
+screen_review() {
+  local x
   case "$kind" in
     official) say "  source   official ($dir)" ;;
     index:*)
@@ -1403,64 +1558,57 @@ cmd_add() {
       ;;
   esac
   case "$kind" in index:*) yank_guard "$n" "$E_ver" "$kind" "$pkg" "$I_hd1" ;; url | path) yank_guard "$n" "$M_version" "$kind" "" "$I_hd1" ;; esac
-  [ "$M_has" = 1 ] || say "  manifest none (unmanaged: no license, os or needs declared)"
-  [ -z "$M_license" ] || say "  license  $M_license"
-  [ -z "$M_maintainer" ] || say "  by       $M_maintainer"
-  say "  summary  ${M_summary:-$I_line}"
-  say "  prompt   +$(num "$bytes") B on every request$x (total on after: $(num $((total + bytes))) B)"
-  [ "$I_card" = 0 ] || say "  card     +$(num "$I_card") B into $(shown "$AGENTS") (henki's limit: $(num $AGENTS_MAX) B for the file)"
-  say "  files    $I_files ($I_links links)"
-  # Every program henki may run from it, a link with its target: on/ runs without anyone asking, so it is named too.
-  [ -z "$I_runs" ] || say "  runs as you, unsandboxed:"
-  while IFS="$tab" read -r a x; do
-    [ -n "$a" ] || continue
-    d=""
-    [ ! -L "$STAGE/m/$a" ] || d=" -> $(target "$STAGE/m/$a" | sed 's/[[:cntrl:]]/?/g')"
-    say "    $a$d ($(file_kind "$STAGE/m/$a")): $x"
-  done <<EOF
-$I_runs
-EOF
-  while IFS= read -r a; do
-    [ -n "$a" ] || continue
-    if command -v "$a" >/dev/null 2>&1; then say "  needs    $a (found)"; else say "  needs    $a: NOT on PATH; install it yourself (henki-mods installs nothing)"; fi
-  done <<EOF
-$M_needs
-EOF
-  need=$(shadows_needed "$n" "$I_cmds" "$M_shadow")
-  line=$(shadow_line "$need")
-  [ -z "$need" ] || say "  shadows  $(printf '%s' "$need" | tr '\n' ' ')"
-  [ -z "$line" ] || say "  config   henki starts only once $(shown "$CONF/config.toml") has: $line"
-  say "  network  ${M_caps:-not declared} (declared, NOT enforced)"
-  if [ "$COMMIT" != - ]; then say "  pin      commit $COMMIT, $I_hd1"; else say "  pin      $I_hd1"; fi
-  if [ "$yes" = 1 ]; then
-    how=yes
-  else
-    tty=${HENKI_MODS_TTY:-/dev/tty}
-    # A subshell tries the open: a failed redirection of `exec` would end a POSIX-mode shell on the spot.
-    (: <"$tty") 2>/dev/null || die "no terminal to ask on; fix: run it in a terminal, or add --yes once you have read the screen above"
-    if [ -c "$tty" ]; then printf 'install and turn on? [y/N] ' >"$tty"; else printf 'install and turn on? [y/N] \n' >&2; fi
-    read -r answer <"$tty" || answer=""
-    case "$answer" in y | Y | yes | YES) how=tty ;; *) die "not installed (the answer was no); fix: run add again and answer y" ;; esac
+}
+
+cmd_add() {
+  local src="" yes=0 want="" kind source fallback dir store ref sub url bytes total extra n need line pkg=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --yes | -y) yes=1 ;;
+      --version)
+        [ $# -ge 2 ] || usage
+        want=$2
+        shift
+        ;;
+      -*) usage ;;
+      *) [ -z "$src" ] && src=$1 || usage ;;
+    esac
+    shift
+  done
+  [ -n "$src" ] || usage
+  case "$src" in *[[:cntrl:]]*) die "the source holds a control character; fix: name it without one" ;; esac
+  trust_guard
+  busy
+  lock_check
+  stage
+  STAGE_LIST="$STAGE/list"
+  stage_src "$src" "$want"
+  n=$I_name
+  if lock_get "$n"; then
+    die "$n is already added (from $L_source); fix: henki-mods update $n for another version, or henki-mods on $n"
   fi
+  if [ -e "$EXT/$n" ] || [ -L "$EXT/$n" ]; then
+    die "$(shown "$EXT/$n") exists and henki-mods did not make it; fix: move it out of $(shown "$EXT") first"
+  fi
+  store="$STORE/$n/$(store_id)"
+  cards_write 1 "$n" "$STAGE/m" || die "$ERR"
+  screen_bytes
+  say "$n ${M_version:-(no version)}"
+  screen_review
+  screen_body
+  confirm "$yes" "install and turn on? [y/N]" "not installed (the answer was no); fix: run add again and answer y"
   # Install: the store copy (read-only, kept for rollback), the link, the lock line, the cards.
-  if [ -d "$store" ]; then
-    STAGE_LIST2=$STAGE_LIST
-    STAGE_LIST="$STAGE/list2"
-    listing "$store" || die "$ERR"
-    [ "$(hd1 "$store")" = "$I_hd1" ] || die "the store copy $store is not what its name says; fix: chmod -R u+w $store && rm -rf $store, then add again"
-    STAGE_LIST=$STAGE_LIST2
-  else
-    mkdir -p "$STORE/$n" && mv "$STAGE/m" "$store" || die "cannot move the copy into $store; fix: make $STORE writable"
-  fi
-  chmod -R a-w "$store"
+  store_put "$store" "$I_hd1" "$n"
   mkdir -p "$EXT" && ln -s -- "$store" "$EXT/$n" || die "cannot link $(shown "$EXT/$n"); fix: make $(shown "$EXT") writable"
-  L_name=$n L_version=${M_version:--} L_kind=$kind L_source=$source L_commit=$COMMIT L_hd1=$I_hd1 L_how=$how L_flags=""
+  L_name=$n L_version=${M_version:--} L_kind=$kind L_source=$source L_commit=$COMMIT L_hd1=$I_hd1 L_how=$HOW L_flags=""
   [ -z "$pkg" ] || L_version=$E_ver
+  [ "$kind" != url ] || L_flags=$(url_flags "$ref")
   L_added=$(date -u +%Y-%m-%dT%H:%MZ)
   lock_put "$n" "$(lock_line on)"
   cards_write 0 || die "$ERR"
   say "added $n: on, $(shown "$store")"
   [ -z "$line" ] || say "add to $(shown "$CONF/config.toml"): $line"
+  allow_follow "$I_cmds" 1 "$yes"
   ext_path_warning
   restart
 }
@@ -1480,12 +1628,13 @@ total_on() {
 ext_names() { [ ! -d "$EXT" ] || (cd "$EXT" && for n in *; do [ -e "$n" ] && echo "$n"; done | sort); }
 
 cmd_onoff() { # on|off NAME
-  local verb="$1" n="${2:-}" store
+  local verb="$1" n="${2:-}" store link
   [ -n "$n" ] && [ $# = 2 ] || usage
+  case "$n" in */*) cmd_mask "$@" && return 0 ;; esac
   [ "$verb" = off ] || trust_guard
   busy
   lock_check
-  STAGE=$(mktemp -d "${TMPDIR:-/tmp}/henki-mods.XXXXXX") || die "cannot make a scratch dir; fix: check TMPDIR"
+  stage
   STAGE_LIST="$STAGE/list"
   lock_get "$n" || die "$n is not added; fix: henki-mods add SRC first (henki-mods list shows what is)"
   cards_ok
@@ -1495,15 +1644,14 @@ cmd_onoff() { # on|off NAME
     index_local_all
     yank_guard "$n" "$L_version" "$L_kind" "$L_source" "$L_hd1"
     [ -d "$store" ] || die "the store copy $store is gone; fix: henki-mods rm $n, then add it again"
-    listing "$store" || die "$ERR"
-    [ "$(hd1 "$store")" = "$L_hd1" ] || die "the store copy $store does not match the lock (it changed); fix: chmod -R u+w $store && rm -rf $store, then henki-mods rm $n and add it again"
-    if [ -L "$EXT/$n" ] && [ "$(target "$EXT/$n")" = "$store" ]; then
+    link=$(mask_make) || exit 1
+    if [ -L "$EXT/$n" ] && [ "$(target "$EXT/$n")" = "$link" ]; then
       [ "$L_state" = on ] && say "$n is already on" && return 0
     elif [ -e "$EXT/$n" ] || [ -L "$EXT/$n" ]; then
-      die "$(shown "$EXT/$n") exists and is not the link to $store; fix: move it away, then turn $n on"
+      die "$(shown "$EXT/$n") exists and is not the link to $link; fix: move it away, then turn $n on"
     fi
-    cards_write 1 "$n" "$store" || die "$ERR"
-    [ -L "$EXT/$n" ] || { mkdir -p "$EXT" && ln -s -- "$store" "$EXT/$n"; } || die "cannot link $(shown "$EXT/$n"); fix: make $(shown "$EXT") writable"
+    cards_write 1 "$n" "$link" || die "$ERR"
+    [ -L "$EXT/$n" ] || { mkdir -p "$EXT" && ln -s -- "$link" "$EXT/$n"; } || die "cannot link $(shown "$EXT/$n"); fix: make $(shown "$EXT") writable"
     lock_put "$n" "$(lock_line on)"
   else
     if [ -L "$EXT/$n" ]; then
@@ -1517,7 +1665,87 @@ cmd_onoff() { # on|off NAME
   fi
   cards_write 0 || die "$ERR"
   say "$n: $verb"
-  [ "$verb" = off ] || ext_path_warning
+  if [ "$verb" = off ]; then allow_offer "$(bin_names "$store")"; else ext_path_warning; fi
+  restart
+}
+
+# The programs in DIR/bin, one per line.
+bin_names() { [ ! -d "$1/bin" ] || (cd "$1/bin" && for x in *; do [ -f "$x" ] && [ -x "$x" ] && printf '%s\n' "$x"; done); }
+
+# The commands the lock line in L_* masks (FLAGS mask=cmd/CMD), sorted, one per line.
+masks_of() { printf '%s\n' "$L_flags" | tr ',' '\n' | sed -n 's|^mask=cmd/||p' | sort; }
+
+# The copy the ext link of the lock line in L_* names: the store copy, or with masks the copy without those commands,
+# beside it (its name: the store copy's, .m and 8 hex digits of the masks' hash).
+linked_of() {
+  local m
+  m=$(masks_of)
+  if [ -z "$m" ]; then store_of; else printf '%s.m%s\n' "$(store_of)" "$(printf '%s\n' "$m" | sha | cut -c 1-8)"; fi
+}
+
+# The copy for the lock line in L_* to link (linked_of), printed, once the store copy holds the lock's hd1. A masked
+# copy is made from the store copy (in $STAGE) when it is missing or not that copy less the masked commands.
+mask_make() {
+  local full link m p want x
+  full=$(store_of) link=$(linked_of)
+  inspect "$full" "$L_name" 2 && [ "$I_hd1" = "$L_hd1" ] ||
+    die "the store copy $full does not match the lock (${ERR:-it changed}); fix: henki-mods rm $L_name and add it again"
+  [ "$link" != "$full" ] || {
+    printf '%s\n' "$full"
+    return 0
+  }
+  m=$(masks_of)
+  want=$(mask_want "$full")
+  if [ -d "$link" ] && inspect "$link" "$L_name" 2 && [ "$I_hd1" = "$want" ]; then
+    printf '%s\n' "$link"
+    return 0
+  fi
+  [ ! -e "$link" ] || { chmod -R u+w "$link" && rm -rf "$link"; } || die "cannot replace $link; fix: make $STORE writable"
+  copy_dir "$full" "$STAGE/mk"
+  for x in $m; do rm -f "$STAGE/mk/cmd/$x" "$STAGE/mk/cmd/$x.md"; done
+  rmdir "$STAGE/mk/cmd" 2>/dev/null
+  mv "$STAGE/mk" "$link" || die "cannot move the copy into $link; fix: make $STORE writable"
+  chmod -R a-w "$link"
+  inspect "$link" "$L_name" 2 && [ "$I_hd1" = "$want" ] || die "$link is not $full less its masked commands; fix: report it"
+  printf '%s\n' "$link"
+}
+
+# The hd1 the masked copy of store copy DIR must have (DIR just inspected; masks from L_flags).
+mask_want() { # DIR
+  local p
+  p=$(masks_of | awk 'NF { print "cmd/" $0; print "cmd/" $0 ".md" }')
+  [ -z "$I_asset" ] || p="$p$nl$(printf '%s' "$I_asset" | cut -f 2)"
+  hd1 "$1" "$(list_less "$p")"
+}
+
+# off NAME/CMD, on NAME/CMD: a mask. off links NAME to a copy without cmd/CMD (and cmd/CMD.md), so two modules with a
+# command of one name can be on together (henki refuses to start on a clash); on links the copy with it again. The lock
+# line keeps the module's own hd1, plus FLAGS mask=cmd/CMD.
+cmd_mask() { # on|off NAME/CMD
+  local verb="$1" n="${2%%/*}" c="${2#*/}" link a
+  is_name "$n" && is_cmd "$c" || usage
+  [ "$verb" = off ] || trust_guard
+  busy
+  lock_check
+  stage
+  STAGE_LIST="$STAGE/list"
+  lock_get "$n" || die "$n is not added; fix: henki-mods list shows what is"
+  if [ "$verb" = off ]; then
+    ! flag_has "mask=cmd/$c" || { say "$n/$c is already off" && return 0; }
+    [ -f "$(store_of)/cmd/$c" ] && [ -x "$(store_of)/cmd/$c" ] || die "$n has no command /$c; fix: henki-mods list shows the modules, /help their commands"
+    a=$(bound_to "$n" | head -n 1)
+    [ -z "$a" ] || confirm 0 "$n holds henki's $a binding; turn its /$c off? [y/N]" "/$c stays on (the answer was no); fix: run it again and answer y"
+    L_flags="${L_flags:+$L_flags,}mask=cmd/$c"
+  else
+    flag_has "mask=cmd/$c" || { say "$n/$c is already on" && return 0; }
+    L_flags=$(flags_less "mask=cmd/$c")
+  fi
+  link=$(mask_make) || exit 1
+  if [ "$L_state" = on ]; then
+    rm -f "$EXT/$n" && ln -s -- "$link" "$EXT/$n" || die "cannot link $(shown "$EXT/$n"); fix: make $(shown "$EXT") writable"
+  fi
+  lock_put "$n" "$(lock_line "$L_state")"
+  if [ "$verb" = off ]; then say "$n/$c: off (/$c of $n is not loaded; henki-mods on $n/$c brings it back)"; else say "$n/$c: on"; fi
   restart
 }
 
@@ -1542,6 +1770,7 @@ cmd_rm() {
   lock_put "$n" ""
   cards_write 0 || die "$ERR"
   say "removed $n; its store copy stays in $(shown "$store") for a rollback"
+  allow_offer "$(bin_names "$store")"
   restart
 }
 
@@ -1570,6 +1799,8 @@ cmd_list() {
       ! flag_has yanked=malicious || src="$src $(red "(yanked: malicious)")"
       ! flag_has yanked=buggy || src="$src (yanked: buggy)"
       ! flag_has pin || src="$src (pinned)"
+      x=$(masks_of | sed 's|^|/|' | tr '\n' ' ')
+      [ -z "$x" ] || src="$src (masked: ${x% })"
       [ -f "$d/.henki/module.toml" ] || src="$src (unmanaged)"
       if [ -f "$d/.henki/card.md" ]; then
         c=$(wc -c <"$d/.henki/card.md")
@@ -1589,7 +1820,7 @@ cmd_list() {
     fi
     printf '%-16s %-5s %-10s %s%s  %s\n' "$n" "$state" "$x" "$b" "$c" "$src"
   done
-  [ "$mods" != 0 ] || say "no modules; henki-mods add NAME | ./DIR | URL adds one, off until you say yes"
+  [ "$mods" != 0 ] || say "no modules; henki-mods add NAME | ./DIR | URL adds one, off until you say yes; henki-mods init offers sets of them"
   off_names=""
   for d in ${HENKI_SHARE:+"$HENKI_SHARE/official"} "$SELF/../share/henki/official" "$SELF/../mods"; do
     [ -d "$d" ] || continue
@@ -1641,7 +1872,7 @@ problem() {
 }
 
 cmd_verify() {
-  local n names store want line need t
+  local n names store want line need t link
   BAD=0
   scratch
   if [ "${1:-}" = --dir ]; then
@@ -1667,19 +1898,24 @@ cmd_verify() {
       problem "$n: the store copy $store is gone; fix: henki-mods rm $n, then add it again"
       continue
     fi
-    if ! inspect "$store" "$n" 0; then
+    if ! inspect "$store" "$n" 2; then
       problem "$n: $ERR"
     elif [ "$I_hd1" != "$L_hd1" ]; then
       problem "$n: the store copy $store changed: $I_hd1, the lock has $L_hd1; fix: chmod -R u+w $store && rm -rf $store, then henki-mods rm $n and add it again"
     elif [ "$I_name" != "$n" ]; then
       problem "$n: the store copy names itself $I_name; fix: henki-mods rm $n and add it again"
+    elif [ "$(linked_of)" != "$store" ]; then
+      link=$(linked_of)
+      want=$(mask_want "$store")
+      inspect "$link" "$n" 2 && [ "$I_hd1" = "$want" ] ||
+        problem "$n: $link is not its store copy less the commands it masks; fix: henki-mods off $n && henki-mods on $n"
     fi
     [ -z "$(find "$store" ! -type l -perm -200 -print | head -n 1)" ] || warn "$n: $store is writable; fix: chmod -R a-w $store"
     if [ "$L_state" = on ]; then
       if [ ! -L "$EXT/$n" ]; then
         problem "$n is on in the lock, but $(shown "$EXT/$n") is not a link; fix: henki-mods on $n"
-      elif [ "$(target "$EXT/$n")" != "$store" ]; then
-        problem "$n: $(shown "$EXT/$n") points at $(target "$EXT/$n"), not at the locked copy $store; fix: henki-mods off $n && henki-mods on $n"
+      elif [ "$(target "$EXT/$n")" != "$(linked_of)" ]; then
+        problem "$n: $(shown "$EXT/$n") points at $(target "$EXT/$n"), not at the locked copy $(linked_of); fix: henki-mods off $n && henki-mods on $n"
       else
         need=$(shadows_needed "$n" "$I_cmds" "$M_shadow")
         line=$(shadow_line "$need")
@@ -1719,6 +1955,987 @@ cmd_verify() {
   ext_path_warning
   [ "$BAD" = 0 ] || die "verify: $BAD problems (above); fix: as each one says"
   say "verify: ok ($(printf '%s\n' "$names" | awk 'NF' | wc -l | tr -d ' ') modules)"
+}
+
+# --- updates: outdated, update, pin, rollback, gc ----------------------------------------------------------------------
+
+# The newest version of package N in loaded index I, at most its `latest`, not yanked, and one this henki can run; or
+# nothing.
+newest_version() { # I N
+  local d="$STAGE/ix/$1" v latest
+  latest=$(HM_N="$2" awk -F '\t' '$1 == ENVIRON["HM_N"] { print $3 }' "$d/pkgs")
+  for v in $(HM_N="$2" awk -F '\t' '$1 == ENVIRON["HM_N"] && $4 == "-" { print $2 }' "$d/vers" | sort -t . -k1,1nr -k2,2nr -k3,3nr); do
+    version_ge "$latest" "$v" || continue
+    [ -n "$(fit_why "$d/r/$2@$v")" ] || {
+      printf '%s\n' "$v"
+      return 0
+    }
+  done
+}
+
+# The commit REF names in the repository at URL now (a branch, a tag, HEAD), or nothing; over the transports add uses.
+ls_remote() { # URL REF
+  git_url "$1" || return 1
+  GIT_ALLOW_PROTOCOL=$(printf '%s' "$GIT_TRANSPORTS" | tr ' ' ':') git -c core.hooksPath=/dev/null -c protocol.allow=never \
+    -c protocol.https.allow=always -c protocol.http.allow=always -c protocol.ssh.allow=always -c protocol.git.allow=always \
+    -c protocol.file.allow=always ls-remote -- "$1" "$2" 2>/dev/null </dev/null |
+    HM_R="$2" awk -F '\t' '{ r = ENVIRON["HM_R"]; p = 0
+      if ($2 == "refs/heads/" r || $2 == r) p = 3; else if ($2 == "refs/tags/" r "^{}") p = 2; else if ($2 == "refs/tags/" r) p = 1
+      if (p > best) { best = p; c = $1 } } END { if (best) print c }'
+}
+
+# L_flags without FLAG, and without FLAG=... (a key): FLAGS of the lock line less one.
+flags_less() { printf '%s\n' "$L_flags" | HM_F="$1" awk -F , '{ f = ENVIRON["HM_F"]; o = ""; for (i = 1; i <= NF; i++) if ($i != f && index($i, f "=") != 1) o = o (o == "" ? "" : ",") $i; print o }'; }
+
+# The ref a URL module follows (its FLAGS ref=), or nothing.
+ref_of() { printf '%s\n' "$L_flags" | tr ',' '\n' | sed -n 's/^ref=//p'; }
+
+# outdated: for each module, whether its source has moved on: a newer version in its index, its URL's ref at another
+# commit, its directory's files changed, or henki's own copy of an official module changed. Changes nothing.
+cmd_outdated() {
+  local n i v x st
+  [ $# = 0 ] || usage
+  busy
+  lock_check
+  scratch
+  [ -n "$(lock_names)" ] || {
+    say "no modules"
+    return 0
+  }
+  if [ -n "$(awk -F '\t' '$1 == "lock/1" && $5 ~ /^index:/' "$LOCK")" ]; then index_sync_all || warn "$ERR"; fi
+  printf '%-16s %-10s %s\n' NAME VERSION STATUS
+  for n in $(lock_names); do
+    lock_get "$n"
+    case "$L_kind" in
+      index:*)
+        i=${L_kind#index:}
+        if [ ! -f "$STAGE/ix/$i/pkgs" ]; then
+          st="unknown: index $i cannot be read"
+        else
+          v=$(newest_version "$i" "$L_source")
+          if [ -z "$v" ]; then
+            st="no version of $L_source in index $i can be installed here (henki-mods info $L_source)"
+          elif [ "$v" = "$L_version" ] || version_ge "$L_version" "$v"; then
+            st="up to date"
+          else
+            st="$v in index $i (henki-mods update $n)"
+          fi
+        fi
+        ;;
+      url)
+        x=$(ref_of)
+        if [ -z "$x" ]; then
+          st="unknown ref: the URL pins a commit (henki-mods update $n --to @BRANCH follows one)"
+        else
+          v=$(ls_remote "${L_source%%#*}" "$x")
+          if [ -z "$v" ]; then st="unknown: cannot read $x of ${L_source%%#*}"; elif [ "$v" = "$L_commit" ]; then st="up to date"; else st="$x is at $(short "$v") (henki-mods update $n)"; fi
+        fi
+        ;;
+      path)
+        if [ ! -d "$L_source" ]; then
+          st="gone: $L_source is not a directory"
+        elif ! inspect "$L_source" "$n" 0; then
+          st="cannot be read: $ERR"
+        elif [ "$I_hd1" = "$L_hd1" ]; then
+          st="up to date"
+        else
+          st="changed: $L_source holds $I_hd1 (henki-mods update $n)"
+        fi
+        ;;
+      official)
+        if ! x=$(official_dir "$n"); then
+          st="this henki ships no $n"
+        elif inspect "$x" "$n" 0 && [ "$I_hd1" = "$L_hd1" ]; then
+          st="up to date"
+        else
+          st="henki's copy changed (henki-mods update $n)"
+        fi
+        ;;
+      *) st="unknown: import it again to update" ;;
+    esac
+    ! flag_has pin || st="pinned; $st"
+    ! flag_has yanked=malicious || st="$st; $(red "yanked as malicious")"
+    printf '%-16s %-10s %s\n' "$n" "$L_version" "$st"
+  done
+}
+
+# What a copy just inspected brings, as KEY<TAB>VALUE lines (for update's and rollback's screens): DIR, VERSION.
+facts() { # DIR VERSION
+  printf 'version\t%s\n' "$2"
+  printf '%s' "$I_runs" | awk -F '\t' '
+    { split($1, p, "/"); k = p[1]; n = substr($1, length(k) + 2); v[k] = v[k] (v[k] == "" ? "" : " ") n }
+    END { printf "commands\t%s\nbins\t%s\nobservers\t%s\nports\t%s\n", v["cmd"], v["bin"], v["on"], v["port"] }'
+  printf 'network\t%s\n' "${M_caps:-not declared}"
+  printf 'needs\t%s\n' "$(printf '%s' "$M_needs" | tr '\n' ' ')"
+  printf 'prompt\t%s B\n' "$(num "$(prompt_bytes "$I_name" "$1")")"
+  printf 'card\t%s B\n' "$(num "$I_card")"
+  printf 'asset\t%s\n' "$(printf '%s' "$I_asset" | cut -f 2,4 | tr '\t' ' ')"
+}
+
+# The screen of a switch between two copies: the facts that differ (files OLD and NEW), the files changed (diff -ru
+# of directories OLD_DIR and NEW_DIR, kept in $STAGE/diff), the CHANGELOG's newest section of NEW_DIR.
+change_screen() { # OLD NEW OLD_DIR NEW_DIR
+  local c
+  HM_O="$1" awk -F '\t' 'FILENAME == ENVIRON["HM_O"] { o[$1] = $2; next } $2 != o[$1] { printf "  %-8s %s -> %s\n", $1, (o[$1] == "" ? "-" : o[$1]), ($2 == "" ? "-" : $2) }' "$1" "$2"
+  diff -ruN -- "$3" "$4" >"$STAGE/diff" 2>&1
+  if [ -s "$STAGE/diff" ]; then
+    say "  files changed:"
+    HM_O="$3/" HM_N="$4/" awk '
+      function rel(p) { sub(/\t.*/, "", p); if (index(p, ENVIRON["HM_N"]) == 1) p = substr(p, length(ENVIRON["HM_N"]) + 1); return p }
+      /^Only in / || /^Binary files / || /^File / { print "    " $0; next }
+      /^\+\+\+ / { f = rel(substr($0, 5)); if (!(f in a)) { a[f] = 0; d[f] = 0; o[++n] = f }; next }
+      /^--- / || /^diff / || /^@@/ { next }
+      /^\+/ { a[f]++; next }
+      /^-/ { d[f]++ }
+      END { for (i = 1; i <= n; i++) printf "    %s +%d -%d\n", o[i], a[o[i]], d[o[i]] }' "$STAGE/diff" | sed "s|$3/||g; s|$4/||g"
+  fi
+  for c in "$4"/CHANGELOG*; do
+    [ -f "$c" ] && [ ! -L "$c" ] || continue
+    say "  ${c##*/}, newest section:"
+    awk '/^## / { if (p) exit; p = 1 } p && NF && ++k <= 20 { print "    " $0 }' "$c" | sed 's/[[:cntrl:]]/?/g'
+    break
+  done
+}
+
+# Switches module L_name to the lock line in L_* (its store copy in place): every port it binds moves along once the
+# new copy passes the port's suite, then the ext link (with its masks), the lock line, the history line (hist/1, WHY,
+# OLD_LINE), the cards. Exit through die before anything changed when a suite fails.
+pin_switch() { # WHY OLD_LINE
+  local p link h store
+  store=$(store_of)
+  for p in $(bound_to "$L_name"); do
+    [ -f "$store/port/$p" ] && [ -x "$store/port/$p" ] || die "$L_name $L_version has no port/$p, and $L_name holds henki's $p binding; fix: henki-mods swap $p std first"
+    C_suite="$(conform_dir)/$p.tsv" || die "no conformance suites found; fix: reinstall henki"
+    h=$(henki_bin) || exit 1
+    conform_run "$p" "$store/port/$p" "$h" >"$STAGE/conform" || {
+      cat "$STAGE/conform"
+      die "$L_name $L_version does not pass the $p/1 suite (above); nothing changed; fix: ask its author, or keep this version"
+    }
+    say "  $p: $L_name $L_version passes the $p/1 suite ($C_checks checks)"
+  done
+  link=$(mask_make) || exit 1
+  if [ "$L_state" = on ]; then
+    rm -f "$EXT/$L_name" && ln -s -- "$link" "$EXT/$L_name" || die "cannot link $(shown "$EXT/$L_name"); fix: make $(shown "$EXT") writable"
+  fi
+  for p in $(bound_to "$L_name"); do
+    ln -s -- "$store/port/$p" "$CONF/port/.$p.$$" && mv -f "$CONF/port/.$p.$$" "$CONF/port/$p" || {
+      rm -f "$CONF/port/.$p.$$"
+      die "cannot link $(shown "$CONF/port/$p"); fix: make it writable, then henki-mods swap $p $L_name"
+    }
+    bind_get "$p"
+    lock_write bind/1 "$p" "$(printf 'bind/1\t%s\t%s\t%s\t%s\t%s' "$p" "$L_name" "${store##*/}" "$(date -u +%Y-%m-%dT%H:%MZ)" "$B_how")"
+  done
+  hist_add "$1" "$2"
+  lock_put "$L_name" "$(lock_line "$L_state")"
+  cards_write 0 || die "$ERR"
+}
+
+# The FLAGS of L_flags kept across a switch to the copy at DIR: pin, ref= and the masks of commands DIR still has (each
+# one dropped is said); a yank of the old version is not.
+flags_across() { # DIR
+  local f o=""
+  for f in $(printf '%s\n' "$L_flags" | tr ',' ' '); do
+    case "$f" in
+      yanked=*) continue ;;
+      mask=cmd/*) [ -f "$1/${f#mask=}" ] || {
+        say "  /${f#mask=cmd/} is gone from this version, so its mask is too" >&2
+        continue
+      } ;;
+    esac
+    o="${o:+$o,}$f"
+  done
+  printf '%s' "$o"
+}
+
+# update NAME [--to VERSION|@REF] [--force] [--yes]: NAME's copy from its source now (an index's newest version, a URL's
+# ref, a directory, henki's official copy), staged and checked as add does; a screen of what changes; the question; the
+# switch (pin_switch). A pinned module needs --force. Never automatic.
+cmd_update() {
+  local n="" to="" force=0 yes=0 kind source fallback dir store ref sub url pkg="" src want="" x old old_line new_ver new_hd1 new_cmds new_commit
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --yes | -y) yes=1 ;;
+      --force) force=1 ;;
+      --to)
+        [ $# -ge 2 ] || usage
+        to=$2
+        shift
+        ;;
+      -*) usage ;;
+      *) [ -z "$n" ] && n=$1 || usage ;;
+    esac
+    shift
+  done
+  is_name "$n" || usage
+  case "$to" in *[[:cntrl:]]* | *[[:space:]]*) die "--to holds a space or a control character; fix: name a version or @REF" ;; esac
+  trust_guard
+  busy
+  lock_check
+  stage
+  STAGE_LIST="$STAGE/list"
+  lock_get "$n" || die "$n is not added; fix: henki-mods add SRC first (henki-mods list shows what is)"
+  ! flag_has pin || [ "$force" = 1 ] || die "$n is pinned; fix: henki-mods unpin $n, or henki-mods update $n --force"
+  case "$L_kind:$to" in
+    official: | path:) src=$L_source ;;
+    official:* | path:*) die "a module from henki or from a directory has one version, the one there now; fix: drop --to" ;;
+    url:@?*) x=${to#@} ;;
+    url:) x=$(ref_of) && [ -n "$x" ] || die "$n's URL pins a commit, so there is nothing to follow; fix: henki-mods update $n --to @BRANCH" ;;
+    url:*) die "--to takes @REF for a module from a URL; fix: henki-mods update $n --to @BRANCH" ;;
+    index:*:@*) die "--to takes a version for a module from an index; fix: henki-mods info $L_source lists them" ;;
+    index:*) src="$L_source@${L_kind#index:}" want=$to ;;
+    *) die "$n was made from an Agent Skill; fix: import the skill again" ;;
+  esac
+  if [ "$L_kind" = url ]; then
+    src=${L_source%%#*}
+    [ "$x" = HEAD ] || src="$src@$x"
+    case "$L_source" in *'#'*) src="$src#${L_source#*#}" ;; esac
+  fi
+  stage_src "$src" "$want"
+  new_hd1=$I_hd1 new_cmds=$I_cmds new_commit=$COMMIT new_ver=${M_version:--}
+  [ -z "$pkg" ] || new_ver=$E_ver
+  # A sync applied the yanks meanwhile, which reads every lock line: read NAME's again.
+  lock_get "$n"
+  [ "$I_name" = "$n" ] || die "the copy at the source names itself $I_name, not $n; fix: henki-mods rm $n, then add the new one"
+  [ "$new_hd1" != "$L_hd1" ] || {
+    say "$n is up to date ($L_version, $L_hd1)"
+    return 0
+  }
+  old=$(store_of)
+  old_line=$(lock_line "$L_state")
+  facts "$STAGE/m" "$new_ver" >"$STAGE/new.facts"
+  if inspect "$old" "$n" 2; then facts "$old" "$L_version" >"$STAGE/old.facts"; else printf 'version\t%s (its store copy: %s)\n' "$L_version" "$ERR" >"$STAGE/old.facts"; fi
+  inspect "$STAGE/m" "$n" 3 || die "$ERR"
+  say "$n: $L_version -> $new_ver"
+  screen_review
+  say "  pin      ${L_commit} $L_hd1 -> $new_commit $new_hd1"
+  change_screen "$STAGE/old.facts" "$STAGE/new.facts" "$old" "$STAGE/m"
+  for x in $(bound_to "$n"); do say "  $x: bound to $n; the new copy runs the $x/1 suite before the switch"; done
+  x=$(allow_hits "$new_cmds")
+  [ -z "$x" ] || say "  allow rules that run its programs without asking: $(printf '%s\n' "$x" | tr '\n' ' ')(asked after the update)"
+  if [ "$yes" != 1 ] && [ -s "$STAGE/diff" ] && tty_ask "show the whole diff? [y/N]"; then
+    case "$ANSWER" in y | Y | yes | YES) ${PAGER:-more} <"$STAGE/diff" ;; esac
+  fi
+  confirm "$yes" "update? [y/N]" "not updated (the answer was no); fix: run update again and answer y"
+  cards_ok
+  store="$STORE/$n/$(store_id)"
+  store_put "$store" "$new_hd1" "$n"
+  L_flags=$(flags_across "$store")
+  if [ "$kind" = url ] && [ -n "$to" ]; then
+    L_flags=$(flags_less ref)
+    x=$(url_flags "${to#@}")
+    [ -z "$x" ] || L_flags="${L_flags:+$L_flags,}$x"
+  fi
+  L_version=$new_ver L_commit=$new_commit L_hd1=$new_hd1 L_how=$HOW L_added=$(date -u +%Y-%m-%dT%H:%MZ)
+  pin_switch update "$old_line"
+  say "updated $n: $(printf '%s' "$old_line" | cut -f 4) -> $new_ver, $(shown "$(linked_of)")"
+  allow_follow "$new_cmds" 1 "$yes"
+  restart
+}
+
+# pin NAME, unpin NAME: FLAGS pin, which update refuses without --force (a sync still turns off a malicious yank).
+cmd_pin() { # pin|unpin NAME
+  local n="${2:-}"
+  [ $# = 2 ] && is_name "$n" || usage
+  busy
+  lock_check
+  lock_get "$n" || die "$n is not added; fix: henki-mods list shows what is"
+  if [ "$1" = pin ]; then
+    ! flag_has pin || { say "$n is already pinned" && return 0; }
+    L_flags="${L_flags:+$L_flags,}pin"
+    say "$n: pinned at $L_version (update leaves it as it is; henki-mods unpin $n)"
+  else
+    flag_has pin || { say "$n is not pinned" && return 0; }
+    L_flags=$(flags_less pin)
+    say "$n: unpinned"
+  fi
+  lock_put "$n" "$(lock_line "$L_state")"
+}
+
+# The hist/1 lines of module NAME, newest first, each as its lock/1 line after "TIME<TAB>WHY<TAB>".
+hist_of() { # NAME
+  [ -f "$HIST" ] || return 0
+  HM_N="$1" awk -F '\t' '$1 == "hist/1" && $4 == "lock/1" && $5 == ENVIRON["HM_N"] && NF == 14 { print NR "\t" $0 }' "$HIST" | sort -t "$tab" -k1,1nr | cut -f 3-
+}
+
+# rollback NAME [--yes]: back to the newest pin of NAME in the history whose store copy is still there, still holds its
+# hd1, and is not yanked as malicious in an index verified here (no network); a buggy yank is a warning. A screen of what
+# changes, the question, the switch (pin_switch); the pin left goes to the history.
+cmd_rollback() {
+  local n="" yes=0 line t why x cur cur_line state flags found="" new_cmds old
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --yes | -y) yes=1 ;;
+      -*) usage ;;
+      *) [ -z "$n" ] && n=$1 || usage ;;
+    esac
+    shift
+  done
+  is_name "$n" || usage
+  trust_guard
+  busy
+  lock_check
+  stage
+  STAGE_LIST="$STAGE/list"
+  lock_get "$n" || die "$n is not added; fix: henki-mods add it again (a rollback starts from the lock)"
+  cur=$L_hd1 cur_line=$(lock_line "$L_state") state=$L_state flags=$L_flags old=$(store_of)
+  index_local_all
+  while IFS= read -r line; do
+    [ -n "$line" ] || continue
+    t=${line%%"$tab"*} line=${line#*"$tab"}
+    why=${line%%"$tab"*} line=${line#*"$tab"}
+    IFS="$tab" read -r _ L_name L_state L_version L_kind L_source L_commit L_hd1 L_added L_how L_flags <<EOF
+$line
+EOF
+    [ "$L_hd1" != "$cur" ] || continue
+    x=$(store_of)
+    if ! inspect "$x" "$n" 2 2>/dev/null || [ "$I_hd1" != "$L_hd1" ]; then
+      say "skipped $n $L_version (from $t): its store copy $x is gone or changed"
+      continue
+    fi
+    x=$(yank_hit "$L_kind" "$L_source" "$L_version" "$L_hd1")
+    case "$x" in malicious*)
+      say "skipped $n $L_version (from $t): $(red "yanked as malicious") by index ${x##*"$tab"}"
+      continue
+      ;;
+    esac
+    found=1
+    break
+  done <<EOF
+$(hist_of "$n")
+EOF
+  [ -n "$found" ] || die "no earlier pin of $n can be gone back to (above, or none in $(shown "$HIST")); fix: henki-mods update $n, or rm and add it again"
+  facts "$(store_of)" "$L_version" >"$STAGE/new.facts"
+  new_cmds=$I_cmds
+  x=$(printf '%s' "$cur_line" | cut -f 4)
+  if inspect "$old" "$n" 2; then facts "$old" "$x" >"$STAGE/old.facts"; else printf 'version\t%s\n' "$x" >"$STAGE/old.facts"; fi
+  say "$n: $x -> $L_version (the pin before $why, $t)"
+  say "  source   $L_kind $L_source, $(shown "$(store_of)")"
+  say "  pin      $(printf '%s' "$cur_line" | cut -f 7,8 | tr '\t' ' ') -> $L_commit $L_hd1"
+  x=$(yank_hit "$L_kind" "$L_source" "$L_version" "$L_hd1")
+  [ -z "$x" ] || say "  $(yellow "yanked   as ${x%%"$tab"*} by index ${x##*"$tab"}")"
+  change_screen "$STAGE/old.facts" "$STAGE/new.facts" "$old" "$(store_of)"
+  confirm "$yes" "roll back? [y/N]" "not rolled back (the answer was no); fix: run rollback again and answer y"
+  cards_ok
+  L_state=$state L_flags=$flags
+  L_flags=$(flags_across "$(store_of)")
+  L_how=$HOW L_added=$(date -u +%Y-%m-%dT%H:%MZ)
+  pin_switch rollback "$cur_line"
+  say "rolled back $n to $L_version, $(shown "$(linked_of)")"
+  allow_follow "$new_cmds" 1 "$yes"
+  restart
+}
+
+# gc [--all] [--yes]: removes the store copies nothing names: not the lock (masked copies too), not a port link, not one
+# of the two newest history pins of a module (--all: no history pin), and the clones of indexes no longer in use. Lists
+# them with their sizes and asks.
+cmd_gc() {
+  local all=0 yes=0 a n d keep="" gone="" k
+  for a in "$@"; do case "$a" in --all) all=1 ;; --yes | -y) yes=1 ;; *) usage ;; esac; done
+  busy
+  lock_check
+  scratch
+  for n in $(lock_names); do
+    lock_get "$n"
+    keep="$keep$(store_of)$nl$(linked_of)$nl"
+  done
+  for a in $(port_names); do
+    d=$(target "$CONF/port/$a")
+    case "$d" in "$STORE"/*/*/*) d=${d#"$STORE"/} && keep="$keep$STORE/${d%%/*}/$(printf '%s' "${d#*/}" | cut -d / -f 1)$nl" ;; esac
+  done
+  if [ "$all" = 0 ] && [ -f "$HIST" ]; then
+    for n in $(awk -F '\t' '$1 == "hist/1" { print $5 }' "$HIST" | sort -u); do
+      k=0
+      while IFS="$tab" read -r _ _ _ L_name L_state L_version L_kind L_source L_commit L_hd1 L_added L_how L_flags; do
+        [ -n "$L_name" ] || continue
+        d=$(store_of)
+        case "$nl$keep" in *"$nl$d$nl"*) continue ;; esac
+        [ -d "$d" ] || continue
+        keep="$keep$d$nl"
+        k=$((k + 1))
+        [ "$k" -lt 2 ] || break
+      done <<EOF
+$(hist_of "$n")
+EOF
+    done
+  fi
+  [ ! -d "$STORE" ] || for d in "$STORE"/*/*; do
+    [ -d "$d" ] && [ ! -L "$d" ] || continue
+    case "$nl$keep" in *"$nl$d$nl"*) continue ;; esac
+    gone="$gone$d$nl"
+  done
+  [ ! -d "$IDXD" ] || for d in "$IDXD"/*.git; do
+    [ -d "$d" ] || continue
+    a=${d##*/}
+    index_names | command grep -qx "${a%.git}" || gone="$gone$d$nl"
+  done
+  [ -n "$gone" ] || {
+    say "nothing to remove"
+    return 0
+  }
+  say "not named by the lock, a port, or the history's two newest pins of a module:"
+  printf '%s' "$gone" | while IFS= read -r d; do printf '  %6s KiB  %s\n' "$(du -sk "$d" | cut -f 1)" "$(shown "$d")"; done
+  confirm "$yes" "remove them? [y/N]" "nothing removed (the answer was no); fix: run gc again and answer y"
+  printf '%s' "$gone" | while IFS= read -r d; do
+    chmod -R u+w "$d" && rm -rf "$d" || die "cannot remove $d; fix: check its permissions"
+    case "$d" in *.git) rm -f "${d%.git}.synced" ;; *) rmdir "${d%/*}" 2>/dev/null ;; esac
+  done
+  say "removed $(printf '%s' "$gone" | awk 'END { print NR }')"
+}
+
+# --- packs, profiles, init (pack/1) --------------------------------------------------------------------------------------
+
+# Installs copy DIR (checked by the caller) as the module of the lock line in L_*: the store copy, the link (with its
+# masks) when STATE is on, the lock line; a line it replaces goes to the history (hist/1, WHY). The cards are the
+# caller's to write.
+install_copy() { # DIR WHY
+  local store old link
+  old=$(HM_N="$L_name" awk -F '\t' '$1 == "lock/1" && $2 == ENVIRON["HM_N"]' "$LOCK" 2>/dev/null)
+  store=$(store_of)
+  store_put "$store" "$L_hd1" "$L_name" "$1"
+  link=$(mask_make) || exit 1
+  if [ -L "$EXT/$L_name" ]; then rm -f "$EXT/$L_name" || die "cannot remove $(shown "$EXT/$L_name"); fix: make $(shown "$EXT") writable"; fi
+  if [ "$L_state" = on ]; then
+    mkdir -p "$EXT" && ln -s -- "$link" "$EXT/$L_name" || die "cannot link $(shown "$EXT/$L_name"); fix: make $(shown "$EXT") writable"
+  fi
+  [ -z "$old" ] || hist_add "$2" "$old"
+  lock_put "$L_name" "$(lock_line "$L_state")"
+}
+
+# FILE's lock/1 lines checked as the lock is (lock_check), in a subshell: a pack's or a profile's. Exit 1 with the
+# reason said.
+lines_check() { # FILE
+  (LOCK=$1 && lock_check) || return 1
+  ! command grep -q "^bind/1$tab" "$1" || {
+    printf 'henki-mods: %s: holds a port binding (bind/1), which is not moved this way; fix: remove the line\n' "$1" >&2
+    return 1
+  }
+}
+
+# Writes DIR's entries into the tar.gz FILE so the same files give the same bytes: sorted names, no recursion, owner 0,
+# every mtime 1970-01-01, gzip without a name or time (as release.sh packs).
+tar_pack() { # DIR FILE
+  local owner
+  (cd "$1" && find . -exec env TZ=UTC touch -h -t 197001010000.00 {} +) || die "cannot set the times in $1; fix: check TMPDIR"
+  if tar --version 2>/dev/null | command grep -q 'GNU tar'; then
+    owner="--owner=0 --group=0 --numeric-owner"
+  else
+    owner="--uid 0 --gid 0 --numeric-owner"
+    [ "$OS" != macos ] || owner="$owner --no-mac-metadata --no-xattrs"
+  fi
+  # shellcheck disable=SC2086 # owner is several flags
+  (cd "$1" && find . ! -name . | sed 's|^\./||' | sort | tar -c --format=ustar --no-recursion $owner -f - -T -) | gzip -n -9 >"$2.tmp.$$" &&
+    mv -f "$2.tmp.$$" "$2" || {
+    rm -f "$2.tmp.$$"
+    die "cannot write $2; fix: check the path and the free space"
+  }
+}
+
+# pack [NAME...] [--with-index] -o FILE: the modules (all by default) as a pack/1 tar.gz another machine installs with no
+# network: PACK (`pack/1`, their lock/1 lines, an asset/1 line per prebuilt program), store/NAME/ID/ (each store copy as
+# it is) and, with --with-index, index/NAME.bundle (each index's verified commit, for the review lines there).
+cmd_pack() {
+  local out="" ix=0 names="" n i p
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      -o)
+        [ $# -ge 2 ] || usage
+        out=$2
+        shift
+        ;;
+      --with-index) ix=1 ;;
+      -*) usage ;;
+      *) is_name "$1" && names="$names $1" || usage ;;
+    esac
+    shift
+  done
+  [ -n "$out" ] || usage
+  busy
+  lock_check
+  scratch
+  [ -n "$names" ] || names=$(lock_names)
+  [ -n "$names" ] || die "no modules to pack; fix: add some first (henki-mods list)"
+  p="$STAGE/p"
+  mkdir -p "$p/store" && printf 'pack/1\n' >"$p/PACK" && : >"$STAGE/assets" || die "cannot write $STAGE; fix: check TMPDIR"
+  for n in $names; do
+    lock_get "$n" || die "$n is not added; fix: henki-mods list shows what is"
+    ! flag_has yanked=malicious || die "$n $L_version was yanked as malicious; it is not packed; fix: henki-mods rm $n"
+    inspect "$(store_of)" "$n" 2 && [ "$I_hd1" = "$L_hd1" ] || die "the store copy $(store_of) does not match the lock (${ERR:-it changed}); fix: henki-mods rm $n and add it again"
+    copy_dir "$(store_of)" "$p/store/$n/$(basename "$(store_of)")"
+    L_flags=$(flags_less yanked)
+    printf '%s\n' "$(lock_line "$L_state")" >>"$p/PACK"
+    [ -z "$I_asset" ] || printf 'asset/1\t%s\t%s\t%s\n' "$n" "$(printf '%s' "$I_asset" | cut -f 2)" "$(printf '%s' "$I_asset" | cut -f 4)" >>"$STAGE/assets"
+  done
+  cat "$STAGE/assets" >>"$p/PACK"
+  if [ "$ix" = 1 ]; then
+    for i in $(index_names); do
+      index_conf "$i" && X_V=$(index_v) || continue
+      mkdir -p "$p/index"
+      _ix -c pack.threads=1 bundle create "$p/index/$i.bundle" refs/henki/verified >/dev/null 2>&1 || die "cannot bundle index $i; fix: henki-mods sync, then pack again"
+      say "index $i: $(short "$X_V") goes along (the review lines on the other machine)"
+    done
+  fi
+  tar_pack "$p" "$out"
+  say "packed $(printf '%s\n' $names | awk 'END { print NR }') modules into $out ($(num "$(wc -c <"$out" | tr -d ' ')") B)"
+}
+
+# Index I's verified commit from BUNDLE, under the local anchor and checkpoint only: used when its head has the commit
+# verified here on its first-parent line (or nothing is verified here), never moving refs/henki/verified. Its entries go
+# to $STAGE/ix/I, with this machine's own yanks and removals added after (a pack cannot undo a yank). Exit 1, said,
+# when the bundle is not used.
+bundle_load() { # I BUNDLE
+  local v n out
+  index_conf "$1" && index_tools || {
+    say "  index $1 in the pack: not used ($ERR)"
+    return 1
+  }
+  v=$(index_v) || v=""
+  X_git="$STAGE/b/$1.git"
+  mkdir -p "$STAGE/b" && git init -q --bare "$X_git" && GIT_ALLOW_PROTOCOL=file _ix -c protocol.allow=never -c protocol.file.allow=always \
+    fetch --quiet --no-tags --no-write-fetch-head -- "$2" '+refs/henki/verified:refs/henki/fetched' 2>/dev/null </dev/null &&
+    n=$(_ix rev-parse -q --verify 'refs/henki/fetched^{commit}') || {
+    say "  index $1 in the pack: not used (not a bundle of an index)"
+    return 1
+  }
+  [ "$n" != "$v" ] || {
+    say "  index $1 in the pack: the commit verified here already"
+    return 1
+  }
+  out=$(index_chain "$X_git" "$n" "$v" "$X_ck" "$X_anchor" "$X_refused" "index $1 in the pack" 2>&1) || {
+    say "  $(printf '%s' "$out" | head -n 1 | sed 's/^/not used: /')"
+    return 1
+  }
+  X_V=$n
+  [ ! -d "$STAGE/ix/$1" ] || mv "$STAGE/ix/$1" "$STAGE/ix/$1.here"
+  index_load "$1"
+  [ ! -d "$STAGE/ix/$1.here" ] || {
+    awk -F '\t' '$4 != "-"' "$STAGE/ix/$1.here/vers" "$STAGE/ix/$1.here/yanks" >>"$STAGE/ix/$1/yanks"
+    cat "$STAGE/ix/$1.here/removed" >>"$STAGE/ix/$1/removed"
+  }
+  say "  index $1 in the pack: $(short "$n"), verified from the anchor here"
+}
+
+# The members of tar.gz FILE, before anything is extracted: each a file, a directory or a link under PACK, store/NAME/ID/
+# or index/NAME.bundle, no absolute path, no `..`, no name twice, nothing under a link, links only in a store copy.
+# Exit 1 with ERR.
+pack_members() { # FILE
+  tar -tzf "$1" >"$STAGE/names" 2>"$STAGE/tar.err" || {
+    ERR="$1 is not a tar.gz ($(head -n 1 "$STAGE/tar.err")); fix: name a file henki-mods pack wrote"
+    return 1
+  }
+  tar -tzvf "$1" 2>/dev/null | cut -c 1 >"$STAGE/kinds"
+  [ "$(wc -l <"$STAGE/names")" = "$(wc -l <"$STAGE/kinds")" ] || {
+    ERR="$1: a member's name holds a newline; fix: do not unpack it"
+    return 1
+  }
+  paste "$STAGE/kinds" "$STAGE/names" >"$STAGE/members"
+  # Two reads: the links first, so a member under one is refused wherever it stands in the archive.
+  ERR=$(awk -F '\t' '
+    function bad(m) { print $2 ": " m; exit 1 }
+    { k = $1; p = $2; sub(/^\.\//, "", p); sub(/\/$/, "", p) }
+    FNR == NR { if (k == "l") ln[p] = 1; next }
+    p == "" || p == "." { next }
+    substr(p, 1, 1) == "/" { bad("an absolute path") }
+    { n = split(p, c, "/"); for (i = 1; i <= n; i++) if (c[i] == ".." || c[i] == "") bad("a .. or an empty name") }
+    p in seen { bad("twice") }
+    { seen[p] = 1 }
+    k != "-" && k != "d" && k != "l" { bad("not a file, a directory or a link") }
+    { for (q in ln) if (index(p, q "/") == 1) bad("under the link " q) }
+    k == "l" { if (n < 4 || c[1] != "store") bad("a link outside a store copy") }
+    p == "PACK" { if (k != "-") bad("not a file"); next }
+    c[1] == "store" { if (n == 3 && k != "d") bad("a store copy that is not a directory"); next }
+    c[1] == "index" { if (n == 1 && k == "d") next; if (n != 2 || k != "-" || c[2] !~ /^[a-z0-9][a-z0-9_-]*\.bundle$/) bad("not index/NAME.bundle"); next }
+    { bad("not PACK, store/ or index/") }' "$STAGE/members" "$STAGE/members")
+  [ -z "$ERR" ] || {
+    ERR="$1: $ERR; fix: do not unpack it"
+    return 1
+  }
+}
+
+# unpack FILE [--yes]: installs a pack's modules with no network: the members are checked before anything is
+# extracted; each copy must hold its lock line's hd1 and asset sha256s; the review line comes from the indexes verified
+# here (or the pack's bundle, under bundle_load's rules); a malicious yank refuses. One screen, one question; a module of
+# the same hd1 is left as it is, another one replaced (its line goes to the history).
+cmd_unpack() {
+  local f="" yes=0 u line n x i hd old cmds="" k=0
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --yes | -y) yes=1 ;;
+      -*) usage ;;
+      *) [ -z "$f" ] && f=$1 || usage ;;
+    esac
+    shift
+  done
+  [ -n "$f" ] || usage
+  trust_guard
+  busy
+  lock_check
+  stage
+  STAGE_LIST="$STAGE/list"
+  [ -f "$f" ] || die "$f is not a file; fix: name a pack"
+  case "$f" in /*) ;; *) f="$(pwd -P)/$f" ;; esac
+  pack_members "$f" || die "$ERR"
+  u="$STAGE/u"
+  mkdir -p "$u" && (cd "$u" && tar -xzf "$f") || die "cannot unpack $f into $u; fix: check TMPDIR"
+  [ -f "$u/PACK" ] && [ "$(sed -n 1p "$u/PACK")" = pack/1 ] || die "$f has no PACK starting with pack/1; fix: name a file henki-mods pack wrote"
+  [ "$(wc -c <"$u/PACK")" -le 1048576 ] || die "$f: its PACK is over 1 MiB; fix: do not unpack it"
+  sed 1d "$u/PACK" | awk -F '\t' '$1 != "asset/1"' >"$STAGE/pack.lock"
+  sed 1d "$u/PACK" | awk -F '\t' '$1 == "asset/1"' >"$STAGE/pack.assets"
+  lines_check "$STAGE/pack.lock" || die "$f: its PACK is not lock/1 lines this henki-mods reads (above); fix: upgrade henki, or pack it again"
+  awk -F '\t' 'NF != 4 || $2 !~ /^[a-z0-9][a-z0-9_-]*$/ { exit 1 }' "$STAGE/pack.assets" || die "$f: an asset/1 line is not NAME DEST SHA256; fix: pack it again"
+  [ -z "$(awk -F '\t' 'a[$2]++' "$STAGE/pack.lock")" ] || die "$f names a module twice; fix: pack it again"
+  index_local_all
+  for x in "$u"/index/*.bundle; do
+    [ -f "$x" ] || continue
+    i=${x##*/}
+    i=${i%.bundle}
+    if index_names | command grep -qx "$i"; then bundle_load "$i" "$x" || :; else say "  index $i in the pack: not one you use; not read"; fi
+  done
+  say "unpack $f:"
+  while IFS= read -r line; do
+    IFS="$tab" read -r _ L_name L_state L_version L_kind L_source L_commit L_hd1 L_added L_how L_flags <<EOF
+$line
+EOF
+    n=$L_name
+    x="$u/store/$n/$(basename "$(store_of)")"
+    [ -d "$x" ] && [ ! -L "$x" ] || die "$f has no store copy for $n ($x); fix: pack it again"
+    inspect "$x" "$n" 3 || die "$n: $(printf '%s' "$ERR" | sed "s|$u/||g")"
+    [ "$I_hd1" = "$L_hd1" ] && [ "$I_name" = "$n" ] || die "$n: the copy in $f is not the one its lock line names ($I_hd1); fix: do not unpack it"
+    hd=$(HM_N="$n" awk -F '\t' '$2 == ENVIRON["HM_N"] { print $3 "\t" $4 }' "$STAGE/pack.assets")
+    [ "$hd" = "$(printf '%s' "$I_asset" | cut -f 2,4)" ] || die "$n: the pack's asset/1 line does not match its prebuilt program; fix: pack it again on a machine of this kind"
+    old=$(HM_N="$n" awk -F '\t' '$1 == "lock/1" && $2 == ENVIRON["HM_N"] { print $8 }' "$LOCK" 2>/dev/null)
+    if [ "$old" = "$L_hd1" ]; then
+      say "  $n $L_version: already here, left as it is"
+      continue
+    fi
+    if [ -n "$old" ]; then
+      i=$(bound_to "$n" | head -n 1)
+      [ -z "$i" ] || die "$n holds henki's $i binding; fix: henki-mods swap $i std, then unpack again"
+    elif [ -e "$EXT/$n" ] || [ -L "$EXT/$n" ]; then
+      die "$(shown "$EXT/$n") exists and henki-mods did not make it; fix: move it out of $(shown "$EXT") first"
+    fi
+    x=-
+    case "$L_kind" in index:*) x=$L_source ;; esac
+    yank_guard "$n" "$L_version" "$L_kind" "$x" "$L_hd1"
+    say "  $n $L_version ($L_kind $L_source)$([ -z "$old" ] || printf ', replaces the one here'): $L_state, +$(num "$(prompt_bytes "$n" "$u/store/$n/$(basename "$(store_of)")")") B of prompt"
+    x=$(hd1_hits "$L_hd1" | head -n 1)
+    if [ -n "$x" ]; then
+      tier_of "${x%%"$tab"*}" "$STAGE/ix/${x%%"$tab"*}/r/$(printf '%s' "$x" | cut -f 2)@${x##*"$tab"}"
+      say "    review   $(tier_paint)"
+    elif [ "$L_kind" != official ]; then
+      say "    $(red "UNREVIEWED: in no index you use; nobody has read this code for you")"
+    fi
+    printf '%s' "$I_runs" | while IFS="$tab" read -r i x; do [ -z "$i" ] || say "    runs     $i: $x"; done
+    printf '%s\n' "$line" >>"$STAGE/todo"
+    cmds="$cmds$I_cmds"
+    k=$((k + 1))
+  done <"$STAGE/pack.lock"
+  [ "$k" != 0 ] || {
+    say "nothing to install"
+    return 0
+  }
+  confirm "$yes" "install these $k modules? [y/N]" "nothing installed (the answer was no); fix: run unpack again and answer y"
+  cards_ok
+  while IFS= read -r line; do
+    IFS="$tab" read -r _ L_name L_state L_version L_kind L_source L_commit L_hd1 L_added L_how L_flags <<EOF
+$line
+EOF
+    L_how=$HOW L_added=$(date -u +%Y-%m-%dT%H:%MZ)
+    install_copy "$u/store/$L_name/$(basename "$(store_of)")" unpack
+    say "installed $L_name $L_version: $L_state"
+  done <"$STAGE/todo"
+  cards_write 0 || die "$ERR"
+  allow_follow "$cmds" 1 "$yes"
+  ext_path_warning
+  restart
+}
+
+# The dir of the profiles henki ships (share/henki/mod-profiles), or nothing.
+profile_dir() {
+  local d
+  for d in ${HENKI_SHARE:+"$HENKI_SHARE/mod-profiles"} "$SELF/../share/henki/mod-profiles" "$SELF/mod-profiles"; do
+    [ ! -d "$d" ] || {
+      (cd -P "$d" && pwd)
+      return 0
+    }
+  done
+  return 1
+}
+
+# Profile P's lock/1 lines into $STAGE/profile: a shipped NAME, a file by path, or NAME@INDEX (profiles/NAME.lock of a
+# verified index; P_index then names it). Lines are official modules ("-" fields: as shipped) or index packages pinned
+# by version and hd1. Dies when it cannot be read.
+profile_get() { # P
+  local n d
+  P_index=""
+  case "$1" in
+    /* | ./* | ../*) [ -f "$1" ] && cp "$1" "$STAGE/profile" || die "$1 is not a file; fix: name a profile file" ;;
+    *@*)
+      n=${1%@*} P_index=${1#*@}
+      is_name "$n" && is_name "$P_index" || usage
+      index_names | command grep -qx "$P_index" || die "no index $P_index is in use; fix: henki-mods index list"
+      index_sync_all || die "$ERR"
+      index_again "$P_index"
+      _ix cat-file blob "$X_V:profiles/$n.lock" 2>/dev/null | head -c 65537 >"$STAGE/profile"
+      [ -s "$STAGE/profile" ] || die "index $P_index has no profile $n; fix: henki-mods profile list"
+      ;;
+    *)
+      is_name "$1" || usage
+      d=$(profile_dir) && [ -f "$d/$1.lock" ] || die "no profile $1; fix: henki-mods profile list names them"
+      cp "$d/$1.lock" "$STAGE/profile"
+      ;;
+  esac
+  [ "$(wc -c <"$STAGE/profile")" -le 65536 ] || die "profile $1 is over 64 KiB; fix: name another"
+  lines_check "$STAGE/profile" || die "profile $1 is not lock/1 lines this henki-mods reads (above); fix: upgrade henki, or name another"
+  awk -F '\t' '$5 != "official" && $5 !~ /^index:/ { exit 1 }' "$STAGE/profile" || die "profile $1 names a module from a URL or a directory; fix: a profile holds official modules and index packages only"
+}
+
+# The prompt bytes of profile file F's official modules on, the header included (index lines: their entries' bytes
+# when loaded).
+profile_bytes() { # F
+  local n d t=0 b
+  for n in $(awk -F '\t' '$3 == "on" && $5 == "official" { print $2 }' "$1"); do
+    d=$(official_dir "$n") || continue
+    b=$(prompt_bytes "$n" "$d") && t=$((t + b))
+  done
+  [ "$t" = 0 ] || t=$((t + ${#HEADER} + 2))
+  printf '%s\n' "$t"
+}
+
+# init [PROFILE] [--yes]: without PROFILE, the profiles henki ships, each with its modules and prompt bytes; with one,
+# its modules staged and checked as add does (a module in the lock already is left as it is: an off line is never turned
+# on), one screen, one question, then each installed.
+cmd_init() {
+  local p="" yes=0 d f line n s x want kind source fallback dir ref sub url pkg cmds="" bytes=0 b k=0
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --yes | -y) yes=1 ;;
+      -*) usage ;;
+      *) [ -z "$p" ] && p=$1 || usage ;;
+    esac
+    shift
+  done
+  if [ -z "$p" ]; then
+    scratch
+    d=$(profile_dir) || die "no profiles beside henki-mods; fix: reinstall henki"
+    say "module profiles: sets of official modules, nothing on until you say yes"
+    for f in "$d"/*.lock; do
+      [ -f "$f" ] || continue
+      n=${f##*/}
+      printf '  %-10s %6s B  %s\n' "${n%.lock}" "$(num "$(profile_bytes "$f")")" "$(awk -F '\t' '$1 == "lock/1" { printf "%s ", $2 }' "$f")"
+    done
+    say "henki-mods init NAME shows a profile's modules, then asks; henki-mods profile list shows the indexes' too"
+    return 0
+  fi
+  trust_guard
+  busy
+  lock_check
+  stage
+  STAGE_LIST="$STAGE/list"
+  profile_get "$p"
+  mkdir -p "$STAGE/init" && : >"$STAGE/todo"
+  say "profile $p:"
+  # The profile on fd 5: a git clone below must not read it as its stdin.
+  while IFS= read -r line <&5; do
+    IFS="$tab" read -r _ n _ want kind source _ b _ _ _ <<EOF
+$line
+EOF
+    if lock_get "$n"; then
+      if [ "$L_state" = off ]; then say "  $n: off in your lock, so it stays off (henki-mods on $n turns it on)"; else say "  $n: added already"; fi
+      continue
+    fi
+    if [ "$kind" = official ]; then
+      official_dir "$n" >/dev/null || {
+        say "  $n: this henki ships no $n; left out"
+        continue
+      }
+      s=$n want=""
+    else
+      s="$source@${P_index:-${kind#index:}}"
+    fi
+    stage_src "$s" "$want"
+    [ "$I_name" = "$n" ] || die "profile $p: $s names itself $I_name, not $n; fix: report it"
+    [ "$kind" = official ] || [ "$b" = - ] || [ "$b" = "$I_hd1" ] || die "profile $p: $n $want in index ${kind#index:} is not the profile's ($b); fix: report it to the profile's author"
+    n=$I_name
+    x=$(prompt_bytes "$n" "$STAGE/m")
+    bytes=$((bytes + x))
+    say "  $n ${M_version:--} ($kind): +$(num "$x") B of prompt"
+    case "$kind" in index:*) tier_of "$F_index" "$E_rec" && say "    review   $(tier_paint)" ;; esac
+    printf '%s' "$I_runs" | while IFS="$tab" read -r s x; do [ -z "$s" ] || say "    runs     $s: $x"; done
+    L_name=$n L_state=$(printf '%s' "$line" | cut -f 3) L_version=${M_version:--} L_kind=$kind L_source=$source L_commit=$COMMIT L_hd1=$I_hd1 L_added=- L_how=- L_flags=""
+    [ -z "$pkg" ] || L_version=$E_ver
+    printf '%s\n' "$(lock_line "$L_state")" >>"$STAGE/todo"
+    mv "$STAGE/m" "$STAGE/init/$n" || die "cannot move $STAGE/m; fix: check TMPDIR"
+    cmds="$cmds$I_cmds"
+    k=$((k + 1))
+  done 5<"$STAGE/profile"
+  [ "$k" != 0 ] || {
+    say "nothing to add"
+    return 0
+  }
+  [ "$bytes" = 0 ] || [ "$(total_on)" != 0 ] || bytes=$((bytes + ${#HEADER} + 2))
+  say "  prompt   +$(num "$bytes") B on every request (total on after: $(num $(($(total_on) + bytes))) B)"
+  confirm "$yes" "add these $k modules? [y/N]" "nothing added (the answer was no); fix: run init again and answer y"
+  cards_ok
+  while IFS= read -r line; do
+    IFS="$tab" read -r _ L_name L_state L_version L_kind L_source L_commit L_hd1 L_added L_how L_flags <<EOF
+$line
+EOF
+    L_how=$HOW L_added=$(date -u +%Y-%m-%dT%H:%MZ)
+    install_copy "$STAGE/init/$L_name" init
+    say "added $L_name: $L_state"
+  done <"$STAGE/todo"
+  cards_write 0 || die "$ERR"
+  allow_follow "$cmds" 1 "$yes"
+  ext_path_warning
+  restart
+}
+
+# profile list | show P | save FILE: the profiles henki ships and each index's, one profile's lines, or the modules on
+# now as a profile file (official modules and index packages; others are said and left out).
+cmd_profile() {
+  local d f n i x
+  case "${1:-}:$#" in
+    list:1)
+      scratch
+      if d=$(profile_dir); then
+        for f in "$d"/*.lock; do
+          [ -f "$f" ] || continue
+          n=${f##*/}
+          printf '  %-16s %6s B  %s\n' "${n%.lock}" "$(num "$(profile_bytes "$f")")" "$(awk -F '\t' '$1 == "lock/1" { printf "%s ", $2 }' "$f")"
+        done
+      fi
+      for i in $(index_names); do
+        index_ready "$i" 2>/dev/null || continue
+        _ix ls-tree --name-only "$X_V" profiles/ 2>/dev/null | sed -n 's|^profiles/\([a-z0-9][a-z0-9_-]*\)\.lock$|\1|p' |
+          while IFS= read -r n; do printf '  %-16s %s\n' "$n@$i" "(index $i; henki-mods profile show $n@$i)"; done
+      done
+      ;;
+    show:2)
+      busy
+      stage
+      profile_get "$2"
+      awk -F '\t' '{ printf "  %-16s %-10s %-3s %s %s\n", $2, $4, $3, $5, ($5 == "official" ? "" : $6 " " $8) }' "$STAGE/profile"
+      ;;
+    save:2)
+      [ ! -e "$2" ] || die "$2 exists; fix: name a new file"
+      lock_check
+      scratch
+      : >"$STAGE/save"
+      for n in $(lock_names_on); do
+        lock_get "$n"
+        case "$L_kind" in
+          official) printf 'lock/1\t%s\ton\t-\tofficial\t%s\t-\t-\t-\t-\t\n' "$n" "$n" >>"$STAGE/save" ;;
+          index:*) printf 'lock/1\t%s\ton\t%s\t%s\t%s\t%s\t%s\t-\t-\t\n' "$n" "$L_version" "$L_kind" "$L_source" "$L_commit" "$L_hd1" >>"$STAGE/save" ;;
+          *) say "left out $n: a module from $L_kind is not in a profile" ;;
+        esac
+      done
+      cp "$STAGE/save" "$2" || die "cannot write $2; fix: check the path"
+      say "wrote $2 ($(awk 'END { print NR }' "$STAGE/save") modules); henki-mods init $2 adds them elsewhere"
+      ;;
+    *) usage ;;
+  esac
+}
+
+# --- the index verbs: index list, add, rm ---------------------------------------------------------------------------------
+
+cmd_index() {
+  case "${1:-list}" in
+    list)
+      [ $# -le 1 ] || usage
+      index_list
+      ;;
+    add) shift && index_add "$@" ;;
+    rm) shift && index_rm "$@" ;;
+    *) usage ;;
+  esac
+}
+
+# Each index in use: its URL, who signs it (the anchor's key), its checkpoint, the commit verified here and its age.
+index_list() {
+  local n
+  scratch
+  for n in $(index_names); do
+    if ! index_conf "$n"; then
+      say "index $n: $ERR"
+      continue
+    fi
+    say "index $n: $X_url"
+    say "  signed by  $X_principal (key $X_fp)"
+    [ -z "$X_where" ] || say "  $(yellow "anchor     $X_where")"
+    say "  checkpoint ${X_ck:-none}"
+    if X_V=$(index_v); then
+      index_age
+      say "  verified   $(short "$X_V") ($X_age)"
+    else
+      say "  verified   never (henki-mods sync)"
+    fi
+  done
+  [ -n "$(index_names)" ] || say "no index in use"
+}
+
+# index add NAME URL --signers FILE [--checkpoint COMMIT] [--yes]: an index of your own choosing: its allowed_signers
+# FILE becomes the pinned anchor CONFIG/index/NAME.signers (shown by key fingerprint first), then the first sync.
+index_add() {
+  local n="" u="" f="" c="" yes=0 k
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --yes | -y) yes=1 ;;
+      --signers | --checkpoint)
+        [ $# -ge 2 ] || usage
+        if [ "$1" = --signers ]; then f=$2; else c=$2; fi
+        shift
+        ;;
+      -*) usage ;;
+      *) if [ -z "$n" ]; then n=$1; elif [ -z "$u" ]; then u=$1; else usage; fi ;;
+    esac
+    shift
+  done
+  is_name "$n" && [ -n "$u" ] && [ -n "$f" ] || usage
+  trust_guard
+  busy
+  lock_check
+  scratch
+  [ "$n" != "$INDEX_DEFAULT" ] && ! index_names | command grep -qx "$n" || die "index $n is in use already; fix: henki-mods index rm $n first, or name another"
+  case "$u" in *[[:space:]]* | *[[:cntrl:]]*) die "the URL holds a space or a control character; fix: name it without one" ;; https://?* | ssh://?* | file://?*) ;; *) die "$u is not an https, ssh or file URL; fix: name one" ;; esac
+  case "$c" in '') ;; *[!0-9a-f]*) die "--checkpoint $c is not a full commit id; fix: give all 40 hex digits" ;; *) [ ${#c} = 40 ] || die "--checkpoint $c is not a full commit id; fix: give all 40 hex digits" ;; esac
+  [ -f "$f" ] && [ "$(wc -c <"$f")" -le 65536 ] || die "$f is not a file of at most 64 KiB; fix: name the index's allowed_signers file"
+  k=$(key_lines "$f" | awk '{ for (i = 2; i < NF; i++) if ($i ~ /^(ssh-|sk-|ecdsa-)/) { print $1 "\t" $i "\t" $(i + 1); break } }')
+  [ -n "$k" ] || die "$f holds no key line; fix: name the index's allowed_signers file"
+  say "index $n: $u"
+  printf '%s\n' "$k" | while IFS="$tab" read -r f u c; do say "  signer   $f $u $(key_fp "$c")"; done
+  [ -n "$c" ] || say "  $(yellow "no checkpoint: a key this index rotated out could still graft a branch on the first sync (--checkpoint COMMIT, from its owner, closes that)")"
+  confirm "$yes" "trust these keys for index $n? [y/N]" "not added (the answer was no); fix: run index add again and answer y"
+  mkdir -p "$CONF/index" && cp "$f" "$CONF/index/$n.signers" && { [ -z "$c" ] || printf '%s\n' "$c" >"$CONF/index/$n.checkpoint"; } &&
+    printf 'index/1\t%s\t%s\n' "$n" "$u" >>"$MINDEX" || die "cannot write $(shown "$CONF/index"); fix: make $(shown "$CONF") writable"
+  if ! index_sync "$n"; then
+    index_drop "$n"
+    die "$ERR (index $n was not added)"
+  fi
+  say "added index $n: henki-mods search lists what it holds"
+}
+
+# Index NAME out of CONFIG/mods.index, with its pinned anchor and checkpoint.
+index_drop() { # NAME
+  HM_N="$1" awk -F '\t' '$2 != ENVIRON["HM_N"]' "$MINDEX" >"$MINDEX.tmp.$$" && mv -f "$MINDEX.tmp.$$" "$MINDEX" &&
+    rm -f "$CONF/index/$1.signers" "$CONF/index/$1.checkpoint" || die "cannot write $(shown "$MINDEX"); fix: make $(shown "$CONF") writable"
+  [ -s "$MINDEX" ] || rm -f "$MINDEX"
+}
+
+# index rm NAME [--yes]: stops using an index you added (not while a module of it is in the lock: its yanks would stop
+# applying). Its clone stays until henki-mods gc.
+index_rm() {
+  local n="" yes=0 a x
+  for a in "$@"; do case "$a" in --yes | -y) yes=1 ;; -*) usage ;; *) [ -z "$n" ] && n=$a || usage ;; esac; done
+  is_name "$n" || usage
+  busy
+  lock_check
+  [ "$n" != "$INDEX_DEFAULT" ] || die "index $n ships with henki; fix: install modules by URL or path if you do not want it"
+  [ -f "$MINDEX" ] && HM_N="$n" awk -F '\t' '$1 == "index/1" && $2 == ENVIRON["HM_N"] { f = 1 } END { exit !f }' "$MINDEX" || die "no index $n in $(shown "$MINDEX"); fix: henki-mods index list"
+  x=$(HM_K="index:$n" awk -F '\t' '$1 == "lock/1" && $5 == ENVIRON["HM_K"] { printf "%s ", $2 }' "$LOCK" 2>/dev/null)
+  [ -z "$x" ] || die "modules from index $n are added: ${x% }; fix: henki-mods rm them first"
+  confirm "$yes" "stop using index $n? [y/N]" "kept (the answer was no); fix: run index rm again and answer y"
+  index_drop "$n"
+  say "index $n: removed; its clone stays until henki-mods gc"
 }
 
 # --- port bindings: conformance, swap ---------------------------------------------------------------------------------
@@ -1765,7 +2982,7 @@ inst_start() { # X [V]
   rm -f "$CT/$x.in" "$CT/$x.out" && mkfifo "$CT/$x.in" "$CT/$x.out" || die "cannot make a FIFO in $CT; fix: check TMPDIR"
   # A home of its own, so the binding keeps its state in the scratch dir (hello names it).
   # The other instances' FIFO ends stay out of it, or their EOF would never come.
-  (cd "$CT/scope" && exec 3>&- 4>&- 5>&- 6>&- 7>&- 8>&- && HOME="$CT/home" XDG_STATE_HOME="$CT/home/state" exec "$C_henki" port "$C_port" ${2:+--offer "$2"} -- "$C_exe" <"$CT/$x.in" >"$CT/$x.out" 2>>"$CT/stderr") &
+  (cd "$CT/scope" && exec 3>&- 4>&- 5>&- 6>&- 7>&- 8>&- 9<&- && HOME="$CT/home" XDG_STATE_HOME="$CT/home/state" exec "$C_henki" port "$C_port" ${2:+--offer "$2"} -- "$C_exe" <"$CT/$x.in" >"$CT/$x.out" 2>>"$CT/stderr") &
   eval "P_$x=\$! && exec $w>\"\$CT/\$x.in\" $r<\"\$CT/\$x.out\""
   IFS= read -r -t 30 -u "$r" H_LINE || H_LINE="(no hello line)"
   eval "U_$x=1 H_$x=\$H_LINE"
@@ -1846,7 +3063,7 @@ EOF
   inst_end b
   # The binding alone, its stdin at EOF: it must end (on macOS nothing else stops it when henki is killed).
   n=$((n + 1))
-  (cd "$CT/scope" && exec 3>&- 4>&- 5>&- 6>&- 7>&- 8>&- && HOME="$CT/home" exec "$C_exe" </dev/null >/dev/null 2>&1) &
+  (cd "$CT/scope" && exec 3>&- 4>&- 5>&- 6>&- 7>&- 8>&- 9<&- && HOME="$CT/home" exec "$C_exe" </dev/null >/dev/null 2>&1) &
   pid=$!
   for i in 1 2 3 4 5 6 7 8 9 10; do kill -0 "$pid" 2>/dev/null || break; sleep 0.1; done
   if kill -0 "$pid" 2>/dev/null; then
@@ -1919,7 +3136,7 @@ cmd_swap() {
   store=$(store_of)
   exe="$store/port/$port"
   [ -f "$exe" ] && [ -x "$exe" ] || die "$n has no port/$port; fix: swap to a module that binds $port"
-  inspect "$store" "$n" 0 || die "$n: $ERR"
+  inspect "$store" "$n" 2 || die "$n: $ERR"
   [ "$I_hd1" = "$L_hd1" ] || die "the store copy $store does not match the lock (it changed); fix: henki-mods rm $n and add it again"
   printf '%s\n' "$M_ports" | command grep -qx "$port" || die "$n's manifest does not list $port in ports; fix: swap to a module that declares it"
   C_suite="$(conform_dir)/$port.tsv" || die "no conformance suites found; fix: reinstall henki"
@@ -1935,21 +3152,15 @@ cmd_swap() {
   [ "$port" != history ] || say "  your sessions in the std store stay there; henki --port history=std --resume reaches them; import comes with a later henki"
   [ "$port" != policy ] || [ "$(toml approve <"$CONF/config.toml" 2>/dev/null)" != "approve${tab}S${tab}auto" ] ||
     say "  henki refuses approve = auto with a policy binding; set approve = \"ask\" in $(shown "$CONF/config.toml")"
-  if [ "$yes" = 1 ]; then
-    how=yes
-  else
-    tty=${HENKI_MODS_TTY:-/dev/tty}
-    (: <"$tty") 2>/dev/null || die "no terminal to ask on; fix: run it in a terminal, or add --yes once you have read the screen above"
-    if [ -c "$tty" ]; then printf 'swap? [y/N] ' >"$tty"; else printf 'swap? [y/N] \n' >&2; fi
-    read -r answer <"$tty" || answer=""
-    case "$answer" in y | Y | yes | YES) how=tty ;; *) die "not swapped (the answer was no); fix: run swap again and answer y" ;; esac
-  fi
+  confirm "$yes" "swap? [y/N]" "not swapped (the answer was no); fix: run swap again and answer y"
+  how=$HOW
   mkdir -p "$CONF/port" && ln -s -- "$exe" "$CONF/port/.$port.$$" && mv -f "$CONF/port/.$port.$$" "$CONF/port/$port" || {
     rm -f "$CONF/port/.$port.$$"
     die "cannot link $(shown "$CONF/port/$port"); fix: make $(shown "$CONF") writable"
   }
   lock_write bind/1 "$port" "$(printf 'bind/1\t%s\t%s\t%s\t%s\t%s' "$port" "$n" "$id" "$(date -u +%Y-%m-%dT%H:%MZ)" "$how")"
   say "$port: $n $id"
+  allow_follow "$I_cmds" 0 "$yes"
   restart
 }
 
@@ -2809,7 +4020,7 @@ yanks_apply() {
       flag_has yanked=buggy && continue
       L_flags=$(flags_with yanked=buggy)
       lock_put "$n" "$(lock_line "$L_state")"
-      say "$(yellow "$n $L_version was yanked as $y ($r) by index $i; it stays as it is; fix: henki-mods rm $n, or add another version")"
+      say "$(yellow "$n $L_version was yanked as $y ($r) by index $i; it stays as it is; fix: $(yank_way)")"
       continue
     fi
     t=""
@@ -2846,6 +4057,19 @@ yanks_apply() {
     cards_write 0 || die "$ERR"
     restart
   }
+}
+
+# The way off a version yanked as buggy, for the lock line in L_*: an index's newer version (update), else the pin
+# before it in the history (rollback), else rm.
+yank_way() {
+  local v
+  case "$L_kind" in index:*) v=$(newest_version "${L_kind#index:}" "$L_source") ;; *) v="" ;; esac
+  if [ -n "$v" ] && [ "$v" != "$L_version" ] && ! version_ge "$L_version" "$v"; then
+    printf 'henki-mods update %s goes to %s' "$L_name" "$v"
+    return 0
+  fi
+  v=$(hist_of "$L_name" | HM_H="$L_hd1" awk -F '\t' '$10 != ENVIRON["HM_H"] { print $6; exit }')
+  if [ -n "$v" ]; then printf 'henki-mods rollback %s goes back to %s' "$L_name" "$v"; else printf 'henki-mods rm %s' "$L_name"; fi
 }
 
 # The indexed versions whose hd1 is H, from the indexes loaded this run: "INDEX<TAB>PACKAGE<TAB>VERSION" lines.
@@ -3059,7 +4283,7 @@ cmd_doctor() {
       [ -d "$d" ] || continue
       n=${d%/*}
       n=${n##*/}
-      lock_get "$n" && [ "$(store_of)" = "$d" ] || stray=$((stray + 1))
+      lock_get "$n" && { [ "$(store_of)" = "$d" ] || [ "$(linked_of)" = "$d" ]; } || stray=$((stray + 1))
     done
   fi
   [ "$stray" = 0 ] || dnote "$stray store copies the lock does not name (kept for a rollback)"
@@ -3365,7 +4589,7 @@ cmd_eval() {
       lock_check
       lock_get "$pkg" || die "$pkg is not added; fix: henki-mods add SRC first, or name a module directory by its path"
       dir=$(store_of)
-      inspect "$dir" "$pkg" 0 || die "$pkg: $ERR"
+      inspect "$dir" "$pkg" 2 || die "$pkg: $ERR"
       [ "$I_hd1" = "$L_hd1" ] || die "the store copy $dir does not match the lock (it changed); fix: henki-mods rm $pkg and add it again"
       name=$pkg ver=$L_version hd1=$L_hd1
       ;;
@@ -3555,6 +4779,14 @@ cmd_allow() {
   n=$(printf '%s' "$2" | sed 's/^0*//')
   [ -e "$file" ] || die "no rule ${n:-0} in $file; fix: henki-mods allow lists the rules"
   why=$(allow_unreadable "$file") && die "$file: $why; fix: make it a regular file of at most $(num "$ALLOW_MAX") bytes you can read"
+  allow_drop "$file" "$n"
+  [ -z "${HENKI_NEXT:-}" ] || restart
+}
+
+# Removes rule N of allow file FILE (allow_rules' numbers), every other byte kept, through a 0600 file in the same dir
+# renamed over it; says which.
+allow_drop() { # FILE N
+  local file="$1" n="$2" hit dir tmp why
   hit=$(allow_rules "$file" | while IFS= read -r why; do case "$why" in ("$n "*) printf '%s\n' "$why" && break ;; esac; done)
   [ -n "$hit" ] || die "no rule ${n:-0} in $file; fix: henki-mods allow lists the rules"
   set -- ${hit%%"$tab"*}
@@ -3565,7 +4797,58 @@ cmd_allow() {
     die "cannot write $file; fix: make $dir writable"
   fi
   printf 'removed rule %s: %b\n' "$n" "${hit#*"$tab"}"
-  [ -z "${HENKI_NEXT:-}" ] || restart
+}
+
+# The numbers of the allow rules whose command's first word is one of NAMES (one per line), highest first: rules that
+# run a module's programs without asking.
+allow_hits() { # NAMES
+  [ -f "$CONF/allow" ] && ! allow_unreadable "$CONF/allow" >/dev/null || return 0
+  HM_N="$1" awk 'BEGIN { n = split(ENVIRON["HM_N"], a, "\n"); for (i = 1; i <= n; i++) if (a[i] != "") w[a[i]] = 1 }
+    { sub(/\r$/, "") } $0 == "" || substr($0, 1, 1) == "#" { next }
+    { k++; t = index($0, "\t"); if (!t) next; c = substr($0, t + 1); sub(/ .*/, "", c); if (c in w) print k }' "$CONF/allow" | sort -rn
+}
+
+# The allow rules HITS lists, one per line as `allow` shows them.
+allow_show() { # HITS
+  local n x
+  allow_rules "$CONF/allow" | while IFS="$tab" read -r n x; do
+    case "$nl$1$nl" in *"$nl${n%% *}$nl"*) printf '  %s  %b\n' "${n%% *}" "$x" ;; esac
+  done
+}
+
+# Allow rules follow code: after a change to the programs NAMES, each rule whose first word is one of them is kept or
+# removed. CHANGED 1: the code changed, so remove is the default (a rule approved other code); 0: keep is. YES 1: the
+# default, unasked.
+allow_follow() { # NAMES CHANGED YES
+  local hits n q def
+  hits=$(allow_hits "$1")
+  [ -n "$hits" ] || return 0
+  say "allow rules that run these programs without asking:"
+  allow_show "$hits"
+  if [ "$2" = 1 ]; then def=remove q="keep or remove them? [k/R]"; else def=keep q="keep or remove them? [K/r]"; fi
+  if [ "$3" != 1 ] && tty_ask "$q"; then
+    case "$ANSWER" in k | K | keep) def=keep ;; r | R | remove) def=remove ;; esac
+  fi
+  if [ "$def" = keep ]; then
+    say "kept them"
+    return 0
+  fi
+  for n in $hits; do allow_drop "$CONF/allow" "$n"; done
+}
+
+# After rm or off: the allow rules for the programs NAMES are offered for removal (no terminal: how to remove them).
+allow_offer() { # NAMES
+  local hits n
+  hits=$(allow_hits "$1")
+  [ -n "$hits" ] || return 0
+  say "allow rules for programs that are no longer on:"
+  allow_show "$hits"
+  if ! tty_ask "remove them? [y/N]"; then
+    say "henki-mods allow rm N removes one"
+    return 0
+  fi
+  case "$ANSWER" in y | Y | yes | YES) ;; *) say "kept them" && return 0 ;; esac
+  for n in $hits; do allow_drop "$CONF/allow" "$n"; done
 }
 
 # henki-mods-dev sources this file for its functions: it stops here.
@@ -3583,6 +4866,16 @@ case "${1:-list}" in
     ;;
   add) shift && cmd_add "$@" ;;
   on | off) cmd_onoff "$@" ;;
+  outdated) shift && cmd_outdated "$@" ;;
+  update) shift && cmd_update "$@" ;;
+  pin | unpin) cmd_pin "$@" ;;
+  rollback) shift && cmd_rollback "$@" ;;
+  gc) shift && cmd_gc "$@" ;;
+  pack) shift && cmd_pack "$@" ;;
+  unpack) shift && cmd_unpack "$@" ;;
+  init) shift && cmd_init "$@" ;;
+  profile) shift && cmd_profile "$@" ;;
+  index) shift && cmd_index "$@" ;;
   rm) shift && cmd_rm "$@" ;;
   lock) shift && cmd_lock "$@" ;;
   verify) shift && cmd_verify "$@" ;;

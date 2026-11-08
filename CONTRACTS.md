@@ -46,6 +46,7 @@ A program reads the contracts this henki ships from the rows of this table: each
 | `eval/1` | henki-mods | a module's eval tasks, the two arms they run in, and the line that records them |
 | `hist/1` | henki-mods | the lock lines a change replaced or removed, `mods.history` |
 | `index/1` | henki-mods | a signed module index: its entries, its signature chain, and what henki-mods reads from it |
+| `pack/1` | henki-mods | a pack of modules for a machine with no network: its members and its `PACK` |
 
 ## journal/1
 
@@ -481,7 +482,17 @@ shadow = ["halti/pbpaste"]       # optional; the NAME/COMMAND entries the user m
 caps_net = "none"                # optional: none | loopback | any (declared, NOT enforced)
 maintainer = "..."               # optional
 ports = ["history"]              # optional; exactly the programs in port/ (port/1), each a port henki can bind
+asset_aarch64_apple_darwin = ["bin/x", "https://...", "sha256:..."]   # optional; a prebuilt program per target
 ```
+
+`asset_TARGET` names a prebuilt program for one machine: TARGET is `aarch64_apple_darwin`, `x86_64_apple_darwin`,
+`aarch64_unknown_linux_musl`, `x86_64_unknown_linux_musl`, `aarch64_unknown_linux_gnu` or `x86_64_unknown_linux_gnu`
+(on Linux the musl one is taken first), and the array holds the program's place (`bin/NAME`), an https URL and the
+SHA-256 of its bytes (64 lowercase hex digits). At an install henki-mods downloads this machine's one (curl, https
+only, at most 64 MiB), refuses other bytes, and puts it at its place in the store copy, as a program; the module's own
+files must not hold that place. A module with assets but none for this machine is refused. The asset is left out of
+the hd1 (which stays the hash of the module's own files, the one an index lists) and is checked by its SHA-256 instead,
+whenever the store copy is (`verify`, `on`, a swap).
 
 A module without a manifest is unmanaged (allowed for path and URL installs, and listed as such). `port/PORT` is a
 program its owner can run (a file, or a link inside the module), PORT one that henki binds (`history` or `policy`).
@@ -509,13 +520,20 @@ lock/1 NAME STATE VERSION SOURCE_KIND SOURCE COMMIT HD1 ADDED HOW FLAGS
   COMMIT 40 hex digits or `-`; HD1 the module's `hd1:` hash; ADDED the UTC time, `YYYY-MM-DDTHH:MMZ`; HOW `tty`
   (answered on the terminal) or `yes` (`--yes`).
 - FLAGS is empty or a comma-separated list: `pin` (an update leaves the module as it is), `ref=REF` (the ref a URL
-  install follows), `yanked=malicious` or `yanked=buggy` (an index yanked this version; a malicious one stays off),
-  `skill=hd1:HASH` (the Agent Skill the module was made from), `mask=cmd/NAME` (the store copy leaves out that
-  command).
+  install follows: the branch or tag it named, `HEAD` for the default branch; none when it named a commit),
+  `yanked=malicious` or `yanked=buggy` (an index yanked this version; a malicious one stays off), `skill=hd1:HASH`
+  (the Agent Skill the module was made from), `mask=cmd/NAME`, one per masked command (`henki-mods off NAME/CMD`: the
+  link names a copy of the store copy without `cmd/CMD` and `cmd/CMD.md`, beside it as `ID.mHASH`, where HASH is 8 hex
+  digits of the SHA-256 of the masked names, sorted, one per line; HD1 stays the module's own).
 - A line whose first field is not `lock/1` (or `bind/1`, after them), or that holds a kind or flag henki-mods does not
   know, is refused: `this lock is newer than this henki-mods; upgrade henki`. So no rewrite of the lock drops what a
   later henki-mods wrote.
-- On means the link `CONFIG_DIR/ext/NAME` points at the module's store copy; off means no link.
+- On means the link `CONFIG_DIR/ext/NAME` points at the module's store copy (or its masked copy); off means no link.
+- A profile is a file of lock/1 lines that `henki-mods init PROFILE` adds: lines of kind `official` (VERSION, COMMIT,
+  HD1, ADDED and HOW `-`: the copy this henki ships) and of kind `index:INDEX` (a package pinned by VERSION and HD1).
+  henki ships some in `share/henki/mod-profiles/NAME.lock`, an index may hold more in `profiles/NAME.lock`, and
+  `henki-mods profile save FILE` writes the modules on as one. A module the lock has already is left as it is: an off
+  line is never turned on by a profile.
 
 ## bind/1
 
@@ -556,7 +574,8 @@ Owned by henki-mods. A module index is a git repository whose `main` lists modul
 full commit and its hd1; it never holds module code. henki-mods reads it to search, show and install modules, and to
 apply yanks.
 
-- **Files.** `mods/NAME.toml` (a package), `mods/NAME/VERSION.toml` (one per indexed version), `removed.toml`
+- **Files.** `mods/NAME.toml` (a package), `mods/NAME/VERSION.toml` (one per indexed version), `profiles/NAME.lock`
+  (a profile, lock/1), `removed.toml`
   (`NAME = "malicious|buggy|withdrawn: REASON (YYYY-MM-DD)"`, a name taken out for good), `.signers` (who may sign
   `main`, git's allowed_signers format), and the index's own gate and docs. Entries are in module/1's grammar; an
   unknown key is refused, and `index = 2` is a later format (`this index is newer than this henki-mods`).
@@ -580,7 +599,8 @@ apply yanks.
   index screen then names): `NAME.url`, `NAME.signers` (its root's keys; with no key line the index is not live yet),
   `NAME.checkpoint` (a commit on its first-parent line) and `refused.keys` (key blobs that never verify, one per
   line). More indexes are `index/1<TAB>NAME<TAB>URL` lines in `CONFIG_DIR/mods.index`, each with its pinned
-  `CONFIG_DIR/index/NAME.signers` and, optionally, `NAME.checkpoint`. Index URLs are https, ssh or file. A first sync
+  `CONFIG_DIR/index/NAME.signers` and, optionally, `NAME.checkpoint` (`henki-mods index add NAME URL --signers FILE
+  [--checkpoint COMMIT]` writes them after showing the keys' fingerprints, `index rm NAME` takes them out). Index URLs are https, ssh or file. A first sync
   of the default index with no checkpoint beside henki-mods is refused; elsewhere (`HENKI_SHARE`, `mods.index`) it is
   a warning.
 - **A sync** fetches `main` into the bare clone `DATA/henki/index/NAME.git` (`refs/henki/fetched`). The commit verified
@@ -607,6 +627,26 @@ apply yanks.
   at a sync it turns the module off (a pin too) with the flag `yanked=malicious`, puts `policy` and `context`
   bindings of it back to std, and makes any other binding of it the `yanked` marker (bind/1). A buggy or withdrawn
   one is said and flagged; nothing else changes.
+
+## pack/1
+
+Owned by henki-mods. `henki-mods pack [NAME...] [--with-index] -o FILE` writes modules into a gzip ustar archive that
+`henki-mods unpack FILE` installs on another machine without the network. The same store copies give the same bytes:
+members sorted by name, owner 0, every time 1970-01-01, gzip without a name or time. Members:
+
+- `PACK`: line 1 `pack/1`; then one lock/1 line per module (FLAGS without a yank); then one line per prebuilt program,
+  `asset/1<TAB>NAME<TAB>DEST<TAB>SHA256` (module/1's asset of the machine it was packed on).
+- `store/NAME/ID/...`: each module's store copy as it is (asset in place), ID as for its lock line.
+- `index/INDEX.bundle` (with `--with-index`): a git bundle of `refs/henki/verified` of each index in use.
+
+`unpack` lists the members before it extracts anything and refuses an absolute path, a `..`, a name twice, a member
+under a link, a link outside a store copy, and anything but files, directories and links. Each copy must hold its
+line's hd1 and its asset's SHA-256, and fit this machine (module/1's `os`, `requires`, assets). A bundle counts only
+for an index in use here, checked from the anchor and checkpoint here (never a key or anchor in the pack), and only when
+its head has the commit verified here on its first-parent line (or nothing is verified here); it never moves
+`refs/henki/verified`, and the yanks and removals of the commit verified here apply after its own. A malicious yank
+refuses the install. A module the lock holds with the same hd1 is left as it is; another one is replaced, its line
+going to the history (hist/1, `unpack`).
 
 ## hd1
 

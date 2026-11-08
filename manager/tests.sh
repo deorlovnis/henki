@@ -2223,7 +2223,7 @@ t_index_yank() {
   check "the history marker" [ "$(readlink "$CONF/port/history")" = yanked ]
   check "bind/1 history yanked" [ "$(awk -F '\t' '$1 == "bind/1" && $2 == "history" { print $6 }' "$CONF/mods.lock")" = yanked ]
   check "policy unbound" [ ! -L "$CONF/port/policy" ] && [ -z "$(awk -F '\t' '$2 == "policy"' "$CONF/mods.lock")" ]
-  check "the URL install is untouched (a removal acts on index lines only)" [ "$(field byurl 3):$(field byurl 11)" = "on:" ]
+  check "the URL install is untouched (a removal acts on index lines only)" [ "$(field byurl 3):$(field byurl 11)" = "on:ref=HEAD" ]
   run sync
   out_lacks "was yanked as malicious"
   run on hello
@@ -2275,7 +2275,7 @@ t_index_yank() {
   ixc "$IX" "buggy"
   run sync
   rc_is 0
-  out_has "hello 0.2.0 was yanked as buggy (slow (2026-11-08)) by index deorlovnis; it stays as it is"
+  out_has "hello 0.2.0 was yanked as buggy (slow (2026-11-08)) by index deorlovnis; it stays as it is; fix: henki-mods rm hello"
   out_lacks "lean"
   run sync
   out_lacks "was yanked"
@@ -2399,6 +2399,565 @@ t_index_guard() {
   fi
 }
 
+# --- updates, masks, assets, packs, profiles, the index verbs -------------------------------------------------------------
+
+# The ID of a store copy dir: its last name.
+idof() { printf '%s' "${1##*/}"; }
+
+t_update() {
+  case_ "outdated, update (the screen, the allow rules), pin, rollback (hd1 checks), gc, the history"
+  local r="$W/up" s1 s2 n
+  mkmod "$r"
+  printf '# Changelog\n\n## 0.1.0\n- first\n' >"$r/CHANGELOG.md"
+  mkrepo "$r"
+  mkmod "$W/pm"
+  run add "file://$r" --yes
+  rc_is 0
+  check "a URL install follows its default branch" [ "$(field up 11)" = ref=HEAD ]
+  run add "$W/pm" --yes
+  s1=$(readlink "$CONF/ext/up")
+  run outdated
+  rc_is 0
+  check "all up to date" [ "$(printf '%s\n' "$OUT" | command grep -c 'up to date')" = 2 ]
+  # A new version: a command more, a changed doc, a CHANGELOG section.
+  setkey "$r/.henki/module.toml" version '"0.2.0"'
+  mkdir -p "$r/cmd"
+  printf '#!/bin/sh\necho new\n' >"$r/cmd/newcmd"
+  chmod 755 "$r/cmd/newcmd"
+  printf '# up: says hello for tests\n\nA longer body.\n' >"$r/doc.md"
+  printf '# Changelog\n\n## 0.2.0\n- a command\n\n## 0.1.0\n- first\n' >"$r/CHANGELOG.md"
+  commit "$r" second
+  printf 'more\n' >>"$W/pm/doc.md"
+  run outdated
+  out_has "HEAD is at $(git -C "$r" rev-parse HEAD | cut -c 1-12) (henki-mods update up)"
+  out_has "changed: $W/pm holds hd1:"
+  mkdir -p "$CONF"
+  printf '*\tup --loud\n/src\tgit status\n' >"$CONF/allow"
+  chmod 600 "$CONF/allow"
+  printf 'n\nn\n' >"$W/answer"
+  HENKI_MODS_TTY="$W/answer" run update up
+  refused "not updated (the answer was no)"
+  out_has "up: 0.1.0 -> 0.2.0"
+  out_has "commands - -> newcmd"
+  out_has "files changed:"
+  out_has "    cmd/newcmd +2 -0"
+  out_has "    doc.md +1 -1"
+  out_has "CHANGELOG.md, newest section:"
+  out_has "    ## 0.2.0"
+  out_lacks "    ## 0.1.0"
+  out_has "allow rules that run its programs without asking: 1 (asked after the update)"
+  check "nothing changed on a no" [ "$(readlink "$CONF/ext/up")" = "$s1" ] && [ ! -f "$CONF/mods.history" ]
+  printf 'n\ny\nk\n' >"$W/answer"
+  HENKI_MODS_TTY="$W/answer" run update up
+  rc_is 0
+  out_has "updated up: 0.1.0 -> 0.2.0"
+  out_has "kept them"
+  s2=$(readlink "$CONF/ext/up")
+  check "the link moved to the new copy, the old one stays" [ "$s2" != "$s1" ] && [ -d "$s1" ] && [ -f "$s2/cmd/newcmd" ]
+  check "the lock line" [ "$(field up 4):$(field up 7)" = "0.2.0:$(git -C "$r" rev-parse HEAD)" ]
+  check "a hist/1 update line with the old lock line" [ "$(cut -f 3 "$CONF/mods.history")" = update ] && [ "$(cut -f 7 "$CONF/mods.history")" = 0.1.0 ]
+  check "the rule kept" command grep -q 'up --loud' "$CONF/allow"
+  run verify
+  rc_is 0
+  run update up
+  rc_is 0
+  out_has "up is up to date (0.2.0"
+  run pin up
+  rc_is 0
+  check "pin" [ "$(field up 11)" = ref=HEAD,pin ]
+  run update up --yes
+  refused "up is pinned; fix: henki-mods unpin up, or henki-mods update up --force"
+  run unpin up
+  check "unpin" [ "$(field up 11)" = ref=HEAD ]
+  # rollback: the pin before, its copy checked; the rules for the code that changed go by default.
+  run rollback up --yes
+  rc_is 0
+  out_has "up: 0.2.0 -> 0.1.0 (the pin before update"
+  out_has "rolled back up to 0.1.0"
+  out_has "removed rule 1: *  up --loud"
+  check "back on the old copy" [ "$(readlink "$CONF/ext/up")" = "$s1" ] && [ "$(field up 4)" = 0.1.0 ]
+  check "the rollback line" [ "$(tail -n 1 "$CONF/mods.history" | cut -f 3,7)" = "rollback${tab}0.2.0" ]
+  check "the other rule stays" [ "$(cat "$CONF/allow")" = "/src${tab}git status" ]
+  # The copy rolled back to must hold its hd1: an edited one is skipped, and with none left the rollback refuses.
+  chmod u+w "$s2/doc.md" && printf 'edited\n' >>"$s2/doc.md"
+  run rollback up --yes
+  refused "no earlier pin of up can be gone back to"
+  out_has "skipped up 0.2.0"
+  check "still 0.1.0" [ "$(field up 4)" = 0.1.0 ]
+  run verify up
+  rc_is 0
+  # A path module updated three times: gc keeps the lock's copy and the two newest history pins.
+  for n in 2 3 4; do
+    printf 'v%s\n' "$n" >>"$W/pm/doc.md"
+    run update pm --yes
+    rc_is 0
+  done
+  check "four copies of pm" [ "$(ls "$STORE/pm" | wc -l | tr -d ' ')" = 4 ]
+  mkdir -p "$XDG_DATA_HOME/henki/index/gone.git"
+  printf 'n\n' >"$W/answer"
+  HENKI_MODS_TTY="$W/answer" run gc
+  refused "nothing removed (the answer was no)"
+  out_has "gone.git"
+  run gc --yes
+  rc_is 0
+  check "gc keeps three of pm" [ "$(ls "$STORE/pm" | wc -l | tr -d ' ')" = 3 ]
+  check "the index clone no index uses is gone" [ ! -d "$XDG_DATA_HOME/henki/index/gone.git" ]
+  check "up's copies are kept (lock and history)" [ -d "$s1" ] && [ -d "$s2" ]
+  run gc --all --yes
+  rc_is 0
+  check "gc --all keeps the lock's copy only" [ "$(ls "$STORE/pm" | wc -l | tr -d ' ')" = 1 ] && [ ! -d "$s2" ] && [ -d "$s1" ]
+  run gc
+  out_has "nothing to remove"
+  run verify
+  rc_is 0
+  run outdated
+  out_has "up to date"
+  case_ "update and outdated for an index package and an official module"
+  ix_two
+  run add hello --version 0.1.0 --yes
+  rc_is 0
+  run outdated
+  out_has "0.2.0 in index deorlovnis (henki-mods update hello)"
+  run update hello --to @main --yes
+  refused "--to takes a version for a module from an index"
+  run update hello --yes
+  rc_is 0
+  out_has "review   reviewed by someone (signed index henki-index, 2026-11-08)"
+  check "hello 0.2.0 from the index" [ "$(field hello 4):$(field hello 5)" = "0.2.0:index:deorlovnis" ]
+  run update hello --to 0.1.0 --yes
+  rc_is 0
+  check "back to 0.1.0 by --to" [ "$(field hello 4)" = 0.1.0 ]
+  mkmod "$W/share/official/offi"
+  run add offi --yes
+  rc_is 0
+  printf 'more\n' >>"$W/share/official/offi/doc.md"
+  run outdated
+  out_has "henki's copy changed (henki-mods update offi)"
+  run update offi --yes
+  rc_is 0
+  run outdated
+  check "official up to date" [ -n "$(printf '%s\n' "$OUT" | awk '$1 == "offi" && /up to date/')" ]
+}
+
+t_masks() {
+  case_ "masks: off NAME/CMD and on NAME/CMD; allow rules on add, off and rm"
+  local store link
+  mkmod "$W/ma"
+  mkdir -p "$W/ma/cmd"
+  printf '#!/bin/sh\necho fork\n' >"$W/ma/cmd/fork"
+  printf 'the fork template\n' >"$W/ma/cmd/fork.md"
+  printf '#!/bin/sh\necho keep\n' >"$W/ma/cmd/keep"
+  chmod 755 "$W/ma/cmd/fork" "$W/ma/cmd/keep"
+  mkdir -p "$CONF"
+  printf '*\tma x\n*\tls\n' >"$CONF/allow"
+  chmod 600 "$CONF/allow"
+  run add "$W/ma" --yes
+  rc_is 0
+  out_has "allow rules that run these programs without asking:"
+  out_has "removed rule 1: *  ma x"
+  check "the other rule stays" [ "$(cat "$CONF/allow")" = "*${tab}ls" ]
+  store=$(readlink "$CONF/ext/ma")
+  run off ma/fork
+  rc_is 0
+  out_has "ma/fork: off"
+  link=$(readlink "$CONF/ext/ma")
+  check "the link names a copy beside the store copy" [ "$link" != "$store" ] && [ "${link%.m*}" = "$store" ]
+  check "without /fork, with /keep" [ ! -e "$link/cmd/fork" ] && [ ! -e "$link/cmd/fork.md" ] && [ -x "$link/cmd/keep" ]
+  check "the flag, the module's own hd1" [ "$(field ma 11)" = mask=cmd/fork ] && [ "$(field ma 8)" = "$(cd "$W" && $RUN "$MODS" verify --dir ./ma | sed 's/.*, //')" ]
+  check "the masked copy is read-only" [ -z "$(find "$link" ! -type l -perm -200 -print)" ]
+  run off ma/fork
+  out_has "ma/fork is already off"
+  run off ma/nope
+  refused "ma has no command /nope"
+  run list
+  out_has "(masked: /fork)"
+  run verify
+  rc_is 0
+  run off ma
+  run on ma
+  rc_is 0
+  check "on links the masked copy" [ "$(readlink "$CONF/ext/ma")" = "$link" ]
+  chmod u+w "$link/cmd/keep" && printf 'x\n' >>"$link/cmd/keep"
+  run verify
+  refused "is not its store copy less the commands it masks"
+  run off ma
+  run on ma
+  rc_is 0
+  run verify
+  rc_is 0
+  out_has "verify: ok"
+  run on ma/fork
+  rc_is 0
+  check "on NAME/CMD: the store copy again" [ "$(readlink "$CONF/ext/ma")" = "$store" ] && [ -z "$(field ma 11)" ]
+  run verify
+  rc_is 0
+  # rm and off offer to drop the rules of programs no longer on.
+  printf '*\tma y\n' >>"$CONF/allow"
+  printf 'y\n' >"$W/answer"
+  HENKI_MODS_TTY="$W/answer" run off ma
+  rc_is 0
+  out_has "allow rules for programs that are no longer on:"
+  out_has "removed rule 2: *  ma y"
+  printf '*\tma z\n' >>"$CONF/allow"
+  printf 'n\n' >"$W/answer"
+  HENKI_MODS_TTY="$W/answer" run rm ma
+  rc_is 0
+  out_has "kept them"
+  check "kept" command grep -q 'ma z' "$CONF/allow"
+  HENKI_MODS_TTY="$W/none" run add "$W/ma" --yes
+  rc_is 0
+  printf '*\tma w\n' >>"$CONF/allow"
+  HENKI_MODS_TTY="$W/none" run rm ma
+  out_has "henki-mods allow rm N removes one"
+  if [ -n "${HENKI_BIN:-}" ]; then
+    mkport tree
+    printf '*\ttree --x\n' >"$CONF/allow"
+    run add "$W/tree" --yes
+    printf '*\ttree --x\n' >"$CONF/allow"
+    run swap history tree --yes
+    rc_is 0
+    out_has "kept them"
+    check "swap keeps a rule by default (its code did not change)" command grep -q 'tree --x' "$CONF/allow"
+    # An update of a bound module: the new copy passes the suite, then the binding moves with it.
+    printf 'more\n' >>"$W/tree/doc.md"
+    run update tree --yes
+    rc_is 0
+    out_has "history: tree 0.1.0 passes the history/1 suite"
+    check "the port link moved" [ "$(readlink "$CONF/port/history")" = "$(readlink "$CONF/ext/tree")/port/history" ]
+    check "bind/1 names the new copy" [ "$(awk -F '\t' '$1 == "bind/1" { print $4 }' "$CONF/mods.lock")" = "$(idof "$(readlink "$CONF/ext/tree")")" ]
+    run verify
+    rc_is 0
+    run rollback tree --yes
+    rc_is 0
+    check "the port link moved back" [ "$(readlink "$CONF/port/history")" = "$(readlink "$CONF/ext/tree")/port/history" ]
+    run swap history std
+  fi
+}
+
+# Serves W/www over https on 127.0.0.1 (a certificate made here, trusted through CURL_CA_BUNDLE): ASSET_URL, SRV.
+asset_server() {
+  mkdir -p "$W/www" "$W/tls"
+  openssl req -x509 -newkey rsa:2048 -nodes -keyout "$W/tls/key.pem" -out "$W/tls/cert.pem" -days 2 -subj /CN=127.0.0.1 \
+    -addext subjectAltName=IP:127.0.0.1 >/dev/null 2>&1 || return 1
+  python3 -I -c '
+import http.server, ssl, sys, os
+d, t, pf = sys.argv[1:4]
+os.chdir(d)
+class H(http.server.SimpleHTTPRequestHandler):
+    def log_message(self, *a): pass
+s = http.server.HTTPServer(("127.0.0.1", 0), H)
+c = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+c.load_cert_chain(t + "/cert.pem", t + "/key.pem")
+s.socket = c.wrap_socket(s.socket, server_side=True)
+open(pf + ".tmp", "w").write(str(s.server_address[1]))
+os.rename(pf + ".tmp", pf)
+s.serve_forever()
+' "$W/www" "$W/tls" "$W/port" 2>/dev/null &
+  SRV=$!
+  local i=0
+  while [ ! -f "$W/port" ] && [ $i -lt 100 ]; do sleep 0.1 && i=$((i + 1)); done
+  [ -f "$W/port" ] || return 1
+  ASSET_URL="https://127.0.0.1:$(cat "$W/port")"
+  export CURL_CA_BUNDLE="$W/tls/cert.pem"
+}
+
+# This machine's asset target, as henki-mods names it.
+my_target() {
+  local m
+  m=$(uname -m)
+  [ "$m" != arm64 ] || m=aarch64
+  case "$(uname -s)" in Darwin) echo "${m}_apple_darwin" ;; *) echo "${m}_unknown_linux_musl" ;; esac
+}
+
+t_assets() {
+  case_ "assets: a prebuilt program by https and sha256 (right, wrong, missing target, http, a clash, edited), packed"
+  if ! command -v python3 >/dev/null 2>&1 || ! command -v openssl >/dev/null 2>&1 || ! command -v curl >/dev/null 2>&1; then
+    echo "tests.sh: assets: skipped (no python3, openssl or curl)"
+    return 0
+  fi
+  asset_server || {
+    fail "the https server did not start"
+    return 0
+  }
+  local t h store other
+  t=$(my_target)
+  case "$t" in aarch64_*) other=x86_64_apple_darwin ;; *) other=aarch64_apple_darwin ;; esac
+  printf '#!/bin/sh\necho prebuilt\n' >"$W/www/tool"
+  h=$(sha <"$W/www/tool")
+  mkmod "$W/as" "asset_$t = [\"bin/tool\", \"$ASSET_URL/tool\", \"sha256:$h\"]\n"
+  run verify --dir "$W/as"
+  rc_is 0
+  local want=${OUT##*, }
+  run add "$W/as" --yes
+  rc_is 0
+  out_has "asset    bin/tool for $t: $ASSET_URL/tool, sha256:$h (downloaded, sha256 checked)"
+  out_has "bin/tool ("
+  store=$(readlink "$CONF/ext/as")
+  check "the program in place" [ -x "$store/bin/tool" ] && [ "$("$store/bin/tool")" = prebuilt ]
+  check "the lock's hd1 is the tree's (the asset left out)" [ "$(field as 8)" = "$want" ]
+  run verify
+  rc_is 0
+  run off as
+  run on as
+  rc_is 0
+  # Packed with its program, installed where curl is not.
+  mkdir -p "$W/nocurl"
+  printf '#!/bin/sh\necho called >"%s/curl-called"\nexit 7\n' "$W" >"$W/nocurl/curl"
+  chmod 755 "$W/nocurl/curl"
+  run pack as -o "$W/as.tgz"
+  rc_is 0
+  check "PACK holds the asset/1 line" sh -c "tar -xzOf '$W/as.tgz' PACK | command grep -q \"^asset/1${tab}as${tab}bin/tool${tab}sha256:$h\$\""
+  local keep="$HOME"
+  export HOME="$W/home2" XDG_DATA_HOME="$W/data2"
+  mkdir -p "$HOME"
+  PATH="$W/nocurl:$PATH" run unpack "$W/as.tgz" --yes
+  rc_is 0
+  check "installed from the pack, no curl" [ -x "$XDG_DATA_HOME/henki/mods/as/$(idof "$store")/bin/tool" ] && [ ! -f "$W/curl-called" ]
+  run verify
+  rc_is 0
+  export HOME="$keep" XDG_DATA_HOME="$SCRATCH/$CASES/data"
+  CONF="$HOME/.config/henki"
+  chmod u+w "$store/bin/tool" && printf 'echo changed\n' >>"$store/bin/tool"
+  run verify
+  refused "not the prebuilt program its manifest names"
+  # Refused at add: the wrong bytes, no build for here, an http URL, a file where the program goes.
+  mkmod "$W/wrong" "asset_$t = [\"bin/tool\", \"$ASSET_URL/tool\", \"sha256:$(printf x | sha)\"]\n"
+  run add "$W/wrong" --yes
+  refused "$ASSET_URL/tool is not the program wrong names (sha256 $h"
+  check "nothing added" [ -z "$(lockline wrong)" ]
+  mkmod "$W/elsewhere" "asset_$other = [\"bin/tool\", \"$ASSET_URL/tool\", \"sha256:$h\"]\n"
+  run add "$W/elsewhere" --yes
+  refused "elsewhere runs a prebuilt program made for $other only, none for this machine"
+  mkmod "$W/plain" "asset_$t = [\"bin/tool\", \"http://127.0.0.1:1/tool\", \"sha256:$h\"]\n"
+  run add "$W/plain" --yes
+  refused "asset_$t must be [\"bin/NAME\", \"https://...\", \"sha256:HEX\"]"
+  mkmod "$W/clash" "asset_$t = [\"bin/tool\", \"$ASSET_URL/tool\", \"sha256:$h\"]\n"
+  cp "$W/www/tool" "$W/clash/bin/tool" && chmod 755 "$W/clash/bin/tool"
+  run add "$W/clash" --yes
+  refused "bin/tool: a file of the module where its asset_$t goes"
+  mkmod "$W/gone" "asset_$t = [\"bin/tool\", \"$ASSET_URL/nothere\", \"sha256:$h\"]\n"
+  run add "$W/gone" --yes
+  refused "cannot download $ASSET_URL/nothere"
+  kill "$SRV" 2>/dev/null
+  wait "$SRV" 2>/dev/null
+  unset CURL_CA_BUNDLE
+}
+
+t_pack() {
+  case_ "pack and unpack: a round trip with no network, the same bytes twice, an index bundle, hostile tars"
+  ix_two
+  run add hello --version 0.1.0 --yes
+  rc_is 0
+  mkmod "$W/pp"
+  run add "$W/pp" --yes
+  run off pp
+  run pack --with-index -o "$W/a.tgz"
+  rc_is 0
+  out_has "packed 2 modules into $W/a.tgz"
+  out_has "index deorlovnis: "
+  run pack --with-index -o "$W/b.tgz"
+  check "the same bytes twice" cmp -s "$W/a.tgz" "$W/b.tgz"
+  check "the members" [ "$(tar -tzf "$W/a.tgz" | command grep -v '/$' | command grep -vc '^store/')" = 2 ]
+  local ix_url keep_home="$HOME" keep_data="$XDG_DATA_HOME" share2="$W/share2"
+  # Another machine: the same anchor, an index it cannot reach, no curl.
+  mkdir -p "$share2/index" "$W/nocurl"
+  cp "$W/share/index/"* "$share2/index/"
+  printf 'file:///nonexistent/index\n' >"$share2/index/deorlovnis.url"
+  printf '#!/bin/sh\necho called >"%s/curl-called"\nexit 7\n' "$W" >"$W/nocurl/curl"
+  chmod 755 "$W/nocurl/curl"
+  export HOME="$W/home2" XDG_DATA_HOME="$W/data2" HENKI_SHARE="$share2"
+  CONF="$HOME/.config/henki"
+  mkdir -p "$HOME"
+  PATH="$W/nocurl:$PATH" run unpack "$W/a.tgz" --yes
+  rc_is 0
+  out_has "index deorlovnis in the pack: "
+  out_has "verified from the anchor here"
+  out_has "review   reviewed by someone (signed index henki-index, 2026-11-08)"
+  out_has "installed hello 0.1.0: on"
+  out_has "installed pp 0.1.0: off"
+  check "the lock lines" [ "$(field hello 5):$(field hello 3):$(field pp 3)" = "index:deorlovnis:on:off" ]
+  check "no clone, no verified ref moved" [ ! -d "$XDG_DATA_HOME/henki/index/deorlovnis.git" ]
+  check "no curl" [ ! -f "$W/curl-called" ]
+  run verify
+  rc_is 0
+  run unpack "$W/a.tgz" --yes
+  rc_is 0
+  out_has "hello 0.1.0: already here, left as it is"
+  out_has "nothing to install"
+  # A bundle signed by a key the anchor here does not hold: not used, so no review line.
+  export HOME="$W/home3" XDG_DATA_HOME="$W/data3"
+  CONF="$HOME/.config/henki"
+  mkdir -p "$HOME"
+  signer k2 >"$share2/index/deorlovnis.signers"
+  run unpack "$W/a.tgz" --yes
+  rc_is 0
+  out_has "not used: "
+  out_has "UNREVIEWED: in no index you use"
+  # A malicious yank made after the pack, verified here: the pack's older bundle cannot undo it.
+  signer k1 >"$share2/index/deorlovnis.signers"
+  printf 'file://%s\n' "$IX" >"$share2/index/deorlovnis.url"
+  setkey "$IX/mods/hello/0.1.0.toml" yanked '"malicious: steals keys (2026-11-08)"'
+  ixc "$IX" yank
+  export HOME="$W/home4" XDG_DATA_HOME="$W/data4"
+  CONF="$HOME/.config/henki"
+  mkdir -p "$HOME"
+  run sync
+  rc_is 0
+  run unpack "$W/a.tgz" --yes
+  refused "hello 0.1.0 was yanked as malicious (steals keys (2026-11-08)) by index deorlovnis; not installed"
+  out_has "no longer holds the verified commit"
+  check "nothing installed" [ ! -f "$CONF/mods.lock" ]
+  # Hostile archives: refused before anything is extracted.
+  local k
+  for k in abs dotdot under fifo hard outside notpack; do
+    python3 -I -c '
+import tarfile, sys, io
+k, out = sys.argv[1:3]
+t = tarfile.open(out, "w:gz", format=tarfile.USTAR_FORMAT)
+def add(name, data=b"x", type=tarfile.REGTYPE, link=""):
+    i = tarfile.TarInfo(name); i.type = type; i.linkname = link; i.mode = 0o644
+    i.size = len(data) if type == tarfile.REGTYPE else 0
+    t.addfile(i, io.BytesIO(data) if type == tarfile.REGTYPE else None)
+add("PACK", b"pack/1\n")
+if k == "abs": add("/tmp/henki-escape")
+if k == "dotdot": add("store/a/0123456789ab/../../../escape")
+if k == "under":
+    add("store/a/0123456789ab/l/passwd")
+    add("store/a/0123456789ab/l", type=tarfile.SYMTYPE, link="/etc")
+if k == "fifo": add("store/a/0123456789ab/f", type=tarfile.FIFOTYPE)
+if k == "hard": add("store/a/0123456789ab/h", type=tarfile.LNKTYPE, link="PACK")
+if k == "outside": add("l", type=tarfile.SYMTYPE, link="store")
+if k == "notpack": add("etc/x")
+t.close()
+' "$k" "$W/bad-$k.tgz"
+    run unpack "$W/bad-$k.tgz" --yes
+    refused "fix: do not unpack it"
+  done
+  check "nothing escaped" [ ! -e /tmp/henki-escape ] && [ ! -e "$W/escape" ] && [ ! -f "$CONF/mods.lock" ]
+  export HOME="$keep_home" XDG_DATA_HOME="$keep_data"
+}
+
+# Shipped profiles in W/share/mod-profiles (HENKI_SHARE): official modules sessions (no prompt bytes) and tooly.
+mkprofiles() {
+  mkdir -p "$W/share/mod-profiles" "$W/share/official/sessions/cmd" "$W/share/index"
+  printf '# sessions: for tests\n' >"$W/share/official/sessions/doc.md"
+  printf '#!/bin/sh\n' >"$W/share/official/sessions/cmd/sessions"
+  chmod 755 "$W/share/official/sessions/cmd/sessions"
+  mkmod "$W/share/official/tooly"
+  printf 'lock/1\tsessions\ton\t-\tofficial\tsessions\t-\t-\t-\t-\t\n' >"$W/share/mod-profiles/minimal.lock"
+  printf 'lock/1\tsessions\ton\t-\tofficial\tsessions\t-\t-\t-\t-\t\nlock/1\ttooly\ton\t-\tofficial\ttooly\t-\t-\t-\t-\t\nlock/1\tlater\ton\t-\tofficial\tlater\t-\t-\t-\t-\t\n' >"$W/share/mod-profiles/starter.lock"
+  export HENKI_SHARE="$W/share"
+}
+
+t_init() {
+  case_ "init: the offer, a profile (tombstones, bytes, a module this henki lacks), profile list, show, save"
+  mkprofiles
+  local b h='Extensions are commands on PATH; read the doc in brackets before first use.'
+  b=$($RUN "$MODS" verify --dir "$W/share/official/tooly" | sed 's/.*ok: tooly 0.1.0, \([0-9,]*\) B of prompt.*/\1/' | tr -d ,)
+  run list
+  out_has "henki-mods init offers sets of them"
+  run init
+  rc_is 0
+  check "minimal: 0 B" [ -n "$(printf '%s\n' "$OUT" | awk '$1 == "minimal" && $2 == "0" && $4 == "sessions"')" ]
+  check "starter: its bytes with the header" [ -n "$(printf '%s\n' "$OUT" | HM_B="$(num $((b + ${#h} + 2)))" awk '$1 == "starter" && $2 == ENVIRON["HM_B"] && $4 == "sessions" && $5 == "tooly" && $6 == "later"')" ]
+  run add sessions --yes
+  run off sessions
+  printf 'n\n' >"$W/answer"
+  HENKI_MODS_TTY="$W/answer" run init starter
+  refused "nothing added (the answer was no)"
+  out_has "  sessions: off in your lock, so it stays off"
+  out_has "  later: this henki ships no later; left out"
+  out_has "  tooly 0.1.0 (official): +$b B of prompt"
+  check "nothing added on a no" [ -z "$(lockline tooly)" ]
+  run init starter --yes
+  rc_is 0
+  out_has "added tooly: on"
+  check "tooly on, sessions still off" [ "$(field tooly 3):$(field sessions 3)" = "on:off" ]
+  run init starter --yes
+  out_has "nothing to add"
+  run init nothere
+  refused "no profile nothere"
+  run profile list
+  rc_is 0
+  out_has "minimal"
+  run profile show starter
+  rc_is 0
+  out_has "tooly"
+  run profile save "$W/mine.lock"
+  rc_is 0
+  out_has "wrote $W/mine.lock (1 modules)"
+  check "the saved line" [ "$(cat "$W/mine.lock")" = "lock/1${tab}tooly${tab}on${tab}-${tab}official${tab}tooly${tab}-${tab}-${tab}-${tab}-${tab}" ]
+  run profile save "$W/mine.lock"
+  refused "exists"
+  export HOME="$W/home2"
+  CONF="$HOME/.config/henki"
+  mkdir -p "$HOME"
+  run init "$W/mine.lock" --yes
+  rc_is 0
+  check "from the saved file" [ "$(field tooly 3)" = on ]
+  printf 'lock/1\tx\ton\t-\tpath\t/x\t-\t-\t-\t-\t\n' >"$W/bad.lock"
+  run init "$W/bad.lock" --yes
+  refused "a profile holds official modules and index packages only"
+  # The profiles shipped in the repository read as profiles, and name official modules.
+  unset HENKI_SHARE
+  run init
+  rc_is 0
+  out_has "minimal"
+  out_has "starter"
+  out_has "mac"
+}
+
+t_index_verbs() {
+  case_ "index list, add, rm; the trust-changing verbs refuse inside a tool call"
+  ix_two
+  local main="$IX" v
+  run index list
+  rc_is 0
+  out_has "index deorlovnis: file://$main"
+  out_has "verified   never"
+  mkindex "$W/extra"
+  signer k1 >"$W/extra.signers"
+  signer k2 >"$W/k2.signers"
+  run index add extra "file://$W/extra" --signers "$W/k2.signers" --yes
+  refused "(index extra was not added)"
+  check "not added" [ ! -f "$CONF/mods.index" ] && [ ! -f "$CONF/index/extra.signers" ]
+  printf 'n\n' >"$W/answer"
+  HENKI_MODS_TTY="$W/answer" run index add extra "file://$W/extra" --signers "$W/extra.signers"
+  refused "not added (the answer was no)"
+  out_has "  signer   henki-index ssh-ed25519 SHA256:"
+  out_has "no checkpoint"
+  run index add extra "file://$W/extra" --signers "$W/extra.signers" --checkpoint "$(git -C "$W/extra" rev-parse HEAD)" --yes
+  rc_is 0
+  out_has "added index extra"
+  check "mods.index and the anchor" [ "$(cat "$CONF/mods.index")" = "index/1${tab}extra${tab}file://$W/extra" ] && cmp -s "$W/extra.signers" "$CONF/index/extra.signers"
+  run index list
+  out_has "index extra: file://$W/extra"
+  out_has "checkpoint $(git -C "$W/extra" rev-parse HEAD)"
+  run index add extra "file://$W/extra" --signers "$W/extra.signers" --yes
+  refused "index extra is in use already"
+  run index add deorlovnis "file://$W/extra" --signers "$W/extra.signers" --yes
+  refused "index deorlovnis is in use already"
+  run index add x2 "http://example.invalid/x" --signers "$W/extra.signers" --yes
+  refused "is not an https, ssh or file URL"
+  run index rm deorlovnis --yes
+  refused "index deorlovnis ships with henki"
+  run index rm extra --yes
+  rc_is 0
+  check "gone from mods.index" [ ! -f "$CONF/mods.index" ] && [ ! -f "$CONF/index/extra.signers" ]
+  run gc --yes
+  rc_is 0
+  check "gc removes its clone" [ ! -d "$XDG_DATA_HOME/henki/index/extra.git" ]
+  # Inside a tool call (a session id, no HENKI_NEXT) the verbs that change what henki runs refuse.
+  mkmod "$W/hello2"
+  run add "$W/hello2" --yes
+  printf 'y\n' >"$W/answer"
+  for v in "update hello2 --yes" "rollback hello2 --yes" "unpack $W/x.tgz --yes" "init minimal --yes" "index add e2 file://$W/extra --signers $W/extra.signers --yes" "on hello2/x"; do
+    # shellcheck disable=SC2086 # the verb and its arguments
+    HENKI_SESSION=20261108T100000Z-abcd HENKI_MODS_TTY="$W/answer" run $v
+    refused "this changes what henki runs, and it runs inside a tool call; fix: run it at the prompt with /mods"
+  done
+}
+
 all() {
   t_add_path
   t_ask
@@ -2431,6 +2990,12 @@ all() {
   t_index_add
   t_index_yank
   t_index_guard
+  t_update
+  t_masks
+  t_assets
+  t_pack
+  t_init
+  t_index_verbs
 }
 
 static_bash32

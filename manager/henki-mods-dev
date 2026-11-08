@@ -64,6 +64,7 @@ entry_derive() { # REPO PATH COMMIT
   printf 'prompt_bytes = %s\n' "$b"
   printf 'card_bytes = %s\n' "$I_card"
   printf 'caps_net = "%s"\n' "${M_caps:-none}"
+  printf '%s' "$M_assets" | awk -F '\t' 'NF == 4 { printf "asset_%s = [\"%s\", \"%s\", \"%s\"]\n", $1, $2, $3, $4 }'
 }
 
 entry_lint() { # FILE
