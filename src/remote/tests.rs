@@ -304,7 +304,7 @@ fn contracts_port_timeouts_and_methods() {
     code.sort();
     assert_eq!(doc_ms, code);
     let rows = |s: &str| doc(s).lines().filter_map(|l| Some(l.strip_prefix("| `")?.split('`').next()?.to_string())).collect::<Vec<_>>();
-    let mut names: Vec<String> = ["hello".to_string()].into_iter().chain(rows("history/1")).chain(rows("policy/1")).collect();
+    let mut names: Vec<String> = ["hello".to_string()].into_iter().chain(rows("history/1")).chain(rows("policy/1")).chain(rows("context/1")).collect();
     names.sort();
     names.dedup();
     let mut methods: Vec<String> = METHODS.iter().map(|m| m.0.to_string()).collect();
@@ -326,4 +326,144 @@ fn contracts_port_names() {
     assert_eq!(ticked(d.split(". Each").next().unwrap()), crate::port::PORTS);
     let binds = d.split("This henki binds ").nth(1).unwrap().split(" that way").next().unwrap();
     assert_eq!(ticked(binds), crate::port::LINKED);
+}
+
+fn user(text: &str) -> Value {
+    json!({"msg": {"content": text, "role": "user"}, "t": "user"})
+}
+
+/// A history of two turns: a user record, a call and its result, the answer, then the next user record.
+fn two_turns() -> Vec<Value> {
+    let call =
+        json!({"finish": "tool_calls", "msg": {"content": "", "role": "assistant", "tool_calls": [{"args": {"command": "true"}, "id": "h1", "name": "shell"}]}, "t": "assistant"});
+    let result = json!({"bytes": 2, "content": "ok", "id": "h1", "is_error": false, "ms": 1, "name": "shell", "t": "tool_result"});
+    let said = json!({"finish": "stop", "msg": {"content": "done", "role": "assistant", "tool_calls": []}, "t": "assistant"});
+    vec![user("one"), call, result, said, user("two")]
+}
+
+/// context/1's rules for a `fit` answer, one by one: calls and results are the history's, unchanged and in order; the
+/// rest user or assistant text; paired; ending in the history's last record; within the limit, newlines counted.
+#[test]
+fn fits_rules() {
+    let h = two_turns();
+    let roomy = json!({"fixed": 100, "limit": 100_000});
+    let fits = |r: &[Value]| port::fits(r, &h, &roomy);
+    let summary = json!({"msg": {"content": "the earlier turns, in short", "role": "assistant"}, "t": "assistant"});
+    for ok in [h.clone(), h[4..].to_vec(), vec![user("Summary: one, done"), h[4].clone()], vec![summary, h[1].clone(), h[2].clone(), h[4].clone()]] {
+        assert_eq!(fits(&ok), Ok(()), "{ok:?}");
+    }
+    let mut edited = h.clone();
+    edited[2]["content"] = "not ok".into();
+    let mut renamed = h.clone();
+    renamed[1]["msg"]["tool_calls"][0]["name"] = Value::Null;
+    let invented = json!({"msg": {"content": "", "role": "assistant", "tool_calls": [{"id": "x"}]}, "t": "assistant"});
+    let swapped = vec![h[0].clone(), h[2].clone(), h[1].clone(), h[4].clone()];
+    let notice = json!({"t": "notice", "text": "n"});
+    let odd = json!({"msg": {"content": [{"text": "x"}], "role": "user"}, "t": "user"});
+    for (bad, why) in [
+        (edited, "a call or result that is not the history's"),
+        (renamed, "a call or result that is not the history's"),
+        (vec![invented, json!({"content": "x", "id": "x", "name": "shell", "t": "tool_result"}), h[4].clone()], "a call or result that is not the history's"),
+        (swapped, "a call or result that is not the history's"),
+        (vec![notice, h[4].clone()], "a record that is not user or assistant text"),
+        (vec![odd, h[4].clone()], "a record that is not user or assistant text"),
+        (vec![h[0].clone(), h[1].clone(), h[4].clone()], "call \"h1\" has no result before the next user record"),
+        (vec![h[0].clone(), h[2].clone(), h[4].clone()], "result \"h1\" has no open call"),
+        (h[..4].to_vec(), "it does not end with the history's last record"),
+        (vec![], "it does not end with the history's last record"),
+    ] {
+        let got = fits(&bad).unwrap_err();
+        assert!(got.contains(why), "{bad:?}: {got}");
+    }
+    // The size: `fixed` plus each record's canonical line and its newline, against `limit`; no `fixed` never fits.
+    let line = crate::term::json_line(&h[4]).len() as u64 + 1;
+    assert_eq!(port::fits(&h[4..], &h, &json!({"fixed": 100, "limit": 100 + line})), Ok(()));
+    let over = port::fits(&h[4..], &h, &json!({"fixed": 100, "limit": 99 + line})).unwrap_err();
+    assert_eq!(over, format!("{} bytes, over the limit of {}", 100 + line, 99 + line));
+    assert!(port::fits(&h[4..], &h, &json!({"fixed": 100, "limit": 50})).is_err(), "a limit below fixed");
+    assert!(port::fits(&h[4..], &h, &json!({"limit": 100_000})).is_err(), "no fixed");
+    assert!(port::fits(&h[4..], &h, &json!({"fixed": 0})).is_err(), "no limit");
+}
+
+/// Std passes context.tsv: for every `fit` step, the history as std's elision shapes it (old results elided once)
+/// keeps the four rules within the step's budget, so the suite's limits are ones std meets, and std answers keep.
+#[test]
+fn context_suite_std() {
+    let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("manager/conform");
+    let suite = fs::read_to_string(dir.join("context.tsv")).unwrap();
+    let mut n = 0;
+    for step in suite.lines().filter(|l| !l.starts_with('#') && l.contains("\"method\":\"fit\"")) {
+        let mut req = step.split('\t').nth(2).unwrap().to_string();
+        while let Some(at) = req.find("@F:") {
+            let name = req[at + 3..].split('@').next().unwrap().to_string();
+            req = req.replace(&format!("@F:{name}@"), fs::read_to_string(dir.join(format!("fixtures/{name}.json"))).unwrap().trim_end());
+        }
+        let p: Value = serde_json::from_str(&req).unwrap();
+        let hist = p["params"]["records"].as_array().unwrap().clone();
+        let budget = &p["params"]["budget"];
+        assert_eq!(budget["limit"], budget["window"].as_u64().unwrap() * 16 / 5, "{step}");
+        let mut elided = hist.clone();
+        crate::journal::elide(&mut elided);
+        assert_eq!(port::fits(&elided, &elided, budget), Ok(()), "{}", &step[..4]);
+        // Every tight budget needs the elision: the history as it is would not fit.
+        assert_eq!(port::fits(&hist, &hist, budget).is_ok(), budget["limit"] == 104_857, "{}", &step[..4]);
+        n += 1;
+    }
+    assert_eq!(n, 9, "C04 to C11 and C11a");
+}
+
+/// `fit` through a binding: keep is None, records come back once `fits` takes them, a refused answer is the binding's
+/// `invalid` error and it lives on, an answer with neither keep nor records kills it.
+#[test]
+fn remote_fit() {
+    let h = two_turns();
+    let budget = json!({"fixed": 10, "limit": 100_000, "max_tokens": 100, "window": 31_250});
+    let body = r#"case "$line" in *'"session":"keep"'*) ok '{"keep":true}' ;; *'"session":"last"'*) ok '{"records":[{"msg":{"content":"two","role":"user"},"t":"user"}]}' ;; *'"session":"bad"'*) ok '{"records":[{"t":"notice"}]}' ;; *) ok '{"other":1}' ;; esac"#;
+    let (_t, mut r) = binding(body);
+    assert_eq!(r.fit("keep", &h, &budget, false), Ok(None));
+    assert_eq!(r.fit("last", &h, &budget, false), Ok(Some(vec![user("two")])));
+    let e = r.fit("bad", &h, &budget, false).unwrap_err();
+    assert_eq!((e.code, e.message.starts_with("history binding t 1: fit: a call or result")), ("invalid", true), "{}", e.message);
+    assert_eq!(r.fit("keep", &h, &budget, true), Ok(None), "it lives on");
+    let e = r.fit("x", &h, &budget, false).unwrap_err();
+    assert_eq!((e.code, e.message.as_str()), ("protocol", "history binding t 1: protocol: fit: an answer holds keep or records; fix: X"));
+    assert_eq!(r.fit("keep", &h, &budget, false).unwrap_err().code, "protocol", "dead for the session");
+}
+
+/// The cost of context over port/1: 200 `fit`s of a 1 MiB and of an 8 MiB history through `Remote` to port_toy, which
+/// answers the last two turns, each checked by `fits`: the round trip a request waits for before it is sent. p95 under
+/// 20 ms at 1 MiB and under 150 ms at 8 MiB.
+#[test]
+#[ignore = "release gate"]
+fn remote_fit_cost() {
+    let _timed = crate::types::lock(&crate::types::TIMED);
+    let t = Tmp(std::env::temp_dir().join(format!("henki-remote-fit-{}", std::process::id())));
+    let _ = fs::remove_dir_all(&t.0);
+    fs::create_dir_all(&t.0).unwrap();
+    let w = t.0.join("toy");
+    fs::write(&w, format!("#!/bin/sh\nexec {} context last 2\n", port_toy().display())).unwrap();
+    fs::set_permissions(&w, fs::Permissions::from_mode(0o700)).unwrap();
+    let env = vec![("PATH".into(), "/usr/bin:/bin".into())];
+    for (mib, p95_max) in [(1, 20.0), (8, 150.0)] {
+        let mut r = Remote::start("context", &w, ("toy".into(), String::new()), &t.0, &env, Stdio::null()).unwrap();
+        r.hello(&t.0, &t.0, &[1]).unwrap();
+        // Turns of a user record, a call and its 4 KiB result, an answer, up to the size.
+        let (mut hist, mut size) = (Vec::new(), 0);
+        while size < mib << 20 {
+            let id = format!("h{}", hist.len());
+            let call = json!({"finish": "tool_calls", "msg": {"content": "", "role": "assistant", "tool_calls": [{"args": {"command": "cat f"}, "id": id, "name": "shell"}]}, "t": "assistant"});
+            let result = json!({"bytes": 4_096, "content": "x".repeat(4_096), "id": id, "is_error": false, "ms": 1, "name": "shell", "t": "tool_result"});
+            let said = json!({"finish": "stop", "msg": {"content": "done", "role": "assistant", "tool_calls": []}, "t": "assistant"});
+            for r in [user(&format!("task {id}")), call, result, said] {
+                size += crate::term::json_line(&r).len() + 1;
+                hist.push(r);
+            }
+        }
+        hist.push(user("last"));
+        let budget = json!({"fixed": 4_000, "limit": 1u64 << 40, "max_tokens": 1_024, "window": 1u64 << 38});
+        let ms: Vec<f64> = (0..200).map(|_| (Instant::now(), r.fit("s", &hist, &budget, false).unwrap().unwrap()).0.elapsed().as_secs_f64() * 1e3).collect();
+        let (p50, p95) = p50_p95(ms);
+        eprintln!("fit of {mib} MiB ({} records): p50 {p50:.1} ms, p95 {p95:.1} ms", hist.len());
+        assert!(p95 < p95_max, "{mib} MiB: p95 {p95:.1} ms");
+    }
 }

@@ -41,11 +41,12 @@ nl='
 # ext::prompt's header line; henki joins it to the rest of the system prompt with a blank line ("\n\n").
 HEADER='Extensions are commands on PATH; read the doc in brackets before first use.'
 # The named formats this henki ships (CONTRACTS.md); a module's `contracts` must all be here.
-CONTRACTS_KNOWN='journal/1 json/1 wire/1 ext/1 ext/2 handoff/1 observe/1 module/1 lock/1 hd1 port/1 history/1 policy/1 exec/1 conform/1 bind/1 eval/1'
+CONTRACTS_KNOWN='journal/1 json/1 wire/1 ext/1 ext/2 handoff/1 observe/1 module/1 lock/1 hd1 port/1 history/1 policy/1 context/1 exec/1 conform/1 bind/1 eval/1'
 # The ports a package may bind (henki's port::LINKED), and what each one gets to see, for the swap screen.
-PORTS_KNOWN='history policy exec'
+PORTS_KNOWN='history policy context exec'
 PORT_SEES_history='stores every session record'
 PORT_SEES_policy='decides every call before it runs; protected paths stay refused'
+PORT_SEES_context='sees the whole history before every model request and chooses what the model sees of it; henki checks each answer, and the session file keeps everything'
 PORT_SEES_exec='runs every shell call; read, write and edit are off while it is bound'
 AGENTS_MAX=4096 # henki refuses to start with a bigger AGENTS.md
 CARDS_BEGIN='# >>> mods cards'
@@ -1725,6 +1726,7 @@ inst_end() { # X [kill]
 # Runs SUITE (a conform/1 file) for PORT against PROGRAM through HENKI: "ok NAME" or "FAIL NAME: got LINE" per check,
 # then "PORT/1: N checks, N passed"; exit 1 on any failure. A step whose name ends in a lowercase letter prepares a
 # check: it counts only when it fails. After a `#cap NAME` line, steps run only when instance a's hello lists cap NAME.
+# `@F:NAME@` in a request is the one-line JSON of fixtures/NAME.json beside the suite.
 # Last, PROGRAM run on its own must exit within 1 s of reading EOF on stdin.
 conform_run() { # PORT PROGRAM HENKI
   local name inst req want save got n=0 ok=0 v w r pid big i x skip=""
@@ -1747,6 +1749,14 @@ conform_run() { # PORT PROGRAM HENKI
       '' | '#'*) continue ;;
     esac
     [ -z "$skip" ] || continue
+    # Fixtures by prefix and suffix, not ${//}: a replacement string's & and \ are not literal in every bash.
+    while :; do
+      case "$req" in *@F:*@*) ;; *) break ;; esac
+      x=${req#*@F:} x=${x%%@*}
+      case "$x" in '' | *[!a-z0-9_]*) die "$C_suite: step $name names fixture [$x]; fix: reinstall henki" ;; esac
+      [ -f "${C_suite%/*}/fixtures/$x.json" ] || die "no fixture ${C_suite%/*}/fixtures/$x.json; fix: reinstall henki"
+      req="${req%%@F:$x@*}$(tr -d '\n' <"${C_suite%/*}/fixtures/$x.json")${req#*@F:$x@}"
+    done
     case "$inst" in
       *!)
         inst_end "${inst%!}" kill

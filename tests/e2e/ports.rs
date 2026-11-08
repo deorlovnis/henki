@@ -232,12 +232,12 @@ fn e2e_port_links_checked() {
     d.finish();
     d.check(d.result()["error"]["message"].as_str().unwrap().starts_with(&format!("{} is group- or world-writable", w.display())), "a writable binding ran");
     fs::set_permissions(&w, fs::Permissions::from_mode(0o700)).unwrap();
-    symlink(&w, port.join("context")).unwrap();
+    symlink(&w, port.join("frontend")).unwrap();
     let d = r.json("hi");
     d.finish();
-    let says = format!("{}: this henki cannot bind that port; fix: henki mods swap context std, or upgrade henki", port.join("context").display());
+    let says = format!("{}: this henki cannot bind that port; fix: henki mods swap frontend std, or upgrade henki", port.join("frontend").display());
     d.check(d.result()["error"]["message"] == says.as_str(), "an unknown port entry");
-    fs::remove_file(port.join("context")).unwrap();
+    fs::remove_file(port.join("frontend")).unwrap();
     fs::write(port.join(".history.123"), "").unwrap(); // the manager's temporary names are skipped
     fs::remove_file(&w).unwrap();
     let d = r.json("hi");

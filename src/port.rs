@@ -1,11 +1,11 @@
 //! The ports: the parts without which there is no agent. Each always has one binding: the std one built in, or a program
 //! that `CONFIG/port/NAME` links to (written by `henki mods swap`, never by henki). The kernel calls `history` and
-//! `policy` through these traits and checks every answer the same way, whoever gave it; `exec` is a program put in front
-//! of every shell call (`Config.exec`, exec/1); the other three ports keep their typed seams (model: `types::Wire`;
-//! context: `Session::elide`; frontend: `repl::run` and the headless branch of `main::run`). Each trait mirrors its
-//! protocol's method set (`port/1`, `history/1`, `policy/1` in CONTRACTS.md), one method each, and only henki implements
-//! them.
-use crate::{allow, allow::Std, config, config::Config, journal::Journal, remote::Remote, supervise, sys, tools::Target, types::Call, types::Outcome};
+//! `policy` through these traits and checks every answer the same way, whoever gave it; `context` is a `Remote` or std
+//! elide (`Ports.context`, request.rs), its answers held to `fits`; `exec` is a program put in front of every shell call
+//! (`Config.exec`, exec/1); the other two ports keep their typed seams (model: `types::Wire`; frontend: `repl::run` and
+//! the headless branch of `main::run`). Each trait mirrors its protocol's method set (`port/1`, `history/1`, `policy/1`
+//! in CONTRACTS.md), one method each, and only henki implements them.
+use crate::{allow, allow::Std, config, config::Config, journal, journal::Journal, remote::Remote, supervise, sys, term, tools::Target, types::Call, types::Outcome};
 use serde_json::Value;
 use std::path::{Path, PathBuf};
 use std::{fs, os::unix::ffi::OsStrExt, os::unix::fs::MetadataExt, process::Stdio, time::Instant};
@@ -16,7 +16,7 @@ pub type Record = Value;
 /// What `--port NAME=std` accepts (all six, so a script stays valid as more ports open), then what a link can bind now:
 /// the port/1 ones first (`henki port` takes those), then `exec` (exec/1, no protocol).
 pub const PORTS: [&str; 6] = ["model", "history", "context", "exec", "policy", "frontend"];
-pub const LINKED: [&str; 3] = ["history", "policy", "exec"];
+pub const LINKED: [&str; 4] = ["history", "policy", "context", "exec"];
 /// The codes a binding may send; henki itself adds timeout, crashed, protocol, interrupted and budget.
 const CODES: [&str; 10] = ["invalid", "unsupported", "io", "not_found", "busy", "exists", "tampered", "corrupt", "version", "other"];
 
@@ -106,6 +106,8 @@ pub trait Policy {
 pub struct Ports {
     pub history: Box<dyn History>,
     pub policy: Box<dyn Policy>,
+    /// None: std elide (request.rs), also once the binding died.
+    pub context: Option<Remote>,
     pub bound: Vec<(&'static str, String)>,
 }
 
@@ -143,7 +145,7 @@ pub fn links(dir: &Path, std: &[String], home: &Path) -> Result<Vec<(&'static st
 /// with the repair; each bound one becomes a notice (the REPL banner shows it, `run` journals it). Started before any
 /// session record; on an error the ones already started drop (bye, kill), so a refused start leaves no kernel child.
 pub fn bind(cfg: &mut Config, deadline: Option<Instant>) -> Result<Ports, Outcome> {
-    let mut ports = Ports { history: Box::new(Journal::new(&cfg.state)), policy: Box::new(Std), bound: Vec::new() };
+    let mut ports = Ports { history: Box::new(Journal::new(&cfg.state)), policy: Box::new(Std), context: None, bound: Vec::new() };
     let (env, lp) = (supervise::child_env(&cfg.env, &cfg.pass_env, &cfg.user_path, &cfg.user_path, ""), kernel_log(cfg));
     let bad = |e: String| Outcome::error("config", e);
     for (p, exe, name) in cfg.links.clone() {
@@ -156,6 +158,8 @@ pub fn bind(cfg: &mut Config, deadline: Option<Instant>) -> Result<Ports, Outcom
             (cfg.exec, _) = (Some(exe), ports.bound.push((p, name)));
             continue;
         }
+        // The anthropic dialect replays the history unchanged: a context binding is not started there.
+        let None = (p == "context" && cfg.dialect == "anthropic").then(|| cfg.notices.push(format!("context: {name} is not used with the anthropic dialect"))) else { continue };
         let log = sys::create_excl(&lp, 0o600, true).or_else(|_| sys::open_append(&lp)).map_err(|e| bad(format!("{}: {e}", lp.display())))?;
         let state = cfg.state.join("port").join(p);
         sys::private_dir(&state).map_err(|e| bad(format!("{}: {e}", state.display())))?;
@@ -163,12 +167,33 @@ pub fn bind(cfg: &mut Config, deadline: Option<Instant>) -> Result<Ports, Outcom
         let started = Remote::start(p, &exe, (name.clone(), fix), &cfg.cwd, &env, Stdio::from(log));
         // The session deadline ends a slow hello as a signal does.
         let greeted = started.and_then(|mut r| (r.deadline = deadline, r.hello(&cfg.cwd, &state, &[1])).1.map(|()| r));
-        let r = greeted.map_err(|e| if matches!(e.code, "interrupted" | "budget") { outcome(e) } else { bad(e.message) })?;
+        let stop = |e: PortError| if matches!(e.code, "interrupted" | "budget") { outcome(e) } else { bad(e.message) };
+        // A context binding that does not start leaves std elide for the session, and the start goes on (context/1).
+        let soft = |e: PortError| if p == "context" && !matches!(e.code, "interrupted" | "budget") { Ok(e.message) } else { Err(stop(e)) };
+        let Some(r) = greeted.map(Some).or_else(|e| soft(e).map(|m| cfg.notices.push(format!("{m}; std elide shapes this session"))).map(|()| None))? else { continue };
         cfg.notices.push(format!("{p}: {name} (port/1, {}); henki --port {p}=std runs a session without it", r.said));
         ports.bound.push((p, name));
-        if p == "history" { ports.history = Box::new(r) } else { ports.policy = Box::new(r) }
+        match p {
+            "history" => ports.history = Box::new(r),
+            "policy" => ports.policy = Box::new(r),
+            _ => ports.context = Some(r),
+        }
     }
     Ok(ports)
+}
+
+/// The kernel's check of a context binding's `fit` answer `recs` for `hist` within `budget` (context/1): every call and
+/// result is one of the history's records, unchanged and in its order; the rest user or assistant text; paired; ending
+/// in the history's last record; `fixed` plus the records' canonical lines (and a newline each) within `limit` bytes.
+pub fn fits(recs: &[Record], hist: &[Record], budget: &Value) -> Result<(), String> {
+    let (call, mut from) = (|r: &Value| r["t"] == "tool_result" || r["msg"]["tool_calls"].as_array().is_some_and(|c| !c.is_empty()), hist.iter());
+    let text = |r: &Value| (r["t"] == "user" || r["t"] == "assistant") && r["msg"]["content"].is_string();
+    let ok = recs.iter().all(|r| if call(r) { from.any(|h| h == r) } else { text(r) });
+    ok.then_some(()).ok_or("a call or result that is not the history's, in its order, or a record that is not user or assistant text")?;
+    journal::pairing(recs)?;
+    (recs.last() == hist.last()).then_some(()).ok_or("it does not end with the history's last record")?;
+    let size = recs.iter().fold(budget["fixed"].as_u64().unwrap_or(u64::MAX), |n, r| n.saturating_add(term::json_line(r).len() as u64 + 1));
+    (size <= budget["limit"].as_u64().unwrap_or(0)).then_some(()).ok_or_else(|| format!("{} bytes, over the limit of {}", term::num(size), budget["limit"]))
 }
 
 /// The kernel log of this process: bindings' stderr, observers' stdout and stderr. In the spill dir, so the 24 h sweep
@@ -180,10 +205,8 @@ pub fn kernel_log(cfg: &Config) -> PathBuf {
 // The other ports have one binding each, so they stay seams until a second one exists: a trait with one impl costs
 // lines and buys nothing (measured: three such shells, with their std impls, cost 34 lines). The shapes below are
 // fixed, so opening one reshapes nothing:
-// - context: `trait Context { fn fit(&mut self, hist: &[Record], budget: &Budget) -> Result<Fit, PortError>; }` with
-//   `Budget { window, used, overflowed }` and `Fit { records, journal }`. The kernel keeps the history unmutated (today
-//   `journal::elide` mutates it), checks the pairing and the budget of what comes back, and falls back to the std
-//   elision with a notice. The one call site is `Session::elide`.
+// - context has no trait either: its one outside implementation is `Remote::fit`, and std elide stays the kernel's own
+//   code (request.rs), the fallback for every answer `fits` refuses. Nothing a binding answers is journaled.
 // - frontend: `enum Front { Repl, Headless(Option<String>), Serve }`; the frontends stay built in, and `Serve` reads a
 //   command stream and writes the `--json` records. `repl::run` returns the exit code and, when a command handed back
 //   a new henki (`handoff`), the argv `main` execs.

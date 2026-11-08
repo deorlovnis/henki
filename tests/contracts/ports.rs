@@ -41,7 +41,10 @@ fn contracts_port_names() {
     let six = ticked(d.split(". Each").next().unwrap());
     let bound = ticked(d.split("This henki binds ").nth(1).unwrap().split(" that way").next().unwrap());
     let own = ticked(d.split("links say. ").nth(1).unwrap().split(" speaks no protocol").next().unwrap());
-    assert_eq!((six.len(), bound.len(), own.as_slice()), (6, 3, &["exec".to_string()][..]), "{six:?} {bound:?} {own:?}");
+    assert_eq!((six.len(), bound.len(), own.as_slice()), (6, 4, &["exec".to_string()][..]), "{six:?} {bound:?} {own:?}");
+    // A context binding that does not start leaves the std elision: the session starts (context/1).
+    let soft = ["context"];
+    assert!(flat("context/1").contains("A context binding never ends a turn and never stops a start"));
     assert!(flat("exec/1").contains("`henki port` does not take `exec`"));
     for p in &six {
         let m = Mock::start(vec![say("ok")]);
@@ -51,8 +54,8 @@ fn contracts_port_names() {
     }
     refused(&Run::new("http://127.0.0.1:9/v1").cmd(&["--json", "--port", "tools=std", "x"]).go(), "--port takes PORT=std", "--port tools=std");
     for p in &six {
-        // A binding that exits at once: a port/1 port henki binds fails at its hello, exec runs (no call starts it), any
-        // other fails at the link rule.
+        // A binding that exits at once: a port/1 port henki binds fails at its hello (context goes on without it), exec
+        // runs (no call starts it), any other fails at the link rule.
         let m = Mock::start(vec![say("ok")]);
         let r = Run::new(&m.url());
         let prog = r.config_dir().join("bindings/exits");
@@ -61,9 +64,10 @@ fn contracts_port_names() {
         fs::create_dir_all(r.config_dir().join("port")).unwrap();
         std::os::unix::fs::symlink(&prog, r.config_dir().join("port").join(p)).unwrap();
         let d = r.json("x");
-        if own.contains(p) {
+        if own.contains(p) || soft.contains(&p.as_str()) {
             d.finish();
             assert_eq!(d.code, Some(0), "a link for {p}\n{}", d.diag());
+            assert_eq!(d.notices().iter().any(|n| n.ends_with("std elide shapes this session")), soft.contains(&p.as_str()), "{p}\n{}", d.diag());
         } else {
             let says = if bound.contains(p) { format!("{p} binding") } else { "this henki cannot bind that port".into() };
             refused(&d, &says, &format!("a link for {p}"));
@@ -150,4 +154,36 @@ fn contracts_exec_argv() {
     // The tools: `shell` only, as the `session` record says.
     assert!(flat("exec/1").contains("henki offers the model the `shell` tool only: `read`, `write` and `edit` are off (the `session` record's `tools` shows it"));
     assert_eq!(d.of("session")[0]["tools"], serde_json::json!(["shell"]));
+}
+
+/// context/1 as henki keeps it: a binding that does not start is one notice in the form the section gives, the session
+/// starts; with the anthropic dialect the binding is not started, with the notice the section quotes.
+#[test]
+fn contracts_context() {
+    let doc = flat("context/1");
+    for said in ["`window` × 16 / 5", "ending `std elide shapes this request`", "ending `std elide shapes this session`", "ending `std elide shapes the rest of the session`"] {
+        assert!(doc.contains(said), "context/1 lacks {said}");
+    }
+    let unused = doc.split("(the notice `").nth(1).unwrap().split('`').next().unwrap().to_string();
+    for anthropic in [false, true] {
+        let m = if anthropic { Mock::start_api(Api::Anthropic, vec![say("ok")]) } else { Mock::start(vec![say("ok")]) };
+        let mut r = Run::new(&m.url());
+        if anthropic {
+            r.set("dialect", "\"anthropic\"");
+        }
+        let prog = r.dir.join("bindings/exits");
+        file(&prog, "#!/bin/sh\nexit 0\n", 0o700);
+        fs::set_permissions(prog.parent().unwrap(), fs::Permissions::from_mode(0o700)).unwrap();
+        fs::create_dir_all(r.config_dir().join("port")).unwrap();
+        std::os::unix::fs::symlink(&prog, r.config_dir().join("port/context")).unwrap();
+        let d = r.json("x");
+        d.finish();
+        assert_eq!(d.code, Some(0), "{}", d.diag());
+        let p = prog.display().to_string();
+        if anthropic {
+            assert!(d.notices().contains(&unused.replace("NAME ID", &p)), "{unused}\n{}", d.diag());
+        } else {
+            assert!(d.notices().iter().any(|n| n.starts_with(&format!("context binding {p}: ")) && n.ends_with("; std elide shapes this session")), "{}", d.diag());
+        }
+    }
 }

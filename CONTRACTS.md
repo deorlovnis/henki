@@ -38,6 +38,7 @@ A program reads the contracts this henki ships from the rows of this table: each
 | `port/1` | henki | how henki talks to a port binding: a program it starts, JSON lines both ways |
 | `history/1` | henki | the history port's methods over port/1: where sessions are kept |
 | `policy/1` | henki | the policy port's methods over port/1: who may run a call |
+| `context/1` | henki | the context port's methods over port/1: what the model sees of the history |
 | `exec/1` | henki | the exec port: a program henki puts in front of every shell call |
 | `conform/1` | henki | the conformance suite files a binding is held to |
 | `module/1` | henki-mods | the module manifest, `.henki/module.toml` |
@@ -322,7 +323,8 @@ Headers: `anthropic-version: 2023-06-01`, and `x-api-key: KEY` when `api_key` is
   min(2^(N-1), 30) s, with the notice `CAUSE; retry N/4 in S s`. After the last attempt the message ends
   `(gave up after 5 attempts)`.
 - `context_exceeded` (openai): henki elides old tool results once (an `elide` record) and sends again; with nothing to
-  elide, or in the anthropic dialect, the turn ends with that error.
+  elide, or in the anthropic dialect, the turn ends with that error. A context binding is asked once more first
+  (context/1).
 
 ## ext/1
 
@@ -580,7 +582,7 @@ symbolic link, `MODE SHA256 PATH\n`, sorted bytewise (`LC_ALL=C`) by PATH:
 
 A port is a part without which there is no agent: `model`, `history`, `context`, `exec`, `policy`, `frontend`. Each
 has one binding: the std one built into henki, or a program that `CONFIG_DIR/port/PORT` links to. This henki binds
-`history`, `policy` and `exec` that way; `--port PORT=std` (repeatable, all six names) runs a session on std whatever the
+`history`, `policy`, `context` and `exec` that way; `--port PORT=std` (repeatable, all six names) runs a session on std whatever the
 links say. `exec` speaks no protocol (exec/1): of this section only the link rules apply to it.
 
 - **The link.** henki reads `CONFIG_DIR/port/` at start: names starting with `.` are skipped; any other name must be a
@@ -613,8 +615,9 @@ links say. `exec` speaks no protocol (exec/1): of this section only the link rul
   `exists`, `tampered`, `corrupt`, `version`; anything else arrives as `other`. henki adds `timeout`, `crashed`,
   `protocol`, `interrupted` (a signal) and `budget` (the session's time ran out).
 - **Timeouts.** `hello` 5 s, `create` 2 s, `open` 5 s, `read` 10 s per page, `list` 5 s, `append` 2 s, `discard` 2 s,
-  `fork` 10 s, `decide` 5 s, `record` 2 s, `bye` 300 ms. A signal or the session deadline ends a wait for `hello`,
-  `create`, `open`, `read`, `list`, `fork` or `decide` within 50 ms, never one for a method that changes state.
+  `fork` 10 s, `decide` 5 s, `record` 2 s, `fit` 10 s, `bye` 300 ms. A signal or the session deadline ends a wait for
+  `hello`, `create`, `open`, `read`, `list`, `fork`, `decide` or `fit` within 50 ms, never one for a method that changes
+  state.
 - **The dead rule.** A timeout, a closed stdout, a line over the cap or cut at EOF, a non-object line, or an answer
   with both or neither of `result` and `error`, or 256 MiB of lines no request asked for, kills the binding for the
   rest of the session: every later call fails at once. An error answer is one failed call; the binding lives on.
@@ -698,6 +701,45 @@ call's arguments, its target, the tripwire) and before the call runs.
 - **Std.** `approve = "auto"` is a mode of the std policy: henki refuses to start with it while a policy binding is
   linked (`error config`). While one is linked henki reads no allow rules; `--port policy=std` runs a session on std.
 
+## context/1
+
+The context port over port/1: what the model sees of the history. The std binding is henki's own elision (journal/1
+`elide`; wire/1 `context_exceeded`). A program bound by `CONFIG_DIR/port/context` (`henki mods swap context NAME`)
+shapes each model request instead: henki checks every answer and uses the std elision for any it does not take. The
+journal always keeps the whole history, nothing a binding answers is written to it, and `--resume` replays the whole
+history.
+
+| Method | Params | Result |
+|---|---|---|
+| `fit` | `session`; `records`: the history (every `user`, `assistant` and `tool_result` record as journal/1 replays them, std's earlier elisions applied); `budget`: `window` (`context_window`, tokens), `max_tokens`, `fixed` (the bytes of the request with no messages of the history: the system message with AGENTS.md and the context sources, and the tools), `limit` (bytes); `overflowed` (B) | `{"keep":true}`: std decides, as with no binding; or `{"records":[...]}`: the records the model sees |
+| `bye` | `{}` | `null`, then exit |
+
+`fit` is asked before every attempt of every model request, with the whole history each time; a binding ignores params
+it does not know. `overflowed` is true when the server answered "context exceeded" to this binding's answer for the
+same request: henki asks once more, then uses the std elision for that request. The binding does not see or place the
+system message: it sees only its size, inside `fixed`. A `keep`, or an answer henki does not take, leaves that request
+to std, which elides as it does without a binding.
+
+A `records` answer is used only when all of these hold (henki checks each answer):
+1. every `tool_result`, and every `assistant` record with calls, is a record of the history, unchanged, in the
+   history's order; every other record is a `user` or `assistant` record whose `msg.content` is a string (a summary,
+   say);
+2. the records pass journal/1's pairing rule;
+3. the last record equals the history's last record;
+4. `fixed` + the sum over the records of (the bytes of the record as a canonical line + 1) ≤ `limit`, where `limit` is
+   `window` × 16 / 5: 80 % of the window at 4 bytes a token.
+
+Otherwise, and on an error answer, henki journals a notice naming the binding and why, ending `std elide shapes this
+request`. A binding that does not start or answer `hello` is not used for the session: one notice, ending `std elide
+shapes this session`, and the session starts. A binding that times out, exits or breaks its lines is dead (port/1):
+one notice, ending `std elide shapes the rest of the session`. A context binding never ends a turn and never stops a
+start; a `CONFIG_DIR/port/context` link that names nothing runnable is a config error and does stop it (port/1's link
+rules). With `dialect = "anthropic"` the binding is not started (the notice `context: NAME ID is not used with the
+anthropic dialect`): that dialect replays the history unchanged.
+
+`henki port context -- PROGRAM` passes `fit` answers through as the binding gives them. `context.tsv` checks their
+shape; henki applies the four rules above to every answer in a session.
+
 ## exec/1
 
 Where shell calls run. The std binding runs `BASH --noprofile --norc -c COMMAND`, where BASH is the absolute path of
@@ -755,7 +797,8 @@ NAME INST REQUEST EXPECT [SAVE]
   `bye`; the next `a` step starts a fresh one; its REQUEST and EXPECT are `-`), or `+V` (a fresh instance offering
   version V).
 - REQUEST is `hello` (the instance's first line) or `{"method":M,"params":P}`. `@NAME@` is a saved value; `@SCOPE@` and
-  `@SCOPE2@` are two empty directories, `@BIG@` 1 MiB of text.
+  `@SCOPE2@` are two empty directories, `@BIG@` 1 MiB of text, `@F:NAME@` the one-line JSON in `fixtures/NAME.json`
+  beside the suite (histories for `context.tsv`).
 - EXPECT is the canonical answer line, where `*` is any text and `@(A|B)` is A or B; every other character stands for
   itself. SAVE is `NAME=KEY`: the first string value of `"KEY"` in the answer.
 - A line `#cap NAME` makes the steps after it run only for a binding whose `hello` (instance a's) lists cap NAME;
@@ -764,7 +807,8 @@ NAME INST REQUEST EXPECT [SAVE]
   `henki port` must end within 1 s of its stdin closing, and the program run alone must exit within 1 s of EOF on its
   stdin. henki's own tests run the history file against the std binding through its trait: std speaks no protocol,
   so the hello, version and kill steps are skipped, and the test itself answers `list`, `read`'s `from` (std reads
-  whole sessions) and an unknown method (`unsupported`). Std has cap `fork`.
+  whole sessions) and an unknown method (`unsupported`). Std has cap `fork`. For `context.tsv` they check that std's
+  elision of each step's history keeps context/1's rules within the step's budget (std itself answers as `keep` does).
 
 
 ## eval/1

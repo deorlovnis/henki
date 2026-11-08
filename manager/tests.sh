@@ -485,18 +485,18 @@ t_refusals() {
   rm -rf "$m" && mkmod "$m" 'ports = ["history"]\n'
   run add "$m" --yes
   refused "ports must name exactly the programs in port/"
-  rm -rf "$m" && mkmod "$m" 'ports = ["context"]\n'
+  rm -rf "$m" && mkmod "$m" 'ports = ["frontend"]\n'
   run add "$m" --yes
-  refused "port context is not one this henki binds (history policy exec)"
+  refused "port frontend is not one this henki binds (history policy context exec)"
   rm -rf "$m" && mkmod "$m" && mkdir "$m/port" && printf '#!/bin/sh\n' >"$m/port/history"
   run add "$m" --yes
   refused "port/history: port/ holds a program you can run per port"
-  chmod 755 "$m/port/history" && mv "$m/port/history" "$m/port/context"
+  chmod 755 "$m/port/history" && mv "$m/port/history" "$m/port/frontend"
   run add "$m" --yes
-  refused "port/context: port/ holds a program you can run per port, named history policy"
-  rm -rf "$m" && mkmod "$m" 'contracts = ["ext/1", "context/1"]\n'
+  refused "port/frontend: port/ holds a program you can run per port, named history policy context exec"
+  rm -rf "$m" && mkmod "$m" 'contracts = ["ext/1", "frontend/1"]\n'
   run add "$m" --yes
-  refused "contract context/1 is not one this henki ships"
+  refused "contract frontend/1 is not one this henki ships"
   rm -rf "$m" && mkmod "$m" 'caps_net = "lots"\n'
   sed '/^caps_net = "none"/d' "$m/.henki/module.toml" >"$W/t" && mv "$W/t" "$m/.henki/module.toml"
   run add "$m" --yes
@@ -1466,8 +1466,8 @@ t_ports() {
   run test --port history std
   rc_is 0
   out_has "std passes this suite in henki's own tests"
-  run test --port context std
-  refused "context is not a port this henki binds (history policy exec)"
+  run test --port frontend std
+  refused "frontend is not a port this henki binds (history policy context exec)"
   mkport tree
   run add "$W/tree" --yes
   rc_is 0
@@ -1532,12 +1532,12 @@ t_ports() {
   refused "not a bind/1 line; fix: henki-mods swap history std"
   run swap history std
   refused "not a bind/1 line"
-  # A port a later henki binds, in a line its manager wrote: newer, not broken (swap context std cannot be named here).
+  # A port a later henki binds, in a line its manager wrote: newer, not broken (swap frontend std cannot be named here).
   awk '!/^bind\/1/' "$CONF/mods.lock" >"$W/lock" && cp "$W/lock" "$CONF/mods.lock"
-  printf 'bind/1\tcontext\tfoo\tabcabcabcabc\t2026-11-08T10:00Z\tyes\n' >>"$CONF/mods.lock"
+  printf 'bind/1\tfrontend\tfoo\tabcabcabcabc\t2026-11-08T10:00Z\tyes\n' >>"$CONF/mods.lock"
   run list
-  refused "this lock is newer than this henki-mods (it binds context); fix: upgrade henki"
-  printf 'bind/1\tcontext\tfoo\n' >"$CONF/mods.lock"
+  refused "this lock is newer than this henki-mods (it binds frontend); fix: upgrade henki"
+  printf 'bind/1\tfrontend\tfoo\n' >"$CONF/mods.lock"
   run list
   refused "not a bind/1 line; fix: remove the line"
   rm "$CONF/mods.lock"
@@ -1887,6 +1887,58 @@ t_exec() {
   check "std: no link" [ ! -L "$CONF/port/exec" ]
 }
 
+# context/1's suite (shapes only; henki checks the records in a session): port_toy's context modes pass, its faults
+# fail the first fit; swap shows the context screen and links it.
+t_context() {
+  case_ "context: test --port, the suite's faults, swap"
+  local toy f
+  run test --port context std
+  rc_is 0
+  out_has "std passes this suite in henki's own tests"
+  toy="$(dirname "${HENKI_BIN:-/nonexistent/henki}")/examples/port_toy"
+  [ -x "$toy" ] || return 0
+  for f in keep "last 2"; do
+    printf '#!/bin/sh\nexec %s context %s\n' "$toy" "$f" >"$W/fits"
+    chmod 755 "$W/fits"
+    run test --port context "$W/fits"
+    rc_is 0
+    out_has "ok C11"
+    out_has "context/1: 12 checks, 12 passed"
+  done
+  for f in "--garbage-at fit" "--exit-at fit" "--error-at fit" "--hang-at hello"; do
+    printf '#!/bin/sh\nexec %s context keep %s\n' "$toy" "$f" >"$W/faulty"
+    chmod 755 "$W/faulty"
+    run test --port context "$W/faulty"
+    rc_is 1
+    case "$f" in *hello) out_has "FAIL C01: got" ;; *) out_has "FAIL C04: got" ;; esac
+  done
+  # A suite naming a fixture that is not there stops the run, and names it.
+  mkdir -p "$W/share/conform"
+  cp "$HERE/conform/history.tsv" "$W/share/conform/"
+  printf 'C04\ta\t{"method":"fit","params":{"records":@F:gone@}}\t*\n' >"$W/share/conform/context.tsv"
+  HENKI_SHARE="$W/share" run test --port context "$W/fits"
+  refused "no fixture $W/share/conform/fixtures/gone.json; fix: reinstall henki"
+  mkmod "$W/shaper" 'ports = ["context"]\ncontracts = ["port/1", "context/1"]\n'
+  mkdir -p "$W/shaper/port"
+  printf '#!/bin/sh\nexec %s context keep\n' "$toy" >"$W/shaper/port/context"
+  chmod 755 "$W/shaper/port/context"
+  run add "$W/shaper" --yes
+  rc_is 0
+  run swap context shaper --yes
+  rc_is 0
+  out_has "context: std -> shaper 0.1.0 ("
+  out_has "conformance: passed (context/1, 12 checks) · it runs with your rights and sees the whole history before every model request"
+  check "the link to the store copy's port/context" [ "$(readlink "$CONF/port/context")" = "$(readlink "$CONF/ext/shaper")/port/context" ]
+  check "a bind/1 line for context" [ "$(tail -n 1 "$CONF/mods.lock" | cut -f 1-3)" = "$(printf 'bind/1\tcontext\tshaper')" ]
+  run list
+  out_has "context: shaper 0.1.0 (bound)"
+  run rm shaper
+  refused "shaper holds the context binding; fix: henki-mods swap context std"
+  run swap context std
+  rc_is 0
+  check "std: no link" [ ! -L "$CONF/port/context" ]
+}
+
 # A stub model server for the eval checks in D, a small agent: a message holding `CALL: CMD` gets a shell call of CMD
 # and then the call's output as the answer, one holding BYTES the text of eval_bytes, and any other "yes" when the
 # system prompt lists the module probe, else "no". Each request's model goes to D/models.
@@ -2152,6 +2204,7 @@ all() {
   t_history
   t_policy
   t_exec
+  t_context
   t_eval
 }
 

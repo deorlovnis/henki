@@ -5,7 +5,8 @@
 #   bin/henki                    the static binary (musl on Linux)
 #   bin/henki-mods               the module manager; it finds the official modules at ../share/henki/official
 #   share/henki/official/NAME/   every module in mods/, as git tracks it (off until `henki-mods add NAME`)
-#   share/henki/conform/         the conformance suites of manager/conform/ (henki-mods test --port, swap)
+#   share/henki/conform/         the conformance suites of manager/conform/ (henki-mods test --port, swap), with the
+#                                histories in fixtures/ that context.tsv sends
 #   share/henki/eval/general/    the general eval suite of eval/general/ (henki-mods eval --suite general)
 #   share/henki/config.*.toml    the config profiles in profiles/ (henki's no-config message names config.mac.toml)
 #   LICENSE README.md CONTRACTS.md
@@ -154,13 +155,15 @@ hd1_of() {
 stage() {
   local dir="$1/henki-$2-$3" bin=$4 m n
   rm -rf "$dir"
-  mkdir -p "$dir/bin" "$dir/share/henki/official" "$dir/share/henki/conform" "$dir/share/henki/eval"
+  mkdir -p "$dir/bin" "$dir/share/henki/official" "$dir/share/henki/conform/fixtures" "$dir/share/henki/eval"
   cp "$bin" "$dir/bin/henki" && chmod 755 "$dir/bin/henki"
   cp manager/henki-mods "$dir/bin/henki-mods" && chmod 755 "$dir/bin/henki-mods"
   for n in LICENSE README.md CONTRACTS.md; do cp "$n" "$dir/$n" && chmod 644 "$dir/$n"; done
   # The profiles, where henki's no-config message sends a Homebrew user: $(brew --prefix)/share/henki/.
   for n in $(git ls-files 'profiles/config.*.toml'); do cp "$n" "$dir/share/henki/${n#profiles/}" && chmod 644 "$dir/share/henki/${n#profiles/}"; done
-  for n in $(git ls-files 'manager/conform/*.tsv'); do cp "$n" "$dir/share/henki/conform/" && chmod 644 "$dir/share/henki/conform/${n##*/}"; done
+  for n in $(git ls-files 'manager/conform/*.tsv' 'manager/conform/fixtures/*.json'); do
+    cp "$n" "$dir/share/henki/${n#manager/}" && chmod 644 "$dir/share/henki/${n#manager/}"
+  done
   # The general suite as git tracks it: its programs (setup, check, fake-bin/) 755, the rest 644.
   git ls-files -s -z -- eval/general | while IFS= read -r -d '' m; do
     n=${m#*$'\t'}
@@ -348,11 +351,11 @@ selftest() {
   got=$(tar -tzf "$DIST/$name.tar.gz" | sed 's,/$,,' | sort)
   want=$(
     {
-      for x in "" /bin /bin/henki /bin/henki-mods /share /share/henki /share/henki/official /share/henki/conform /share/henki/eval /LICENSE /README.md /CONTRACTS.md; do
+      for x in "" /bin /bin/henki /bin/henki-mods /share /share/henki /share/henki/official /share/henki/conform /share/henki/conform/fixtures /share/henki/eval /LICENSE /README.md /CONTRACTS.md; do
         echo "$name$x"
       done
       git ls-files 'profiles/config.*.toml' | sed "s,^profiles/,$name/share/henki/,"
-      git ls-files 'manager/conform/*.tsv' | sed "s,^manager/conform/,$name/share/henki/conform/,"
+      git ls-files 'manager/conform/*.tsv' 'manager/conform/fixtures/*.json' | sed "s,^manager/conform/,$name/share/henki/conform/,"
       git ls-files eval/general | sed "s,^,$name/share/henki/," | while read -r x; do
         while [ "$x" != "$name/share/henki/eval" ]; do
           echo "$x"

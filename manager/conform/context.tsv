@@ -1,0 +1,20 @@
+# conform/1: the context/1 suite (CONTRACTS.md). One step per line: NAME, INST, REQUEST, EXPECT and an optional SAVE,
+# TAB-separated, as in history.tsv. REQUEST `hello` is the instance's hello line; `@F:NAME@` is the one-line JSON in
+# fixtures/NAME.json: histories as journal/1 replays them, tool-output heavy, so that std's elision fits each limit
+# (henki's own tests check that it does). Every budget keeps limit = window * 16 / 5. EXPECT: `*` is any text, `@(A|B)`
+# A or B, every other character itself. A fit's answer is checked for its shape (keep, or records); henki checks the
+# records themselves against the history in every session (context/1). C11a only prepares C11 (a step whose name ends
+# in a lowercase letter counts only when it fails). After the steps the runner checks that each instance ends within
+# 1 s of its stdin closing, and the binding alone within 1 s of EOF on its stdin.
+C01	a	hello	{"result":{"caps":[*],"name":"* *"}}
+C02	+99	hello	{"error":{"code":"version",*
+C03	a	{"method":"x-none","params":{}}	{"error":{"code":"unsupported",*
+C04	a	{"method":"fit","params":{"budget":{"fixed":2500,"limit":104857,"max_tokens":4096,"window":32768},"overflowed":false,"records":@F:short@,"session":"conform-1"}}	{"result":@({"keep":true}|{"records":[*]})}
+C05	a	{"method":"fit","params":{"budget":{"fixed":2500,"limit":24000,"max_tokens":1024,"window":7500},"overflowed":false,"records":@F:long@,"session":"conform-1"}}	{"result":@({"keep":true}|{"records":[*]})}
+C06	a	{"method":"fit","params":{"budget":{"fixed":2500,"limit":24000,"max_tokens":1024,"window":7500},"overflowed":true,"records":@F:long@,"session":"conform-1"}}	{"result":@({"keep":true}|{"records":[*]})}
+C07	a	{"method":"fit","params":{"budget":{"fixed":2500,"limit":104857,"max_tokens":4096,"window":32768,"x-future":1},"overflowed":false,"records":@F:short@,"session":"conform-1","x-future":{"a":[1,"b"]}}}	{"result":@({"keep":true}|{"records":[*]})}
+C08	a	{"method":"fit","params":{"budget":{"fixed":2500,"limit":12800,"max_tokens":1024,"window":4000},"overflowed":false,"records":@F:two_calls@,"session":"conform-1"}}	{"result":@({"keep":true}|{"records":[*]})}
+C09	a	{"method":"fit","params":{"budget":{"fixed":2500,"limit":20000,"max_tokens":1024,"window":6250},"overflowed":false,"records":@F:one_turn@,"session":"conform-1"}}	{"result":@({"keep":true}|{"records":[*]})}
+C10	a	{"method":"fit","params":{"budget":{"fixed":2500,"limit":12800,"max_tokens":1024,"window":4000},"overflowed":false,"records":@F:unicode@,"session":"conform-1"}}	{"result":@({"keep":true}|{"records":[*]})}
+C11a	b	{"method":"fit","params":{"budget":{"fixed":2500,"limit":24000,"max_tokens":1024,"window":7500},"overflowed":false,"records":@F:long@,"session":"conform-2"}}	{"result":@({"keep":true}|{"records":[*]})}
+C11	b	{"method":"fit","params":{"budget":{"fixed":2500,"limit":24000,"max_tokens":1024,"window":7500},"overflowed":false,"records":@F:long@,"session":"conform-2"}}	{"result":@({"keep":true}|{"records":[*]})}

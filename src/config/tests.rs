@@ -700,7 +700,20 @@ fn config_ext_empty_list() {
     assert!(c.exts.is_empty());
     assert!(!c.protected.contains(&ext), "{:?}", c.protected);
     let d = t.cfg_dir();
-    assert_eq!(c.trust, [t.cfg(), d.join("allow"), d.join("AGENTS.md"), t.bin.join("bash"), d.join("port"), d.join("port/history"), d.join("port/policy"), d.join("port/exec")]);
+    assert_eq!(
+        c.trust,
+        [
+            t.cfg(),
+            d.join("allow"),
+            d.join("AGENTS.md"),
+            t.bin.join("bash"),
+            d.join("port"),
+            d.join("port/history"),
+            d.join("port/policy"),
+            d.join("port/context"),
+            d.join("port/exec")
+        ]
+    );
 }
 
 #[test]
@@ -1027,7 +1040,18 @@ fn config_trust_paths() {
     let c = load(&flags(), &t.env(&[("HENKI_MODEL", "m"), ("HENKI_BASE_URL", "http://127.0.0.1:1/v1")]), &t.cwd).unwrap();
     assert_eq!(
         c.trust,
-        [t.cfg(), d.join("allow"), d.join("AGENTS.md"), t.bin.join("bash"), ext.clone(), d.join("port"), d.join("port/history"), d.join("port/policy"), d.join("port/exec")]
+        [
+            t.cfg(),
+            d.join("allow"),
+            d.join("AGENTS.md"),
+            t.bin.join("bash"),
+            ext.clone(),
+            d.join("port"),
+            d.join("port/history"),
+            d.join("port/policy"),
+            d.join("port/context"),
+            d.join("port/exec")
+        ]
     );
     fs::create_dir_all(t.home.join("exts")).unwrap();
     let c = t.explicit(&format!("{BASE}ext = [\"~/exts\"]\n")).unwrap();
@@ -1043,14 +1067,15 @@ fn config_trust_paths() {
             cfg.join("port"),
             cfg.join("port/history"),
             cfg.join("port/policy"),
+            cfg.join("port/context"),
             cfg.join("port/exec")
         ]
     );
 }
 
 /// The port links the tripwire stamps (absent ones too): `CONFIG/port/` and each port a link can bind.
-fn ports(d: &Path) -> [PathBuf; 4] {
-    [d.join("port"), d.join("port/history"), d.join("port/policy"), d.join("port/exec")]
+fn ports(d: &Path) -> [PathBuf; 5] {
+    [d.join("port"), d.join("port/history"), d.join("port/policy"), d.join("port/context"), d.join("port/exec")]
 }
 
 #[test]

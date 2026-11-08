@@ -58,7 +58,7 @@ fn open(mut cfg: Config, mode: Mode, input: Option<std::io::PipeReader>) -> (Ses
 
 /// The std bindings, with a new session held in the history.
 fn std_ports(cfg: &Config) -> (Ports, String) {
-    let mut ports = Ports { history: Box::new(crate::journal::Journal::new(&cfg.state)), policy: Box::new(crate::allow::Std), bound: Vec::new() };
+    let mut ports = Ports { history: Box::new(crate::journal::Journal::new(&cfg.state)), policy: Box::new(crate::allow::Std), context: None, bound: Vec::new() };
     let sid = ports.history.create(&cfg.cwd, None).unwrap();
     (ports, sid)
 }
@@ -598,7 +598,7 @@ fn body_by_dialect() {
         let (mut s, _, _) = open(c, Mode::Json, None);
         s.hist.push(rec::user("hi"));
         let render = if dialect == "anthropic" { anthropic::body } else { crate::openai::body };
-        assert_eq!(s.body(), render("m", 4_096, &s.system, &s.tools, &s.hist), "{dialect}");
+        assert_eq!(s.body(&s.hist), render("m", 4_096, &s.system, &s.tools, &s.hist), "{dialect}");
     }
     std::fs::remove_dir_all(d).unwrap();
 }

@@ -21,8 +21,8 @@ pub const LINE_MAX: usize = 16 << 20;
 const READ_MAX: usize = 256 << 20;
 /// The contract timeout of each method in ms, and whether a signal or the deadline ends the wait (side-effect free only).
 #[rustfmt::skip]
-const METHODS: [(&str, u64, bool); 11] = [("hello", 5_000, true), ("create", 2_000, true), ("open", 5_000, true), ("read", 10_000, true), ("list", 5_000, true),
-    ("append", 2_000, false), ("discard", 2_000, false), ("fork", 10_000, true), ("decide", 5_000, true), ("record", 2_000, false), ("bye", 300, false)];
+const METHODS: [(&str, u64, bool); 12] = [("hello", 5_000, true), ("create", 2_000, true), ("open", 5_000, true), ("read", 10_000, true), ("list", 5_000, true),
+    ("append", 2_000, false), ("discard", 2_000, false), ("fork", 10_000, true), ("decide", 5_000, true), ("record", 2_000, false), ("fit", 10_000, true), ("bye", 300, false)];
 
 /// One line from the binding: the object and its length, or why the binding is broken.
 type Line = Result<(Value, usize), String>;
@@ -126,6 +126,17 @@ impl Remote {
                 Err(_) if left.is_zero() => return Err(self.fail(err("timeout", format!("no answer to {method} in {} s", term::secs(ms))))),
                 Err(_) => {}
             }
+        }
+    }
+
+    /// `context/1` `fit`: the records the model sees for one request, once `port::fits` holds for them, or None for
+    /// std's (`keep`). An answer `fits` refuses is an `invalid` error; the binding lives on.
+    pub fn fit(&mut self, session: &str, hist: &[Record], budget: &Value, overflowed: bool) -> Result<Option<Vec<Record>>, PortError> {
+        let mut a = self.call("fit", json!({"budget": budget, "overflowed": overflowed, "records": hist, "session": session}))?;
+        match (a["keep"] == true, a["records"].take()) {
+            (true, _) => Ok(None),
+            (_, Value::Array(r)) => port::fits(&r, hist, budget).map(|()| Some(r)).map_err(|w| self.named("invalid", &format!("fit: {w}"))),
+            _ => Err(self.fail(err("protocol", "fit: an answer holds keep or records"))),
         }
     }
 
