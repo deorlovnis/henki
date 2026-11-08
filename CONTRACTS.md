@@ -437,7 +437,9 @@ JSON cannot hold). No event comes before `session_start`.
   `{"data":DATA,"event":"EVENT","seq":N,"session":"ID","v":1}` in journal/1's JSON, read from a file, so a run that
   never reads it holds up nothing. `seq` counts this henki's events, so runs that overlap can be put in order. stdout
   and stderr go to henki's log, `STATE/spill/.kernel-PID.log`; the exit status is ignored, and a run that does not
-  start is a notice.
+  start is a notice. No run starts once a trust file changed (the tripwire tells): a changed `on/` file, or a trust
+  file it runs (`bin/`, `cmd/`), is used only after a restart. Other files of the module (a dot file) are not trust
+  files and may change under a running henki, so an observer should run only trust files.
 - **Waiting.** The `.wait` runs of one event are waited for together, for at most 2 s; a signal or the run's time
   budget ends that wait as it ends any other. An observer whose run misses the 2 s gets one notice and is not waited
   for again in this henki; the run goes on. No other run is waited for, and no run is killed for being slow.

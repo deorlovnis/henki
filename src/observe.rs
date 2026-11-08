@@ -67,7 +67,8 @@ impl Observers {
     /// Runs `event`'s observers, the event numbered `seq`; their output goes to the kernel log, or /dev/null without
     /// one. Each wait run sends `Ev::Observed { tag }` once it is reaped (another run tag 0, which the session end's
     /// grace waits on): returns how many will send `tag`, and the notices. None runs unless `intact` (no trust file
-    /// changed): a changed `on/` file, or one it runs, is used only once a restart reads it again; the tripwire tells.
+    /// changed): a changed `on/` file, or a trust file it runs (`bin/`, `cmd/`), is used only once a restart reads it
+    /// again; the tripwire tells. A file it runs that is no trust file (a dot file of its module) is not held so.
     pub fn emit(&mut self, event: &str, session: &str, data: &Value, tag: u32, intact: impl Fn() -> bool) -> (usize, Vec<String>) {
         let (mut waits, mut notes, mut line, mut fresh) = (0, Vec::new(), None, None);
         self.seq += 1;
