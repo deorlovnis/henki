@@ -18,7 +18,7 @@ echo "a long task" | henki run -
 
 `henki` starts a line REPL on the terminal it was started from (without a terminal on stdin and on stderr it refuses: use `henki run`). Its banner names the model, the server and its dialect, the approval mode, the config file, the extensions, any notices, and every allow rule for this project. What you send with Enter at the `> ` prompt is one message. The answer streams to stdout; the banner, the prompt, what you type, questions, call lines and notices go to stderr, so `henki > answers.txt` keeps only the answers.
 
-- `/exit` or Ctrl-D on an empty line quits (Ctrl-D at a question ends the turn first, then quits). `/help` lists the commands, `/allow` lists the allow rules and `/allow rm N` removes rule N. Any other line that starts with `/` is an unknown command and never reaches the model.
+- `/exit` or Ctrl-D on an empty line quits (Ctrl-D at a question ends the turn first, then quits). `/help` lists the commands. `/mods ARGS` runs the module manager, `henki-mods ARGS`, on this terminal (the one shipped with henki, never a module's command), and `/allow` (`/mods allow`) lists the allow rules and `/allow rm N` removes rule N. Like `!CMD`, a `/mods` or `/allow` that changes a trust file stops the REPL until you restart henki. Any other line that starts with `/` is an unknown command and never reaches the model.
 - `!CMD` runs CMD yourself with bash on this terminal, so an editor or a pager works, and what you type while it runs goes to the command. Your next message starts with `[the user ran in their terminal: CMD (exit N)]`. The command gets the terminal modes henki started with, and at the next prompt henki sets its own again, so a change made with `!stty` does not last.
 - Ctrl-C while the model answers or a call runs cancels the turn: the calls get SIGINT, then SIGTERM, then SIGKILL, and the text so far stays on the screen. At a question Ctrl-C answers no; during `!CMD` it goes to the command; at the prompt it does not quit, it prints a hint.
 - Ctrl-C, like any other stop, closes henki's connection to the model server. While llama-server generates, it frees its slot for the next request within milliseconds; while it still reads a long prompt, it frees it only after the prompt batch it is on, so the next request can wait several seconds (about 7 s for a long prompt on a small CPU-only machine).
@@ -56,20 +56,20 @@ An allow rule lets one exact shell command run without asking in one project. Th
 
 ```
 # henki allow rules: ROOT<TAB>COMMAND, one per line; COMMAND then runs without asking in ROOT.
-# List and remove them with /allow in henki or henki allow [rm N]; or edit this file.
+# List and remove them with henki mods allow [rm N] (/allow in henki); or edit this file.
 /Users/me/src/app	git status
 ```
 
 - ROOT is the project's root directory, or `*` for every project. COMMAND must equal the call's command byte for byte: `git status` never matches `git status --short`, `git status && x` or `git status; rm -rf ~`.
 - A rule fixes the bytes of a command, not what it does: `git status` runs what the repository's `.git/config` names, and `make` runs the Makefile. That is why a rule holds only in its own project.
 - henki adds a rule only after a confirmed `always`; a `*` rule comes only from your editor. The model's `write` and `edit` refuse the file. `always` does not create the config dir: without it (no config file, only `HENKI_MODEL` and `HENKI_BASE_URL`) the call runs once and no rule is saved.
-- `/allow` and `henki allow [--config FILE]` list the rules with their numbers; `/allow rm N` and `henki allow [--config FILE] rm N` remove one. N counts every rule line from 1, invalid ones included.
+- `henki mods allow [--config FILE]` (also `henki allow`, and `/allow` in the REPL) lists the rules with their numbers; `henki mods allow [--config FILE] rm N` (`/allow rm N`) removes one. N counts every rule line from 1, invalid ones included. `henki mods ARGS` is `henki-mods ARGS`, found next to henki or on your PATH; it reads no config.
 - At every start in ask mode a notice counts the rules for this project (`allow: N rules apply to this root ...`), and the REPL lists each of them. In `auto` mode the file is not read.
-- henki does not start when the file is a symlink, writable by others, owned by another user, over 64 KiB, or holds an invalid line; `henki allow` still lists and removes, and the error names the fix.
+- henki does not start when the file is a symlink, writable by others, owned by another user, over 64 KiB, or holds an invalid line; `henki mods allow` still lists and removes, and the error names the fix.
 
 ### Trust files
 
-The config file, the allow file, `AGENTS.md` in the config dir, the bash henki runs and every extension file are trust files. henki stamps them when it reads them at start, and checks them before every call (again right before it runs, after you answer a question), after it, and before a turn ends. When one changed (a call edited it, a background process, another program), the turn ends with `error changed`: `henki run` exits 2, and the REPL takes no more messages until you restart henki; `henki --resume` continues the session with the files read again. Editing a trust file with `!CMD` stops the REPL the same way. henki's own writes to the allow file (`always`, `/allow rm`) do not count.
+The config file, the allow file, `AGENTS.md` in the config dir, the bash henki runs and every extension file are trust files. henki stamps them when it reads them at start, and checks them before every call (again right before it runs, after you answer a question), after it, and before a turn ends. When one changed (a call edited it, a background process, another program), the turn ends with `error changed`: `henki run` exits 2, and the REPL takes no more messages until you restart henki; `henki --resume` continues the session with the files read again. Editing a trust file with `!CMD`, `/mods` or `/allow rm` stops the REPL the same way. henki's own write to the allow file (`always`) does not count.
 
 ### Extensions
 

@@ -21,22 +21,22 @@ use crate::types::{Ev, Outcome, Usage};
 use crate::{config::Config, config::Env, config::Flags, journal::Journal, journal::rec, term::Mode, term::Out, term::Reader, turn::Session, turn::outcome_line};
 use serde_json::Value;
 use std::sync::mpsc::{self, Receiver, Sender};
-use std::{io, io::Read, path::PathBuf, process::ExitCode, time::Duration, time::Instant};
+use std::{ffi::OsString, io, io::Read, process::ExitCode, time::Duration, time::Instant};
 
 const USAGE: &str = "usage: henki [--config FILE] [--approve ask|auto] [--model NAME] [--resume[=ID]] [--nested]
        henki run [--json] [--max-steps N] [--max-seconds N] [--approve ask|auto] [--config FILE] [--model NAME] [--resume[=ID]] [--nested] [TASK | -]
-       henki allow [--config FILE] [rm N]
+       henki mods [ARGS] | henki allow [rm N]
        henki --version | --help";
 
-/// The arguments of the REPL (`mode` Repl), `run` (Plain or Json) and `allow`.
+/// The arguments of the REPL (`mode` Repl), `run` (Plain or Json) and `mods`.
 struct Args {
     mode: Mode,
-    allow: bool,
     flags: Flags,
     resume: Option<Option<String>>,
     nested: bool,
     task: Option<String>,
-    rm: Option<usize>,
+    /// `henki mods ARGS`, and `henki allow ARGS` as `henki mods allow ARGS`: the manager's arguments, untouched.
+    mods: Option<Vec<OsString>>,
 }
 
 fn main() -> ExitCode {
@@ -49,12 +49,14 @@ fn main() -> ExitCode {
         sys::raw(false); // the terminal modes the REPL started with
         term::panic_line(&info.to_string());
     }));
-    let mut a = Args { mode: Mode::Plain, allow: false, flags: Flags::default(), resume: None, nested: false, task: None, rm: None };
+    let mut a = Args { mode: Mode::Plain, flags: Flags::default(), resume: None, nested: false, task: None, mods: None };
     let cmd = parse(&mut a);
     let out = Out::start(a.mode, tx.clone());
     ExitCode::from(match cmd {
-        Ok(None) if a.allow => allow(a, out),
-        Ok(None) => run(a, out, tx, rx, t0, early),
+        Ok(None) => match a.mods.take() {
+            Some(args) => mods(args, out),
+            None => run(a, out, tx, rx, t0, early),
+        },
         Ok(Some(text)) => {
             out.answer(&text);
             code(out, &Outcome::Ok, None)
@@ -77,10 +79,11 @@ fn parse(a: &mut Args) -> Result<Option<String>, lexopt::Error> {
     let text = match p.next()? {
         Some(Long("version")) => format!("henki {version} ({}, {arch}-{os})", option_env!("HENKI_COMMIT").unwrap_or("unknown")),
         Some(Long("help")) => format!("henki {version}: a small terminal agent\n\n{USAGE}"),
-        Some(Value(v)) if v == "run" || v == "allow" => {
-            a.allow = v == "allow";
-            String::new()
+        Some(Value(v)) if v == "mods" || v == "allow" => {
+            a.mods = Some((v == "allow").then_some(v).into_iter().chain(p.raw_args()?).collect());
+            return Ok(None);
         }
+        Some(Value(v)) if v == "run" => String::new(),
         // The REPL, whose flags start at the first argument.
         _ => {
             (p, a.mode) = (lexopt::Parser::from_env(), Mode::Repl);
@@ -90,47 +93,38 @@ fn parse(a: &mut Args) -> Result<Option<String>, lexopt::Error> {
     if !text.is_empty() {
         return p.next()?.map_or(Ok(Some(text)), |arg| Err(arg.unexpected()));
     }
-    let (run, session) = (a.mode != Mode::Repl && !a.allow, !a.allow);
+    let run = a.mode != Mode::Repl;
     while let Some(arg) = p.next()? {
         match arg {
             Long("config") => a.flags.config = Some(p.value()?.into()),
             Long("json") if run => a.mode = Mode::Json,
             Long("max-steps") if run => a.flags.max_steps = Some(p.value()?.parse()?),
             Long("max-seconds") if run => a.flags.max_seconds = Some(p.value()?.parse()?),
-            Long("approve") if session => match p.value()?.string()?.as_str() {
+            Long("approve") => match p.value()?.string()?.as_str() {
                 m @ ("ask" | "auto") => a.flags.approve = Some(m == "auto"),
                 m => return Err(format!("--approve takes ask or auto, not {m}").into()),
             },
-            Long("model") if session => a.flags.model = Some(p.value()?.string()?),
-            Long("resume") if session => a.resume = Some(p.optional_value().map(|v| v.string()).transpose()?),
-            Long("nested") if session => a.nested = true,
+            Long("model") => a.flags.model = Some(p.value()?.string()?),
+            Long("resume") => a.resume = Some(p.optional_value().map(|v| v.string()).transpose()?),
+            Long("nested") => a.nested = true,
             Value(v) if run && a.task.is_none() => a.task = Some(v.string()?),
-            Value(v) if !session && v == "rm" && a.rm.is_none() => a.rm = Some(p.value()?.parse()?),
             arg => return Err(arg.unexpected()),
         }
     }
     if run && a.task.is_none() && a.resume.is_none() { Err("missing TASK".into()) } else { Ok(None) }
 }
 
-/// `henki allow [--config FILE] [rm N]`: lists the rules of the allow file in the config dir, or removes one. It loads
-/// no config, so it works on a broken config or allow file, and inside henki too.
-fn allow(a: Args, out: Out) -> u8 {
-    let home = PathBuf::from(std::env::var_os("HOME").unwrap_or_default());
-    let config = a.flags.config.unwrap_or_else(|| home.join(".config/henki/config.toml"));
-    let file = std::env::current_dir().unwrap_or_default().join(config).with_file_name("allow");
-    // As for the config: a HOME that is not absolute would name a file below the working directory, and show `~` wrong.
-    let home = Some(home).filter(|h| h.is_absolute()).ok_or_else(|| "HOME is not set; fix: set HOME to your home directory".to_string());
-    let o = match home.and_then(|h| a.rm.map_or_else(|| Ok(allow::list(&file, &h)), |n| allow::remove(&file, n, &h).map(|l| vec![l]))) {
-        Ok(lines) => {
-            lines.iter().for_each(|l| out.answer(l));
-            Outcome::Ok
-        }
-        Err(e) => {
-            out.note(&e);
-            Outcome::error("config", e)
-        }
-    };
-    code(out, &o, None)
+/// `henki mods ARGS`: henki becomes the shipped manager, with its environment plus HENKI_BIN, and the signals it blocks
+/// and ignores back to their defaults. No config is read and no nested check runs, so it repairs a broken setup, from
+/// inside henki too. Returns only on failure.
+fn mods(args: Vec<OsString>, out: Out) -> u8 {
+    let mut env = Env::os();
+    let found = config::which("henki-mods", env.get("PATH"), true);
+    env.0.push(("HENKI_BIN".into(), std::env::current_exe().unwrap_or_default().into()));
+    let e = found.map_or_else(|| "not found".into(), |m| supervise::exec(&m, &args, &env.0).to_string());
+    let e = format!("henki mods needs henki-mods next to henki or on PATH: {e}; fix: reinstall henki");
+    out.note(&e);
+    code(out, &Outcome::error("config", e), None)
 }
 
 /// `henki run` (startup, one turn, the `result`, the session end) and the REPL (startup, then `repl::run`).

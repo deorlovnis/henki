@@ -2,7 +2,7 @@
 //! that henki kills by group and, on Linux, by sweeping every descendant. Also the user's own `!cmd`, on the terminal.
 use crate::{config::Env, sys, term, term::head_end, types::End, types::Ev, types::ToolOutput, types::lock};
 use std::sync::{Arc, Condvar, Mutex, OnceLock, PoisonError, mpsc, mpsc::Sender};
-use std::{collections::VecDeque, ffi::OsString, fs::File, os::unix::process::ExitStatusExt, thread};
+use std::{collections::VecDeque, ffi::OsString, fs::File, os::unix::process::CommandExt, os::unix::process::ExitStatusExt, thread};
 use std::{io, io::Read, io::Write, path::Path, path::PathBuf, process::Child, process::Command, process::Stdio, time::Duration, time::Instant};
 
 pub const GRACE: Duration = Duration::from_millis(300);
@@ -75,19 +75,19 @@ pub fn spawn(bash: &Path, cmd: &str, cwd: &Path, env: &[(OsString, OsString)], c
     Ok(pgid)
 }
 
-/// MAIN thread only. The user's `!cmd`: `bash --noprofile --norc -c CMD` in henki's own process group on the terminal
-/// (stdin, stdout and stderr inherited), exactly `env`; not in the ledger, though a `!cmd &` job it leaves is counted and
-/// swept like a call's. A waiter thread reaps it and sends one `Ev::BangDone { tag, code }` (128 + N when signal N ended
-/// it). Returns the pid.
-pub fn bang(bash: &Path, cmd: &str, cwd: &Path, env: &[(OsString, OsString)], tag: u32, tx: &Sender<Ev>) -> io::Result<i32> {
+/// MAIN thread only. The user's own command, `prog ARGS` (`!cmd`: `bash --noprofile --norc -c CMD`; `/mods`: the
+/// manager), in henki's own process group on the terminal (stdin, stdout and stderr inherited), exactly `env`; not in the
+/// ledger, though a `!cmd &` job it leaves is counted and swept like a call's. A waiter thread reaps it and sends one
+/// `Ev::BangDone { tag, code }` (128 + N when signal N ended it). Returns the pid.
+pub fn bang(prog: &Path, args: &[OsString], cwd: &Path, env: &[(OsString, OsString)], tag: u32, tx: &Sender<Ev>) -> io::Result<i32> {
     let (tx, (give, take)) = (tx.clone(), mpsc::channel::<Child>());
     // The waiter starts before the fork, so nothing can fail once the command runs.
     thread::Builder::new().spawn(move || {
         let code = take.recv().map(|mut c| c.wait().map_or(-1, |st| st.code().unwrap_or_else(|| 128 + st.signal().unwrap_or(0))));
         let _ = code.map(|code| tx.send(Ev::BangDone { tag, code }));
     })?;
-    let mut c = Command::new(bash);
-    c.args(["--noprofile", "--norc", "-c", cmd]).current_dir(cwd).env_clear().envs(env.iter().map(|(k, v)| (k, v)));
+    let mut c = Command::new(prog);
+    c.args(args).current_dir(cwd).env_clear().envs(env.iter().map(|(k, v)| (k, v)));
     sys::bang_setup(&mut c);
     // As before a call: the children henki had before it started anything are fixed first, so the job is not one of them.
     INHERITED.get_or_init(|| children(&sys::procs()));
@@ -96,6 +96,14 @@ pub fn bang(bash: &Path, cmd: &str, cwd: &Path, env: &[(OsString, OsString)], ta
     let pid = child.id() as i32;
     let _ = give.send(child);
     Ok(pid)
+}
+
+/// Replaces henki with `prog ARGS` (the manager), exactly `env`, the four signals back to their default and unblocked
+/// first (`sys::bang_setup`). Returns only on failure.
+pub fn exec(prog: &Path, args: &[OsString], env: &[(OsString, OsString)]) -> io::Error {
+    let mut c = Command::new(prog);
+    sys::bang_setup(c.args(args).env_clear().envs(env.iter().map(|(k, v)| (k, v))));
+    c.exec()
 }
 
 /// Sends `sig` (0 probes) to every group in the ledger, drops the groups that are gone (ESRCH), returns how many remain.

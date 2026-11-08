@@ -1,9 +1,11 @@
 //! The line REPL: a banner, a prompt, `/` commands, `!cmd`, and one turn per message, on the terminal henki was
 //! started from.
-use crate::{allow, http, supervise, sys, term, turn::Session, turn::outcome_line, types::Outcome, types::Stop};
+use crate::{allow, config, http, supervise, sys, term, turn::Session, turn::outcome_line, types::Outcome, types::Stop};
+use std::{ffi::OsString, path::Path};
 
 const HELP: &str = "/exit  quit (also Ctrl-D)
-/allow  list the allow rules; /allow rm N removes rule N
+/mods [ARGS]  the module manager on this terminal (henki mods ARGS)
+/allow [rm N]  list the allow rules, or remove rule N (henki mods allow)
 /help  this list
 !CMD  run CMD yourself on this terminal; the model is told you ran it
 Enter sends the message; a paste goes into it whole (up to 1 MiB, newlines kept) and is never a command.";
@@ -62,26 +64,31 @@ fn lines(s: &mut Session) -> u8 {
         // Only a line typed alone is a command; a paste, or a line that came with more input pending, is a message.
         let t = line.trim();
         let cmd = if typed { t } else { "" };
-        let rm = cmd.strip_prefix("/allow rm ").and_then(|n| n.trim().parse().ok());
-        match (cmd, rm, cmd.strip_prefix('!')) {
+        // `/mods ARGS` and `/allow ARGS` (`/mods allow ARGS`): the shipped manager, never a module's, its words split at spaces.
+        let (verb, rest) = cmd.split_once(' ').unwrap_or((cmd, ""));
+        let mods = matches!(verb, "/mods" | "/allow")
+            .then(|| verb.strip_prefix("/allow").map(|_| "allow").into_iter().chain(rest.split_whitespace()).map(OsString::from).collect::<Vec<_>>());
+        match (cmd, mods, cmd.strip_prefix('!')) {
             _ if t.is_empty() || cmd == "!" => {}
             ("/exit", ..) => return 0,
             ("/help", ..) => s.out().line(HELP),
-            ("/allow", ..) => allow::list(&s.cfg.allow.file, &s.cfg.home).iter().for_each(|l| s.out().line(l)),
-            (_, Some(n), _) => tripped |= remove(s, n),
+            (_, Some(args), _) => {
+                let (found, env) = (config::which("henki-mods", Some(s.cfg.user_path.as_ref()), true), s.command_env());
+                let Some(m) = found else {
+                    s.out().note("/mods needs henki-mods next to henki or on PATH; fix: reinstall henki");
+                    continue;
+                };
+                if let Err(code) = terminal(s, verb, &m, &args, &env, &mut tripped) {
+                    return code;
+                }
+            }
             _ if cmd.starts_with('/') => s.out().note(&format!("unknown command {t}; /help lists the commands")),
             (_, _, Some(cmd)) => {
-                let before = s.changed();
-                match s.bang(cmd) {
+                let (bash, env, args) = (s.cfg.bash.clone(), supervise::bang_env(&s.cfg.env), ["--noprofile", "--norc", "-c", cmd].map(OsString::from));
+                match terminal(s, "!cmd", &bash, &args, &env, &mut tripped) {
                     Ok(code) => code.iter().for_each(|n| notes += &format!("[the user ran in their terminal: {cmd} (exit {n})]\n")),
-                    Err(e) => return Outcome::from(e).exit() as u8, // a closed stdout, or TERM or HUP
+                    Err(code) => return code,
                 }
-                // Nothing is read again: what the command changed applies only after a restart. A file that differed
-                // before it changed outside it: named once, as `/allow rm` names it, and never blamed on the command.
-                let (old, new): (Vec<_>, Vec<_>) = s.changed().into_iter().partition(|p| before.contains(p));
-                old.iter().filter(|_| !tripped).for_each(|p| s.out().note(&format!("trust file changed: {}", p.display())));
-                new.iter().for_each(|p| s.out().note(&format!("{} changed by !cmd; restart henki to apply it (henki --resume continues this session)", p.display())));
-                tripped |= !old.is_empty() || !new.is_empty();
             }
             _ if tripped => s.out().note(TRIPPED),
             _ => {
@@ -106,16 +113,15 @@ fn lines(s: &mut Session) -> u8 {
     }
 }
 
-/// `/allow rm N`; true when it leaves the REPL TRIPPED. henki's own writes re-arm the tripwire, so a change it finds is
-/// an outside one: nothing is removed, and a restart shows the rules as they are.
-fn remove(s: &mut Session, n: usize) -> bool {
-    let changed = s.changed();
-    changed.iter().for_each(|p| s.out().note(&format!("trust file changed: {}", p.display())));
-    if !changed.is_empty() {
-        return true;
-    }
-    allow::remove(&s.cfg.allow.file, n, &s.cfg.home).map_or_else(|e| s.out().note(&e), |line| s.out().line(&line));
-    let loaded = allow::load(&s.cfg.allow.file, !s.cfg.auto);
-    s.rearm();
-    loaded.map(|a| s.cfg.allow = a).map_err(|e| s.out().note(&e)).is_err()
+/// `prog ARGS` on the terminal (`!cmd`, `/mods`); Err(the exit code) when the REPL ends there. Nothing is read again:
+/// what it changed applies only after a restart. A trust file that differed before it changed outside it: named once,
+/// and never blamed on the command.
+fn terminal(s: &mut Session, what: &str, prog: &Path, args: &[OsString], env: &[(OsString, OsString)], tripped: &mut bool) -> Result<Option<i32>, u8> {
+    let before = s.changed();
+    let code = s.bang(prog, args, env).map_err(|e| Outcome::from(e).exit() as u8)?; // a closed stdout, or TERM or HUP
+    let (old, new): (Vec<_>, Vec<_>) = s.changed().into_iter().partition(|p| before.contains(p));
+    old.iter().filter(|_| !*tripped).for_each(|p| s.out().note(&format!("trust file changed: {}", p.display())));
+    new.iter().for_each(|p| s.out().note(&format!("{} changed by {what}; restart henki to apply it (henki --resume continues this session)", p.display())));
+    *tripped |= !old.is_empty() || !new.is_empty();
+    Ok(code)
 }

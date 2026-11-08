@@ -71,7 +71,7 @@ pub struct Config {
 }
 
 /// The HENKI_* variables henki reads or sets for its children; any other gives a notice.
-const KNOWN: [&str; 6] = ["HENKI_MODEL", "HENKI_BASE_URL", "HENKI_DEPTH", "HENKI_SESSION", "HENKI_USER_PATH", "HENKI_VERSION"];
+const KNOWN: [&str; 8] = ["HENKI_MODEL", "HENKI_BASE_URL", "HENKI_DEPTH", "HENKI_SESSION", "HENKI_USER_PATH", "HENKI_VERSION", "HENKI_CONFIG", "HENKI_BIN"];
 const KEYS: &str = "model, base_url, dialect, api_key, approve, tools, ext, shadow, pass_env, max_steps, max_seconds, tool_timeout_s, output_cap, context_window, max_tokens";
 /// The integer keys and their ranges; `context_window` also takes 0 (unknown).
 #[rustfmt::skip]
@@ -173,9 +173,7 @@ pub fn load(f: &Flags, env: &Env, cwd: &Path) -> Result<Config, String> {
     let found = ext::discover(&paths, listed.is_none() && !explicit, &c.shadow, env.get("PATH").unwrap_or_default()).map_err(at_ext)?;
     (c.exts, c.user_path) = (found.exts, found.user_path);
     // Looked up on the user PATH, so no extension's bin/ supplies the shell henki runs.
-    let exe = |b: &PathBuf| fs::metadata(b).is_ok_and(|m| m.is_file() && m.mode() & 0o111 != 0);
-    let dirs = std::env::split_paths(&c.user_path).filter(|d| d.is_absolute());
-    c.bash = dirs.map(|d| d.join("bash")).find(exe).ok_or("bash is not on PATH; fix: install bash, or add its directory to PATH")?;
+    c.bash = which("bash", Some(c.user_path.as_ref()), false).ok_or("bash is not on PATH; fix: install bash, or add its directory to PATH")?;
     let agents = c.dir.join("AGENTS.md");
     if agents.exists() {
         let text = read(&agents, 4 << 10)?;
@@ -206,6 +204,14 @@ pub fn load(f: &Flags, env: &Env, cwd: &Path) -> Result<Config, String> {
     // taken for the state henki read.
     c.snap = c.trust.iter().map(|p| (p.clone(), sys::stamp(p))).collect();
     Ok(c)
+}
+
+/// `name` next to henki's realpath when `near` (the release tarball's bin/), else the first executable `name` in the
+/// absolute dirs of `path`.
+pub fn which(name: &str, path: Option<&OsStr>, near: bool) -> Option<PathBuf> {
+    let here = near.then(|| std::env::current_exe().and_then(fs::canonicalize).ok()).flatten().map(|e| e.with_file_name(name));
+    let dirs = std::env::split_paths(path.unwrap_or_default()).filter(|d| d.is_absolute()).map(|d| d.join(name));
+    here.into_iter().chain(dirs).find(|b| fs::metadata(b).is_ok_and(|m| m.is_file() && m.mode() & 0o111 != 0))
 }
 
 /// One key into `c`. Err: "PROBLEM; fix: ...".

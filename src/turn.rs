@@ -17,7 +17,7 @@ pub const SLICE: Duration = Duration::from_millis(50); // how often a kill step 
 // The 1,800 s attempt limit is `http::LIMITS.request`, held in `Session.lim` so a unit test can shorten it.
 
 pub struct Session {
-    /// The REPL reads it (the banner, the allow rules) and replaces `cfg.allow` after removing a rule.
+    /// The REPL reads it: the banner, the allow rules, the paths and the environment for `!cmd` and `/mods`.
     /// Its `snap` is what the tripwire compares with: the trust files as `config::load` found them.
     pub(crate) cfg: Config,
     /// The signal that ended the last wait: INT and QUIT cancel a REPL turn, TERM and HUP end the REPL (and stay while
@@ -199,13 +199,16 @@ impl Session {
         got
     }
 
-    /// `!CMD` on the terminal: its exit code, None when bash did not start (a notice says why). INT and QUIT reach the
-    /// command alone (it runs in henki's process group); TERM, HUP and a closed stdout SIGKILL it and return Err.
-    pub fn bang(&mut self, cmd: &str) -> Result<Option<i32>, Stop> {
+    /// `prog ARGS` on the terminal with exactly `env` (`!CMD`, `/mods`): its exit code, None when it did not start (a
+    /// notice says why). INT and QUIT reach the command alone (it runs in henki's process group); TERM, HUP and a closed
+    /// stdout SIGKILL it and return Err.
+    pub fn bang(&mut self, prog: &Path, args: &[OsString], env: &[(OsString, OsString)]) -> Result<Option<i32>, Stop> {
         // The line's end and bracketed paste off reach the terminal before the command writes to it.
         self.sync().or_else(|s| if matches!(s, Stop::Signal(libc::SIGINT | libc::SIGQUIT)) { Ok(()) } else { Err(s) })?;
-        let (tag, env) = (self.next_tag(), supervise::bang_env(&self.cfg.env));
-        let Ok(pid) = supervise::bang(&self.cfg.bash, cmd, &self.cfg.cwd, &env, tag, &self.tx).map_err(|e| self.out.note(&tools::not_started(&e))) else { return Ok(None) };
+        let tag = self.next_tag();
+        let Ok(pid) = supervise::bang(prog, args, &self.cfg.cwd, env, tag, &self.tx).map_err(|e| self.out.note(&format!("cannot start {}: {e}", prog.display()))) else {
+            return Ok(None);
+        };
         let mut got = self.wait(tag, None);
         while let Err(Stop::Signal(libc::SIGINT | libc::SIGQUIT)) = got {
             got = self.wait(tag, None); // the command got it too
@@ -214,12 +217,18 @@ impl Session {
         Ok(done.and_then(|ev| if let Ev::BangDone { code, .. } = ev { Some(code) } else { None }))
     }
 
+    /// A typed command's environment (`/mods`): the tool child's, plus HENKI_CONFIG (the config dir) and HENKI_BIN.
+    pub fn command_env(&self) -> Vec<(OsString, OsString)> {
+        let bin = std::env::current_exe().unwrap_or_default();
+        self.env.iter().cloned().chain([("HENKI_CONFIG".into(), self.cfg.dir.clone().into()), ("HENKI_BIN".into(), bin.into())]).collect()
+    }
+
     /// Every trust file whose stamps differ from the snapshot, in `cfg.trust` order.
     pub fn changed(&self) -> Vec<PathBuf> {
         self.cfg.snap.iter().filter(|(p, s)| sys::stamp(p) != *s).map(|(p, _)| p.clone()).collect()
     }
 
-    /// A new stamp of the allow file, after henki's own write to it (`always`, `/allow rm`) and right after a `changed()`
+    /// A new stamp of the allow file, after henki's own write to it (`always`) and right after a `changed()`
     /// that was empty. Every other trust file keeps its stamp, so no outside change is ever absorbed.
     pub fn rearm(&mut self) {
         self.cfg.snap.iter_mut().filter(|(p, _)| *p == self.cfg.allow.file).for_each(|(p, s)| *s = sys::stamp(p));

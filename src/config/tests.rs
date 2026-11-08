@@ -510,9 +510,9 @@ fn config_ignores_xdg_config_home() {
 #[test]
 fn config_unknown_henki_env_notice() {
     let t = T::new();
-    let silent = [("HENKI_DEPTH", "1"), ("HENKI_SESSION", "x"), ("HENKI_USER_PATH", "/bin"), ("HENKI_VERSION", "0.1.0")];
-    let c = t.load_env(&format!("{BASE}context_window = 8192\n"), &[&silent[..], &[("HENKI_FOO", "1"), ("HENKI_CONFIG", "/x")]].concat()).unwrap();
-    assert_eq!(c.notices, ["ignoring HENKI_FOO: henki does not read it", "ignoring HENKI_CONFIG: henki does not read it"]);
+    let silent = [("HENKI_DEPTH", "1"), ("HENKI_SESSION", "x"), ("HENKI_USER_PATH", "/bin"), ("HENKI_VERSION", "0.1.0"), ("HENKI_CONFIG", "/x"), ("HENKI_BIN", "/y")];
+    let c = t.load_env(&format!("{BASE}context_window = 8192\n"), &[&silent[..], &[("HENKI_FOO", "1"), ("HENKI_JOURNAL", "/x")]].concat()).unwrap();
+    assert_eq!(c.notices, ["ignoring HENKI_FOO: henki does not read it", "ignoring HENKI_JOURNAL: henki does not read it"]);
     assert!(t.load_env(&format!("{BASE}context_window = 8192\n"), &silent).unwrap().notices.is_empty());
 }
 
