@@ -455,8 +455,10 @@ or else on the user's PATH (never a module's), with ARGS split at spaces. A past
 - **The new henki** is `henki` (its realpath) with this henki's arguments without `--resume` and `--resume=ID`, so
   `--config`, `--approve`, `--model`, `--nested` and every `--port` stay, then `--resume=ID`; it gets the environment
   henki started with. `henki run` has no hand-off. In `henki serve` (front/1) the command runs with no terminal, its
-  output is a `command_output` record, henki asks none of these questions, and `send` TEXT and a new henki's argv are
-  `next` records for the frontend; what henki refuses is a `reject`.
+  output is a `command_output` record, henki asks none of these questions, and `send` TEXT and a new henki's argv
+  (with the trust files the command changed) are `next` records for the frontend; what henki refuses, and each line
+  about the hand-off the REPL notes (a trust file changed or listed, an ignored `HENKI_NEXT`, where a session stays), is
+  a `reject`.
 - **The manager** writes `restart` into `HENKI_NEXT` after every change (add, on, off, rm, swap, allow rm), and without
   `HENKI_NEXT` prints `restart henki (or /exit and start again) to load the change`. `HENKI_CONFIG`, when set, is the
   config dir it changes.
@@ -802,22 +804,27 @@ socket, a network) must authenticate the other side itself.
 The json/1 records, as `henki run --json` writes them: a resume's repairs, the `session` record, then every record the
 session journals (without `close`), with the `text` and `reasoning` records as replies stream; no `result`. Startup
 notices come with the first turn, journaled then. A start henki refuses writes one `result` record with `session`
-`null`, then henki exits (as `run --json`). stderr is empty unless henki crashes. Three more kinds are on stdout only,
+`null`, then henki exits (as `run --json`). stderr is empty unless henki crashes. The REPL's banner is not written:
+the command `allow` lists the allow rules (the banner's `allow:` lines). Three more kinds are on stdout only,
 never in the journal, with no `ts`:
 
 | Kind | Fields |
 |---|---|
 | `reject` | `t` `why` |
 | `command_output` | `t` `text` `exit` |
-| `next` | `t` `send?` `argv?` |
+| `next` | `t` `send?` `argv?` `changed?` |
 
-- `reject`: a line henki did not take now, or why a command did nothing (an unknown command, a trust file changed);
-  `why` may change.
+- `reject`: a line henki did not take now, why a command did nothing (an unknown command, a trust file changed), or a
+  line about its hand-off that the REPL notes (handoff/1: `changed while /NAME ran: PATH`, one per file); `why` may
+  change.
 - `command_output`: what a `command` printed, stdout and stderr as one stream (over 1 MiB: its first and last 512 KiB
   around a cut marker), and its exit code, `null` when a signal ended it.
 - `next`: what a command handed back (handoff/1). `send`: the text, shown to the person; the frontend sends it as a
-  `send` if the person wants it. `argv`: a new henki to start (`resume`, `new`, `restart`; the REPL's question is the
-  frontend's to ask); henki then closes the session and exits 0, and the frontend starts the argv after that exit.
+  `send` if the person wants it. `argv`: a new henki to start (`resume`, `new`, `restart`); henki then closes the
+  session and exits 0, and the frontend starts the argv after that exit. `changed`, always with `argv`: the trust files
+  the command changed (as the REPL shows them, `~/` for home), maybe none. The REPL's question is the frontend's to
+  ask: before it starts the argv it must show the person every path in `changed` and get their yes (the REPL asks
+  `restart on these changes? [y/N]`), since the new henki trusts them.
 
 ### In (stdin)
 

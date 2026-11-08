@@ -186,11 +186,12 @@ fn run(a: Args, out: Out, tx: Sender<Ev>, rx: Receiver<Ev>, t0: Instant, early: 
     if repl {
         let (code, next) = repl::run(&mut s);
         let out = s.into_out();
-        // serve hands a new henki's argv to its frontend, which starts it once this one exits.
-        next.iter().filter(|_| serve).for_each(|n| out.record(&json!({"t": "next", "argv": n.iter().map(|a| a.to_string_lossy()).collect::<Vec<_>>()})));
+        // serve hands a new henki's argv to its frontend, which starts it once this one exits, and the trust files the
+        // command changed, which the frontend shows the person first.
+        next.iter().filter(|_| serve).for_each(|(n, c)| out.record(&json!({"t": "next", "argv": n.iter().map(|a| a.to_string_lossy()).collect::<Vec<_>>(), "changed": c})));
         out.flush(Instant::now() + Duration::from_secs(5));
         // A command handed back a new henki (`handoff`): this one is closed, its bindings ended, so it becomes that one.
-        let Some((exe, args)) = next.as_deref().filter(|_| !serve).and_then(<[OsString]>::split_first) else { return code };
+        let Some((exe, args)) = next.as_ref().filter(|_| !serve).and_then(|n| n.0.split_first()) else { return code };
         let e = supervise::exec(exe.as_ref(), args, &Env::os().0);
         term::panic_line(&format!("cannot start {}: {e}", exe.to_string_lossy()));
         return 2;

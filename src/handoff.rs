@@ -3,7 +3,8 @@
 //! ID@N`: a fork), `new` or `restart`. No text is sent once a trust file changed; a new henki (new, resume, restart) on
 //! trust files the command changed is asked for, naming them; after a change from before the command there is no
 //! one-key restart. A `restart` after a change to the history link starts a new session: the old one stays in the store
-//! it was kept in. In `henki serve` what henki refuses is a `reject` record (front/1).
+//! it was kept in. In `henki serve` (front/1) what henki refuses or notes is a `reject` record, and a new henki's argv
+//! is a `next` record with the trust files the command changed, for the frontend to show and confirm.
 use crate::{allow, port, sys, term, turn::Session, types::Stop};
 use std::{ffi::OsString, fs, io::Read, os::unix::fs::MetadataExt, path::Path, path::PathBuf};
 
@@ -14,8 +15,11 @@ pub enum Next {
     /// Shown whole, labelled `[from /NAME]`; Enter sends it, n drops it.
     Send(String),
     /// Close the session as /exit does, then exec this argv.
-    Exec(Vec<OsString>),
+    Exec(Again),
 }
+
+/// A new henki's argv, and the trust files (as shown) the command changed: `henki serve`'s frontend asks about them.
+pub type Again = (Vec<OsString>, Vec<String>);
 
 const NEXT_MAX: u64 = 64 << 10;
 
@@ -28,7 +32,7 @@ pub fn run(s: &mut Session, name: &str, prog: &Path, module: Option<&Path>, args
     let Ok(made) = made.map_err(|e| s.reject(&format!("/{name}: cannot make {}: {e}", next.display()))) else { return Ok(Next::Stay) };
     let before = s.changed();
     // A trust file that differed before the command: named once, and never blamed on it.
-    before.iter().filter(|_| !tripped).for_each(|p| s.out().note(&format!("trust file changed: {}", p.display())));
+    before.iter().filter(|_| !tripped).for_each(|p| s.reject(&format!("trust file changed: {}", p.display())));
     let (pre, env) = (tripped || !before.is_empty(), s.command_env(module, &next));
     let code = s.bang(prog, args, &env).inspect_err(|_| _ = fs::remove_file(&next))?;
     let changed: Vec<PathBuf> = s.changed().into_iter().filter(|p| !before.contains(p)).collect();
@@ -38,10 +42,11 @@ pub fn run(s: &mut Session, name: &str, prog: &Path, module: Option<&Path>, args
     let gone = fs::symlink_metadata(&next).is_err(); // removed by the command: nothing handed back
     let ok = gone || opened.is_some_and(|(f, _)| f.take(NEXT_MAX + 1).read_to_end(&mut b).is_ok() && b.len() as u64 <= NEXT_MAX);
     let _ = fs::remove_file(&next);
-    changed.iter().for_each(|p| s.out().note(&format!("changed while /{name} ran: {}", allow::shown(p, &s.cfg.home))));
+    let shown: Vec<String> = changed.iter().map(|p| allow::shown(p, &s.cfg.home)).collect();
+    shown.iter().for_each(|p| s.reject(&format!("changed while /{name} ran: {p}")));
     code.filter(|&c| c != 0).iter().for_each(|c| s.out().note(&format!("/{name} exited {c}")));
     let text = String::from_utf8(b).ok().filter(|_| ok);
-    text.is_none().then(|| s.out().note(&format!("/{name}: HENKI_NEXT is not henki's file, over 64 KiB or not UTF-8; ignored")));
+    text.is_none().then(|| s.reject(&format!("/{name}: HENKI_NEXT is not henki's file, over 64 KiB or not UTF-8; ignored")));
     let text = text.unwrap_or_default();
     let (line, body) = text.split_once('\n').unwrap_or((&text, ""));
     let (verb, arg) = line.trim().split_once(' ').map_or((line.trim(), ""), |(v, a)| (v, a.trim()));
@@ -63,8 +68,8 @@ pub fn run(s: &mut Session, name: &str, prog: &Path, module: Option<&Path>, args
         "resume" if !port::session_id(p) || n.is_some_and(|n| n.parse::<u64>().is_err()) => (s.reject(&format!("/{name}: cannot resume {:?}", term::escape(arg))), stay).1,
         "resume" if !s.yes(&n.map_or(format!("switch to session {arg}{to}? [y/N] "), |n| format!("fork session {p} at line {n}{to}? [y/N] ")))? => stay,
         "new" | "restart" if !changed.is_empty() && !s.yes("restart on these changes? [y/N] ")? => stay,
-        "restart" if moved => (s.resumable().iter().for_each(|i| s.out().note(&kept(i))), Next::Exec(again(None))).1,
-        "new" | "resume" | "restart" => Next::Exec(again(id)),
+        "restart" if moved => (s.resumable().iter().for_each(|i| s.reject(&kept(i))), Next::Exec((again(None), shown))).1,
+        "new" | "resume" | "restart" => Next::Exec((again(id), shown)),
         v => (s.reject(&format!("/{name} handed back {:?}, which henki does not know", term::escape(&v.chars().take(40).collect::<String>()))), stay).1,
     })
 }

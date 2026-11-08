@@ -14,7 +14,7 @@ const TRIPPED: &str = "a trust file changed; restart henki to go on (henki --res
 
 /// From the banner to the exit code, and the argv of the henki a command handed back (`handoff`); closes the session on
 /// every path.
-pub fn run(s: &mut Session) -> (u8, Option<Vec<OsString>>) {
+pub fn run(s: &mut Session) -> (u8, Option<handoff::Again>) {
     // What henki inherited is not its own: from here on every process below it counts, a `!cmd &` job included.
     supervise::reap();
     banner(s);
@@ -52,7 +52,7 @@ fn banner(s: &Session) {
 }
 
 /// IDLE and TRIPPED: one line at a time, until the exit code. TRIPPED (a trust file changed) refuses messages.
-fn lines(s: &mut Session) -> (u8, Option<Vec<OsString>>) {
+fn lines(s: &mut Session) -> (u8, Option<handoff::Again>) {
     let (mut notes, mut tripped) = (String::new(), false);
     loop {
         let (line, typed) = match s.line("> ") {
@@ -121,12 +121,12 @@ fn lines(s: &mut Session) -> (u8, Option<Vec<OsString>>) {
 /// What a command handed back, as the REPL's next step: Ok(Some(TEXT)) a message to send, Ok(None) the next prompt,
 /// Err the REPL's end (a new henki's argv for Exec). A typed message is a `Send` too, sent without a question. In
 /// `henki serve` a command's text is a `next` record instead, which its frontend sends or not.
-fn after(s: &mut Session, name: &str, next: Result<Next, Stop>, tripped: &mut bool) -> Result<Option<String>, (u8, Option<Vec<OsString>>)> {
+fn after(s: &mut Session, name: &str, next: Result<Next, Stop>, tripped: &mut bool) -> Result<Option<String>, (u8, Option<handoff::Again>)> {
     let end = |e: Stop| (Outcome::from(e).exit() as u8, None);
     match next.map_err(end)? {
         Next::Stay => Ok(None),
         Next::Tripped => Ok(None).inspect(|_| *tripped = true),
-        Next::Exec(argv) => Err((0, Some(argv))),
+        Next::Exec(again) => Err((0, Some(again))),
         Next::Send(text) if name.is_empty() => Ok(Some(text)),
         Next::Send(text) if s.out().json() => Ok(None).inspect(|_| s.out().record(&serde_json::json!({"t": "next", "send": text}))),
         Next::Send(text) => {

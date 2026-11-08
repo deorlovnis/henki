@@ -75,8 +75,8 @@ impl Session {
         }
     }
 
-    /// `reply` is y or yes. Always yes in `henki serve`: what the question would start is a `next` record, which the
-    /// frontend acts on or not.
+    /// `reply` is y or yes. Always yes in `henki serve`: what the question would start is a `next` record, with the
+    /// trust files the command changed, which the frontend asks the person about.
     pub fn yes(&mut self, prompt: &str) -> Result<bool, Stop> {
         Ok(self.out.json() || matches!(self.reply(prompt)?.as_deref(), Some("y" | "yes")))
     }

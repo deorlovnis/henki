@@ -35,12 +35,14 @@ pub fn reader(tx: Sender<Ev>) -> Option<Reader> {
 }
 
 /// A command line as the REPL's line: idle, a `send`'s text, which is not typed (never a command), or a `command` as
-/// the typed line `/NAME ARGS` (not `/exit` or `/help`: EOF ends the session); at the question about call `asked`, the verdict of an `answer` for it (yes, no or
-/// always). Anything else is a `reject` and an empty typed line: nothing when idle, a no at a question.
+/// the typed line `/NAME ARGS`, NAME a command's name (`[A-Za-z0-9._-]+`, not `exit` or `help`: EOF ends the session);
+/// at the question about call `asked`, the verdict of an `answer` for it (yes, no or always). Anything else is a
+/// `reject` and an empty typed line: nothing when idle, a no at a question.
 pub fn take(s: &Session, line: &[u8], asked: Option<&str>) -> (String, bool) {
     let v: Value = serde_json::from_slice(line).unwrap_or_default();
     let verdict = v["verdict"].as_str().filter(|a| v["c"] == "answer" && asked.is_some_and(|id| v["id"] == id) && ["yes", "no", "always"].contains(a));
-    let cmd = v["name"].as_str().filter(|n| v["c"] == "command" && !["exit", "help"].contains(n)).map(|n| format!("/{n} {}", v["args"].as_str().unwrap_or_default()));
+    let named = |n: &&str| !n.is_empty() && n.bytes().all(|b| b.is_ascii_alphanumeric() || b"._-".contains(&b)) && !["exit", "help"].contains(n);
+    let cmd = v["name"].as_str().filter(|n| v["c"] == "command" && named(n)).map(|n| format!("/{n} {}", v["args"].as_str().unwrap_or_default()));
     match (asked, v["text"].as_str().filter(|t| v["c"] == "send" && !t.trim().is_empty()), cmd, verdict) {
         (None, Some(t), ..) => (t.to_string(), false),
         (None, _, Some(c), _) => (c, true),
