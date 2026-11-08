@@ -1726,6 +1726,7 @@ t_history_live() {
   chmod 755 "$W/tree/port/history"
   run add "$W/tree" --yes
   rc_is 0
+  sleep 1 && touch "$st/$sc/20261108T070000Z-open.jsonl" # std's newest-written session, though not its newest id
   printf 'y\ny\n' >"$W/yes" # swap? and import? (one terminal, read in turn)
   HENKI_MODS_TTY="$W/yes" run swap history tree
   rc_is 0
@@ -1744,7 +1745,7 @@ t_history_live() {
   out_lacks "cut"
   run_in "$work" history list
   out_has "$id"
-  out_has "20261108T070000Z-open"
+  out_has " 1   20261108T070000Z-open" # imported oldest-written first: the binding's newest is std's
   out_lacks "evil"
   run history import --yes
   out_has "imported 0 sessions (0 records) into history binding tree"

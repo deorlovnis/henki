@@ -591,12 +591,15 @@ lock/1 NAME STATE VERSION SOURCE_KIND SOURCE COMMIT HD1 ADDED HOW FLAGS
 - FLAGS is empty or a comma-separated list: `pin` (an update leaves the module as it is), `ref=REF` (the ref a URL
   install follows: the branch or tag it named, `HEAD` for the default branch; none when it named a commit),
   `yanked=malicious` or `yanked=buggy` (an index yanked this version; a malicious one stays off), `skill=hd1:HASH`
-  (the hd1 of the Agent Skill's directory the module was made from; a skill from a URL has `ref=` too), `mask=cmd/NAME`, one per masked command (`henki-mods off NAME/CMD`: the
-  link names a copy of the store copy without `cmd/CMD` and `cmd/CMD.md`, beside it as `ID.mHASH`, where HASH is 8 hex
-  digits of the SHA-256 of the masked names, sorted, one per line; HD1 stays the module's own).
+  (the hd1 of the Agent Skill's directory the module was made from; a skill from a URL has `ref=` too),
+  `mask=cmd/NAME`, one per masked command (`henki-mods off NAME/CMD`: the link names a copy of the store copy without
+  `cmd/CMD` and `cmd/CMD.md`, beside it as `ID.mHASH`, where HASH is 8 hex digits of the SHA-256 of the masked names,
+  sorted, one per line; HD1 stays the module's own).
 - A line whose first field is not `lock/1` (or `bind/1`, after them), or that holds a kind or flag henki-mods does not
   know, is refused: `this lock is newer than this henki-mods; upgrade henki`. So no rewrite of the lock drops what a
-  later henki-mods wrote.
+  later henki-mods wrote. The henki-mods of henki 0.2, which had no FLAGS, refuses the kinds `skill` and `index:INDEX`
+  and a `bind/1` line of a port it does not bind, but ignores field 11 on a line of kind `official`, `path` or `url`:
+  a pin, a mask or a yank there has no effect on it.
 - On means the link `CONFIG_DIR/ext/NAME` points at the module's store copy (or its masked copy); off means no link.
 - A profile is a file of lock/1 lines that `henki-mods init PROFILE` adds: lines of kind `official` (VERSION, COMMIT,
   HD1, ADDED and HOW `-`: the copy this henki ships) and of kind `index:INDEX` (a package pinned by VERSION and HD1).
@@ -817,10 +820,11 @@ the fix `henki --port history=std for this session, or henki mods swap history s
 a session. `list` is for tools (henki-mods, an import); henki itself does not call it.
 
 `henki-mods history list` and `history show` read a binding through `henki port`'s `list` and `read`.
-`henki-mods history import` copies std's sessions into a binding: for each journal, `create` with its id as the
-`hint` (`exists`: the binding has it, skipped) in the scope of the working directory the journal belongs to, then each
-complete line through `append`, as it is in the file. So an imported `close` keeps its `bytes` and a resumed `session`
-its `from_bytes`; henki reads neither in a binding's session. std's files are only read.
+`henki-mods history import` copies std's sessions into a binding: for each journal, oldest written first, `create`
+with its id as the `hint` (`exists`: the binding has it, skipped) in the scope of the working directory the journal
+belongs to, then each complete line through `append`, as it is in the file. So an imported `close` keeps its `bytes`
+and a resumed `session` its `from_bytes`; henki reads neither in a binding's session. std's files are only read. A
+binding whose `open(scope, null)` takes the session it wrote last (as std and tree do) then picks the one std would.
 
 `henki --resume=ID@N` forks (journal/1): henki reads session ID, checks its records 1 to N-1 (the dialect, tampering,
 the pairing) and only then calls `fork`; it then appends `close` and the new segment's `session` record with

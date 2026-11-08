@@ -4393,12 +4393,17 @@ std_count() { # [SCOPEDIR]
 # Copies std's sessions (every scope, or scope dir SCOPEDIR's) into H_EXE through `henki port`: for each journal,
 # `create` with its id as the hint (`exists`: the binding has it already, skipped), then each complete line through
 # `append`, as it is in the file (a `close` keeps its `bytes`, a resumed `session` its `from_bytes`). std's files are
-# only read, each once, into a copy: a session in use is copied as far as its last complete line. `henki port` is
-# started again every 100 sessions, so a binding that holds each session it creates releases them (one open file each).
+# only read, each once, into a copy, oldest written first: a session in use is copied as far as its last complete
+# line. `henki port` is started again every 100 sessions, so a binding that holds each session it creates releases
+# them (one open file each).
 import_std() { # [SCOPEDIR]
   local f id k cwd rec n ok=0 old=0 bad=0 recs=0 held=0 done
   hp_open
-  for f in "$ST"/sessions/${1:-*}/*.jsonl; do
+  # Oldest written first: a binding that orders a scope's sessions by when it last wrote them (as std does) then has
+  # the same newest session as std, so a plain --resume continues the same one after the swap.
+  # shellcheck disable=SC2012 # the names are session ids in hex scope dirs: no newline in them
+  ls -dtr -- "$ST"/sessions/${1:-*}/*.jsonl >"$HP/order" 2>/dev/null || :
+  while IFS= read -r f; do
     [ -s "$f" ] || continue
     id=${f##*/} id=${id%.jsonl} k=${f%/*}
     is_id "$id" || { bad=$((bad + 1)) && say "import: $(shown "$f") is not named by a session id; skipped" && continue; }
@@ -4423,7 +4428,7 @@ import_std() { # [SCOPEDIR]
     done <"$HP/s"
     recs=$((recs + n))
     if [ "$done" = 1 ]; then ok=$((ok + 1)); else bad=$((bad + 1)); fi
-  done
+  done <"$HP/order"
   hp_close
   say "imported $ok sessions ($(num "$recs") records) into $H_NAME; skipped $old (already there); $bad failed"
   [ "$bad" = 0 ] || { say "a failed session stays in the binding as far as it got (history/1 has no delete)" && return 1; }
