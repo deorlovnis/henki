@@ -1,7 +1,8 @@
 //! Extensions (`ext/2` modules): directories that teach the model a CLI and give the user commands. `NAME/doc.md`'s
 //! first line goes into the prompt; an optional `NAME/bin/` goes first on the tool PATH; `NAME/cmd/X` is the user's
-//! `/X` (`handoff`); `NAME/port/PORT` is a binding that only a link in `CONFIG/port/` runs.
-use crate::{allow, config, port};
+//! `/X` (`handoff`); `NAME/on/EVENT` watches the session (`observe`); `NAME/port/PORT` is a binding that only a link
+//! in `CONFIG/port/` runs.
+use crate::{allow, config, observe, port};
 use std::io;
 use std::path::{Path, PathBuf};
 use std::{collections::BTreeMap, collections::BTreeSet, ffi::OsStr, ffi::OsString, fmt::Display, fs, os::unix::ffi::OsStrExt, os::unix::fs::MetadataExt};
@@ -14,9 +15,10 @@ pub struct Ext {
     pub bin: Option<PathBuf>,  // <ext path>/NAME/bin when present
     pub cmds: Vec<String>,     // bin/ entry names, sorted bytewise
     pub user: Vec<String>,     // cmd/ entry names, sorted bytewise: the user's `/NAME` commands
-    pub prompt: bool,          // in the system prompt: with bin/, or with no cmd/ and no port/ (a doc for the model)
+    pub on: Vec<String>,       // on/ entry names, sorted bytewise: `EVENT` or `EVENT.wait` (observers)
+    pub prompt: bool,          // in the system prompt: with bin/, or with no cmd/, on/ or port/ (a doc for the model)
     pub shadows: Vec<PathBuf>, // user-PATH executables its commands shadow (each listed in `shadow`)
-    pub paths: Vec<PathBuf>,   // stamped by the tripwire: the NAME dir, doc.md, bin/, cmd/, port/ and each entry of them
+    pub paths: Vec<PathBuf>,   // stamped by the tripwire: the NAME dir, doc.md, bin/, cmd/, on/, port/ and each entry
     pub targets: Vec<PathBuf>, // realpaths of the symlinks among `paths` (protected)
 }
 
@@ -48,6 +50,9 @@ pub fn discover(paths: &[PathBuf], optional: bool, shadow: &[String], path: &OsS
                 return Err(format!("ext {name}: cmd/{c} is also in ext {}; fix: turn one of them off", o.name));
             }
             exts.push(x);
+            if exts.iter().map(|x| x.on.len()).sum::<usize>() > observe::MAX {
+                return Err(bad(&dir, format!("more than {} observers (on/ files) over all modules", observe::MAX), "turn a module off"));
+            }
         }
     }
     if let Some(s) = shadow.iter().find(|s| !s.split_once('/').is_some_and(|(e, c)| ext_name(e) && cmd_name(c))) {
@@ -69,16 +74,16 @@ pub fn discover(paths: &[PathBuf], optional: bool, shadow: &[String], path: &OsS
     Ok(Found { exts, user_path: dirs.join(":") })
 }
 
-/// One extension directory: doc.md, then the optional bin/, cmd/ and port/, ignored names, nothing else. Every link in
+/// One extension directory: doc.md, then the optional bin/, cmd/, on/ and port/, ignored names, nothing else. Every link in
 /// it stays inside it.
 fn one(dir: &Path, name: &str) -> Result<Ext, String> {
     let entries = names(dir).map_err(|e| bad(dir, e, "make it an extension directory, or move it out of the ext path"))?;
     // `port/` holds bindings that `CONFIG/port/` links, `eval/` the manager's tasks: henki runs nothing from either here.
     let known = |n: &&OsString| {
-        ["doc.md", "bin", "cmd", "port", "eval"].iter().any(|p| *n == p) || ["README", "LICENSE", "CHANGELOG", "."].iter().any(|p| n.as_bytes().starts_with(p.as_bytes()))
+        ["doc.md", "bin", "cmd", "on", "port", "eval"].iter().any(|p| *n == p) || ["README", "LICENSE", "CHANGELOG", "."].iter().any(|p| n.as_bytes().starts_with(p.as_bytes()))
     };
     if let Some(n) = entries.iter().find(|n| !known(n)) {
-        return Err(bad(dir, format!("unknown entry {}; ext/2 modules hold doc.md, bin/, cmd/, port/ and eval/", dir.join(n).display()), "move it out of the extension"));
+        return Err(bad(dir, format!("unknown entry {}; ext/2 modules hold doc.md, bin/, cmd/, on/, port/ and eval/", dir.join(n).display()), "move it out of the extension"));
     }
     // The whole doc steers the model as AGENTS.md does, so it is held to the same rules; line 1 is the summary.
     let doc = dir.join("doc.md");
@@ -95,9 +100,12 @@ fn one(dir: &Path, name: &str) -> Result<Ext, String> {
     }
     let mut paths = vec![dir.to_path_buf(), doc.clone()];
     let mut part = |d: &str| has(d).map_or(Ok(Vec::new()), |p| scan(&p, d, &mut paths));
-    let (cmds, user, ports) = (part("bin")?, part("cmd")?, part("port")?);
+    let (cmds, user, on, ports) = (part("bin")?, part("cmd")?, part("on")?, part("port")?);
     if let Some(c) = user.iter().find(|c| ["exit", "help", "mods", "allow"].contains(&c.as_str())) {
         return Err(bad(&dir.join("cmd").join(c), "a name henki keeps for its own command", "rename it"));
+    }
+    if let Some(o) = on.iter().find(|o| observe::parse(o).is_none()) {
+        return Err(bad(&dir.join("on").join(o), format!("not an event; on/ holds {}, and turn_start.wait or call_start.wait", observe::EVENTS.join(", ")), "rename it"));
     }
     if let Some(p) = ports.iter().find(|p| !port::PORTS.contains(&p.as_str())) {
         return Err(bad(&dir.join("port").join(p), format!("not a port; ports are {}", port::PORTS.join(", ")), "rename it, or move it out of port/"));
@@ -109,11 +117,11 @@ fn one(dir: &Path, name: &str) -> Result<Ext, String> {
         return Err(bad(p, "a link that leaves the module", "copy the file in"));
     }
     let targets = paths.iter().filter(|p| p.is_symlink()).filter_map(|p| fs::canonicalize(p).ok()).collect();
-    let prompt = bin.is_some() || (has("cmd").is_none() && has("port").is_none());
-    Ok(Ext { name: name.into(), line: line.into(), dir: dir.to_path_buf(), doc, bin, cmds, user, prompt, shadows: Vec::new(), paths, targets })
+    let prompt = bin.is_some() || ["cmd", "on", "port"].iter().all(|d| has(d).is_none());
+    Ok(Ext { name: name.into(), line: line.into(), dir: dir.to_path_buf(), doc, bin, cmds, user, on, prompt, shadows: Vec::new(), paths, targets })
 }
 
-/// The runnable entries of `dir` (`bin/`, `cmd/` or `port/` of a module) named by `cmd_name`, sorted bytewise; every
+/// The runnable entries of `dir` (`bin/`, `cmd/`, `on/` or `port/` of a module) named by `cmd_name`, sorted bytewise; every
 /// entry joins `paths`. A dot file that cannot run is no command (Finder's .DS_Store, the ._NAME files a copy from a
 /// Mac leaves), but it is watched: made runnable, it would be one. In cmd/, a NAME.md is a command's data, held to
 /// doc.md's rules. Anything else is refused.

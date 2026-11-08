@@ -36,6 +36,8 @@ pub enum Ev {
     Tool { tag: u32, out: ToolOutput },
     /// The end of `!cmd` `tag`: its exit code, 128 + N when signal N ended it.
     BangDone { tag: u32, code: i32 },
+    /// A `.wait` observer run of the event `tag` ended (`observe`).
+    Observed { tag: u32 },
     /// The output writer got EPIPE on stdout.
     OutputClosed,
 }

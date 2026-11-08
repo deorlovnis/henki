@@ -110,6 +110,7 @@ fn contracts_index() {
         ("ext/1", "henki"),
         ("ext/2", "henki"),
         ("handoff/1", "henki"),
+        ("observe/1", "henki"),
         ("port/1", "henki"),
         ("history/1", "henki"),
         ("conform/1", "henki"),

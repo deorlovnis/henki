@@ -9,6 +9,7 @@ mod files;
 mod handoff;
 mod http;
 mod journal;
+mod observe;
 mod openai;
 mod port;
 mod remote;
@@ -163,7 +164,7 @@ fn pipe((port, offer, exe): (&'static str, Vec<u64>, PathBuf), out: Out, ch: (Se
 /// `henki run` (startup, one turn, the `result`, the session end) and the REPL (startup, then `repl::run`).
 fn run(a: Args, out: Out, tx: Sender<Ev>, rx: Receiver<Ev>, t0: Instant, early: io::Result<()>) -> u8 {
     let (mut deadline, repl) = (None, a.mode == Mode::Repl);
-    let (cfg, ports, sid, hist, task, head, reader) = match start(a, &tx, &rx, t0, early, &mut deadline) {
+    let (cfg, ports, sid, hist, task, mut head, reader) = match start(a, &tx, &rx, t0, early, &mut deadline) {
         Ok(r) => r,
         Err(o) => {
             refuse(&out, &o, t0);
@@ -172,6 +173,7 @@ fn run(a: Args, out: Out, tx: Sender<Ev>, rx: Receiver<Ev>, t0: Instant, early: 
     };
     head.iter().for_each(|r| out.record(r));
     let mut s = Session::new(cfg, ports, sid, hist, out, (tx, rx), deadline, reader);
+    s.opened = head.pop(); // the `session` record, for `session_start`
     if repl {
         let (code, next) = repl::run(&mut s);
         s.into_out().flush(Instant::now() + Duration::from_secs(5));

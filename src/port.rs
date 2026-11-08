@@ -154,8 +154,8 @@ pub fn bind(cfg: &mut Config, deadline: Option<Instant>) -> Result<Ports, Outcom
     Ok(ports)
 }
 
-/// The kernel log of this process: bindings' stderr. In the spill dir, so the 24 h sweep removes it; a dot name, so it
-/// never matches a session's spill name.
+/// The kernel log of this process: bindings' stderr, observers' stdout and stderr. In the spill dir, so the 24 h sweep
+/// removes it; a dot name, so it never matches a session's spill name.
 pub fn kernel_log(cfg: &Config) -> PathBuf {
     cfg.state.join("spill").join(format!(".kernel-{}.log", std::process::id()))
 }

@@ -126,7 +126,7 @@ impl Remote {
     }
 
     fn end(&mut self, e: PortError) -> PortError {
-        supervise::kernel_end(self.child.take());
+        supervise::kernel_end(self.child.take(), true);
         self.dead = Some(e.clone());
         e
     }
@@ -144,7 +144,7 @@ impl Drop for Remote {
         if self.dead.is_none() && self.child.is_some() {
             let _ = self.call("bye", json!({}));
         }
-        supervise::kernel_end(self.child.take());
+        supervise::kernel_end(self.child.take(), true);
     }
 }
 
@@ -241,7 +241,7 @@ pub fn pipe(port: &'static str, exe: &Path, state: &Path, env: &[(OsString, OsSt
     while let Ok(Ev::Input { bytes: Some(b), .. }) = rx.recv() {
         let q: Value = serde_json::from_slice(&b).unwrap_or_default();
         if q["kill"] == true {
-            return (supervise::kernel_end(r.child.take()), Outcome::Ok).1;
+            return (supervise::kernel_end(r.child.take(), true), Outcome::Ok).1;
         }
         line(r.call(q["method"].as_str().unwrap_or_default(), q["params"].clone()).map_or_else(fail, |v| json!({"result": v})));
     }

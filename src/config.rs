@@ -76,8 +76,8 @@ pub struct Config {
 
 /// The HENKI_* variables henki reads or sets for its children; any other gives a notice.
 #[rustfmt::skip]
-const KNOWN: [&str; 11] = ["HENKI_MODEL", "HENKI_BASE_URL", "HENKI_DEPTH", "HENKI_SESSION", "HENKI_USER_PATH", "HENKI_VERSION", "HENKI_CONFIG", "HENKI_BIN",
-    "HENKI_STATE", "HENKI_MODULE", "HENKI_NEXT"];
+const KNOWN: [&str; 12] = ["HENKI_MODEL", "HENKI_BASE_URL", "HENKI_DEPTH", "HENKI_SESSION", "HENKI_USER_PATH", "HENKI_VERSION", "HENKI_CONFIG", "HENKI_BIN",
+    "HENKI_STATE", "HENKI_MODULE", "HENKI_NEXT", "HENKI_EVENT"];
 const KEYS: &str = "model, base_url, dialect, api_key, approve, tools, ext, shadow, pass_env, max_steps, max_seconds, tool_timeout_s, output_cap, context_window, max_tokens";
 /// The integer keys and their ranges; `context_window` also takes 0 (unknown).
 #[rustfmt::skip]

@@ -67,7 +67,28 @@ fn contracts_ext_refuses() {
                 file(&x.join("demo"), "doc.md", "a summary\n", 0o644);
                 fs::create_dir_all(x.join("demo/ctx")).unwrap();
             },
-            "ext/2 modules hold doc.md, bin/, cmd/, port/ and eval/",
+            "ext/2 modules hold doc.md, bin/, cmd/, on/, port/ and eval/",
+        ),
+        (
+            "an observer of no event",
+            |x| {
+                file(&x.join("demo"), "doc.md", "a summary\n", 0o644);
+                file(&x.join("demo"), "on/turn_end.wait", "#!/bin/sh\n", 0o755);
+            },
+            "on/turn_end.wait: not an event",
+        ),
+        (
+            "17 observers",
+            |x| {
+                for n in ["one", "two"] {
+                    file(&x.join(n), "doc.md", "a summary\n", 0o644);
+                    for e in ["session_start", "turn_start", "call_start", "call_end", "turn_end", "question", "session_end", "record"] {
+                        file(&x.join(n), &format!("on/{e}"), "#!/bin/sh\n", 0o755);
+                    }
+                }
+                file(&x.join("two"), "on/call_start.wait", "#!/bin/sh\n", 0o755);
+            },
+            "more than 16 observers",
         ),
         (
             "a stray file",

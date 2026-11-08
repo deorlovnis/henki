@@ -19,6 +19,8 @@ mod inert;
 mod input;
 #[path = "e2e/journal.rs"]
 mod journal;
+#[path = "e2e/observe.rs"]
+mod observe;
 #[path = "e2e/outcomes.rs"]
 mod outcomes;
 #[path = "e2e/ports.rs"]

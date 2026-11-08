@@ -2,6 +2,7 @@
 //! and escalation, its result, the stuck rule and the kill path.
 use super::{CALL_MAX_S, LATE, SLICE, Session, approve::DENIED};
 use crate::{files, journal, journal::rec, port::Decision, supervise, supervise::GRACE, sys, term, tools, tools::Killed, tools::Target, types::*};
+use serde_json::json;
 use std::{time::Duration, time::Instant};
 
 /// A call extends the run when it repeats the previous call (name and arguments) and both failed; another failure
@@ -36,8 +37,8 @@ impl Session {
     }
 
     /// One call of the step and its result: its error; else the tripwire, then who approves it (the policy binding
-    /// allows it, or the user decides: `run` ends the turn, the REPL asks), the tripwire right before the run, the run,
-    /// and the tripwire again.
+    /// allows it, or the user decides: `run` ends the turn, the REPL asks), `call_start` with the verdict, the tripwire
+    /// right before the run, the run, and the tripwire again.
     pub(super) fn dispatch(&mut self, c: &Call) -> Result<(), Outcome> {
         if let Some(e) = &c.error {
             return self.answer(c, e, true, None, None);
@@ -48,20 +49,23 @@ impl Session {
             t => t.and_then(Result::ok),
         };
         self.tripwire()?;
-        let head = match self.ports.policy.decide(c, t.as_ref(), &self.cfg, &self.sid) {
+        let (verdict, rule, head) = match self.ports.policy.decide(c, t.as_ref(), &self.cfg, &self.sid) {
             Decision::Allow { verdict, rule, line } => {
                 line.iter().for_each(|l| self.out.line(l));
                 self.record(rec::approval(&c.id, verdict, rule))?;
-                line.is_none()
+                (verdict, rule, line.is_none())
             }
             Decision::Ask { .. } if self.reader.is_none() => {
                 self.record(rec::ask(c, t.as_ref().map(|t| t.shown.as_str())))?;
                 return Err(Outcome::NeedsApproval(c.clone()));
             }
-            Decision::Ask { always } if self.ask(c, t.as_ref(), always)? => true,
-            Decision::Ask { .. } => return self.answer(c, DENIED, true, None, None),
+            Decision::Ask { always } => match self.ask(c, t.as_ref(), always)? {
+                Some((verdict, rule)) => (verdict, rule, true),
+                None => return self.answer(c, DENIED, true, None, None),
+            },
         };
-        // Again right before the call starts: the question can wait for as long as the user takes.
+        self.observe("call_start", &json!({"call": {"args": c.args, "id": c.id, "name": c.name}, "rule": rule, "target": t.as_ref().map(|t| &t.path), "verdict": verdict}))?;
+        // Again right before the call starts: the question, and a `call_start.wait` observer, can take time.
         self.tripwire()?;
         self.call(c, t, head)?;
         self.tripwire()

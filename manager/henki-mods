@@ -39,7 +39,7 @@ nl='
 # ext::prompt's header line; henki joins it to the rest of the system prompt with a blank line ("\n\n").
 HEADER='Extensions are commands on PATH; read the doc in brackets before first use.'
 # The named formats this henki ships (CONTRACTS.md); a module's `contracts` must all be here.
-CONTRACTS_KNOWN='journal/1 json/1 wire/1 ext/1 ext/2 handoff/1 module/1 lock/1 hd1 port/1 history/1 conform/1 bind/1'
+CONTRACTS_KNOWN='journal/1 json/1 wire/1 ext/1 ext/2 handoff/1 observe/1 module/1 lock/1 hd1 port/1 history/1 conform/1 bind/1'
 # The ports a package may bind (henki's port::LINKED), and what each one gets to see, for the swap screen.
 PORTS_KNOWN='history'
 PORT_SEES_history='stores every session record'
@@ -53,6 +53,8 @@ RESTART='restart henki (or /exit and start again) to load the change'
 DOC_MAX=16384 # doc.md and cmd/*.md (ext/2)
 # The names henki keeps for its own commands; a module's cmd/ may not use them.
 RESERVED='exit help mods allow'
+# The names an observer in on/ may have (observe/1): an event, or a waited-for one.
+EVENTS='session_start turn_start turn_start.wait call_start call_start.wait call_end turn_end question session_end record'
 LICENSE_BAD='*[!A-Za-z0-9.+ ()-]*' # an SPDX expression: ids, AND/OR/WITH, parentheses
 NAME_RULE='a name is 1 to 32 of a-z, 0-9, _ and -, starting with a-z or 0-9'
 
@@ -546,13 +548,13 @@ docline() {
 # A top-level NAME henki takes (anything but doc.md and bin, which inspect checks itself); else 1 with ERR.
 top_ok() {
   case "$2" in
-    ctx | on)
-      ERR="$1/$2/: a later module layout (context, observers) that this henki does not load; fix: remove it, or set henki_module and requires for the henki that loads it"
+    ctx)
+      ERR="$1/$2/: a later module layout (context) that this henki does not load; fix: remove it, or set henki_module and requires for the henki that loads it"
       return 1
       ;;
     README* | LICENSE* | CHANGELOG* | .*) ;;
     *)
-      ERR="$1/$2: unknown entry; a module holds doc.md, bin/, cmd/, port/, eval/, README*, LICENSE*, CHANGELOG* and dot files only; fix: move it out of the module"
+      ERR="$1/$2: unknown entry; a module holds doc.md, bin/, cmd/, on/, port/, eval/, README*, LICENSE*, CHANGELOG* and dot files only; fix: move it out of the module"
       return 1
       ;;
   esac
@@ -578,14 +580,14 @@ inspect() {
   while IFS= read -r p; do
     [ -n "$p" ] || continue
     p=${p#"$dir"/}
-    case "$p" in bin/.* | cmd/.* | doc.md | bin | cmd | port | eval | eval/*) ;; bin/* | cmd/* | port/*) p="$p/x" ;; *) top_ok "$dir" "$p" || return 1 ;; esac
-    case "$p" in bin/*/x | cmd/*/x | port/*/x)
+    case "$p" in bin/.* | cmd/.* | on/.* | doc.md | bin | cmd | on | port | eval | eval/*) ;; bin/* | cmd/* | on/* | port/*) p="$p/x" ;; *) top_ok "$dir" "$p" || return 1 ;; esac
+    case "$p" in bin/*/x | cmd/*/x | on/*/x | port/*/x)
       ERR="$dir/${p%/x}: a directory; fix: a command or a port binding is a file you can run, so move it out of ${p%%/*}/"
       return 1
       ;;
     esac
   done <<EOF
-$(find "$dir" -mindepth 1 -maxdepth 1 -print; for x in bin cmd port; do [ ! -d "$dir/$x" ] || [ -L "$dir/$x" ] || find "$dir/$x" -mindepth 1 -maxdepth 1 -type d -print; done)
+$(find "$dir" -mindepth 1 -maxdepth 1 -print; for x in bin cmd on port; do [ ! -d "$dir/$x" ] || [ -L "$dir/$x" ] || find "$dir/$x" -mindepth 1 -maxdepth 1 -type d -print; done)
 EOF
   while IFS= read -r p; do
     kind=${p##*"$tab"}
@@ -666,6 +668,34 @@ EOF
         esac
         ;;
       eval) ;; # eval/1 tasks: henki ignores them
+      on)
+        # on/EVENT: an observer henki runs once per event (observe/1); henki's test as for bin/, named for an event.
+        case "$rest" in
+          '')
+            ERR="$dir/on: not a directory; fix: make on a directory of observers"
+            return 1
+            ;;
+          .*/*) ;;
+          */*)
+            ERR="$dir/on/${rest%%/*}: a directory; fix: an observer is a file you can run, so move it out of on/"
+            return 1
+            ;;
+          *)
+            x=0
+            [ -n "$(find -L "$dir/$p" -prune -type f -perm -100 -print 2>/dev/null)" ] && x=1
+            if [ "$x" = 1 ]; then
+              case " $EVENTS " in *" $rest "*) ;; *)
+                ERR="$dir/$p: not an event; on/ holds $EVENTS; fix: rename it"
+                return 1
+                ;;
+              esac
+            elif [ "${rest#.}" = "$rest" ]; then
+              ERR="$dir/$p: an observer is a file you can run; fix: chmod u+x it, or move it out of on/"
+              return 1
+            fi
+            ;;
+        esac
+        ;;
       port)
         # port/PORT: a program henki runs as that port's binding, once a swap links it (henki's test, as for bin/).
         x=0
@@ -980,10 +1010,10 @@ bind_get() {
 # --- prompt bytes and cards --------------------------------------------------------------------------------------------
 
 # What NAME's module adds to the system prompt (ext::prompt): "\n- NAME: LINE [DOC]", DOC as henki shows it; nothing
-# for a module of commands or bindings without bin/, whose doc is not for the model.
+# for a module of commands, observers or bindings without bin/, whose doc is not for the model.
 prompt_bytes() { # NAME DIR
   local l
-  if [ ! -d "$2/bin" ] && { [ -e "$2/cmd" ] || [ -L "$2/cmd" ] || [ -e "$2/port" ] || [ -L "$2/port" ]; }; then
+  if [ ! -d "$2/bin" ] && { [ -e "$2/cmd" ] || [ -L "$2/cmd" ] || [ -e "$2/on" ] || [ -L "$2/on" ] || [ -e "$2/port" ] || [ -L "$2/port" ]; }; then
     echo 0
     return 0
   fi

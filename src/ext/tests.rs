@@ -220,9 +220,9 @@ fn ext_ignored_entries() {
 fn ext_unknown_entry_fails() {
     let t = T::new();
     let d = t.ext("e/a", "# a");
-    for n in ["notes.txt", "lib", "tool", "gate", "tools.json", "transport", "on", "ctx", "cmds", "binary", "evals"] {
+    for n in ["notes.txt", "lib", "tool", "gate", "tools.json", "transport", "ctx", "cmds", "binary", "evals", "events"] {
         let p = if n.contains('.') { t.file(&format!("e/a/{n}"), "x") } else { t.dir(&format!("e/a/{n}")) };
-        let want = format!("ext {}: unknown entry {}; ext/2 modules hold doc.md, bin/, cmd/, port/ and eval/; fix: move it out of the extension", d.display(), p.display());
+        let want = format!("ext {}: unknown entry {}; ext/2 modules hold doc.md, bin/, cmd/, on/, port/ and eval/; fix: move it out of the extension", d.display(), p.display());
         assert_eq!(err(&[t.p("e")]), want);
         let _ = fs::remove_file(&p).or_else(|_| fs::remove_dir(&p));
     }
@@ -433,6 +433,40 @@ fn ext_port_rules() {
     assert_eq!((f.exts[0].prompt, &f.exts[0].paths[2..]), (false, &[t.p("e/a/port"), h][..]));
     let p = t.exe("e/a/port/journal");
     assert_eq!(err(&[t.p("e")]), format!("ext {}: not a port; ports are model, history, context, exec, policy, frontend; fix: rename it, or move it out of port/", p.display()));
+}
+
+/// on/: an event, or a `.wait` one for turn_start and call_start; stamped; a module of observers only is not in the
+/// prompt; at most 16 over all modules.
+#[test]
+fn ext_on_rules() {
+    let t = T::new();
+    t.ext("e/a", "# a: watches");
+    let (w, e, dot) = (t.exe("e/a/on/call_start.wait"), t.exe("e/a/on/turn_end"), t.file("e/a/on/.keep", ""));
+    symlink("turn_end", t.p("e/a/on/question")).unwrap();
+    let f = ok(&[t.p("e")]);
+    assert_eq!((&f.exts[0].on, f.exts[0].prompt), (&vec!["call_start.wait".to_string(), "question".into(), "turn_end".into()], false));
+    assert_eq!(f.exts[0].paths[2..], [t.p("e/a/on"), dot, w, t.p("e/a/on/question"), e]);
+    assert_eq!(f.exts[0].targets, [t.p("e/a/on/turn_end")], "the link's target is protected");
+    assert_eq!(prompt(&f.exts, &t.0), "", "a module of observers costs no prompt bytes");
+    let events = "session_start, turn_start, call_start, call_end, turn_end, question, session_end, record";
+    for n in ["call_end.wait", "turn_end.wait", "record.wait", "stop", "turn_start.WAIT", "call_start.wait.wait", "session_start.sh"] {
+        let p = t.exe(&format!("e/a/on/{n}"));
+        let want = format!("ext {}: not an event; on/ holds {events}, and turn_start.wait or call_start.wait; fix: rename it", p.display());
+        assert_eq!(err(&[t.p("e")]), want);
+        fs::remove_file(&p).unwrap();
+    }
+    let plain = t.file("e/a/on/turn_start", "#!/bin/sh\n");
+    assert!(err(&[t.p("e")]).contains("a command is a file you can run"), "an observer that cannot run is refused");
+    fs::remove_file(&plain).unwrap();
+    for (i, ev) in ["session_start", "turn_start", "turn_start.wait", "call_start", "call_end", "session_end"].iter().enumerate() {
+        t.ext(&format!("e/b{i}"), "# b");
+        t.exe(&format!("e/b{i}/on/{ev}"));
+        t.exe(&format!("e/b{i}/on/turn_end"));
+    }
+    t.exe("e/b0/on/record");
+    assert_eq!(ok(&[t.p("e")]).exts.iter().map(|x| x.on.len()).sum::<usize>(), 16);
+    t.exe("e/b1/on/record");
+    assert_eq!(err(&[t.p("e")]), format!("ext {}: more than 16 observers (on/ files) over all modules; fix: turn a module off", t.p("e/b5").display()));
 }
 
 #[test]

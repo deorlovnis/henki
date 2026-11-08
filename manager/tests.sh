@@ -365,10 +365,10 @@ t_refusals() {
   refused "henki_module = 2 needs henki >= 0.2"
 
   rm -rf "$m" && mkmod "$m"
-  mkdir -p "$m/on" && printf '#!/bin/sh\n' >"$m/on/turn_end"
+  mkdir -p "$m/ctx" && printf 'x\n' >"$m/ctx/x"
   run add "$m" --yes
-  refused "on/: a later module layout"
-  rm -rf "$m/on" && mkdir "$m/lib" && printf 'x\n' >"$m/lib/x"
+  refused "ctx/: a later module layout (context)"
+  rm -rf "$m/ctx" && mkdir "$m/lib" && printf 'x\n' >"$m/lib/x"
   run add "$m" --yes
   refused "lib: unknown entry"
 
@@ -446,9 +446,9 @@ t_refusals() {
   chmod 755 "$m/port/history" && mv "$m/port/history" "$m/port/context"
   run add "$m" --yes
   refused "port/context: port/ holds a program you can run per port, named history"
-  rm -rf "$m" && mkmod "$m" 'contracts = ["ext/1", "observe/1"]\n'
+  rm -rf "$m" && mkmod "$m" 'contracts = ["ext/1", "context/1"]\n'
   run add "$m" --yes
-  refused "contract observe/1 is not one this henki ships"
+  refused "contract context/1 is not one this henki ships"
   rm -rf "$m" && mkmod "$m" 'caps_net = "lots"\n'
   sed '/^caps_net = "none"/d' "$m/.henki/module.toml" >"$W/t" && mv "$W/t" "$m/.henki/module.toml"
   run add "$m" --yes
@@ -1180,6 +1180,42 @@ t_ext2() {
   refused "leaves the module"
 }
 
+# on/: observers named for an event (a waited one for turn_start and call_start), runnable, links inside; a module of
+# observers costs no prompt bytes.
+t_observe() {
+  case_ "observe/1: on/ names, modes, prompt bytes"
+  local m="$W/watch" bad
+  mkmod "$m" 'contracts = ["ext/2", "observe/1"]\n'
+  rm -rf "$m/bin"
+  mkdir -p "$m/on"
+  printf '#!/bin/sh\ncat >/dev/null\n' >"$m/on/turn_end"
+  printf '#!/bin/sh\n' >"$m/on/call_start.wait"
+  chmod 755 "$m/on/turn_end" "$m/on/call_start.wait"
+  ln -s turn_end "$m/on/question"
+  printf 'x\n' >"$m/on/.DS_Store"
+  run verify --dir "$m"
+  rc_is 0
+  out_has "0 B of prompt"
+  run add "$m" --yes
+  rc_is 0
+  out_has "prompt   +0 B on every request"
+  for bad in call_end.wait turn_end.wait stop .hidden; do
+    rm -rf "$W/r" && mkmod "$W/r" && mkdir -p "$W/r/on" && printf '#!/bin/sh\n' >"$W/r/on/$bad" && chmod 755 "$W/r/on/$bad"
+    run verify --dir "$W/r"
+    refused "on/$bad: not an event; on/ holds session_start turn_start turn_start.wait call_start call_start.wait call_end turn_end question session_end record"
+  done
+  rm -rf "$W/r" && mkmod "$W/r" && mkdir -p "$W/r/on" && printf '#!/bin/sh\n' >"$W/r/on/record"
+  run verify --dir "$W/r"
+  refused "on/record: an observer is a file you can run"
+  rm -rf "$W/r" && mkmod "$W/r" && mkdir -p "$W/r/on/sub"
+  run verify --dir "$W/r"
+  refused "on/sub: a directory"
+  rm -rf "$W/r" && mkmod "$W/r" && mkdir -p "$W/r/on"
+  ln -s ../../elsewhere "$W/r/on/record"
+  run verify --dir "$W/r"
+  refused "leaves the module"
+}
+
 # After a change the manager writes `restart` to the hand-off file a henki gives it (/mods), and prints the restart
 # line without one; listing writes nothing.
 t_restart() {
@@ -1440,6 +1476,7 @@ all() {
   t_halti
   t_allow
   t_ext2
+  t_observe
   t_restart
   t_ports
   t_port_toy

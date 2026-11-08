@@ -34,6 +34,7 @@ A program reads the contracts this henki ships from the rows of this table: each
 | `ext/1` | henki | the extension directory layout henki loaded first; valid under ext/2 |
 | `ext/2` | henki | the module directory layout henki loads: doc, tools, user commands, bindings |
 | `handoff/1` | henki | a user command's environment, and what it hands back to henki in `HENKI_NEXT` |
+| `observe/1` | henki | a module's observers: the session's events, how henki runs them, and what it waits for |
 | `port/1` | henki | how henki talks to a port binding: a program it starts, JSON lines both ways |
 | `history/1` | henki | the history port's methods over port/1: where sessions are kept |
 | `conform/1` | henki | the conformance suite files a binding is held to |
@@ -335,14 +336,15 @@ default config). henki runs nothing while it loads them; a violation of any rule
 
 ## ext/2
 
-ext/2 is ext/1 with user commands and bindings, and stricter text and link rules. henki loads every module under it;
-an ext/1 module stays valid unless it holds a link out of itself or a doc.md that fails the text rules below.
+ext/2 is ext/1 with user commands, observers and bindings, and stricter text and link rules. henki loads every module
+under it; an ext/1 module stays valid unless it holds a link out of itself or a doc.md that fails the text rules below.
 
 ```
 NAME/doc.md              required: line 1 the summary; the whole file a text (below)
 NAME/bin/CMD             tools: commands first on the calls' PATH (ext/1)
 NAME/cmd/CMD             a user command /CMD (handoff/1); CMD as for bin/, not exit, help, mods or allow
 NAME/cmd/CMD.md          data for a command: a text (below)
+NAME/on/EVENT            an observer of EVENT (observe/1); EVENT.wait for turn_start and call_start
 NAME/port/PORT           a binding program (port/1); run only through a link in CONFIG_DIR/port/
 NAME/eval/...            the manager's; henki ignores it
 NAME/README* LICENSE* CHANGELOG* .*   ignored
@@ -351,18 +353,19 @@ NAME/README* LICENSE* CHANGELOG* .*   ignored
 - **Texts.** doc.md and each `cmd/*.md` are at most 16 KiB of UTF-8 without a code point henki escapes (on any line),
   regular files (or links to them) owned by the user or root and not group- or world-writable, as AGENTS.md is. A
   failure names the file and the line (`PATH:LINE: holds U+202E, which a terminal does not show; fix: remove it`).
-- **Entries.** `bin/`, `cmd/` and `port/` hold files their owner can run, named `[A-Za-z0-9._-]+`; in `port/` the name
-  is a port (`model`, `history`, `context`, `exec`, `policy`, `frontend`). A dot file that cannot run is ignored but
-  watched; in `cmd/` a `NAME.md` that cannot run is data. Anything else there is refused. `ctx/`, `on/` and any other
-  name are refused (`unknown entry PATH; ext/2 modules hold doc.md, bin/, cmd/, port/ and eval/`).
+- **Entries.** `bin/`, `cmd/`, `on/` and `port/` hold files their owner can run, named `[A-Za-z0-9._-]+`; in `on/`
+  the name is an event (observe/1), in `port/` a port (`model`, `history`, `context`, `exec`, `policy`, `frontend`). A
+  dot file that cannot run is ignored but watched; in `cmd/` a `NAME.md` that cannot run is data. Anything else there
+  is refused. `ctx/` and any other name are refused (`unknown entry PATH; ext/2 modules hold doc.md, bin/, cmd/, on/,
+  port/ and eval/`). At most 16 `on/` files over all modules.
 - **Links.** Inside a module every link must be relative and lead to a path inside it (`a link that leaves the module;
   fix: copy the file in`); the module directory itself may be a link (the manager's store copy).
 - **Names across modules.** A `bin/` or a `cmd/` name in two modules stops the start.
-- **Trust.** The module directory, doc.md, `bin/`, `cmd/`, `port/` and every entry of them are trust files; the
-  realpaths of the links among them are protected.
-- **The prompt.** A module enters the system prompt (ext/1's line) only with `bin/`, or with neither `cmd/` nor
-  `port/`: a module of commands or bindings costs no prompt bytes. The banner says `ext NAME: CMDS` (its `bin/` names),
-  `doc only` or `no tools`; `/help` lists every user command as `/CMD  (NAME)`.
+- **Trust.** The module directory, doc.md, `bin/`, `cmd/`, `on/`, `port/` and every entry of them are trust files;
+  the realpaths of the links among them are protected.
+- **The prompt.** A module enters the system prompt (ext/1's line) only with `bin/`, or with none of `cmd/`, `on/` and
+  `port/`: a module of commands, observers or bindings costs no prompt bytes. The banner says `ext NAME: CMDS` (its
+  `bin/` names), `doc only` or `no tools`; `/help` lists every user command as `/CMD  (NAME)`.
 
 ## handoff/1
 
@@ -400,6 +403,47 @@ or else on the user's PATH (never a module's), with ARGS split at spaces. A past
   `HENKI_NEXT` prints `restart henki (or /exit and start again) to load the change`. `HENKI_CONFIG`, when set, is the
   config dir it changes.
 
+## observe/1
+
+A module's `on/EVENT` programs watch a session. henki runs each once per event, as git runs a hook, and nothing they
+do changes the session.
+
+```
+NAME/on/EVENT            runs once per EVENT; never waited for
+NAME/on/EVENT.wait       turn_start and call_start only: henki waits for it, up to 2 s
+```
+
+| Event | When | `data` |
+|---|---|---|
+| `session_start` | the first turn of the session in this henki; a REPL session that gets no message has none | the `session` record |
+| `turn_start` | each `user` record; a `run --resume` without TASK | that record; `{"t":"turn_start"}` |
+| `call_start` | after a call's approval, before henki's last trust check and the run | `{"call":{"args","id","name"},"rule","target","verdict"}` |
+| `call_end` | each `tool_result` record | the record |
+| `question` | each `ask` record | the record |
+| `turn_end` | each `turn_end` record | the record |
+| `session_end` | the `close` record | the record |
+| `record` | every record a turn journals, after the record's own event; not observer notices | the record |
+
+`call_start`'s `verdict` is the `approval` record's (`auto`, `rule`, `yes`, `always`), `rule` the rule's number or
+null, `target` the resolved path of a file tool's target or null. No event comes before `session_start`.
+
+- **The run.** The program with no arguments, in the session's working directory, in a process group and session of
+  its own, with the tool environment (journal/1 "Files") plus `HENKI_EVENT` (the event), `HENKI_MODULE` (the module
+  dir) and `HENKI_STATE` (the state dir); never `HENKI_NEXT`. stdin is one line
+  `{"data":DATA,"event":"EVENT","seq":N,"session":"ID","v":1}` in journal/1's JSON, read from a file, so a run that
+  never reads it holds up nothing. `seq` counts this henki's events, so runs that overlap can be put in order. stdout
+  and stderr go to henki's log, `STATE/spill/.kernel-PID.log`; the exit status is ignored, and a run that does not
+  start is a notice.
+- **Waiting.** The `.wait` runs of one event are waited for together, for at most 2 s; a signal or the run's time
+  budget ends that wait as it ends any other. An observer whose run misses the 2 s gets one notice and is not waited
+  for again in this henki; the run goes on. No other run is waited for, and no run is killed for being slow.
+- **Slow observers.** An observer with 4 runs still going misses events, with one notice.
+- **No power.** What an observer writes is the user's doing: a trust file it changes ends the turn (`error changed`)
+  as any other change does, `call_start`'s included, since henki checks after it. Observer notices are journaled as
+  `notice` records and are never events.
+- **The session end.** After `close`, the runs still going get 300 ms; then henki kills each one's process group and
+  session. An observer must not leave processes behind.
+
 ## module/1
 
 Owned by henki-mods; henki never reads it. The manifest is `NAME/.henki/module.toml`: flat `key = value` lines in
@@ -423,8 +467,8 @@ ports = ["history"]              # optional; exactly the programs in port/ (port
 
 A module without a manifest is unmanaged (allowed for path and URL installs, and listed as such). `port/PORT` is a
 program its owner can run (a file, or a link inside the module), PORT one that henki binds (`history`). `cmd/` and
-`eval/` are ext/2's; `.henki/template` may hold a program that `cmd/` links run. The directories `ctx/` and `on/` are
-reserved for later layouts: henki-mods refuses them.
+`eval/` are ext/2's, `on/` observe/1's; `.henki/template` may hold a program that `cmd/` links run. The directory
+`ctx/` is reserved for a later layout: henki-mods refuses it.
 
 A git source (`URL[@REF][#SUBDIR]`) is cloned only over `https`, `http`, `ssh`, `git` or `file` URLs, or scp's
 `USER@HOST:PATH`; a remote helper (`ext::`, `fd::`, any other `SCHEME::` or unknown `SCHEME://`) is refused before

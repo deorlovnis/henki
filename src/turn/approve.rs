@@ -6,10 +6,11 @@ use crate::{allow, journal::rec, supervise, sys, term, tools, tools::Target, typ
 pub const DENIED: &str = "denied by the user";
 
 impl Session {
-    /// Shows `c`, asks until there is an answer, journals `ask` before and `approval` after; true to run the call.
+    /// Shows `c`, asks until there is an answer, journals `ask` before and `approval` after; the verdict (`yes`, or
+    /// `always` with the rule's number) to run the call, None for no.
     /// `always`: the policy can save a rule for it. INT and QUIT are a no; EOF, TERM, HUP and a closed stdout end the
     /// turn; a tripwire found before the policy records a rule ends it `Error changed`.
-    pub(super) fn ask(&mut self, c: &Call, t: Option<&Target>, always: bool) -> Result<bool, Outcome> {
+    pub(super) fn ask(&mut self, c: &Call, t: Option<&Target>, always: bool) -> Result<Option<(&'static str, Option<usize>)>, Outcome> {
         self.record(rec::ask(c, t.map(|t| t.shown.as_str())))?;
         let (shell, cmd) = (c.name == "shell", c.args["command"].as_str().unwrap_or_default());
         // A rule saves an exact command; none while a process started earlier still runs, since it may be what the
@@ -77,9 +78,9 @@ impl Session {
         Ok(matches!(self.reply(prompt)?.as_deref(), Some("y" | "yes")))
     }
 
-    /// Journals the verdict; true unless it is `no`.
-    fn verdict(&mut self, c: &Call, verdict: &str, rule: Option<usize>) -> Result<bool, Outcome> {
+    /// Journals the verdict; it and the rule unless it is `no`.
+    fn verdict(&mut self, c: &Call, verdict: &'static str, rule: Option<usize>) -> Result<Option<(&'static str, Option<usize>)>, Outcome> {
         self.record(rec::approval(&c.id, verdict, rule))?;
-        Ok(verdict != "no")
+        Ok((verdict != "no").then_some((verdict, rule)))
     }
 }

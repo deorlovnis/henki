@@ -266,6 +266,15 @@ pub fn tree(ps: &[Proc], root: impl Fn(&Proc) -> bool) -> Vec<i32> {
     out
 }
 
+/// Blocks until child `pid` has ended (or is no child of henki's), and leaves it unreaped (waitid WEXITED | WNOWAIT):
+/// its owner reaps it under supervise's lock.
+pub fn exited(pid: i32) {
+    // SAFETY: an all-zero siginfo_t is a valid out value; waitid writes only into it.
+    let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+    // SAFETY: P_PID with a positive pid names one child; the pointer is to the live local above.
+    let _ = pid > 0 && unsafe { libc::waitid(libc::P_PID, pid as libc::id_t, &mut info, libc::WEXITED | libc::WNOWAIT) } == 0;
+}
+
 /// O_RDONLY|O_NONBLOCK|O_NOCTTY|O_CLOEXEC, then fstat. Never blocks on a FIFO or a device.
 pub fn open_read(path: &Path) -> io::Result<(File, fs::Metadata)> {
     let f = fs::OpenOptions::new().read(true).custom_flags(libc::O_NONBLOCK | libc::O_NOCTTY).open(path)?;

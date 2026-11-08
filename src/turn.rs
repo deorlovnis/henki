@@ -1,8 +1,8 @@
 //! One session: the step loop of a turn, the only place the main thread waits, and the single way a turn and a session end.
-use crate::{anthropic, config::Config, ext, http, journal, journal::rec, port::Ports, supervise, sys, term, term::Out, term::Reader};
+use crate::{anthropic, config::Config, ext, http, journal, journal::rec, observe, observe::Observers, port, port::Ports, supervise, sys, term, term::Out, term::Reader};
 use crate::{tools, tools::Killed, types::*};
 use call::Stuck;
-use serde_json::Value;
+use serde_json::{Value, json};
 use std::{convert::Infallible, ffi::OsString, path::Path, path::PathBuf, sync::mpsc::Receiver, sync::mpsc::Sender, time::Duration, time::Instant};
 
 mod approve;
@@ -28,6 +28,9 @@ pub struct Session {
     sid: String,
     /// The last spill file's number (`journal::spill`).
     spill_n: usize,
+    /// The modules' `on/` programs; silent while `opened` holds the `session` record that `session_start` carries.
+    obs: Observers,
+    pub(crate) opened: Option<Value>,
     out: Out,
     /// Exactly the `user`, `assistant` and `tool_result` records, in journal order: what the next request renders.
     hist: Vec<Value>,
@@ -83,12 +86,15 @@ impl Session {
         // The Anthropic API can be silent for minutes while it buffers a large tool input.
         let lim = http::Limits { stall: if cfg.dialect == "anthropic" { anthropic::STALL } else { http::LIMITS.stall }, ..http::LIMITS };
         let (tools, next_h, spill_n) = (tools::schema(&cfg.tools), journal::next_h(&hist), journal::spill_n(&cfg.state, &sid, &hist));
+        let obs = Observers::new(&cfg.exts, env.clone(), &cfg.cwd, &cfg.state, &port::kernel_log(&cfg), ch.0.clone());
         Session {
             cfg,
             sig: None,
             ports,
             sid,
             spill_n,
+            obs,
+            opened: None,
             out,
             hist,
             tx: ch.0,
@@ -121,11 +127,15 @@ impl Session {
     }
 
     /// Session end: kill and sweep everything henki started (every path, `ok` included), then `result` (when given),
-    /// then `close`. A journal failure is the `Err`, and the `--json` reader still gets one result.
+    /// then `close`. A journal failure is the `Err`, and the `--json` reader still gets one result. Then the observer
+    /// runs still going (`session_end`'s too) get `GRACE`, which a signal cuts short, and the kill.
     pub fn close(&mut self, result: Option<Value>) -> Result<(), Outcome> {
         self.finishing = true;
         let (_, n) = self.stop_all(false);
-        self.end(n, result)
+        let (end, until) = (self.end(n, result), Instant::now() + supervise::GRACE);
+        while !self.obs.running().is_empty() && Instant::now() < until && self.wait(0, Some(until.min(Instant::now() + SLICE))).is_ok() {}
+        supervise::kernel_kill(&self.obs.running());
+        end
     }
 
     /// The last records: the kill notice, `result`, `close`; then the result on `--json` stdout, or in plain mode the
@@ -141,10 +151,14 @@ impl Session {
         let written = (|| {
             stopped.iter().try_for_each(|m| self.notice(m))?;
             let r = result.clone().map(|r| journal::put(self.ports.history.as_mut(), &self.sid, r)).transpose()?;
-            journal::put(self.ports.history.as_mut(), &self.sid, rec::close()).map(|_| r)
+            journal::put(self.ports.history.as_mut(), &self.sid, rec::close()).map(|c| (r, c))
         })();
         let (r, end) = match written {
-            Ok(r) => (r, Ok(())),
+            Ok((r, c)) => {
+                // Nothing is journaled after `close`: its observers' notices go to the terminal only.
+                self.opened.is_none().then(|| self.obs.emit("session_end", &self.sid, &c, 0).1).into_iter().flatten().for_each(|n| self.out.note(&n));
+                (r, Ok(()))
+            }
             Err(e) => {
                 let ms = |r: &Value| (r["duration_s"].as_f64().unwrap_or_default() * 1e3) as u64;
                 let failed = |r: Value| if r["status"] == "error" { r } else { self.result(&e, ms(&r)) };
@@ -257,10 +271,12 @@ impl Session {
     /// Requests and calls until an outcome; `Err` is the only way out.
     fn step_loop(&mut self, task: Option<String>) -> Result<Infallible, Outcome> {
         (self.t, self.sig) = (Turn::default(), None);
+        // Observers start with this process's first turn: a REPL session with no message has none.
+        self.opened.take().map_or(Ok(()), |r| self.observe("session_start", &r))?;
         // The REPL's banner printed them already.
         std::mem::take(&mut self.cfg.notices).iter().try_for_each(|n| if self.reader.is_some() { self.record(rec::notice(n)) } else { self.notice(n) })?;
         match task {
-            // Where and when the model works goes on the session's first task only.
+            // Where and when the model works goes on the session's first task only; its record is `turn_start`.
             Some(t) => {
                 let head = if self.hist.iter().any(|r| r["t"] == "user") { String::new() } else { head(&self.cfg.cwd) };
                 self.record(rec::user(&(head + &t)))?;
@@ -271,7 +287,7 @@ impl Session {
                 let cut = self.hist.last().is_some_and(|r| r["finish"] == "interrupted" || r["finish"] == "error");
                 return Err(Outcome::error("config", if cut { "the last reply was cut short; give a TASK" } else { "nothing to continue; give a TASK" }));
             }
-            None => {}
+            None => self.observe("turn_start", &json!({"t": "turn_start"}))?,
         }
         loop {
             let mut r = self.request()?;
@@ -361,6 +377,7 @@ impl Session {
                 Some(Ev::OutputClosed) if !self.finishing => return Err(Stop::Closed),
                 Some(Ev::Part { tag: t, part }) if t == tag => self.part(part),
                 Some(ev @ (Ev::Reply { tag: t, .. } | Ev::Tool { tag: t, .. } | Ev::Input { tag: t, .. } | Ev::BangDone { tag: t, .. })) if t == tag => return Ok(Some(ev)),
+                Some(ev @ Ev::Observed { tag: t }) if t == tag => return Ok(Some(ev)),
                 _ => {} // stale: an ended attempt, a timer, an answered call, input nobody waits for
             }
         }
@@ -378,14 +395,35 @@ impl Session {
         found.map_or(Ok(()), Err)
     }
 
-    /// The journal first, then the `--json` line; only `user`, `assistant` and `tool_result` enter the history.
+    /// The journal first, then the `--json` line, then the record's events; only `user`, `assistant` and `tool_result`
+    /// enter the history.
     fn record(&mut self, rec: Value) -> Result<(), Outcome> {
         let rec = journal::put(self.ports.history.as_mut(), &self.sid, rec)?;
         self.out.record(&rec);
+        let watched = observe::of(&rec).try_for_each(|e| self.observe(e, &rec));
         if matches!(rec["t"].as_str(), Some("user" | "assistant" | "tool_result")) {
             self.hist.push(rec);
         }
-        Ok(())
+        watched
+    }
+
+    /// Runs `event`'s observers (none before `session_start`), then waits for its `.wait` runs (turn_start and
+    /// call_start only), together, up to `observe::WAIT`; signals and the deadline end the wait as any other. Observers
+    /// whose runs miss it are not waited for again.
+    fn observe(&mut self, event: &str, data: &Value) -> Result<(), Outcome> {
+        let tag = self.next_tag();
+        let (n, notes) = if self.opened.is_some() { (0, Vec::new()) } else { self.obs.emit(event, &self.sid, data, tag) };
+        self.observed(notes)?;
+        // After a miss the others' waits end at once: `until` has passed.
+        let until = Instant::now() + observe::WAIT;
+        let all = (0..n).try_fold(true, |all, _| self.wait(tag, Some(until)).map(|e| all && e.is_some()))?;
+        let late = if all { Vec::new() } else { self.obs.unwait(event) };
+        self.observed(late)
+    }
+
+    /// Observer notices: on the terminal and in the journal, never events themselves.
+    fn observed(&mut self, notes: Vec<String>) -> Result<(), Outcome> {
+        notes.iter().try_for_each(|n| journal::put(self.ports.history.as_mut(), &self.sid, rec::notice(n)).map(|r| (self.out.note(n), self.out.record(&r)).1))
     }
 
     /// A notice: `henki: TEXT` on stderr (plain and REPL), a record in the journal and on `--json` stdout.
