@@ -113,7 +113,7 @@ fn observe_not_intact_runs_nothing() {
 }
 
 /// Four runs still going: the observer misses events, one notice; a wait that runs out stops the waiting, one notice;
-/// a run that does not start is a notice; `kernel_kill` ends the runs and their waiters reap them.
+/// a run that does not start is one notice; `kernel_kill` ends the runs and their waiters reap them.
 #[test]
 fn observe_slow_runs() {
     let (d, x) = setup("slow", &[("call_start.wait", "exec sleep 30"), ("record", "exec sleep 30")]);
@@ -132,6 +132,7 @@ fn observe_slow_runs() {
     assert_eq!(o.emit("call_start", "s", &json!({}), 3, || true).0, 0, "not waited for again");
     let (n, notes) = o.emit("turn_end", "s", &json!({}), 4, || true);
     assert!(n == 0 && notes.len() == 1 && notes[0].starts_with("observer slow/on/turn_end did not start: "), "{notes:?}");
+    assert_eq!(o.emit("turn_end", "s", &json!({}), 5, || true), (0, Vec::new()), "one notice");
     assert_eq!(o.running().len(), 6);
     supervise::kernel_kill(&o.running());
     until("the killed runs to be reaped", || o.running().is_empty());

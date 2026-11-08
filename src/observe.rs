@@ -3,8 +3,8 @@
 //! exit status and output are ignored (both go to the kernel log). The runs of `on/turn_start.wait` and
 //! `on/call_start.wait` are waited for, all of an event's together, for at most `WAIT`; no other run is ever waited
 //! for, and a run is never killed for being slow. An observer with `LIVE` runs still going misses events, with one
-//! notice. Runs are kernel children: a turn's stop leaves them; the session end gives them `supervise::GRACE`, then
-//! kills them.
+//! notice; one whose run does not start (a bad interpreter) has one notice too, not one per event. Runs are kernel
+//! children: a turn's stop leaves them; the session end gives them `supervise::GRACE`, then kills them.
 use crate::{ext::Ext, supervise, sys, term, types::Ev, types::lock};
 use serde_json::{Value, json};
 use std::sync::{Arc, Mutex, mpsc::Sender};
@@ -20,13 +20,15 @@ const LIVE: usize = 4;
 /// At most this many observer files over all modules (discovery refuses more).
 pub const MAX: usize = 16;
 
-/// One `on/` file: its module, its event, whether its runs are waited for (`.wait`, until one misses `WAIT`).
+/// One `on/` file: its module, its event, whether its runs are waited for (`.wait`, until one misses `WAIT`), and
+/// whether it got its notice for missing events, and for a run that did not start.
 struct Observer {
     module: String,
     event: &'static str,
     wait: bool,
     path: PathBuf,
     missed: bool,
+    broken: bool,
 }
 
 /// Every observer, and what their runs share: the tool environment, the cwd, the dir of the event files, the kernel
@@ -57,7 +59,8 @@ impl Observers {
     /// The observers of `exts`. Their runs get `env` (the tool environment) plus HENKI_STATE (`state`), run in `cwd`,
     /// and write to the kernel log `log`, opened only when there is an observer.
     pub fn new(exts: &[Ext], env: Vec<(OsString, OsString)>, cwd: &Path, state: &Path, log: &Path, tx: Sender<Ev>) -> Observers {
-        let one = |x: &Ext, n: &String| parse(n).map(|(event, wait)| Observer { module: x.name.clone(), event, wait, path: x.dir.join("on").join(n), missed: false });
+        let one =
+            |x: &Ext, n: &String| parse(n).map(|(event, wait)| Observer { module: x.name.clone(), event, wait, path: x.dir.join("on").join(n), missed: false, broken: false });
         let all: Vec<Observer> = exts.iter().flat_map(|x| x.on.iter().filter_map(move |n| one(x, n))).collect();
         let log = (!all.is_empty()).then(|| sys::create_excl(log, 0o600, true).or_else(|_| sys::open_append(log)).ok()).flatten();
         let env = env.into_iter().chain([("HENKI_STATE".into(), state.into())]).collect();
@@ -102,7 +105,9 @@ impl Observers {
                         let _ = tx.send(Ev::Observed { tag: if wait { tag } else { 0 } });
                     });
                 }
-                Err(e) => notes.push(format!("observer {}/on/{event} did not start: {e}", o.module)),
+                // Once: a bad interpreter fails every run, and a notice per `record` event would double the journal.
+                Err(e) if !std::mem::replace(&mut o.broken, true) => notes.push(format!("observer {}/on/{event} did not start: {e}; it is not said again", o.module)),
+                Err(_) => {}
             }
         }
         (waits, notes)

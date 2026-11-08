@@ -230,7 +230,7 @@ fn observe_session_end_daemon_swept() {
 }
 
 /// The REPL: no event before the first message (none at all without one); `session_start` once, `turn_start` per
-/// message; an observer that cannot start is a notice, journaled.
+/// message; an observer that cannot start is one notice, journaled, however many events it misses.
 #[test]
 fn observe_repl_events() {
     let m = Mock::start(vec![say("one"), say("two")]);
@@ -260,7 +260,7 @@ fn observe_repl_events() {
     let names: Vec<_> = kept(&r).iter().map(|g| g.0["event"].as_str().unwrap().to_string()).collect();
     assert_eq!(names, ["session_start", "turn_start", "turn_start", "session_end"]);
     let failed = d.notices().iter().filter(|n| n.starts_with("observer broken/on/turn_end did not start: ")).count();
-    assert_eq!(failed, 2, "{}", d.diag());
+    assert_eq!(failed, 1, "one notice, not one per event: {}", d.diag());
 }
 
 /// O6: the official checkpoints mod; before each of 20 write and edit calls, the snapshot holds the files as
