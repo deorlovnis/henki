@@ -2446,7 +2446,8 @@ cmd_list() {
     c=""
     if lock_get "$n"; then
       d=$(store_of)
-      case "$L_kind" in url) src="$L_source (UNREVIEWED)" ;; official) src="official" ;; index:*) src="index ${L_kind#index:}: $L_source" ;; *) src=$L_source ;; esac
+      # A skill from a git URL is as unreviewed as a URL install; one from a directory here is as a path install.
+      case "$L_kind:$L_source" in url:* | skill:[!/]*) src="$L_source (UNREVIEWED)" ;; official:*) src="official" ;; index:*) src="index ${L_kind#index:}: $L_source" ;; *) src=$L_source ;; esac
       ! flag_has yanked=malicious || src="$src $(red "(yanked: malicious)")"
       ! flag_has yanked=buggy || src="$src (yanked: buggy)"
       ! flag_has pin || src="$src (pinned)"

@@ -435,6 +435,7 @@ t_skill_add() {
   out_has "up to date"
   run list
   out_has "plain-skill"
+  out_lacks "UNREVIEWED"
   # Another name, and the same skill twice.
   run add --skill "$SK/plain-skill" --yes
   refused "plain-skill is taken by a module or a command of one (henki-mods list); fix: give the skill another name with --as NAME, or henki-mods update plain-skill"
@@ -517,6 +518,8 @@ t_skill_url() {
   out_has "  skill    beta from $url#skills/beta @ $c1 (Agent Skill)"
   check "lock: skill, URL#DIR, the commit, ref and skill flags" [ "$(lockline beta | cut -f 4-7,11)" = "skill-$(printf '%s' "$c1" | cut -c 1-12)${tab}skill${tab}$url#skills/beta${tab}$c1${tab}ref=HEAD,skill=$(modhd1 "$W/skills/skills/beta")" ]
   has doc "$(cat "$CONF/ext/beta/doc.md")" "Imported from the Agent Skill beta ($url#skills/beta @ $c1)."
+  run list
+  out_has "$url#skills/beta (UNREVIEWED)"
   run add --skill "$url#../x" --yes
   refused "is not a plain directory path"
   run outdated
@@ -652,6 +655,15 @@ t_new() {
     out_lacks "FAIL"
     HENKI_BIN=$REAL_HENKI run add "$W/$n/$n" --yes
     rc_is 0
+    # Committed and pushed as made, it is an entry the index takes.
+    mkrepo "$W/$n"
+    git init -q --bare "$W/$n.git"
+    git -C "$W/$n" remote add origin "file://$W/$n.git"
+    git -C "$W/$n" push -q origin HEAD:main 2>/dev/null
+    git -C "$W/$n" fetch -q origin 2>/dev/null
+    HENKI_BIN=$REAL_HENKI HENKI_INDEX_ALLOW_FILE=1 dev_run "$W/$n" publish "./$n"
+    rc_is 0
+    entry_lints "$n"
   done
   check "the tool's eval task" [ -x "$W/toolx/toolx/eval/greet/check" ]
   run eval --check "$W/toolx/toolx/eval"
@@ -793,6 +805,20 @@ t_try() {
 
 # --- publish -----------------------------------------------------------------------------------------------------------
 
+# The two files publish printed (OUT) for NAME 0.1.0 pass the index's lint (entry lint), as a pull request would.
+entry_lints() { # NAME
+  local o="$OUT" f
+  mkdir -p "$W/ix/mods/$1"
+  printf '%s\n' "$o" | HM_H="# mods/$1.toml" awk 'index($0, ENVIRON["HM_H"]) == 1 { f = 1; next } /^$/ { f = 0 } f' >"$W/ix/mods/$1.toml"
+  printf '%s\n' "$o" | HM_H="# mods/$1/0.1.0.toml" awk '$0 == ENVIRON["HM_H"] { f = 1; next } /^$/ { f = 0 } f' >"$W/ix/mods/$1/0.1.0.toml"
+  for f in "$W/ix/mods/$1.toml" "$W/ix/mods/$1/0.1.0.toml"; do
+    check "$f holds an entry" [ -s "$f" ]
+    HENKI_INDEX_ALLOW_FILE=1 dev_run "$W" entry lint "$f"
+    rc_is 0
+  done
+  OUT=$o
+}
+
 t_publish() {
   case_ "publish: the entry files for a pushed module"
   mkdir -p "$W/src"
@@ -822,14 +848,7 @@ t_publish() {
   has 'commit' "$OUT" "commit = \"$c\""
   has 'bins' "$OUT" 'bins = ["pm"]'
   has 'nothing sent' "$OUT" "Nothing was sent anywhere."
-  # The files it prints pass the index's lint (entry lint), as a pull request would.
-  mkdir -p "$W/ix/mods/pm"
-  printf '%s\n' "$OUT" | awk '/^# mods\/pm.toml/ { f = 1; next } /^$/ { f = 0 } f' >"$W/ix/mods/pm.toml"
-  printf '%s\n' "$OUT" | awk '/^# mods\/pm\/0.1.0.toml/ { f = 1; next } /^$/ { f = 0 } f' >"$W/ix/mods/pm/0.1.0.toml"
-  HENKI_INDEX_ALLOW_FILE=1 dev_run "$W" entry lint "$W/ix/mods/pm.toml"
-  rc_is 0
-  HENKI_INDEX_ALLOW_FILE=1 dev_run "$W" entry lint "$W/ix/mods/pm/0.1.0.toml"
-  rc_is 0
+  entry_lints pm
   # A GitHub ssh remote is named by its https URL, and its owner is the maintainer when the manifest has none.
   sed '/^maintainer/d' "$W/src/pm/.henki/module.toml" >"$W/t" && mv "$W/t" "$W/src/pm/.henki/module.toml"
   commit "$W/src" "no maintainer"

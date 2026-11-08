@@ -476,7 +476,7 @@ summary = "..."                  # optional, at most 160 bytes; defaults to doc.
 license = "Apache-2.0"           # required, an SPDX id or expression
 requires = ["henki >= 0.1"]      # optional
 contracts = ["ext/1"]            # optional; refused when this henki's index lacks one
-os = ["macos", "linux"]          # optional; refused on another OS
+os = ["linux", "macos"]          # optional; refused on another OS
 needs = ["git"]                  # optional; looked for on PATH, never installed (a warning, not a refusal)
 shadow = ["halti/pbpaste"]       # optional; the NAME/COMMAND entries the user must add to the config's shadow
 caps_net = "none"                # optional: none | loopback | any (declared, NOT enforced)

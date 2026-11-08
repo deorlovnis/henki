@@ -149,9 +149,10 @@ version = "0.1.0"
 # An SPDX id or expression; the index takes the licenses its CONTRIBUTING.md lists.
 license = "0BSD"
 requires = ["henki >= 0.2"]
-# The formats it is written for (CONTRACTS.md); a henki-mods that lacks one refuses the module.
+# The formats it is written for (CONTRACTS.md); a henki-mods that lacks one refuses the module. An index wants each
+# array sorted, without repeats.
 contracts = [$1]
-os = ["macos", "linux"]
+os = ["linux", "macos"]
 # Where its programs connect: none, loopback or any (declared for the reader, not enforced).
 caps_net = "none"
 # The ports its port/ programs bind (port/1), each once henki-mods swap binds it.
@@ -206,7 +207,7 @@ EOF
 # Exit 0 is a pass. It runs in the work dir after henki, with the model's last answer on stdin.
 grep -q 'hello, the reader'
 EOF
-  new_manifest '"ext/2", "module/1", "eval/1"' ''
+  new_manifest '"eval/1", "ext/2", "module/1"' ''
 }
 
 new_cmd() {
@@ -271,7 +272,7 @@ log="$HENKI_STATE/@NAME@/events.jsonl"
 mkdir -p "${log%/*}"
 cat >>"$log"
 EOF
-  new_manifest '"ext/2", "observe/1", "module/1"' ''
+  new_manifest '"ext/2", "module/1", "observe/1"' ''
 }
 
 new_port() {
@@ -365,7 +366,7 @@ while IFS= read -r line; do
 done
 release
 EOF
-  new_manifest '"ext/2", "port/1", "history/1", "module/1"' '"history"'
+  new_manifest '"ext/2", "history/1", "module/1", "port/1"' '"history"'
 }
 
 # The files around a first module in D: test.sh (the tests of the module's own programs, which `henki mods test D`
