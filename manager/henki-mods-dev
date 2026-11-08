@@ -1,0 +1,130 @@
+#!/usr/bin/env bash
+# henki-mods-dev: the module author's tools, beside henki-mods (`henki mods entry ...` reaches them through it). It
+# takes henki-mods' functions (it sources henki-mods, which stops before its own verbs), so a module is read here by the
+# rules it is installed by. Bash 3.2 compatible, as henki-mods.
+#
+#   henki-mods-dev entry derive REPO PATH COMMIT
+#       the keys of an index version file (index/1) that the module itself decides, for the module in directory PATH
+#       ("" for the root) of git repository REPO at the full commit COMMIT: version, commit, hd1, requires, contracts,
+#       os, ports, commands, bins, observers, ctx, prompt_bytes, card_bytes and caps_net. Read from the commit's raw
+#       blobs, as `henki-mods add` copies a module; no code of the module runs. The index's own check.sh compares a
+#       version file against this.
+#   henki-mods-dev entry lint FILE
+#       one entry file, mods/NAME.toml (a package) or mods/NAME/VERSION.toml (a version), against the index's rules; a
+#       version may still lack its review (reviewed, reviewer and asset checks are the reviewer's to add)
+set -u
+p="$0"
+while [ -L "$p" ]; do
+  t=$(readlink "$p") || break
+  case "$t" in /*) p=$t ;; *) p="$(dirname "$p")/$t" ;; esac
+done
+# shellcheck source=manager/henki-mods
+. "$(cd -P "$(dirname "$p")" && pwd)/henki-mods" || exit 1
+
+usage() {
+  cat >&2 <<'EOF'
+usage: henki-mods-dev entry derive REPO PATH COMMIT   the derived keys of an index version file
+       henki-mods-dev entry lint FILE                 one index entry file (mods/NAME.toml, mods/NAME/VERSION.toml)
+       henki-mods-dev help | --version
+EOF
+  exit 2
+}
+
+# A TOML array of the lines of LIST: ["a", "b"].
+toml_array() { printf '%s\n' "$1" | awk 'NF { s = s (n++ ? ", " : "") "\"" $0 "\"" } END { print "[" s "]" }'; }
+
+# The names under DIR/ in the listing (STAGE_LIST) that henki takes as entries: no .md data, no dot files.
+listed() { HM_D="$1/" awk -F '\t' 'BEGIN { d = ENVIRON["HM_D"] } index($1, d) == 1 { n = substr($1, length(d) + 1); if (index(n, "/") == 0 && n !~ /\.md$/ && n !~ /^\./) print n }' "$STAGE_LIST"; }
+
+entry_derive() { # REPO PATH COMMIT
+  local repo="$1" path="$2" commit="$3" x fallback b
+  case "$commit" in *[!0-9a-f]*) commit=x ;; esac
+  [ ${#commit} = 40 ] || die "\"$3\" is not a full commit id; fix: give all 40 hex digits (an entry pins a commit, never a branch)"
+  case "/$path/" in *//* | */./* | */../*) [ -z "$path" ] || die "\"$path\" is not a directory path in the repository; fix: give it like mods/NAME, or \"\" for the root" ;; esac
+  x=${repo%/}
+  x=${x##*/}
+  fallback=${path##*/}
+  fallback=${fallback:-${x%.git}}
+  copy_git "$repo" "$commit" "$path" "$STAGE/m"
+  inspect "$STAGE/m" "$fallback" 0 || die "$(printf '%s' "$ERR" | sed "s|$STAGE/m|$repo${path:+#$path}|g")"
+  [ "$M_has" = 1 ] || die "$repo${path:+#$path}: no .henki/module.toml; fix: an indexed module has a manifest (name, version, license)"
+  b=$(prompt_bytes "$I_name" "$STAGE/m")
+  [ "$b" = 0 ] || b=$((b + ${#HEADER} + 2))
+  printf 'version = "%s"\n' "$M_version"
+  printf 'commit = "%s"\n' "$COMMIT"
+  printf 'hd1 = "%s"\n' "$I_hd1"
+  printf 'requires = %s\n' "$(toml_array "$M_requires")"
+  printf 'contracts = %s\n' "$(toml_array "$M_contracts")"
+  printf 'os = %s\n' "$(toml_array "$M_os")"
+  printf 'ports = %s\n' "$(toml_array "$M_ports")"
+  printf 'commands = %s\n' "$(toml_array "$(listed cmd)")"
+  printf 'bins = %s\n' "$(toml_array "$(listed bin)")"
+  printf 'observers = %s\n' "$(toml_array "$(listed on)")"
+  printf 'ctx = %s\n' "$(toml_array "$(listed ctx)")"
+  printf 'prompt_bytes = %s\n' "$b"
+  printf 'card_bytes = %s\n' "$I_card"
+  printf 'caps_net = "%s"\n' "${M_caps:-none}"
+}
+
+entry_lint() { # FILE
+  local f="$1" n v k kind why out
+  [ -f "$f" ] && [ ! -L "$f" ] || die "$f is not a regular file; fix: name an entry file"
+  case "/$f" in
+    */mods/*/*.toml)
+      v=${f##*/}
+      v=${v%.toml}
+      n=${f%/*}
+      n=${n##*/}
+      k=ver
+      ;;
+    */mods/*.toml)
+      n=${f##*/}
+      n=${n%.toml}
+      k=pkg
+      ;;
+    *) die "$f is neither mods/NAME.toml nor mods/NAME/VERSION.toml; fix: name the file in an index's tree" ;;
+  esac
+  why=$(invisible_check "$f") || die "$f holds $why, which a terminal does not show; fix: remove it"
+  out=$(toml <"$f") || die "$f:$out"
+  printf '%s\n' "$out" | command grep -v '^$' >"$STAGE/rec"
+  if [ "$k" = pkg ]; then
+    out=$(lint_pkg "$STAGE/rec" "$n" "$f")
+  else
+    kind=git
+    if [ -f "${f%/*}.toml" ] && toml <"${f%/*}.toml" >"$STAGE/pkg" 2>/dev/null; then kind=$(rget "$STAGE/pkg" kind) || kind=git; fi
+    out=$(CK_PR=1 lint_ver "$STAGE/rec" "$v" "$kind" "$f")
+  fi
+  if [ -n "$out" ]; then
+    printf 'henki-mods-dev: %s\n' "$out" >&2
+    die "entry lint: $(printf '%s\n' "$out" | wc -l | tr -d ' ') problems (above); fix: as each one says"
+  fi
+  say "$f: ok"
+}
+
+setup
+case "${1:-}" in
+  entry)
+    case "${2:-}" in
+      derive)
+        [ $# = 5 ] || usage
+        scratch
+        entry_derive "$3" "$4" "$5"
+        ;;
+      lint)
+        [ $# = 3 ] || usage
+        scratch
+        entry_lint "$3"
+        ;;
+      *) usage ;;
+    esac
+    ;;
+  help | -h | --help)
+    usage 2>&1 | sed 's/^usage: //;s/^       //'
+    exit 0
+    ;;
+  --version)
+    [ $# = 1 ] || usage
+    say "henki-mods-dev $(henki_version)"
+    ;;
+  *) usage ;;
+esac

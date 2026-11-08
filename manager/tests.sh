@@ -17,7 +17,7 @@ MODS="$HERE/henki-mods"
 HENKI_BIN=${MODS_TEST_HENKI:-}
 # The manager's `henki port` for the conformance suites (test --port, swap); none without MODS_TEST_HENKI.
 [ -z "$HENKI_BIN" ] || export HENKI_BIN
-unset MODS_TEST_HENKI HENKI_SHARE HENKI_MODS_TTY HENKI_CONFIG GIT_DIR GIT_WORK_TREE
+unset MODS_TEST_HENKI HENKI_SHARE HENKI_MODS_TTY HENKI_CONFIG HENKI_SESSION HENKI_NEXT GIT_DIR GIT_WORK_TREE
 export GIT_CONFIG_NOSYSTEM=1 GIT_AUTHOR_NAME=fixture GIT_AUTHOR_EMAIL=fixture@example.invalid
 export GIT_COMMITTER_NAME=fixture GIT_COMMITTER_EMAIL=fixture@example.invalid
 SCRATCH=$(mktemp -d "${TMPDIR:-/tmp}/henki-mods-tests.XXXXXX") || exit 1
@@ -44,7 +44,7 @@ case_() {
   W="$d/w"
   CONF="$HOME/.config/henki"
   STORE="$XDG_DATA_HOME/henki/mods"
-  unset HENKI_SHARE HENKI_MODS_TTY HENKI_CONFIG
+  unset HENKI_SHARE HENKI_MODS_TTY HENKI_CONFIG HENKI_SESSION HENKI_NEXT
 }
 
 # Runs the manager; OUT, ERR, RC.
@@ -104,13 +104,13 @@ field() { lockline "$1" | cut -f "$2"; }
 static_bash32() {
   case_ "static: no bash 4+ features"
   local f hits
-  for f in "$MODS" "$HERE/tests.sh"; do
+  for f in "$MODS" "$HERE/henki-mods-dev" "$HERE/tests.sh"; do
     hits=$(command grep -nE '(^|[^[:alnum:]_])(mapfile|readarray|coproc)([^[:alnum:]_]|$)|(declare|local|typeset) +-[a-zA-Z]*[An]|\$\{[[:alnum:]_]+(,,?|\^\^?)[}[:alnum:]]|\$\{[[:alnum:]_]+@[QEPAa]\}|\|&|&>>|;;&|\[\[ +-v |\$\{[[:alnum:]_]+\[-[0-9]|EPOCH(SECONDS|REALTIME)|BASHPID|wait +-n|shopt +-s +(globstar|lastpipe|inherit_errexit)|\{[0-9]+\.\.[0-9]+\.\.' "$f" |
       command grep -vE '^[0-9]+:[[:space:]]*#|command grep -nE' || true)
     [ -z "$hits" ] || fail "$f uses bash 4+ syntax:$(printf '\n%s' "$hits")"
   done
   # GNU-only flags and tools, which a Mac lacks.
-  for f in "$MODS" "$HERE/tests.sh"; do
+  for f in "$MODS" "$HERE/henki-mods-dev" "$HERE/tests.sh"; do
     hits=$(command grep -nE '(^|[^[:alnum:]_-])(sed -i|readlink -f|stat -c|grep -P|date -d|mv -T|cp -T|sort -V|realpath|tac|xargs -r)([^[:alnum:]_-]|$)|-printf' "$f" |
       command grep -vE '^[0-9]+:[[:space:]]*#|command grep -nE' || true)
     [ -z "$hits" ] || fail "$f uses a GNU-only tool or flag:$(printf '\n%s' "$hits")"
@@ -126,7 +126,7 @@ static_bash32() {
   # A bash 3.2 built for tests (HENKI_TEST_BASH32) parses what this bash cannot judge: a case pattern inside $(...)
   # without its opening parenthesis is a syntax error there.
   if [ -n "${HENKI_TEST_BASH32:-}" ]; then
-    for f in "$MODS" "$HERE/tests.sh" "$HERE/mods-tests.sh"; do
+    for f in "$MODS" "$HERE/henki-mods-dev" "$HERE/tests.sh" "$HERE/mods-tests.sh"; do
       "$HENKI_TEST_BASH32" -n "$f" || fail "bash 3.2 cannot parse $f"
     done
   fi
@@ -1827,6 +1827,484 @@ t_general() {
   [ "$n" = "$t" ] || fail "the general suite has $t tasks, and this case covers $n"
 }
 
+# --- the signed index ----------------------------------------------------------------------------------------------------
+
+# The index fixtures are signed with ssh-keygen: OpenSSH's when it is on PATH, else the test stand-in (python3 and
+# openssl; testdata/ssh-keygen), which reads and writes the same files. Three keys for the whole run.
+if ! command -v ssh-keygen >/dev/null 2>&1; then
+  PATH="$HERE/testdata:$PATH"
+  echo "ssh-keygen: the test stand-in (python3 + openssl)"
+fi
+KEYS="$SCRATCH/keys"
+mkdir -p "$KEYS"
+for k in k1 k2 k3; do ssh-keygen -q -t ed25519 -N '' -C "$k" -f "$KEYS/$k" </dev/null >/dev/null || exit 1; done
+# KEY's allowed_signers line, and its blob.
+signer() { printf 'henki-index namespaces="git" %s\n' "$(cut -d ' ' -f 1,2 "$KEYS/$1.pub")"; }
+blob() { cut -d ' ' -f 2 "$KEYS/$1.pub"; }
+
+# A commit of everything in index DIR: signed by KEY (k1 by default), or unsigned with KEY none.
+ixc() { # DIR MESSAGE [KEY]
+  git -C "$1" add -A
+  if [ "${3:-k1}" = none ]; then
+    git -C "$1" -c commit.gpgsign=false -c core.hooksPath=/dev/null commit -q --allow-empty -m "$2"
+  else
+    git -C "$1" -c gpg.format=ssh -c user.signingkey="$KEYS/${3:-k1}" -c core.hooksPath=/dev/null commit -q --allow-empty -S -m "$2"
+  fi
+}
+
+# An index at IX (W/index by default): .signers with k1, an empty removed.toml, one signed root commit on main.
+mkindex() {
+  IX="${1:-$W/index}"
+  mkdir -p "$IX/mods"
+  signer k1 >"$IX/.signers"
+  printf '# removed modules\n' >"$IX/removed.toml"
+  git init -q -b main "$IX"
+  ixc "$IX" root
+}
+
+# The default index's anchors in W/share (HENKI_SHARE): IX's URL, KEY's line (k1), the root commit as the checkpoint,
+# and no refused key.
+mkshare() { # [KEY]
+  mkdir -p "$W/share/index"
+  printf 'file://%s\n' "$IX" >"$W/share/index/deorlovnis.url"
+  signer "${1:-k1}" >"$W/share/index/deorlovnis.signers"
+  git -C "$IX" rev-list --max-parents=0 HEAD >"$W/share/index/deorlovnis.checkpoint"
+  printf '# none\n' >"$W/share/index/refused.keys"
+  export HENKI_SHARE="$W/share"
+}
+
+# KEY = VALUE (raw) in place of FILE's KEY line, or added.
+setkey() { # FILE KEY VALUE
+  HM_K="$2" HM_V="$3" awk '{ k = $0; sub(/ *=.*/, "", k) } k == ENVIRON["HM_K"] { if (!d++) print ENVIRON["HM_K"] " = " ENVIRON["HM_V"]; next } { print } END { if (!d) print ENVIRON["HM_K"] " = " ENVIRON["HM_V"] }' "$1" >"$1.new" && mv "$1.new" "$1"
+}
+
+# FILE without its KEY line.
+unkey() { HM_K="$2" awk '{ k = $0; sub(/ *=.*/, "", k) } k != ENVIRON["HM_K"]' "$1" >"$1.new" && mv "$1.new" "$1"; }
+
+# A module repository W/NAME at VERSION (a commit more), with EXTRA manifest lines.
+mkmodrepo() { # NAME VERSION [EXTRA]
+  [ -d "$W/$1/.git" ] || mkmod "$W/$1" "${3:-}"
+  setkey "$W/$1/.henki/module.toml" version "\"$2\""
+  printf '%s\n' "$2" >"$W/$1/CHANGELOG.md"
+  mkrepo "$W/$1"
+}
+
+# IX's entry for module repository W/NAME at its HEAD as VERSION: the package file (latest VERSION) and the version
+# file the author tool derives, reviewed unless REVIEW is "no".
+ixentry() { # NAME VERSION [REVIEW]
+  local d="$W/$1"
+  mkdir -p "$IX/mods/$1"
+  [ -f "$IX/mods/$1.toml" ] || printf 'index = 1\nname = "%s"\nkind = "git"\nrepo = "file://%s"\npath = ""\nsummary = "%s does things for tests"\nmaintainer = "someone"\nlicense = "0BSD"\nlatest = "%s"\nadded = "2026-11-08"\n' "$1" "$d" "$1" "$2" >"$IX/mods/$1.toml"
+  setkey "$IX/mods/$1.toml" latest "\"$2\""
+  {
+    echo 'index = 1'
+    HENKI_INDEX_ALLOW_FILE=1 $RUN "$HERE/henki-mods-dev" entry derive "file://$d" "" "$(git -C "$d" rev-parse HEAD)"
+    [ "${3:-}" = no ] || printf 'reviewed = "2026-11-08"\nreviewer = "someone"\n'
+  } >"$IX/mods/$1/$2.toml"
+}
+
+ixv() { git --git-dir="$XDG_DATA_HOME/henki/index/${1:-deorlovnis}.git" rev-parse -q --verify refs/henki/verified 2>/dev/null; }
+
+t_index_sync() {
+  case_ "index: placeholder, first sync, bad commits, rotation, rollback, grafts, refused keys, offline, age"
+  mkdir -p "$W/share/index"
+  printf 'https://example.invalid/index\n' >"$W/share/index/deorlovnis.url"
+  printf '# no key yet\n' >"$W/share/index/deorlovnis.signers"
+  export HENKI_SHARE="$W/share"
+  run search
+  refused "index deorlovnis is not live yet"
+  run add nosuch --yes
+  refused "no official module nosuch, and index deorlovnis is not live yet"
+  run add sessions --yes
+  rc_is 0
+  out_lacks "index"
+  mkindex
+  mkshare
+  run sync
+  rc_is 0
+  out_has "index deorlovnis: $(git -C "$IX" rev-parse HEAD | cut -c 1-12), 1 new commits verified (1 epochs)"
+  out_has "index deorlovnis: henki-index @ "
+  out_has "(verified, today; key SHA256:"
+  out_has "anchor: $W/share/index/deorlovnis.signers"
+  check "verified is main" [ "$(ixv)" = "$(git -C "$IX" rev-parse HEAD)" ]
+  local v0 v1
+  v0=$(ixv)
+  # An unsigned commit, and one signed by a key .signers does not list: refused, the verified commit kept.
+  ixc "$IX" unsigned none
+  run sync
+  rc_is 0
+  err_has "is not signed (the .signers of its first parent, minus refused keys); refused"
+  err_has "keeps using $(printf '%s' "$v0" | cut -c 1-12)"
+  check "still the old commit" [ "$(ixv)" = "$v0" ]
+  git -C "$IX" reset -q --hard HEAD~1
+  ixc "$IX" "other key" k2
+  run sync
+  err_has "is signed by a key that is not in the signers list"
+  check "still the old commit" [ "$(ixv)" = "$v0" ]
+  git -C "$IX" reset -q --hard HEAD~1
+  # A rotation: k1 signs .signers = k2, then k2 signs; a later commit by k1 is refused.
+  signer k2 >"$IX/.signers"
+  ixc "$IX" rotate k1
+  ixc "$IX" "by k2" k2
+  run sync
+  rc_is 0
+  out_has "2 new commits verified (2 epochs)"
+  v1=$(ixv)
+  check "verified moved" [ "$v1" = "$(git -C "$IX" rev-parse HEAD)" ]
+  ixc "$IX" "by the old key" k1
+  run sync
+  err_has "is signed by a key that is not in the signers list"
+  check "still v1" [ "$(ixv)" = "$v1" ]
+  # A rewritten main that no longer holds the verified commit: no rollback.
+  git -C "$IX" reset -q --hard "$v0"
+  run sync
+  err_has "main's first-parent line no longer holds the verified commit $v1"
+  check "still v1" [ "$(ixv)" = "$v1" ]
+  # The graft: k1, rotated out at v1's parent, signs X on the pre-rotation root and merges v1 as a second parent.
+  git -C "$IX" -c gpg.format=ssh -c user.signingkey="$KEYS/k1" merge -q --no-ff -S -m graft "$v1" >/dev/null 2>&1 ||
+    fail "the graft merge failed"
+  check "v1 is the merge's second parent" [ "$(git -C "$IX" rev-parse HEAD^2)" = "$v1" ]
+  run sync
+  err_has "no longer holds the verified commit"
+  check "still v1" [ "$(ixv)" = "$v1" ]
+  # A first sync of that history with the checkpoint at v1: refused; without one it would verify (why one ships).
+  printf '%s\n' "$v1" >"$W/share/index/deorlovnis.checkpoint"
+  rm -rf "$XDG_DATA_HOME/henki/index"
+  run sync
+  refused "does not hold the checkpoint $v1"
+  rm -f "$W/share/index/deorlovnis.checkpoint"
+  rm -rf "$XDG_DATA_HOME/henki/index"
+  run sync
+  rc_is 0
+  err_has "no checkpoint to start from"
+  # A key in refused.keys never verifies, even where .signers lists it.
+  rm -rf "$XDG_DATA_HOME/henki/index"
+  blob k1 >"$W/share/index/refused.keys"
+  run sync
+  refused "(a root commit: the anchor's keys, minus refused keys); refused"
+  printf '# none\n' >"$W/share/index/refused.keys"
+  run sync
+  rc_is 0
+  # Offline: the URL is gone, the verified commit stays in use; an edited ref is refused before a read.
+  printf 'file://%s/gone\n' "$W" >"$W/share/index/deorlovnis.url"
+  run search
+  rc_is 0
+  out_has "index deorlovnis: offline; using"
+  ixc "$IX" "unsigned at the head" none
+  git --git-dir="$XDG_DATA_HOME/henki/index/deorlovnis.git" fetch -q "$IX" "+main:refs/henki/verified" 2>/dev/null
+  run search
+  refused "is not signed"
+  rm -rf "$XDG_DATA_HOME/henki/index"
+  # A verified commit over 30 days old: a warning on every index screen.
+  mkindex "$W/old"
+  printf 'file://%s\n' "$IX" >"$W/share/index/deorlovnis.url"
+  GIT_COMMITTER_DATE="2001-01-01T00:00:00Z" ixc "$IX" old
+  run search
+  rc_is 0
+  err_has "days old; a frozen index stops showing yanks; fix: henki-mods sync, or report it"
+  run list
+  err_has "days old"
+}
+
+# 5,001 commits on main's first-parent line are refused before any signature is checked.
+t_index_long() {
+  case_ "index: more than 5,000 commits"
+  mkindex
+  mkshare
+  local i=0 root
+  root=$(git -C "$IX" rev-parse HEAD)
+  {
+    while [ $i -lt 5001 ]; do
+      i=$((i + 1))
+      printf 'commit refs/heads/main\ncommitter f <f@x> %s +0000\ndata 1\nx\n' "$((1700000000 + i))"
+      [ $i != 1 ] || printf 'from %s\n' "$root"
+      printf '\n'
+    done
+  } | git -C "$IX" fast-import --quiet || fail "fast-import"
+  run sync
+  refused "main's first-parent line has more than 5,000 commits; refused"
+}
+
+# An index W/index with module repositories hello (0.1.0 and 0.2.0) and lean (0.1.0), synced from W/share.
+ix_two() {
+  mkindex
+  mkmodrepo hello 0.1.0
+  ixentry hello 0.1.0
+  mkmodrepo hello 0.2.0
+  ixentry hello 0.2.0
+  mkmodrepo lean 0.1.0
+  ixentry lean 0.1.0
+  ixc "$IX" entries
+  mkshare
+}
+
+t_index_add() {
+  case_ "index: search, info, add NAME (tiers, hd1, yanked, os, NAME@INDEX, reserved names, unreviewed, a URL's tier)"
+  ix_two
+  run search
+  rc_is 0
+  out_has "hello            reviewed                 0.2.0"
+  out_has "lean             reviewed                 0.1.0"
+  run search LEAN
+  out_has "lean "
+  out_lacks "hello "
+  run info hello
+  rc_is 0
+  out_has "hello 0.2.0 · reviewed by someone (signed index henki-index, 2026-11-08)"
+  out_has "hello 0.1.0 · reviewed by someone"
+  out_has "install: henki-mods add hello"
+  run add hello --yes
+  rc_is 0
+  out_has "source   index deorlovnis: hello 0.2.0 (file://$W/hello @ $(git -C "$W/hello" rev-parse HEAD))"
+  out_has "review   reviewed by someone (signed index henki-index, 2026-11-08)"
+  check "kind index:deorlovnis, source hello, version 0.2.0" [ "$(field hello 5):$(field hello 6):$(field hello 4)" = "index:deorlovnis:hello:0.2.0" ]
+  run list
+  out_has "index deorlovnis: hello"
+  run verify
+  rc_is 0
+  # A version file whose hd1 is not the commit's files: refused.
+  local hd other=macos
+  hd=$(sed -n 's/^hd1 = //p' "$IX/mods/lean/0.1.0.toml")
+  setkey "$IX/mods/lean/0.1.0.toml" hd1 '"hd1:0000000000000000000000000000000000000000000000000000000000000000"'
+  ixc "$IX" "a wrong hd1"
+  run add lean --yes
+  refused "are not the reviewed ones"
+  check "not added" [ -z "$(lockline lean)" ]
+  setkey "$IX/mods/lean/0.1.0.toml" hd1 "$hd"
+  # A yanked version is never installed; --version takes an older one.
+  run rm hello
+  setkey "$IX/mods/hello/0.1.0.toml" yanked '"buggy: loses data (2026-11-08)"'
+  ixc "$IX" "yank 0.1.0"
+  run add hello --version 0.1.0 --yes
+  refused "hello 0.1.0 was yanked (buggy: loses data (2026-11-08)); not installed"
+  # A latest version for another OS gives way to the newest older one that runs here.
+  unkey "$IX/mods/hello/0.1.0.toml" yanked
+  [ "$(uname -s)" != Darwin ] || other=linux
+  printf 'os = ["%s"]\n' "$other" >>"$W/hello/.henki/module.toml"
+  mkmodrepo hello 0.3.0
+  ixentry hello 0.3.0
+  ixc "$IX" "0.3.0 for $other"
+  run add hello --yes
+  rc_is 0
+  out_has "hello 0.3.0 runs on $other only; looking at older versions"
+  out_has "source   index deorlovnis: hello 0.2.0"
+  run rm hello
+  # A version nobody reviewed: red, and named so.
+  mkmodrepo fresh 0.1.0
+  ixentry fresh 0.1.0 no
+  ixc "$IX" "an unreviewed entry"
+  run add fresh --yes
+  rc_is 0
+  out_has "UNREVIEWED: listed in henki-index, but no reviewer has read this version"
+  # A URL install of files an index lists gets their review; others stay red.
+  run add "file://$W/lean" --yes
+  rc_is 0
+  out_has "review   reviewed by someone (signed index henki-index, 2026-11-08) (the same files as lean 0.1.0 of index deorlovnis)"
+  out_lacks "UNREVIEWED"
+  # A second index, the person's own: a name both list needs NAME@INDEX; it never provides a reserved or official name.
+  mkdir -p "$CONF/index"
+  local main="$IX"
+  mkindex "$W/extra"
+  mkdir -p "$IX/mods/hello" "$IX/mods/sessions"
+  cp "$main/mods/hello.toml" "$IX/mods/"
+  cp "$main/mods/hello/0.2.0.toml" "$IX/mods/hello/"
+  setkey "$IX/mods/hello.toml" latest '"0.2.0"'
+  printf 'index = 1\nname = "sessions"\nkind = "git"\nrepo = "file://%s"\npath = ""\nsummary = "not the official one"\nmaintainer = "someone"\nlicense = "0BSD"\nlatest = "0.2.0"\nadded = "2026-11-08"\n' "$W/hello" >"$IX/mods/sessions.toml"
+  cp "$main/mods/hello/0.2.0.toml" "$IX/mods/sessions/0.2.0.toml"
+  ixc "$IX" "extra entries"
+  printf 'index/1\textra\tfile://%s\n' "$IX" >"$CONF/mods.index"
+  signer k1 >"$CONF/index/extra.signers"
+  IX=$main
+  run add hello --yes
+  refused "hello is listed by more than one index: deorlovnis extra; fix: name one, like henki-mods add hello@extra"
+  run search
+  rc_is 0
+  out_has "index extra: henki-index @ "
+  out_has "anchor: $CONF/index/extra.signers"
+  out_lacks "not the official one"
+  run add hello@extra --yes
+  rc_is 0
+  check "kind index:extra" [ "$(field hello 5)" = index:extra ]
+  run add sessions@extra --yes
+  refused "no index you use lists sessions (in index extra)"
+  # A commit the module repository no longer has.
+  git -C "$W/hello" reset -q --hard HEAD~2
+  git -C "$W/hello" -c commit.gpgsign=false commit -q --allow-empty -m rewritten
+  git -C "$W/hello" reflog expire --expire=now --all && git -C "$W/hello" gc -q --prune=now 2>/dev/null
+  run rm hello
+  run add hello@deorlovnis --yes
+  refused "is gone from file://$W/hello (rewritten history?); fix: tell the module's maintainer"
+}
+
+t_index_yank() {
+  case_ "index: yanks at sync and at every install (malicious, buggy, ports, other indexes, pins)"
+  ix_two
+  run add hello --yes
+  rc_is 0
+  run add lean --yes
+  rc_is 0
+  mkmod "$W/byurl"
+  mkrepo "$W/byurl"
+  run add "file://$W/byurl" --yes
+  rc_is 0
+  local hstore
+  hstore=$(readlink "$CONF/ext/hello")
+  # hello binds history, lean policy (as a swap leaves them).
+  mkdir -p "$CONF/port"
+  ln -s "$hstore/bin/hello" "$CONF/port/history"
+  ln -s "$(readlink "$CONF/ext/lean")/bin/lean" "$CONF/port/policy"
+  printf 'bind/1\thistory\thello\t%s\t2026-11-08T10:00Z\tyes\nbind/1\tpolicy\tlean\t%s\t2026-11-08T10:00Z\tyes\n' "${hstore##*/}" "$(readlink "$CONF/ext/lean" | sed 's|.*/||')" >>"$CONF/mods.lock"
+  # A pin does not keep a malicious module on.
+  awk -F '\t' 'BEGIN { OFS = "\t" } $2 == "hello" { $11 = "pin" } { print }' "$CONF/mods.lock" >"$W/l" && cp "$W/l" "$CONF/mods.lock"
+  setkey "$IX/mods/hello/0.2.0.toml" yanked '"malicious: steals keys (2026-11-08)"'
+  setkey "$IX/mods/lean/0.1.0.toml" yanked '"malicious: phones home (2026-11-08)"'
+  printf 'byurl = "buggy: a test (2026-11-08)"\n' >>"$IX/removed.toml"
+  ixc "$IX" yanks
+  run sync
+  rc_is 0
+  out_has "hello 0.2.0 was yanked as malicious (steals keys (2026-11-08)) by index deorlovnis: turned off; its files are kept at"
+  out_has "history: henki will not start until you choose: henki-mods swap history std (or another package) for good, or henki --port history=std for one session"
+  out_has "policy: std again (it was lean's)"
+  check "hello off, flagged, pinned" [ "$(field hello 3):$(field hello 11)" = "off:pin,yanked=malicious" ]
+  check "no ext link" [ ! -L "$CONF/ext/hello" ]
+  check "the history marker" [ "$(readlink "$CONF/port/history")" = yanked ]
+  check "bind/1 history yanked" [ "$(awk -F '\t' '$1 == "bind/1" && $2 == "history" { print $6 }' "$CONF/mods.lock")" = yanked ]
+  check "policy unbound" [ ! -L "$CONF/port/policy" ] && [ -z "$(awk -F '\t' '$2 == "policy"' "$CONF/mods.lock")" ]
+  check "the URL install is untouched (a removal acts on index lines only)" [ "$(field byurl 3):$(field byurl 11)" = "on:" ]
+  run sync
+  out_lacks "was yanked as malicious"
+  run on hello
+  refused "hello 0.2.0 was yanked as malicious; it stays off; fix: henki-mods rm hello"
+  run list
+  out_has "history: STOPPED: hello was yanked as malicious"
+  run verify
+  refused "history is stopped: hello was yanked as malicious"
+  if [ -n "${HENKI_BIN:-}" ]; then
+    RC=0
+    OUT=$(cd "$W" && HENKI_MODEL=m HENKI_BASE_URL=http://127.0.0.1:9 "$HENKI_BIN" run x 2>&1) || RC=$?
+    case "$OUT" in *"henki mods swap history std"*) ;; *) fail "henki started with the marker: $OUT" ;; esac
+  fi
+  run swap history std
+  rc_is 0
+  run verify
+  rc_is 0
+  # A buggy yank is said once and changes nothing. Another index's yank of the same files, and its removal of a
+  # name, act on nothing it did not provide.
+  mkdir -p "$CONF/index"
+  local main="$IX"
+  mkindex "$W/extra"
+  mkdir -p "$IX/mods/lean"
+  cp "$main/mods/lean.toml" "$IX/mods/"
+  cp "$main/mods/lean/0.1.0.toml" "$IX/mods/lean/"
+  printf 'hello = "malicious: not its own (2026-11-08)"\n' >>"$IX/removed.toml"
+  ixc "$IX" "extra yanks"
+  printf 'index/1\textra\tfile://%s\n' "$IX" >"$CONF/mods.index"
+  signer k1 >"$CONF/index/extra.signers"
+  IX=$main
+  run rm lean
+  run rm hello
+  unkey "$IX/mods/lean/0.1.0.toml" yanked
+  unkey "$IX/mods/hello/0.2.0.toml" yanked
+  ixc "$IX" "unyanked"
+  run add hello@deorlovnis --yes
+  rc_is 0
+  out_has "source   index deorlovnis: hello 0.2.0"
+  run add "file://$W/lean" --yes
+  rc_is 0
+  setkey "$IX/mods/hello/0.2.0.toml" yanked '"buggy: slow (2026-11-08)"'
+  ixc "$IX" "buggy"
+  run sync
+  rc_is 0
+  out_has "hello 0.2.0 was yanked as buggy (slow (2026-11-08)) by index deorlovnis; it stays as it is"
+  out_lacks "lean"
+  run sync
+  out_lacks "was yanked"
+  check "lean by URL stays on" [ "$(field lean 3)" = on ]
+  check "hello stays on, flagged" [ "$(field hello 3):$(field hello 11)" = on:yanked=buggy ]
+  # A malicious hd1 in the default index refuses a URL install.
+  run rm lean
+  setkey "$IX/mods/lean/0.1.0.toml" yanked '"malicious: phones home (2026-11-08)"'
+  ixc "$IX" "lean malicious"
+  run sync
+  run add "file://$W/lean" --yes
+  refused "was yanked as malicious (phones home (2026-11-08)) by index deorlovnis; not installed"
+  run on hello
+  rc_is 0
+  out_has "yanked   as buggy (slow (2026-11-08)) by index deorlovnis"
+}
+
+t_index_guard() {
+  case_ "inside a tool call; the history file; lock flags and kinds; entry derive and lint; test --port DIR"
+  mkmod "$W/hello"
+  printf 'y\n' >"$W/answer"
+  local v
+  for v in "add $W/hello --yes" "on hello" "swap history std"; do
+    # shellcheck disable=SC2086 # the verb and its arguments
+    HENKI_SESSION=20261108T100000Z-abcd HENKI_MODS_TTY="$W/answer" run $v
+    refused "this changes what henki runs, and it runs inside a tool call; fix: run it at the prompt with /mods"
+  done
+  check "nothing added" [ ! -f "$CONF/mods.lock" ]
+  HENKI_SESSION=20261108T100000Z-abcd HENKI_NEXT="$W/next" run add "$W/hello" --yes
+  rc_is 0
+  HENKI_SESSION=20261108T100000Z-abcd run off hello
+  rc_is 0
+  local line
+  line=$(lockline hello)
+  run rm hello
+  rc_is 0
+  check "rm leaves a hist/1 line with the line it removed" [ "$(cut -f 1,3- "$CONF/mods.history")" = "$(printf 'hist/1\trm\t%s' "$line")" ]
+  check "hist/1: a UTC time" sh -c "cut -f 2 '$CONF/mods.history' | command grep -qE '^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}Z$'"
+  run add "$W/hello" --yes
+  awk -F '\t' 'BEGIN { OFS = "\t" } { $5 = "skill"; $11 = "pin,ref=main,skill=hd1:ab12,mask=cmd/x" } { print }' "$CONF/mods.lock" >"$W/l" && cp "$W/l" "$CONF/mods.lock"
+  run lock
+  rc_is 0
+  awk -F '\t' 'BEGIN { OFS = "\t" } { $11 = "pin,later" } { print }' "$CONF/mods.lock" >"$W/l" && cp "$W/l" "$CONF/mods.lock"
+  run lock
+  refused "this lock is newer than this henki-mods (a flag it does not know); fix: upgrade henki"
+  rm "$CONF/mods.lock"
+  # entry derive: what the module decides; entry lint: the index's rules, also through henki-mods.
+  mkmod "$W/derived" 'ports = ["history"]\ncontracts = ["history/1"]\nrequires = ["henki >= 0.2"]\n'
+  mkdir -p "$W/derived/port" "$W/derived/cmd" "$W/derived/on"
+  printf '#!/bin/sh\n' >"$W/derived/port/history"
+  printf '#!/bin/sh\n' >"$W/derived/cmd/zz"
+  printf '#!/bin/sh\n' >"$W/derived/cmd/aa"
+  printf 'data\n' >"$W/derived/cmd/aa.md"
+  printf '#!/bin/sh\n' >"$W/derived/on/session_end"
+  chmod 755 "$W/derived/port/history" "$W/derived/cmd/zz" "$W/derived/cmd/aa" "$W/derived/on/session_end"
+  mkrepo "$W/derived"
+  RC=0
+  OUT=$($RUN "$HERE/henki-mods-dev" entry derive "file://$W/derived" "" "$(git -C "$W/derived" rev-parse HEAD)" 2>"$SCRATCH/err") || RC=$?
+  ERR=$(cat "$SCRATCH/err")
+  rc_is 0
+  out_has "$(printf 'version = "0.1.0"\ncommit = "%s"\nhd1 = "hd1:' "$(git -C "$W/derived" rev-parse HEAD)")"
+  out_has "$(printf 'requires = ["henki >= 0.2"]\ncontracts = ["history/1"]\nos = []\nports = ["history"]\ncommands = ["aa", "zz"]\nbins = ["derived"]\nobservers = ["session_end"]\nctx = []\nprompt_bytes = ')"
+  out_has "$(printf 'card_bytes = 0\ncaps_net = "none"')"
+  mkdir -p "$W/ix/mods/derived"
+  printf 'index = 1\n%s\n' "$OUT" >"$W/ix/mods/derived/0.1.0.toml"
+  run entry lint "$W/ix/mods/derived/0.1.0.toml"
+  refused "conform"
+  printf 'conform = "history/1 25/25"\n' >>"$W/ix/mods/derived/0.1.0.toml"
+  run entry lint "$W/ix/mods/derived/0.1.0.toml"
+  rc_is 0
+  out_has "0.1.0.toml: ok"
+  printf 'index = 1\nname = "derived"\nkind = "git"\nrepo = "http://x.example/r"\npath = ""\nsummary = "s"\nmaintainer = "someone"\nlicense = "0BSD"\nlatest = "0.1.0"\nadded = "2026-11-08"\n' >"$W/ix/mods/derived.toml"
+  run entry lint "$W/ix/mods/derived.toml"
+  refused "repo must be an https URL"
+  RC=0
+  OUT=$($RUN "$HERE/henki-mods-dev" entry derive "file://$W/derived" "" main 2>"$SCRATCH/err") || RC=$?
+  ERR=$(cat "$SCRATCH/err")
+  refused "\"main\" is not a full commit id"
+  # test --port P DIR: a module directory not added.
+  run test --port history "$W/nothere"
+  refused "is not a program"
+  if [ -n "${HENKI_BIN:-}" ]; then
+    mkport tree
+    run test --port history "$W/tree"
+    rc_is 0
+    out_has "history/1: 25 checks, 25 passed"
+  fi
+}
+
 all() {
   t_add_path
   t_ask
@@ -1854,6 +2332,11 @@ all() {
   t_port_toy
   t_policy
   t_eval
+  t_index_sync
+  t_index_long
+  t_index_add
+  t_index_yank
+  t_index_guard
 }
 
 static_bash32

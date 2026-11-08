@@ -44,6 +44,8 @@ A program reads the contracts this henki ships from the rows of this table: each
 | `bind/1` | henki-mods | the lock lines of bound ports, in `mods.lock` |
 | `hd1` | henki-mods | the tree hash that pins a module's files |
 | `eval/1` | henki-mods | a module's eval tasks, the two arms they run in, and the line that records them |
+| `hist/1` | henki-mods | the lock lines a change replaced or removed, `mods.history` |
+| `index/1` | henki-mods | a signed module index: its entries, its signature chain, and what henki-mods reads from it |
 
 ## journal/1
 
@@ -499,14 +501,20 @@ Owned by henki-mods. `CONFIG_DIR/mods.lock` holds one line per module, fields se
 written atomically (a temp file, then a rename):
 
 ```
-lock/1 NAME STATE VERSION SOURCE_KIND SOURCE COMMIT HD1 ADDED HOW MASK
+lock/1 NAME STATE VERSION SOURCE_KIND SOURCE COMMIT HD1 ADDED HOW FLAGS
 ```
 
-- STATE `on` or `off`; SOURCE_KIND `official`, `path` or `url`; SOURCE the module's name (official), the path, or
-  `URL` or `URL#SUBDIR`; COMMIT 40 hex digits or `-`; HD1 the module's `hd1:` hash; ADDED the UTC time,
-  `YYYY-MM-DDTHH:MMZ`; HOW `tty` (answered on the terminal) or `yes` (`--yes`); MASK empty in this version.
-- A line whose first field is not `lock/1` (or `bind/1`, after them) is refused: `this lock is newer than this
-  henki-mods; upgrade henki`.
+- STATE `on` or `off`; SOURCE_KIND `official`, `path`, `url`, `skill` or `index:INDEX`; SOURCE the module's name
+  (official), the path, `URL` or `URL#SUBDIR`, or for `index:INDEX` the package's name in index INDEX (index/1);
+  COMMIT 40 hex digits or `-`; HD1 the module's `hd1:` hash; ADDED the UTC time, `YYYY-MM-DDTHH:MMZ`; HOW `tty`
+  (answered on the terminal) or `yes` (`--yes`).
+- FLAGS is empty or a comma-separated list: `pin` (an update leaves the module as it is), `ref=REF` (the ref a URL
+  install follows), `yanked=malicious` or `yanked=buggy` (an index yanked this version; a malicious one stays off),
+  `skill=hd1:HASH` (the Agent Skill the module was made from), `mask=cmd/NAME` (the store copy leaves out that
+  command).
+- A line whose first field is not `lock/1` (or `bind/1`, after them), or that holds a kind or flag henki-mods does not
+  know, is refused: `this lock is newer than this henki-mods; upgrade henki`. So no rewrite of the lock drops what a
+  later henki-mods wrote.
 - On means the link `CONFIG_DIR/ext/NAME` points at the module's store copy; off means no link.
 
 ## bind/1
@@ -521,9 +529,78 @@ bind/1 PORT NAME ID ADDED HOW
   as in lock/1. The binding is the link `CONFIG_DIR/port/PORT` -> `DATA/henki/mods/NAME/ID/port/PORT`, which
   `henki-mods swap PORT NAME` writes (after the conformance suite passes and the user says yes) and `swap PORT std`
   removes. henki reads the link only, never this line.
+- HOW `yanked`: an index yanked NAME as malicious while it held a port that has no safe fallback (any but `policy` and
+  `context`, which go back to std). The link is then `CONFIG_DIR/port/PORT -> yanked`, which names nothing, so henki
+  refuses to start until the user runs `henki-mods swap PORT std` (or another package), or starts with
+  `--port PORT=std`: a sandbox or a history store never silently falls back.
 - `henki-mods rm NAME` is refused while a link in `CONFIG_DIR/port/` leads into NAME's store copies. A henki-mods that
   does not know `bind/1` refuses the lock, so it never drops a binding it cannot see; one that knows it refuses a line
   for a port it does not bind the same way (`this lock is newer than this henki-mods`).
+
+## hist/1
+
+Owned by henki-mods. `CONFIG_DIR/mods.history` keeps every lock/1 line a change replaced or removed, one per line,
+appended:
+
+```
+hist/1 TIME WHY LOCK_LINE
+```
+
+- TIME is the UTC time (`YYYY-MM-DDTHH:MMZ`), WHY the verb (`rm`, `update`, `rollback`, `unpack`, `init`) and
+  LOCK_LINE the whole lock/1 line as it was, its tabs included. A rollback takes the pin it goes back to from here,
+  never from the module's source.
+
+## index/1
+
+Owned by henki-mods. A module index is a git repository whose `main` lists modules someone has read, each pinned to a
+full commit and its hd1; it never holds module code. henki-mods reads it to search, show and install modules, and to
+apply yanks.
+
+- **Files.** `mods/NAME.toml` (a package), `mods/NAME/VERSION.toml` (one per indexed version), `removed.toml`
+  (`NAME = "malicious|buggy|withdrawn: REASON (YYYY-MM-DD)"`, a name taken out for good), `.signers` (who may sign
+  `main`, git's allowed_signers format), and the index's own gate and docs. Entries are in module/1's grammar; an
+  unknown key is refused, and `index = 2` is a later format (`this index is newer than this henki-mods`).
+- **A package**: `index = 1`, `name` (the file's), `kind` (`git`, or `official` for a record about a module henki
+  ships, never installed from the index), for `git` a `repo` (an https URL) and a `path` (the module's directory in
+  it, `""` for the root), `summary` (at most 160 bytes), `maintainer`, `license`, `latest` (an indexed version, not
+  yanked) and `added` (`YYYY-MM-DD`).
+- **A version**: `index = 1`, `version` (the file's), `commit` (40 hex digits), `hd1` (of the module's directory at
+  that commit, from its raw blobs), the keys the module itself decides (`requires`, `contracts`, `os`, `ports`,
+  `commands`, `bins`, `observers`, `ctx`, `prompt_bytes`, `card_bytes`, `caps_net`; `henki-mods-dev entry derive`
+  prints them), `conform` with `ports`, `asset_TARGET` and `asset_check_TARGET` for a prebuilt binary, `reviewed`
+  and `reviewer` (who read this version, and when), `yanked` (`malicious|buggy|withdrawn: REASON (YYYY-MM-DD)`) and
+  the `eval_*` keys of a badge, all or none.
+- **The signature chain.** Every commit on `main`'s first-parent line is SSH-signed (namespace `git`) by a key listed
+  in the `.signers` of its first parent (at most 64 KiB), the root commit by a key of the anchor; a line whose key
+  blob is in the refused keys never counts. A key changes only through a commit, signed by a current key, that edits
+  `.signers`. At most 5,000 commits are on the line.
+- **Anchors.** The default index's are beside henki-mods (`share/henki/index/`, or `HENKI_SHARE/index/`, which every
+  index screen then names): `NAME.url`, `NAME.signers` (its root's keys; with no key line the index is not live
+  yet), `NAME.checkpoint` (a commit on its first-parent line) and `refused.keys` (key blobs that never verify, one per
+  line). More indexes are `index/1<TAB>NAME<TAB>URL` lines in `CONFIG_DIR/mods.index`, each with its pinned
+  `CONFIG_DIR/index/NAME.signers` and, optionally, `NAME.checkpoint`. Index URLs are https, ssh or file.
+- **A sync** fetches `main` into the bare clone `DATA/henki/index/NAME.git` (`refs/henki/fetched`). The commit verified
+  before (`refs/henki/verified`), or at a first sync the checkpoint, must be on the fetched first-parent line: no
+  rollback, and no branch grafted by a key since rotated out. Then the chain is checked for the commits after it, and
+  `refs/henki/verified` moves to the fetched commit; on any refusal, or offline, the verified commit stays in use.
+  `DATA/henki/index/NAME.synced` holds the time of the last good sync.
+- **Reading.** Entries are read with git from the verified commit only, never from a checkout, and that commit is
+  checked against the chain again once per run before the first read. An entry henki-mods cannot read is skipped
+  with a warning. A verified commit over 30 days old is a warning on every index screen.
+- **Tiers.** A version with `reviewed` and `reviewer` shows `reviewed by REVIEWER (signed index PRINCIPAL, DATE)`,
+  PRINCIPAL being the anchor's; `source only` is added when the asset for this machine has `asset_check = "none"`;
+  without a review it is red, `UNREVIEWED: listed in PRINCIPAL, but no reviewer has read this version`. A URL or path
+  install whose hd1 an index lists shows that version's review.
+- **Names.** `add NAME` takes an official module of that name first, then the one index that lists the package
+  (`NAME@INDEX` when more than one does). An index from `mods.index` never provides a name henki keeps (`std`,
+  `henki`, `mods`, `allow`, `help`, `exit`, `index`, the ports' names, `x-*`) or an official module's.
+- **Yanks** act only on what their index provided: on an `index:INDEX` lock line, index INDEX's yank of that version,
+  its removal of the package, or its yank of a version with the same hd1; on a `url`, `path` or `skill` line, a yank
+  of a version with the same hd1 in the default index; on an `official` line, nothing. They are applied at every
+  sync, and checked at every install from the verified commit, with no network. A malicious one refuses the install;
+  at a sync it turns the module off (a pin too) with the flag `yanked=malicious`, puts `policy` and `context`
+  bindings of it back to std, and makes any other binding of it the `yanked` marker (bind/1). A buggy or withdrawn
+  one is said and flagged; nothing else changes.
 
 ## hd1
 

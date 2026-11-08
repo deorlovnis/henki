@@ -41,7 +41,7 @@ nl='
 # ext::prompt's header line; henki joins it to the rest of the system prompt with a blank line ("\n\n").
 HEADER='Extensions are commands on PATH; read the doc in brackets before first use.'
 # The named formats this henki ships (CONTRACTS.md); a module's `contracts` must all be here.
-CONTRACTS_KNOWN='journal/1 json/1 wire/1 ext/1 ext/2 handoff/1 observe/1 module/1 lock/1 hd1 port/1 history/1 policy/1 conform/1 bind/1 eval/1'
+CONTRACTS_KNOWN='journal/1 json/1 wire/1 ext/1 ext/2 handoff/1 observe/1 module/1 lock/1 hd1 port/1 history/1 policy/1 conform/1 bind/1 eval/1 hist/1 index/1'
 # The ports a package may bind (henki's port::LINKED), and what each one gets to see, for the swap screen.
 PORTS_KNOWN='history policy'
 PORT_SEES_history='stores every session record'
@@ -60,6 +60,8 @@ RESERVED='exit help mods allow'
 EVENTS='session_start turn_start turn_start.wait call_start call_start.wait call_end turn_end question session_end record'
 LICENSE_BAD='*[!A-Za-z0-9.+ ()-]*' # an SPDX expression: ids, AND/OR/WITH, parentheses
 NAME_RULE='a name is 1 to 32 of a-z, 0-9, _ and -, starting with a-z or 0-9'
+INDEX_DEFAULT=deorlovnis # the index whose anchor ships with henki (SHARE/index/NAME.*)
+INDEX_AGE_MAX=30         # days: an older verified index is warned about (a frozen index shows no new yanks)
 
 die() {
   printf 'henki-mods: %s\n' "$*" >&2
@@ -75,17 +77,21 @@ restart() {
 usage() {
   cat >&2 <<'EOF'
 usage: henki-mods [list]              modules: state, version, source, prompt bytes
-       henki-mods add SRC [--yes]     SRC: NAME (official), /DIR or ./DIR [#SUBDIR], URL[@REF][#SUBDIR]
+       henki-mods add SRC [--yes]     SRC: NAME (official, else an index's), /DIR or ./DIR [#SUBDIR], URL[@REF][#SUBDIR]
+       henki-mods add NAME[@INDEX] [--version V] [--yes]   a module of a signed index, at its reviewed commit
+       henki-mods search [TERM] | info NAME[@INDEX] | sync   the signed indexes: what they list, one package, yanks
+       henki-mods doctor              everything henki-mods depends on, each problem with its fix
        henki-mods on NAME | off NAME | rm NAME
        henki-mods lock                print the lock
        henki-mods verify [NAME]       store copies against the lock, the links, the layout
        henki-mods verify --dir DIR    one module directory: layout and manifest
        henki-mods swap PORT NAME|std [--yes]   bind henki's PORT to module NAME's port/PORT, or back to std
-       henki-mods test --port PORT NAME|std|/PROGRAM   the conformance suite of PORT against a binding
+       henki-mods test --port PORT NAME|std|DIR|PROGRAM   the conformance suite of PORT against a binding
        henki-mods eval NAME|/DIR [--suite NAME|general|/DIR] [--repeats N] [--model M] [--yes]
                                       eval/1 tasks with the module on and off
        henki-mods eval --check DIR    the layout of a directory of eval/1 tasks
        henki-mods allow [--config FILE] [rm N]   henki's allow rules: list them, or remove rule N
+       henki-mods entry derive REPO PATH COMMIT | entry lint FILE   index entries (henki-mods-dev)
        henki-mods help | --version
 EOF
   exit 2
@@ -141,10 +147,13 @@ setup() {
   case "${HENKI_CONFIG:-}" in '') ;; /*) CONF=$HENKI_CONFIG ;; *) die "HENKI_CONFIG is not an absolute path; fix: unset it" ;; esac
   EXT="$CONF/ext"
   LOCK="$CONF/mods.lock"
+  HIST="$CONF/mods.history"
+  MINDEX="$CONF/mods.index"
   AGENTS="$CONF/AGENTS.md"
   local data="${XDG_DATA_HOME:-}"
   case "$data" in /*) ;; *) data="$HOME/.local/share" ;; esac
   STORE="$data/henki/mods"
+  IDXD="$data/henki/index"
   case "$(uname -s)" in Darwin) OS=macos ;; Linux) OS=linux ;; *) OS=$(uname -s | tr 'A-Z' 'a-z') ;; esac
 }
 
@@ -890,7 +899,14 @@ copy_git() {
       COMMIT=""
     done
   fi
-  case "$COMMIT" in [0-9a-f]*) ;; *) die "$url has no ${ref:-default branch} to pin; fix: name a branch, tag or commit after @" ;; esac
+  case "$COMMIT:$ref" in
+    [0-9a-f]*) ;;
+    :????????????????????????????????????????)
+      case "$ref" in *[!0-9a-f]*) die "$url has no $ref to pin; fix: name a branch, tag or commit after @" ;; esac
+      die "commit $ref is gone from $url (rewritten history?); fix: tell the module's maintainer"
+      ;;
+    *) die "$url has no ${ref:-default branch} to pin; fix: name a branch, tag or commit after @" ;;
+  esac
   if [ -n "$sub" ] && [ "$(git -C "$g" cat-file -t "$COMMIT:$sub" 2>/dev/null)" != tree ]; then
     die "$url has no directory $sub at ${COMMIT%"${COMMIT#????????????}"}; fix: check the #SUBDIR"
   fi
@@ -958,7 +974,7 @@ lock_check() {
   [ -f "$LOCK" ] || return 0
   HM_F="$LOCK" HM_P=" $PORTS_KNOWN " awk -F '\t' '
     BEGIN { f = ENVIRON["HM_F"] }
-    $1 == "bind/1" && (NF != 6 || $3 !~ /^[a-z0-9][a-z0-9_-]*$/ || $4 !~ /^[0-9a-f]+$/ || ($6 != "yes" && $6 != "tty")) {
+    $1 == "bind/1" && (NF != 6 || $3 !~ /^[a-z0-9][a-z0-9_-]*$/ || $4 !~ /^[0-9a-f]+$/ || ($6 != "yes" && $6 != "tty" && $6 != "yanked")) {
       known = index(ENVIRON["HM_P"], " " $2 " ") > 0
       printf "henki-mods: %s:%d: not a bind/1 line; fix: %s\n", f, NR, known ? "henki-mods swap " $2 " std" : "remove the line"; exit 1 }
     # A port a later henki binds (its manager wrote the line): swap PORT std cannot name it here.
@@ -967,20 +983,26 @@ lock_check() {
       printf "henki-mods: %s:%d: this lock is newer than this henki-mods (it binds %s); fix: upgrade henki\n", f, NR, p; exit 1 }
     $1 == "bind/1" { next }
     $1 != "lock/1" { printf "henki-mods: %s:%d: this lock is newer than this henki-mods; fix: upgrade henki\n", f, NR; exit 1 }
-    NF != 11 || $2 !~ /^[a-z0-9][a-z0-9_-]*$/ || ($3 != "on" && $3 != "off") || $5 !~ /^(official|path|url)$/ {
+    NF != 11 || $2 !~ /^[a-z0-9][a-z0-9_-]*$/ || ($3 != "on" && $3 != "off") || $5 !~ /^(official|path|url|skill|index:[a-z0-9][a-z0-9_-]*)$/ {
       printf "henki-mods: %s:%d: not a lock/1 line; fix: henki-mods rm the module named on it, or remove the line\n", f, NR; exit 1 }
+    # FLAGS: a flag a later henki-mods writes is refused, so a rewrite of the lock never drops one.
+    { n = split($11, fl, ",")
+      for (i = 1; i <= n; i++)
+        if (fl[i] != "pin" && fl[i] != "yanked=malicious" && fl[i] != "yanked=buggy" && fl[i] !~ /^ref=[^,]+$/ &&
+          fl[i] !~ /^skill=hd1:[0-9a-f]+$/ && fl[i] !~ /^mask=cmd\/[A-Za-z0-9._-]+$/) {
+          printf "henki-mods: %s:%d: this lock is newer than this henki-mods (a flag it does not know); fix: upgrade henki\n", f, NR; exit 1 } }
   ' "$LOCK" >&2 || exit 1
 }
 
 # The lock line of NAME into L_* (exit 1 when absent).
 lock_get() {
   local line
-  L_name="" L_state="" L_version="" L_kind="" L_source="" L_commit="" L_hd1="" L_added="" L_how=""
+  L_name="" L_state="" L_version="" L_kind="" L_source="" L_commit="" L_hd1="" L_added="" L_how="" L_flags=""
   [ -f "$LOCK" ] || return 1
   line=$(HM_N="$1" awk -F '\t' '$1 == "lock/1" && $2 == ENVIRON["HM_N"] { print; exit }' "$LOCK")
   [ -n "$line" ] || return 1
-  # No field but the last (MASK, empty) is ever empty, so read's collapsing of tabs changes nothing.
-  IFS="$tab" read -r _ L_name L_state L_version L_kind L_source L_commit L_hd1 L_added L_how _ <<EOF
+  # No field but the last (FLAGS, often empty) is ever empty, so read's collapsing of tabs changes nothing.
+  IFS="$tab" read -r _ L_name L_state L_version L_kind L_source L_commit L_hd1 L_added L_how L_flags <<EOF
 $line
 EOF
 }
@@ -1010,19 +1032,27 @@ lock_write() {
 }
 
 lock_line() { # STATE (the rest from L_*)
-  printf 'lock/1\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t' "$L_name" "$1" "$L_version" "$L_kind" "$L_source" "$L_commit" "$L_hd1" "$L_added" "$L_how"
+  printf 'lock/1\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s' "$L_name" "$1" "$L_version" "$L_kind" "$L_source" "$L_commit" "$L_hd1" "$L_added" "$L_how" "$L_flags"
 }
 
 lock_names() { [ ! -f "$LOCK" ] || awk -F '\t' '$1 == "lock/1" { print $2 }' "$LOCK"; }
 
-# The bind/1 line of PORT into B_name and B_id (exit 1 when PORT is std).
+# The bind/1 line of PORT into B_name, B_id and B_how (exit 1 when PORT is std).
 bind_get() {
   local line
-  B_name="" B_id=""
+  B_name="" B_id="" B_how=""
   [ -f "$LOCK" ] || return 1
-  line=$(HM_P="$1" awk -F '\t' '$1 == "bind/1" && $2 == ENVIRON["HM_P"] { print $3 "\t" $4; exit }' "$LOCK")
+  line=$(HM_P="$1" awk -F '\t' '$1 == "bind/1" && $2 == ENVIRON["HM_P"] { print $3 "\t" $4 "\t" $6; exit }' "$LOCK")
   [ -n "$line" ] || return 1
-  B_name=${line%"$tab"*} B_id=${line#*"$tab"}
+  IFS="$tab" read -r B_name B_id B_how <<EOF
+$line
+EOF
+}
+
+# Appends the lock/1 line LINE, replaced or removed for WHY (rm, update, rollback, ...), to the history (hist/1), where a
+# rollback finds the pin it goes back to.
+hist_add() { # WHY LINE
+  printf 'hist/1\t%s\t%s\t%s\n' "$(date -u +%Y-%m-%dT%H:%MZ)" "$1" "$2" >>"$HIST" || die "cannot write $HIST; fix: make $CONF writable"
 }
 
 # --- prompt bytes and cards --------------------------------------------------------------------------------------------
@@ -1234,16 +1264,23 @@ file_kind() {
 red() { if [ -t 1 ]; then printf '\033[1;31m%s\033[0m' "$1"; else printf '%s' "$1"; fi; }
 
 cmd_add() {
-  local src="" yes=0 a kind source fallback dir id store how answer ref sub url bytes total n d x tty need line
-  for a in "$@"; do
-    case "$a" in
+  local src="" yes=0 want="" a kind source fallback dir id store how answer ref sub url bytes total n d x tty need line pkg=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
       --yes | -y) yes=1 ;;
+      --version)
+        [ $# -ge 2 ] || usage
+        want=$2
+        shift
+        ;;
       -*) usage ;;
-      *) [ -z "$src" ] && src=$a || usage ;;
+      *) [ -z "$src" ] && src=$1 || usage ;;
     esac
+    shift
   done
   [ -n "$src" ] || usage
   case "$src" in *[[:cntrl:]]*) die "the source holds a control character; fix: name it without one" ;; esac
+  trust_guard
   busy
   lock_check
   stage
@@ -1289,16 +1326,43 @@ cmd_add() {
       copy_git "$url" "$ref" "$sub" "$STAGE/m"
       ;;
     *)
-      is_name "$src" || usage
-      kind=official
-      dir=$(official_dir "$src") || die "no official module $src; fix: henki-mods list shows the official ones, or name a path (./DIR) or a URL"
-      source=$src
-      fallback=$src
-      copy_dir "$dir" "$STAGE/m"
+      is_name "${src%@*}" || usage
+      case "$src" in *@*) is_name "${src#*@}" || usage ;; esac
+      if [ "$src" = "${src%@*}" ] && [ -z "$want" ] && dir=$(official_dir "$src"); then
+        kind=official
+        source=$src
+        fallback=$src
+        copy_dir "$dir" "$STAGE/m"
+      else
+        # A package of an index: its entry's full commit, checked against the entry's hd1 below.
+        index_sync_all || die "no official module ${src%@*}, and $ERR"
+        index_find "$src"
+        pkg=${src%@*}
+        [ "$(rget "$STAGE/ix/$F_index/r/$pkg" kind)" = git ] || die "$pkg in index $F_index is a record about a module henki ships; fix: henki-mods add $pkg with the henki that ships it"
+        pick_version "$F_index" "$pkg" "$want"
+        for x in $(asset_targets); do
+          ! rget "$E_rec" "asset_$x" >/dev/null ||
+            die "$pkg $E_ver has a prebuilt binary for this machine (asset_$x), which this henki-mods cannot fetch; fix: upgrade henki"
+        done
+        kind="index:$F_index"
+        url=$(rget "$STAGE/ix/$F_index/r/$pkg" repo)
+        sub=$(rget "$STAGE/ix/$F_index/r/$pkg" path)
+        ref=$(rget "$E_rec" commit)
+        source=$pkg
+        fallback=$pkg
+        copy_git "$url" "$ref" "$sub" "$STAGE/m"
+      fi
       ;;
   esac
   inspect "$STAGE/m" "$fallback" 1 || die "$(printf '%s' "$ERR" | sed "s|$STAGE/m|$source|g")"
   n=$I_name
+  case "$kind" in
+    index:*)
+      [ "$I_hd1" = "$(rget "$E_rec" hd1)" ] ||
+        die "the files of $url at $COMMIT are not the reviewed ones ($I_hd1, the entry has $(rget "$E_rec" hd1)); fix: report it to index $F_index"
+      ;;
+    url | path) index_local_all ;;
+  esac
   if lock_get "$n"; then
     die "$n is already added (from $L_source); fix: henki-mods rm $n first, or turn it on with henki-mods on $n"
   fi
@@ -1319,12 +1383,26 @@ cmd_add() {
   say "$n ${M_version:-(no version)}"
   case "$kind" in
     official) say "  source   official ($dir)" ;;
-    path) say "  source   $source (a directory on this machine)" ;;
-    url)
-      say "  source   $source @ $COMMIT"
-      say "  $(red "UNREVIEWED: in no index you use; nobody has read this code for you")"
+    index:*)
+      say "  source   index $F_index: $pkg $E_ver ($url${sub:+#$sub} @ $COMMIT)"
+      index_again "$F_index"
+      index_say | sed 's/^/  /'
+      tier_of "$F_index" "$E_rec"
+      say "  review   $(tier_paint)"
+      ;;
+    *)
+      if [ "$kind" = path ]; then say "  source   $source (a directory on this machine)"; else say "  source   $source @ $COMMIT"; fi
+      # A copy whose hd1 an index lists gets that version's review (from the indexes verified before; no network).
+      x=$(hd1_hits "$I_hd1" | head -n 1)
+      if [ -n "$x" ]; then
+        tier_of "${x%%"$tab"*}" "$STAGE/ix/${x%%"$tab"*}/r/$(printf '%s' "$x" | cut -f 2)@${x##*"$tab"}"
+        say "  review   $(tier_paint) (the same files as $(printf '%s' "$x" | cut -f 2) ${x##*"$tab"} of index ${x%%"$tab"*})"
+      elif [ "$kind" = url ]; then
+        say "  $(red "UNREVIEWED: in no index you use; nobody has read this code for you")"
+      fi
       ;;
   esac
+  case "$kind" in index:*) yank_guard "$n" "$E_ver" "$kind" "$pkg" "$I_hd1" ;; url | path) yank_guard "$n" "$M_version" "$kind" "" "$I_hd1" ;; esac
   [ "$M_has" = 1 ] || say "  manifest none (unmanaged: no license, os or needs declared)"
   [ -z "$M_license" ] || say "  license  $M_license"
   [ -z "$M_maintainer" ] || say "  by       $M_maintainer"
@@ -1376,7 +1454,8 @@ EOF
   fi
   chmod -R a-w "$store"
   mkdir -p "$EXT" && ln -s -- "$store" "$EXT/$n" || die "cannot link $(shown "$EXT/$n"); fix: make $(shown "$EXT") writable"
-  L_name=$n L_version=${M_version:--} L_kind=$kind L_source=$source L_commit=$COMMIT L_hd1=$I_hd1 L_how=$how
+  L_name=$n L_version=${M_version:--} L_kind=$kind L_source=$source L_commit=$COMMIT L_hd1=$I_hd1 L_how=$how L_flags=""
+  [ -z "$pkg" ] || L_version=$E_ver
   L_added=$(date -u +%Y-%m-%dT%H:%MZ)
   lock_put "$n" "$(lock_line on)"
   cards_write 0 || die "$ERR"
@@ -1403,6 +1482,7 @@ ext_names() { [ ! -d "$EXT" ] || (cd "$EXT" && for n in *; do [ -e "$n" ] && ech
 cmd_onoff() { # on|off NAME
   local verb="$1" n="${2:-}" store
   [ -n "$n" ] && [ $# = 2 ] || usage
+  [ "$verb" = off ] || trust_guard
   busy
   lock_check
   STAGE=$(mktemp -d "${TMPDIR:-/tmp}/henki-mods.XXXXXX") || die "cannot make a scratch dir; fix: check TMPDIR"
@@ -1411,6 +1491,9 @@ cmd_onoff() { # on|off NAME
   cards_ok
   store=$(store_of)
   if [ "$verb" = on ]; then
+    ! flag_has yanked=malicious || die "$n $L_version was yanked as malicious; it stays off; fix: henki-mods rm $n"
+    index_local_all
+    yank_guard "$n" "$L_version" "$L_kind" "$L_source" "$L_hd1"
     [ -d "$store" ] || die "the store copy $store is gone; fix: henki-mods rm $n, then add it again"
     listing "$store" || die "$ERR"
     [ "$(hd1 "$store")" = "$L_hd1" ] || die "the store copy $store does not match the lock (it changed); fix: chmod -R u+w $store && rm -rf $store, then henki-mods rm $n and add it again"
@@ -1455,6 +1538,7 @@ cmd_rm() {
   elif [ -e "$EXT/$n" ]; then
     die "$(shown "$EXT/$n") is not a link; fix: move it out of $(shown "$EXT") yourself"
   fi
+  hist_add rm "$(lock_line "$L_state")"
   lock_put "$n" ""
   cards_write 0 || die "$ERR"
   say "removed $n; its store copy stays in $(shown "$store") for a rollback"
@@ -1482,7 +1566,10 @@ cmd_list() {
     c=""
     if lock_get "$n"; then
       d=$(store_of)
-      case "$L_kind" in url) src="$L_source (UNREVIEWED)" ;; official) src="official" ;; *) src=$L_source ;; esac
+      case "$L_kind" in url) src="$L_source (UNREVIEWED)" ;; official) src="official" ;; index:*) src="index ${L_kind#index:}: $L_source" ;; *) src=$L_source ;; esac
+      ! flag_has yanked=malicious || src="$src $(red "(yanked: malicious)")"
+      ! flag_has yanked=buggy || src="$src (yanked: buggy)"
+      ! flag_has pin || src="$src (pinned)"
       [ -f "$d/.henki/module.toml" ] || src="$src (unmanaged)"
       if [ -f "$d/.henki/card.md" ]; then
         c=$(wc -c <"$d/.henki/card.md")
@@ -1513,7 +1600,9 @@ cmd_list() {
   done
   [ -z "$off_names" ] || say "official, not added:$off_names (henki-mods add NAME)"
   for n in $PORTS_KNOWN; do
-    if bind_get "$n"; then
+    if bind_get "$n" && [ "$B_how" = yanked ]; then
+      say "$(red "$n: STOPPED: $B_name was yanked as malicious; henki will not start; fix: henki-mods swap $n std (or another package)")"
+    elif bind_get "$n"; then
       x=-
       ! lock_get "$B_name" || x=$L_version
       say "$n: $B_name $x (bound)"
@@ -1521,6 +1610,7 @@ cmd_list() {
       say "$n: std"
     fi
   done
+  index_age_warning
   # The cards' share of the prompt: AGENTS.md as it is, against AGENTS.md without the block.
   agents_now=$(agents_bytes "$AGENTS")
   if [ -f "$AGENTS" ]; then
@@ -1553,8 +1643,7 @@ problem() {
 cmd_verify() {
   local n names store want line need t
   BAD=0
-  STAGE=$(mktemp -d "${TMPDIR:-/tmp}/henki-mods.XXXXXX") || die "cannot make a scratch dir; fix: check TMPDIR"
-  STAGE_LIST="$STAGE/list"
+  scratch
   if [ "${1:-}" = --dir ]; then
     [ $# = 2 ] || usage
     [ -d "$2" ] || die "$2 is not a directory; fix: name a module directory"
@@ -1602,7 +1691,9 @@ cmd_verify() {
   done
   # Each port is std (no link, no bind/1 line) or bound: its link points at the locked copy's port/PORT.
   for n in $PORTS_KNOWN; do
-    if bind_get "$n"; then
+    if bind_get "$n" && [ "$B_how" = yanked ]; then
+      problem "$n is stopped: $B_name was yanked as malicious, and henki will not start; fix: henki-mods swap $n std (or another package), or henki --port $n=std for one session"
+    elif bind_get "$n"; then
       if ! lock_get "$B_name"; then
         problem "$n is bound to $B_name, which is not added; fix: henki-mods swap $n std"
       elif [ "$(store_of)" != "$STORE/$B_name/$B_id" ]; then
@@ -1773,8 +1864,9 @@ EOF
   [ -z "$C_fail" ]
 }
 
-# test --port PORT NAME|std|/PROGRAM: the suite of PORT against module NAME's port/PORT (its store copy), a program
-# by path (while writing one), or std.
+# test --port PORT NAME|std|DIR|PROGRAM: the suite of PORT against module NAME's port/PORT (its store copy), a module
+# directory's port/PORT (one not added yet: an author's, or a pull request's to the index), a program by path (while
+# writing one), or std. DIR and PROGRAM start with /, ./ or ../.
 cmd_test() {
   local port="${2:-}" what="${3:-}" exe h
   [ "${1:-}" = --port ] && [ $# = 3 ] || usage
@@ -1782,7 +1874,13 @@ cmd_test() {
   C_suite="$(conform_dir)/$port.tsv" || die "no conformance suites found; fix: reinstall henki"
   case "$what" in
     std) say "std passes this suite in henki's own tests" && return 0 ;;
-    /*) exe=$what ;;
+    /* | ./* | ../*)
+      if [ -d "$what" ]; then
+        exe="$(cd -P "$what" && pwd)/port/$port"
+      else
+        exe="$(cd -P "$(dirname "$what")" 2>/dev/null && pwd)/${what##*/}"
+      fi
+      ;;
     *)
       lock_check
       lock_get "$what" || die "$what is not added; fix: henki-mods add SRC first, or name a program by its absolute path"
@@ -1801,6 +1899,7 @@ cmd_swap() {
   [ $# -ge 2 ] || usage
   for a in "${3:-}" "${4:-}"; do case "$a" in '') ;; --yes | -y) yes=1 ;; *) usage ;; esac; done
   case " $PORTS_KNOWN " in *" $port "*) ;; *) die "$port is not a port this henki binds ($PORTS_KNOWN); fix: name one of them" ;; esac
+  trust_guard
   busy
   lock_check
   if [ "$n" = std ]; then
@@ -1858,6 +1957,1092 @@ bound_to() {
     t=$(target "$CONF/port/$p")
     case "$t" in "$STORE/$1/"*) printf '%s\n' "$p" ;; esac
   done
+}
+
+# --- the signed index (index/1) --------------------------------------------------------------------------------------
+
+# An index is a git repository of entries (mods/NAME.toml, mods/NAME/VERSION.toml, removed.toml) whose main is a chain
+# of SSH signatures: every commit on its first-parent line signed by a key in its first parent's .signers, the root by
+# a key in the anchor this program ships (or, for an index the person added, the one they pinned). The clone is bare,
+# in DATA/henki/index/NAME.git; refs/henki/verified is the newest commit whose chain verified, and entries are read
+# from it with git cat-file only, never from a checkout. VERIFIED lists the indexes whose verified commit was checked
+# this run, SYNCED is 1 once index_sync_all ran.
+VERIFIED=" "
+SYNCED=""
+
+yellow() { if [ -t 1 ]; then printf '\033[1;33m%s\033[0m' "$1"; else printf '%s' "$1"; fi; }
+# The first 12 hex digits of a commit id.
+short() { printf '%s' "${1%"${1#????????????}"}"; }
+# A scratch dir for verbs that copy nothing into the store.
+scratch() {
+  [ -n "$STAGE" ] || STAGE=$(mktemp -d "${TMPDIR:-/tmp}/henki-mods.XXXXXX") || die "cannot make a scratch dir; fix: check TMPDIR"
+  STAGE_LIST="$STAGE/list"
+}
+
+# The value of KEY in a records file of toml() (array items tab-separated); exit 1 when the key is absent.
+rget() { HM_K="$2" awk -F '\t' '$1 == ENVIRON["HM_K"] { f = 1; s = ""; for (i = 3; i <= NF; i++) s = s (i > 3 ? "\t" : "") $i; print s } END { exit !f }' "$1"; }
+
+# The rules of an entry file: AWK_LIB, lint_pkg and lint_ver are the index's own check.sh's, unchanged (an entry
+# this program reads passes the index's gate). lint_ver with CK_PR=1 takes a version nobody reviewed yet.
+# Shared awk: value checks used by both entry kinds.
+AWK_LIB='
+function bad(m) { print ENVIRON["CK_F"] ": " m }
+function tn(ty) { return ty == "S" ? "a string" : ty == "I" ? "an integer" : ty == "A" ? "an array of strings" : "true or false" }
+function need(k, ty) {
+  if (!(k in t)) { bad("no " k "; fix: add it (README: the entry format)"); return 0 }
+  if (t[k] != ty) { bad(k " must be " tn(ty)); return 0 }
+  return 1
+}
+function hex(s, n) { return length(s) == n && s ~ /^[0-9a-f]+$/ }
+function ver(s) { return s ~ /^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-[0-9A-Za-z.-]+)?$/ }
+function day(s) { return length(s) == 10 && s ~ /^20[0-9][0-9]-[01][0-9]-[0-3][0-9]$/ }
+function login(s) { return length(s) <= 39 && s ~ /^[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?$/ && !index(s, "--") }
+function lic(s,   n, a, i, ids) {
+  ids = " Apache-2.0 MIT BSD-2-Clause BSD-3-Clause 0BSD ISC MPL-2.0 Zlib BSL-1.0 Unlicense CC0-1.0 GPL-2.0-or-later" \
+    " GPL-3.0-only GPL-3.0-or-later LGPL-2.1-or-later LGPL-3.0-or-later AGPL-3.0-only AGPL-3.0-or-later "
+  gsub(/[()]/, " ", s); n = split(s, a, " ")
+  if (n % 2 == 0) return 0
+  for (i = 1; i <= n; i++)
+    if (i % 2) { if (!index(ids, " " a[i] " ")) return 0 }
+    else if (a[i] != "OR" && a[i] != "AND") return 0
+  return 1
+}
+function yank(s) { return s ~ /^(malicious|buggy|withdrawn): [^ ].* \(20[0-9][0-9]-[01][0-9]-[0-3][0-9]\)$/ }
+function items(k, a) { return split(r[k], a, "\t") - 2 }
+{ t[$1] = $2; v[$1] = $3; r[$1] = $0 }
+'
+
+# lint_pkg RECORDS NAME LABEL: problems of a package file on stdout.
+lint_pkg() {
+  CK_F="$3" CK_STEM="$2" CK_FILEOK="${HENKI_INDEX_ALLOW_FILE:-}" awk -F '\t' "$AWK_LIB"'
+  END {
+    split("index name kind repo path summary maintainer license latest added", ks, " ")
+    for (i in ks) ok[ks[i]] = 1
+    for (k in t) if (!(k in ok)) bad("unknown key " k "; fix: remove it (index/1 has no such key)")
+    if (need("index", "I") && v["index"] != 1) bad("index = " v["index"] ": this check.sh reads index/1 only")
+    if (need("name", "S") && v["name"] != ENVIRON["CK_STEM"]) bad("name = \"" v["name"] "\" is not the file name")
+    if (need("kind", "S")) {
+      if (v["kind"] == "git") {
+        if (need("repo", "S")) {
+          u = v["repo"]
+          if (!(u ~ /^https:\/\/[A-Za-z0-9.-]+(:[0-9]+)?(\/[A-Za-z0-9._~-]+)+$/ || \
+                (ENVIRON["CK_FILEOK"] == "1" && u ~ /^file:\/\/\/[A-Za-z0-9._~\/-]+$/)))
+            bad("repo must be an https URL with no user, query or fragment: " u)
+        }
+        if (need("path", "S")) {
+          p = v["path"]
+          if (p != "" && (p !~ /^[A-Za-z0-9._-]+(\/[A-Za-z0-9._-]+)*$/ || ("/" p "/") ~ /\/\.\.?\//))
+            bad("path must be a relative directory in the repository (\"\" for its root): " p)
+        }
+      } else if (v["kind"] == "official") {
+        if ("repo" in t || "path" in t) bad("an official package has no repo or path; fix: remove them")
+      } else bad("kind = \"" v["kind"] "\"; fix: git or official")
+    }
+    if (need("summary", "S")) {
+      if (v["summary"] == "") bad("summary is empty")
+      if (length(v["summary"]) > 160) bad("summary is " length(v["summary"]) " bytes; fix: at most 160")
+      if (index(v["summary"], "|")) bad("summary holds a |; fix: reword it")
+    }
+    if (need("maintainer", "S") && !login(v["maintainer"])) bad("maintainer must be a GitHub login: " v["maintainer"])
+    if (need("license", "S") && !lic(v["license"])) bad("license " v["license"] " is not accepted; fix: one of the licenses in CONTRIBUTING.md, or an OR/AND expression of them")
+    if (need("latest", "S") && !ver(v["latest"])) bad("latest = \"" v["latest"] "\" is not a version")
+    if (need("added", "S") && !day(v["added"])) bad("added must be a date YYYY-MM-DD")
+  }' "$1"
+}
+
+# lint_ver RECORDS STEM KIND LABEL: problems of a version file on stdout. CK_PR=1 (a pull request) lets
+# reviewed/reviewer and asset_check_* be missing: the reviewer adds them.
+lint_ver() {
+  CK_F="$4" CK_STEM="$2" CK_KIND="$3" CK_PR="${CK_PR:-}" awk -F '\t' "$AWK_LIB"'
+  function arr(k, re, what, sorted,   a, n, i) {
+    if (!need(k, "A")) return
+    n = items(k, a)
+    for (i = 3; i <= n + 2; i++) {
+      if (a[i] !~ re) bad(k ": \"" a[i] "\" is not " what)
+      if (sorted && i > 3 && a[i] <= a[i - 1]) bad(k " must be sorted and without repeats")
+    }
+  }
+  END {
+    kind = ENVIRON["CK_KIND"]; pr = ENVIRON["CK_PR"] == "1"
+    split("index version commit hd1 requires contracts os ports conform commands bins observers ctx prompt_bytes " \
+      "card_bytes caps_net reviewed reviewer yanked", ks, " ")
+    for (i in ks) ok[ks[i]] = 1
+    ne = split("eval_suite eval_model eval_model_sha256 eval_server eval_hd1 eval_repeats eval_on eval_off " \
+      "eval_effect eval_general eval_by", ev, " ")
+    for (i = 1; i <= ne; i++) ok[ev[i]] = 1
+    split("aarch64_apple_darwin x86_64_apple_darwin aarch64_unknown_linux_musl x86_64_unknown_linux_musl " \
+      "aarch64_unknown_linux_gnu x86_64_unknown_linux_gnu", tg, " ")
+    for (i in tg) { ok["asset_" tg[i]] = 1; ok["asset_check_" tg[i]] = 1; target[tg[i]] = 1 }
+    for (k in t) if (!(k in ok)) bad("unknown key " k "; fix: remove it (index/1 has no such key)")
+    if (need("index", "I") && v["index"] != 1) bad("index = " v["index"] ": this check.sh reads index/1 only")
+    if (need("version", "S") && v["version"] != ENVIRON["CK_STEM"]) bad("version = \"" v["version"] "\" is not the file name")
+    if (!ver(ENVIRON["CK_STEM"])) bad("the file name is not a version")
+    if (need("hd1", "S") && !(substr(v["hd1"], 1, 4) == "hd1:" && hex(substr(v["hd1"], 5), 64))) bad("hd1 must be hd1: and 64 hex digits")
+    if (kind == "official") {
+      split("commit requires contracts os ports conform commands bins observers ctx prompt_bytes card_bytes caps_net reviewed reviewer", no, " ")
+      for (i in no) if (no[i] in t) bad(no[i] ": an official version holds only hd1, a yank and a badge")
+      for (k in t) if (k ~ /^asset_/) bad(k ": an official version has no assets")
+    } else {
+      if (need("commit", "S") && !hex(v["commit"], 40)) bad("commit must be the full 40-hex commit id (no short ids, no branches)")
+      arr("requires", "^henki >= [0-9]+\\.[0-9]+(\\.[0-9]+)?$", "henki >= VERSION", 0)
+      arr("contracts", "^[a-z0-9]+(/[0-9]+)?$", "a contract like ext/2", 1)
+      arr("os", "^(linux|macos)$", "linux or macos", 1)
+      arr("ports", "^(context|exec|history|policy)$", "a port a module binds (context, exec, history, policy)", 1)
+      arr("commands", "^[A-Za-z0-9][A-Za-z0-9._-]*$", "a command name", 1)
+      arr("bins", "^[A-Za-z0-9][A-Za-z0-9._-]*$", "a program name", 1)
+      arr("observers", "^[A-Za-z0-9][A-Za-z0-9._-]*$", "an observer name", 1)
+      arr("ctx", "^[A-Za-z0-9][A-Za-z0-9._-]*$", "a context source name", 1)
+      need("prompt_bytes", "I"); need("card_bytes", "I")
+      if (need("caps_net", "S") && v["caps_net"] !~ /^[A-Za-z0-9.*:, -]+$/) bad("caps_net: \"" v["caps_net"] "\"")
+      if (("ports" in t) && r["ports"] != "ports\tA") {
+        if (!need("conform", "S")) {}
+        else if (v["conform"] !~ /^[a-z]+\/[0-9]+ [0-9]+\/[0-9]+$/) bad("conform must read PORT/MAJOR PASSED/ALL")
+        else { split(v["conform"], c, "[ /]"); if (c[3] != c[4] || c[4] == 0) bad("conform " v["conform"] ": a binding passes every check") }
+      } else if ("conform" in t) bad("conform without ports")
+      for (k in t) if (k ~ /^asset_/ && k !~ /^asset_check_/) {
+        tgt = substr(k, 7)
+        if (t[k] != "A" || items(k, a) != 3) bad(k " must be [\"bin/NAME\", \"https://...\", \"sha256:HEX\"]")
+        else {
+          if (a[3] !~ /^bin\/[A-Za-z0-9][A-Za-z0-9._-]*$/) bad(k ": the first item must be bin/NAME")
+          if (a[4] !~ /^https:\/\/[^ ]+$/) bad(k ": the URL must be https")
+          if (!(substr(a[5], 1, 7) == "sha256:" && hex(substr(a[5], 8), 64))) bad(k ": the third item must be sha256: and 64 hex digits")
+        }
+        if (!(("asset_check_" tgt) in t) && !pr) bad(k " has no asset_check_" tgt "; fix: the reviewer sets rebuilt, attested or none")
+      }
+      for (k in t) if (k ~ /^asset_check_/) {
+        if (!(("asset_" substr(k, 13)) in t)) bad(k " without asset_" substr(k, 13))
+        if (t[k] != "S" || v[k] !~ /^(rebuilt|attested|none)$/) bad(k " must be rebuilt, attested or none")
+      }
+      if (!pr || ("reviewed" in t) || ("reviewer" in t)) {
+        if (need("reviewed", "S") && !day(v["reviewed"])) bad("reviewed must be a date YYYY-MM-DD")
+        if (need("reviewer", "S") && !login(v["reviewer"])) bad("reviewer must be a GitHub login")
+      }
+    }
+    if (("yanked" in t) && (t["yanked"] != "S" || !yank(v["yanked"]))) bad("yanked must read \"malicious|buggy|withdrawn: REASON (YYYY-MM-DD)\"")
+    m = 0; for (i = 1; i <= ne; i++) if (ev[i] in t) m++
+    if (m > 0 && m < ne) bad("the eval_* keys come all together or not at all (" m " of " ne ")")
+    if (m == ne) {
+      for (i = 1; i <= ne; i++) if (ev[i] != "eval_repeats" && t[ev[i]] != "S") bad(ev[i] " must be a string")
+      if (t["eval_repeats"] != "I" || v["eval_repeats"] < 1) bad("eval_repeats must be an integer of at least 1")
+      if (v["eval_hd1"] != v["hd1"]) bad("eval_hd1 is not this version'"'"'s hd1: the badge was measured on other files")
+      if (!hex(v["eval_model_sha256"], 64)) bad("eval_model_sha256 must be 64 hex digits")
+      if (v["eval_on"] !~ /^[0-9]+\/[1-9][0-9]*$/ || v["eval_off"] !~ /^[0-9]+\/[1-9][0-9]*$/) bad("eval_on and eval_off must read PASSED/TASKS")
+      else { split(v["eval_on"], x, "/"); split(v["eval_off"], y, "/"); if (x[2] != y[2] || x[1] + 0 > x[2] + 0 || y[1] + 0 > y[2] + 0) bad("eval_on and eval_off must count the same tasks") }
+    }
+  }' "$1"
+}
+
+
+# The default index's anchors: HENKI_SHARE's index/ (every index screen then names its path), else beside this
+# program in a release, else manager/index/ in the repository.
+index_share() {
+  local d
+  for d in ${HENKI_SHARE:+"$HENKI_SHARE/index"} "$SELF/../share/henki/index" "$SELF/index"; do
+    [ ! -f "$d/$INDEX_DEFAULT.url" ] || { (cd -P "$d" && pwd) && return 0; }
+  done
+  return 1
+}
+
+# The indexes in use, one name per line: the default one, then CONFIG/mods.index's (index/1<TAB>NAME<TAB>URL), in order.
+index_names() {
+  ! index_share >/dev/null || printf '%s\n' "$INDEX_DEFAULT"
+  [ ! -f "$MINDEX" ] || HM_D="$INDEX_DEFAULT" awk -F '\t' '$1 == "index/1" && NF == 3 && $2 ~ /^[a-z0-9][a-z0-9_-]*$/ && $2 != ENVIRON["HM_D"] && !s[$2]++ { print $2 }' "$MINDEX"
+}
+
+# The key lines of an allowed_signers file: neither blank nor comments.
+key_lines() { command grep -v -e '^[[:space:]]*#' -e '^[[:space:]]*$' "$1" 2>/dev/null; }
+
+# The SHA256 fingerprint of a key blob (base64), as ssh-keygen -l prints it.
+key_fp() {
+  local f
+  f=$(printf '%s' "$1" | openssl base64 -d -A 2>/dev/null | openssl dgst -sha256 -binary 2>/dev/null | openssl base64 -A 2>/dev/null)
+  case "$f" in ?*) printf 'SHA256:%s\n' "${f%%=*}" ;; *) printf 'SHA256:? (no openssl)\n' ;; esac
+}
+
+# Index NAME's setup into X_*: X_url, X_anchor (allowed_signers for its root commit), X_ck (a commit that must be on
+# main's first-parent line at a first sync, or ""), X_refused (key blobs that never verify, or ""), X_git (the bare
+# clone), X_principal and X_fp (the anchor's first key), X_where (the anchor's path when it is not the one beside
+# this program). Exit 1 with ERR when the index cannot be used: no anchor, or one with no key (not live yet).
+index_conf() {
+  local s k x
+  X_name=$1 X_url="" X_ck="" X_refused="" X_git="$IDXD/$1.git" X_where="" X_anchor=""
+  s=$(index_share) || s=""
+  [ -z "$s" ] || [ ! -f "$s/refused.keys" ] || X_refused="$s/refused.keys"
+  if [ "$1" = "$INDEX_DEFAULT" ]; then
+    [ -n "$s" ] || {
+      ERR="index $1: no anchor beside henki-mods; fix: reinstall henki"
+      return 1
+    }
+    X_url=$(sed -n 1p "$s/$1.url") X_anchor="$s/$1.signers"
+    [ ! -f "$s/$1.checkpoint" ] || X_ck=$(sed -n 1p "$s/$1.checkpoint")
+    x=$(cd -P "$SELF/../share/henki/index" 2>/dev/null && pwd) || x=""
+    [ "$s" = "$x" ] || [ "$s" = "$SELF/index" ] || X_where=$s/$1.signers
+  else
+    X_url=$(HM_N="$1" awk -F '\t' '$1 == "index/1" && $2 == ENVIRON["HM_N"] { print $3; exit }' "$MINDEX" 2>/dev/null)
+    X_anchor="$CONF/index/$1.signers" X_where="$CONF/index/$1.signers"
+    [ ! -f "$CONF/index/$1.checkpoint" ] || X_ck=$(sed -n 1p "$CONF/index/$1.checkpoint")
+  fi
+  case "$X_url" in https://?* | ssh://?* | file://?*) ;; *)
+    ERR="index $1: \"$X_url\" is not an https, ssh or file URL; fix: correct $( [ "$1" = "$INDEX_DEFAULT" ] && shown "$s/$1.url" || shown "$MINDEX")"
+    return 1
+    ;;
+  esac
+  k=$(key_lines "$X_anchor" | head -n 1)
+  [ -n "$k" ] || {
+    ERR="index $1 is not live yet: henki-mods has no key for it ($(shown "$X_anchor")); fix: install by URL or path, or upgrade henki"
+    return 1
+  }
+  k=$(printf '%s\n' "$k" | awk '{ for (i = 2; i < NF; i++) if ($i ~ /^(ssh-|sk-|ecdsa-)/) { print $1 "\t" $(i + 1); exit } }')
+  X_principal=${k%%"$tab"*}
+  X_fp=$(key_fp "${k#*"$tab"}")
+}
+
+# The tools an index needs: git 2.34 or later (SSH signatures) and ssh-keygen. Exit 1 with ERR without them.
+index_tools() {
+  local v
+  v=$(git --version 2>/dev/null | sed -n 's/^git version \([0-9][0-9.]*\).*/\1/p')
+  version_ge "${v:-0}" 2.34 || {
+    ERR="the index needs git 2.34 or later for SSH signatures (this git is ${v:-not found}); fix: upgrade git; URL and path installs still work"
+    return 1
+  }
+  command -v ssh-keygen >/dev/null 2>&1 || {
+    ERR="the index needs ssh-keygen (OpenSSH) to check signatures; fix: install OpenSSH; URL and path installs still work"
+    return 1
+  }
+}
+
+_ix() { GIT_NO_REPLACE_OBJECTS=1 git --git-dir="$X_git" -c core.hooksPath=/dev/null "$@"; }
+# The verified commit of the index in X_git, or nothing (exit 1).
+index_v() { [ -d "$X_git" ] && _ix rev-parse -q --verify 'refs/henki/verified^{commit}' 2>/dev/null; }
+
+# X_age ("today", "1 day old", "N days old") and X_days: the age of the verified commit X_V (a frozen index ages).
+index_age() {
+  local t
+  t=$(_ix log -1 --format=%ct "$X_V" 2>/dev/null) || t=""
+  X_days=$((($(date -u +%s) - ${t:-0}) / 86400))
+  case "$X_days" in 0 | -*) X_age=today ;; 1) X_age="1 day old" ;; *) X_age="$X_days days old" ;; esac
+}
+
+# The index line of every index screen (for X_* and X_V): who signs it, which commit, how old; the anchor's path when it
+# is not the one beside this program; a warning past INDEX_AGE_MAX days.
+index_say() {
+  index_age
+  say "index $X_name: $X_principal @ $(short "$X_V") (verified, $X_age; key $X_fp)"
+  [ -z "$X_where" ] || say "  $(yellow "anchor: $X_where")"
+  [ "$X_days" -le "$INDEX_AGE_MAX" ] || warn "index $X_name: its verified commit is $X_days days old; a frozen index stops showing yanks; fix: henki-mods sync, or report it"
+}
+
+# The chain verifier, as the index's own check.sh has it between the same two lines.
+# chain: begin
+_ic_git() {
+  GIT_NO_REPLACE_OBJECTS=1 git --git-dir="$IC_GIT" -c log.showSignature=false \
+    -c core.hooksPath=/dev/null "$@"
+}
+
+# The repository and the commit are what they say: no shallow history, no grafts, NEW a commit.
+_ic_pre() {
+  local label="$3"
+  if ! command -v ssh-keygen >/dev/null 2>&1; then
+    echo "$label: ssh-keygen is not on PATH; fix: install OpenSSH (the index needs it to check signatures)" >&2
+    return 1
+  fi
+  IC_GIT=$(cd "$1" 2>/dev/null && pwd) || {
+    echo "$label: no repository at $1" >&2
+    return 1
+  }
+  if [ "$(_ic_git rev-parse --is-shallow-repository 2>/dev/null)" != false ]; then
+    echo "$label: $IC_GIT is a shallow clone (or no repository); fix: remove it and clone again" >&2
+    return 1
+  fi
+  if [ -e "$IC_GIT/info/grafts" ] || [ -e "$IC_GIT/shallow" ]; then
+    echo "$label: $IC_GIT has grafts or a shallow file; fix: remove it and clone again" >&2
+    return 1
+  fi
+  case "$2" in
+    *[!0-9a-f]* | "") echo "$label: \"$2\" is not a full commit id" >&2 && return 1 ;;
+  esac
+  if [ ${#2} != 40 ]; then
+    echo "$label: \"$2\" is not a full commit id" >&2
+    return 1
+  fi
+  if [ "$(_ic_git cat-file -t "$2" 2>/dev/null)" != commit ]; then
+    echo "$label: $2 is not a commit in $IC_GIT" >&2
+    return 1
+  fi
+}
+
+# Verifies the commits listed in $IC_T/todo ("C [FIRST-PARENT [...]]" per line, root first).
+_ic_verify() {
+  local anchor="$1" refused="$2" label="$3" t="$IC_T" key n e=0 bad why
+  : >"$t/refused"
+  if [ -n "$refused" ]; then
+    if [ ! -f "$refused" ]; then
+      echo "$label: the refused keys file $refused is missing" >&2
+      return 1
+    fi
+    # Blank lines would refuse every line: drop them and comments; what is left is fixed strings.
+    LC_ALL=C command grep -v -e '^#' -e '^[[:space:]]*$' "$refused" | LC_ALL=C tr -d ' \t\r' >"$t/refused"
+  fi
+  # The signers blob of each commit's first parent, in one cat-file: "OID blob SIZE" or "NAME missing".
+  awk 'NF > 1 { print $2 ":.signers" }' "$t/todo" | _ic_git cat-file --batch-check >"$t/epochs" || {
+    echo "$label: git cat-file failed" >&2
+    return 1
+  }
+  rm -f "$t"/g.* "$t/keys"
+  bad=$(IC_A="$t" awk '
+    BEGIN { t = ENVIRON["IC_A"]; ef = t "/epochs" }
+    { if (NF == 1) key = "anchor"
+      else {
+        if ((getline x < ef) <= 0) { print "the signers list of " $1 " cannot be read"; exit }
+        split(x, a, " ")
+        if (a[2] != "blob") { print "commit " $1 ": its first parent " $2 " has no .signers file"; exit }
+        if (a[3] + 0 > 65536) { print "commit " $1 ": the .signers of its first parent " $2 " is over 64 KiB"; exit }
+        key = a[1]
+      }
+      f = t "/g." key; print $1 >> f; close(f)
+      if (!(key in seen)) { seen[key] = 1; print key >> (t "/keys"); close(t "/keys") }
+    }' "$t/todo")
+  if [ -n "$bad" ]; then
+    echo "$label: $bad; refused" >&2
+    return 1
+  fi
+  [ -f "$t/keys" ] || return 0
+  while IFS= read -r key; do
+    e=$((e + 1))
+    if [ "$key" = anchor ]; then
+      cat "$anchor" >"$t/s.raw" || return 1
+    else
+      _ic_git cat-file blob "$key" >"$t/s.raw" || return 1
+    fi
+    if [ -s "$t/refused" ]; then
+      LC_ALL=C command grep -v -F -f "$t/refused" "$t/s.raw" >"$t/s"
+      [ $? -le 1 ] || return 1
+    else
+      cp "$t/s.raw" "$t/s"
+    fi
+    _ic_git -c gpg.format=ssh -c gpg.ssh.program=ssh-keygen -c gpg.ssh.allowedSignersFile="$t/s" \
+      log --no-walk=unsorted --stdin --format='%H %G?' <"$t/g.$key" >"$t/out" 2>/dev/null || {
+      echo "$label: git log failed while checking signatures" >&2
+      return 1
+    }
+    # Every commit of the epoch answered, each with G (a good signature by a listed principal).
+    bad=$(IC_A=$(awk 'END { print NR }' "$t/g.$key") awk '
+      BEGIN { want = ENVIRON["IC_A"] }
+      $2 != "G" && b == "" { b = $1 " " $2 }
+      { n++ }
+      END { if (b != "") print b; else if (n != want + 0) print "- count" }' "$t/out")
+    if [ -n "$bad" ]; then
+      n=${bad%% *}
+      case "${bad#* }" in
+        N) why="is not signed" ;;
+        B) why="has a bad signature" ;;
+        U) why="is signed by a key that is not in the signers list" ;;
+        E) why="has a signature that cannot be checked (ssh-keygen failed)" ;;
+        X | Y) why="has an expired signature or key" ;;
+        R) why="is signed by a revoked key" ;;
+        count) n="-" why="was not answered by git log" ;;
+        *) why="did not verify (${bad#* })" ;;
+      esac
+      if [ "$key" = anchor ]; then
+        echo "$label: commit $n $why (a root commit: the anchor's keys, minus refused keys); refused" >&2
+      else
+        echo "$label: commit $n $why (the .signers of its first parent, minus refused keys); refused" >&2
+      fi
+      return 1
+    fi
+  done <"$t/keys"
+  IC_EPOCHS=$e
+}
+
+index_chain() {
+  local new="$2" v="$3" k="$4" anchor="$5" refused="$6" label="${7:-index}" n rc
+  _ic_pre "$1" "$new" "$label" || return 1
+  if [ -n "$v" ] && [ "$v" = "$new" ]; then
+    echo "$label: up to date"
+    return 0
+  fi
+  [ -f "$anchor" ] || {
+    echo "$label: the anchor $anchor is missing" >&2
+    return 1
+  }
+  IC_T=$(mktemp -d "${TMPDIR:-/tmp}/henki-chain.XXXXXX") || return 1
+  rc=0
+  _ic_line "$new" "$v" "$k" "$label" && _ic_verify "$anchor" "$refused" "$label" || rc=1
+  if [ "$rc" = 0 ]; then
+    n=$(awk 'END { print NR }' "$IC_T/todo")
+    echo "$label: $n new commits verified ($IC_EPOCHS epochs)"
+  fi
+  rm -rf "$IC_T"
+  return "$rc"
+}
+
+# The first-parent line of NEW into $IC_T/todo, after V, root first: V (else the checkpoint) must be on that line.
+_ic_line() {
+  local new="$1" v="$2" k="$3" label="$4" n
+  _ic_git rev-list --first-parent --parents --max-count=5001 "$new" >"$IC_T/f" || {
+    echo "$label: git rev-list failed" >&2
+    return 1
+  }
+  n=$(awk 'END { print NR }' "$IC_T/f")
+  if [ "$n" -gt 5000 ]; then
+    echo "$label: main's first-parent line has more than 5,000 commits; refused" >&2
+    return 1
+  fi
+  if [ -n "$v" ]; then
+    if ! IC_A=$v awk '$1 == ENVIRON["IC_A"] { f = 1; exit } END { exit !f }' "$IC_T/f"; then
+      echo "$label: main's first-parent line no longer holds the verified commit $v; fix: report it" >&2
+      return 1
+    fi
+  elif [ -n "$k" ] && ! IC_A=$k awk '$1 == ENVIRON["IC_A"] { f = 1; exit } END { exit !f }' "$IC_T/f"; then
+    echo "$label: this history does not hold the checkpoint $k on its first-parent line; fix: report it" >&2
+    return 1
+  fi
+  IC_A=$v awk 'ENVIRON["IC_A"] != "" && $1 == ENVIRON["IC_A"] { exit } { l[++n] = $0 }
+    END { for (i = n; i > 0; i--) print l[i] }' "$IC_T/f" >"$IC_T/todo"
+}
+
+index_chain_one() {
+  local c="$2" anchor="$3" refused="$4" label="${5:-index}" rc=0
+  _ic_pre "$1" "$c" "$label" || return 1
+  IC_T=$(mktemp -d "${TMPDIR:-/tmp}/henki-chain.XXXXXX") || return 1
+  # "C FIRST-PARENT ..." (git prints all parents; the first is the first parent).
+  if _ic_git rev-list --parents --max-count=1 "$c" >"$IC_T/todo"; then
+    _ic_verify "$anchor" "$refused" "$label" || rc=1
+  else
+    rc=1
+  fi
+  rm -rf "$IC_T"
+  return "$rc"
+}
+# chain: end
+
+# Fetches index NAME's main and verifies the commits it adds: refs/henki/verified then moves there (compare and swap).
+# The verified commit (at a first sync the checkpoint) must stay on main's first-parent line, so no rollback and no
+# branch grafted by a key since rotated out. Offline, or when the new commits do not verify, the commit verified
+# before stays in use. Sets X_* and X_V; exit 1 with ERR when there is none.
+index_sync() {
+  local n v out
+  index_conf "$1" && index_tools || return 1
+  mkdir -p "$IDXD" && { [ -d "$X_git" ] || git init -q --bare "$X_git"; } || {
+    ERR="cannot make $X_git; fix: make $(shown "$IDXD") writable"
+    return 1
+  }
+  v=$(index_v) || v=""
+  if ! GIT_ALLOW_PROTOCOL=https:ssh:file _ix -c transfer.fsckObjects=true -c protocol.allow=never -c protocol.https.allow=always \
+    -c protocol.ssh.allow=always -c protocol.file.allow=always fetch --quiet --no-tags --no-write-fetch-head -- "$X_url" \
+    '+refs/heads/main:refs/henki/fetched' 2>"$STAGE/fetch.err" </dev/null; then
+    [ -n "$v" ] || {
+      ERR="index $1: cannot fetch $X_url ($(head -n 1 "$STAGE/fetch.err")), and nothing of it is verified yet; fix: check the network and the URL, then try again"
+      return 1
+    }
+    X_V=$v
+    index_age
+    say "index $1: offline; using $(short "$v") ($X_age)"
+    return 0
+  fi
+  n=$(_ix rev-parse -q --verify 'refs/henki/fetched^{commit}') || {
+    ERR="index $1: the fetch gave no commit; fix: report it"
+    return 1
+  }
+  [ -n "$v" ] || [ -n "$X_ck" ] || warn "index $1: no checkpoint to start from, so a key it rotated out could still graft a branch on this first sync"
+  if out=$(index_chain "$X_git" "$n" "$v" "$X_ck" "$X_anchor" "$X_refused" "index $1" 2>&1); then
+    if [ "$n" != "$v" ]; then
+      _ix update-ref refs/henki/verified "$n" "$v" || {
+        ERR="index $1: refs/henki/verified moved meanwhile (another henki-mods?); fix: try again"
+        return 1
+      }
+      VERIFIED="$VERIFIED$1 "
+      say "index $1: $(short "$n"), ${out##*: }"
+    fi
+    date -u +%s >"$IDXD/$1.synced"
+    X_V=$n
+  else
+    printf '%s\n' "$out" | sed 's/^/henki-mods: /' >&2
+    [ -n "$v" ] || {
+      ERR="index $1: its history does not verify (above); fix: report it to the index's owner"
+      return 1
+    }
+    warn "index $1: keeps using $(short "$v"), verified before"
+    X_V=$v
+  fi
+}
+
+# Index NAME for reading, with no network: X_* and X_V, the verified commit checked again once per run (an edited clone
+# or a moved ref is refused). Exit 2 when there is nothing to read (never synced, or not live), 1 with ERR when the
+# commit does not verify.
+index_ready() {
+  local out
+  index_conf "$1" || return 2
+  X_V=$(index_v) || return 2
+  case "$VERIFIED" in *" $1 "*) return 0 ;; esac
+  index_tools || return 1
+  out=$(index_chain_one "$X_git" "$X_V" "$X_anchor" "$X_refused" "index $1" 2>&1) || {
+    ERR="$(printf '%s' "$out" | head -n 1); fix: henki-mods sync, or remove $(shown "$X_git") and sync again"
+    return 1
+  }
+  VERIFIED="$VERIFIED$1 "
+}
+
+# Index NAME's entries at X_V into $STAGE/ix/NAME: pkgs (NAME KIND LATEST), vers (PACKAGE VERSION HD1 YANK REASON;
+# YANK malicious, buggy, withdrawn or -), removed (NAME YANK REASON), the records of each entry in r/NAME and
+# r/NAME@VERSION, and v (X_V). From git objects only. An entry this henki-mods cannot read is skipped with a warning.
+index_load() {
+  local d="$STAGE/ix/$1" meta path oid n v k f out kind y pass
+  [ ! -d "$d" ] || return 0
+  mkdir -p "$d/r" && : >"$d/pkgs" && : >"$d/vers" && : >"$d/removed" && printf '%s\n' "$X_V" >"$d/v" || die "cannot write $d; fix: check TMPDIR"
+  _ix ls-tree -r --full-tree "$X_V" -- mods removed.toml >"$d/tree" 2>/dev/null || die "index $1: cannot list $(short "$X_V"); fix: henki-mods sync"
+  for pass in pkg ver; do
+    while IFS="$tab" read -r meta path; do
+      v=""
+      case "$meta" in "100644 blob "* | "100755 blob "*) oid=${meta##* } ;; *) continue ;; esac
+      case "$pass:$path" in
+        pkg:removed.toml) n=removed k=removed f="$d/removed.rec" ;;
+        pkg:mods/*/*) continue ;;
+        pkg:mods/*.toml)
+          n=${path#mods/} && n=${n%.toml}
+          k=pkg f="$d/r/$n"
+          ;;
+        ver:mods/*/*/*) continue ;;
+        ver:mods/*/*.toml)
+          n=${path#mods/} && v=${n#*/} && n=${n%%/*} && v=${v%.toml}
+          k=ver f="$d/r/$n@$v"
+          ;;
+        *) continue ;;
+      esac
+      is_name "$n" || continue
+      case "$k:$v" in ver:'' | ver:*[!A-Za-z0-9.+_-]*) continue ;; esac
+      _ix cat-file blob "$oid" | head -c 65537 >"$f.raw"
+      if [ "$(wc -c <"$f.raw")" -gt 65536 ]; then
+        warn "index $1: $path is over 64 KiB; skipped"
+        continue
+      fi
+      if ! out=$(toml <"$f.raw"); then
+        warn "index $1: $path:$out; skipped"
+        continue
+      fi
+      printf '%s\n' "$out" | command grep -v '^$' >"$f"
+      case "$k" in
+        removed)
+          awk -F '\t' '$2 == "S" { y = $3; sub(/:.*/, "", y); r = $3; sub(/^[^:]*: */, "", r); print $1 "\t" y "\t" r }' "$f" >"$d/removed"
+          continue
+          ;;
+      esac
+      if [ "$(rget "$f" index)" != 1 ]; then
+        warn "index $1: $path: index = $(rget "$f" index): this index is newer than this henki-mods; skipped; fix: upgrade henki"
+        continue
+      fi
+      if [ "$k" = pkg ]; then
+        out=$(HENKI_INDEX_ALLOW_FILE=1 lint_pkg "$f" "$n" "$path")
+      else
+        kind=$(HM_N="$n" awk -F '\t' '$1 == ENVIRON["HM_N"] { print $2 }' "$d/pkgs")
+        [ -n "$kind" ] || continue
+        out=$(CK_PR=1 lint_ver "$f" "$v" "$kind" "$path")
+      fi
+      if [ -n "$out" ]; then
+        warn "index $1: $(printf '%s' "$out" | head -n 1); skipped"
+        continue
+      fi
+      if [ "$k" = pkg ]; then
+        printf '%s\t%s\t%s\n' "$n" "$(rget "$f" kind)" "$(rget "$f" latest)" >>"$d/pkgs"
+      else
+        y=$(rget "$f" yanked) || y=""
+        case "$y" in '') y="-${tab}-" ;; *) y="${y%%:*}$tab${y#*: }" ;; esac
+        printf '%s\t%s\t%s\t%s\n' "$n" "$v" "$(rget "$f" hd1)" "$y" >>"$d/vers"
+      fi
+    done <"$d/tree"
+  done
+  printf '%s\t%s\n' "$X_principal" "$X_fp" >"$d/who"
+}
+
+# Every index in use, synced (once per run) and loaded; then the yanks applied to the lock (with busy held). Each one
+# that cannot be read is a warning; exit 1 with ERR when none can.
+index_sync_all() {
+  local i ok=0 rc errs=""
+  [ -z "$SYNCED" ] || return 0
+  SYNCED=1
+  for i in $(index_names); do
+    rc=0
+    index_sync "$i" || rc=1
+    [ "$rc" = 1 ] || index_ready "$i" || rc=1
+    if [ "$rc" = 0 ]; then
+      index_load "$i"
+      ok=1
+    else
+      errs="$errs$nl$ERR"
+    fi
+  done
+  if [ "$ok" = 0 ]; then
+    ERR=${errs#"$nl"}
+    ERR=${ERR%%"$nl"*}
+    [ -n "$ERR" ] || ERR="no index is in use; fix: install by URL or path"
+    return 1
+  fi
+  printf '%s\n' "$errs" | while IFS= read -r i; do [ -z "$i" ] || warn "$i"; done
+  yanks_apply
+}
+
+# Every index that has a verified commit, loaded with no network (the yank checks at an install). Exit through die when
+# one does not verify.
+index_local_all() {
+  local i rc
+  for i in $(index_names); do
+    rc=0
+    index_ready "$i" || rc=$?
+    case "$rc" in 0) index_load "$i" ;; 1) die "$ERR" ;; esac
+  done
+}
+
+# X_* and X_V of loaded index NAME, for its screen line.
+index_again() {
+  index_conf "$1" || die "$ERR"
+  X_V=$(cat "$STAGE/ix/$1/v")
+}
+
+# A name only henki gives: reserved for henki and its ports, or an official module's. An index the person added never
+# provides one.
+name_kept() {
+  case " std henki mods allow help exit index model history context exec policy frontend " in *" $1 "*) return 0 ;; esac
+  case "$1" in x-*) return 0 ;; esac
+  official_dir "$1" >/dev/null
+}
+
+# The index that lists package NAME (NAME@INDEX: that one) into F_index; dies when none or two do.
+index_find() {
+  local n="${1%@*}" want="" i hits="" k=0
+  case "$1" in *@*) want=${1#*@} ;; esac
+  for i in $(index_names); do
+    [ -z "$want" ] || [ "$i" = "$want" ] || continue
+    [ -f "$STAGE/ix/$i/pkgs" ] || continue
+    HM_N="$n" awk -F '\t' '$1 == ENVIRON["HM_N"] { f = 1 } END { exit !f }' "$STAGE/ix/$i/pkgs" || continue
+    [ "$i" = "$INDEX_DEFAULT" ] || ! name_kept "$n" || continue
+    hits="$hits $i"
+    k=$((k + 1))
+  done
+  [ "$k" != 0 ] || die "no index you use lists $n${want:+ (in index $want)}; fix: henki-mods search ${n%%[!a-z]*} shows what they list"
+  [ "$k" = 1 ] || die "$n is listed by more than one index:$hits; fix: name one, like henki-mods add $n@${hits##* }"
+  F_index=${hits# }
+}
+
+# The review line of index I's version record REC into T_kind (reviewed, source or listed) and T_text: who
+# reviewed it and when, inside the signed index; "source only" when the asset for this machine was not rebuilt.
+tier_of() { # INDEX REC
+  local who day t a p
+  p=$(cut -f 1 "$STAGE/ix/$1/who")
+  who=$(rget "$2" reviewer) || who=""
+  day=$(rget "$2" reviewed) || day=""
+  if [ -z "$who" ] || [ -z "$day" ]; then
+    T_kind=listed T_text="UNREVIEWED: listed in $p, but no reviewer has read this version"
+    return 0
+  fi
+  T_kind=reviewed T_text="reviewed by $who (signed index $p, $day)"
+  for t in $(asset_targets); do
+    a=$(rget "$2" "asset_check_$t") || continue
+    [ "$a" != none ] || T_kind=source T_text="$T_text · source only: the binary $(rget "$2" "asset_$t" | cut -f 1) was NOT reproduced"
+    break
+  done
+}
+
+# The asset targets of this machine, the static (musl) one first on Linux.
+asset_targets() {
+  local m
+  m=$(uname -m)
+  case "$m" in arm64) m=aarch64 ;; esac
+  case "$OS" in macos) echo "${m}_apple_darwin" ;; linux) echo "${m}_unknown_linux_musl ${m}_unknown_linux_gnu" ;; esac
+}
+
+# T_text painted for its tier.
+tier_paint() { case "$T_kind" in listed) red "$T_text" ;; source) yellow "$T_text" ;; *) printf '%s' "$T_text" ;; esac; }
+
+# Why version record REC cannot run here (requires, os, contracts), or nothing.
+fit_why() {
+  local x
+  for x in $(rget "$1" requires | tr '\t' '\n' | sed -n 's/^henki >= //p'); do
+    version_ge "$(henki_version)" "$x" || {
+      echo "needs henki >= $x, and this henki is $(henki_version)"
+      return
+    }
+  done
+  x=$(rget "$1" os | tr '\t' ' ')
+  case " $x " in "  " | *" $OS "*) ;; *) echo "runs on $x only" && return ;; esac
+  for x in $(rget "$1" contracts | tr '\t' '\n'); do
+    case " $CONTRACTS_KNOWN " in *" $x "*) ;; *) echo "needs the contract $x, which this henki does not ship" && return ;; esac
+  done
+}
+
+# The version of package N in index I to install into E_ver and E_rec: WANT, or the package's latest. A yanked version
+# is never taken; one this henki cannot run gives way to the newest older one it can, with a line saying so.
+pick_version() { # I N WANT
+  local d="$STAGE/ix/$1" v latest why y ny=0 nu=0
+  latest=$(HM_N="$2" awk -F '\t' '$1 == ENVIRON["HM_N"] { print $3 }' "$d/pkgs")
+  E_ver=""
+  for v in $(HM_N="$2" awk -F '\t' '$1 == ENVIRON["HM_N"] { print $2 }' "$d/vers" | sort -t . -k1,1nr -k2,2nr -k3,3nr); do
+    if [ -n "$3" ]; then [ "$v" = "$3" ] || continue; else version_ge "$latest" "$v" || continue; fi
+    y=$(HM_N="$2" HM_V="$v" awk -F '\t' '$1 == ENVIRON["HM_N"] && $2 == ENVIRON["HM_V"] && $4 != "-" { print $4 ": " $5 }' "$d/vers")
+    if [ -n "$y" ]; then
+      [ -z "$3" ] || die "$2 $v was yanked ($y); not installed; fix: henki-mods info $2 lists the other versions"
+      ny=$((ny + 1))
+      continue
+    fi
+    why=$(fit_why "$d/r/$2@$v")
+    if [ -n "$why" ]; then
+      [ -z "$3" ] || die "$2 $v $why; fix: upgrade henki, or install another version (henki-mods info $2)"
+      say "$2 $v $why; looking at older versions"
+      nu=$((nu + 1))
+      continue
+    fi
+    E_ver=$v E_rec="$d/r/$2@$v"
+    return 0
+  done
+  [ -z "$3" ] || die "index $1 has no version $3 of $2; fix: henki-mods info $2 lists them"
+  die "no version of $2 in index $1 can be installed here ($ny yanked, $nu not for this henki or system); fix: henki-mods info $2 says why"
+}
+
+# The yank that applies to a module (lock fields KIND SOURCE VERSION HD1), from the indexes loaded this run, as
+# "YANK<TAB>REASON<TAB>INDEX" (a malicious one first), or nothing. index:NAME: that index's yank of the version, its
+# removal of the package, or its yank of a version with the same hd1; url, path, skill: a yank of a version with the
+# same hd1 in the default index only; official: never. An index cannot turn off what it did not provide.
+yank_hit() {
+  local i d
+  case "$1" in
+    index:*) i=${1#index:} ;;
+    url | path | skill) i=$INDEX_DEFAULT ;;
+    *) return 0 ;;
+  esac
+  d="$STAGE/ix/$i"
+  [ -f "$d/vers" ] || return 0
+  HM_I="$i" HM_X="${1%%:*}" HM_S="$2" HM_V="$3" HM_H="$4" awk -F '\t' '
+    function hit(y, r) { if (y == "malicious") { if (m == "") m = y "\t" r } else if (o == "") o = y "\t" r }
+    FILENAME ~ /removed$/ { if (ENVIRON["HM_X"] == "index" && $1 == ENVIRON["HM_S"]) hit($2, $3); next }
+    $4 == "-" { next }
+    ENVIRON["HM_X"] == "index" && $1 == ENVIRON["HM_S"] && $2 == ENVIRON["HM_V"] { hit($4, $5) }
+    $3 == ENVIRON["HM_H"] { hit($4, $5) }
+    END { if (m != "") print m "\t" ENVIRON["HM_I"]; else if (o != "") print o "\t" ENVIRON["HM_I"] }' "$d/removed" "$d/vers"
+}
+
+# At an install (add, on): a malicious yank refuses, any other one is a line of the screen.
+yank_guard() { # NAME VERSION KIND SOURCE HD1
+  local hit y r
+  hit=$(yank_hit "$3" "$4" "$2" "$5")
+  [ -n "$hit" ] || return 0
+  y=${hit%%"$tab"*} r=${hit#*"$tab"}
+  [ "$y" != malicious ] || die "$1 ${2:-} was yanked as malicious (${r%"$tab"*}) by index ${r##*"$tab"}; not installed; fix: do not install it"
+  say "  $(yellow "yanked   as $y (${r%"$tab"*}) by index ${r##*"$tab"}")"
+}
+
+# The FLAGS of the lock line in L_flags, with KEY=VALUE (or the bare flag) in place of any KEY=... it had.
+flags_with() {
+  printf '%s\n' "$L_flags" | HM_F="$1" awk -F , '{ k = ENVIRON["HM_F"]; sub(/=.*/, "", k); o = ""
+    for (i = 1; i <= NF; i++) { x = $i; sub(/=.*/, "", x); if ($i != "" && x != k) o = o $i "," }
+    print o ENVIRON["HM_F"] }'
+}
+flag_has() { case ",$L_flags," in *",$1,"*) return 0 ;; esac && return 1; }
+
+# The links in CONFIG/port/ (not starting with a dot), one per line.
+port_names() { [ ! -d "$CONF/port" ] || (cd "$CONF/port" && for p in *; do [ -L "$p" ] && echo "$p"; done); }
+
+# After a sync, every locked module a yank applies to (yank_hit). Malicious: turned off and flagged; a port binding
+# into its store copy goes back to std for policy and context (std asks, std elides: both safe), and for exec and
+# history becomes the `yanked` marker, which stops henki until the person swaps (never a silent fall to std). Buggy or
+# withdrawn: flagged and said once; nothing else changes.
+yanks_apply() {
+  local n hit y r i store p t line changed=0
+  for n in $(lock_names); do
+    lock_get "$n"
+    hit=$(yank_hit "$L_kind" "$L_source" "$L_version" "$L_hd1")
+    [ -n "$hit" ] || continue
+    y=${hit%%"$tab"*} r=${hit#*"$tab"}
+    i=${r##*"$tab"}
+    r=${r%"$tab"*}
+    store=$(store_of)
+    if [ "$y" != malicious ]; then
+      flag_has yanked=buggy && continue
+      L_flags=$(flags_with yanked=buggy)
+      lock_put "$n" "$(lock_line "$L_state")"
+      say "$(yellow "$n $L_version was yanked as $y ($r) by index $i; it stays as it is; fix: henki-mods rm $n, or add another version")"
+      continue
+    fi
+    t=""
+    for p in $(port_names); do case "$(target "$CONF/port/$p")" in "$STORE/$n/"*) t=1 ;; esac; done
+    if flag_has yanked=malicious && [ "$L_state" = off ] && [ ! -L "$EXT/$n" ] && [ -z "$t" ]; then continue; fi
+    [ "$changed" = 1 ] || cards_ok
+    changed=1
+    if [ -L "$EXT/$n" ]; then rm -f "$EXT/$n" || die "cannot remove $(shown "$EXT/$n"); fix: make $(shown "$EXT") writable"; fi
+    L_flags=$(flags_with yanked=malicious)
+    lock_put "$n" "$(lock_line off)"
+    say "$(red "$n $L_version was yanked as malicious ($r) by index $i: turned off; its files are kept at $(shown "$store"); fix: henki-mods rm $n")"
+    for p in $(port_names); do
+      case "$(target "$CONF/port/$p")" in "$STORE/$n/"*) ;; *) continue ;; esac
+      case "$p" in
+        policy | context)
+          rm -f "$CONF/port/$p" || die "cannot remove $(shown "$CONF/port/$p"); fix: make it writable"
+          lock_write bind/1 "$p" ""
+          say "  $p: std again (it was $n's)"
+          ;;
+        *)
+          ln -s yanked "$CONF/port/.$p.$$" && mv -f "$CONF/port/.$p.$$" "$CONF/port/$p" || {
+            rm -f "$CONF/port/.$p.$$"
+            die "cannot replace $(shown "$CONF/port/$p"); fix: make it writable, then henki-mods swap $p std"
+          }
+          line=$(HM_P="$p" awk -F '\t' 'BEGIN { OFS = "\t" } $1 == "bind/1" && $2 == ENVIRON["HM_P"] { $6 = "yanked"; print; exit }' "$LOCK")
+          [ -n "$line" ] || line=$(printf 'bind/1\t%s\t%s\t%s\t%s\tyanked' "$p" "$n" "${store##*/}" "$(date -u +%Y-%m-%dT%H:%MZ)")
+          lock_write bind/1 "$p" "$line"
+          say "  $(red "$p: henki will not start until you choose: henki-mods swap $p std (or another package) for good, or henki --port $p=std for one session")"
+          ;;
+      esac
+    done
+  done
+  [ "$changed" = 0 ] || {
+    cards_write 0 || die "$ERR"
+    restart
+  }
+}
+
+# The indexed versions whose hd1 is H, from the indexes loaded this run: "INDEX<TAB>PACKAGE<TAB>VERSION" lines.
+hd1_hits() {
+  local i
+  for i in $(index_names); do
+    [ ! -f "$STAGE/ix/$i/vers" ] || HM_H="$1" HM_I="$i" awk -F '\t' '$3 == ENVIRON["HM_H"] { print ENVIRON["HM_I"] "\t" $1 "\t" $2 }' "$STAGE/ix/$i/vers"
+  done
+}
+
+# Inside a tool call (a session id, and no HENKI_NEXT, which henki gives only to commands the person types), a verb
+# that changes what henki runs refuses, --yes and HENKI_MODS_TTY too. A speed bump only: the model can change both
+# variables; henki's question before a shell call is the guard.
+trust_guard() {
+  [ -z "${HENKI_SESSION:-}" ] || [ -n "${HENKI_NEXT:-}" ] ||
+    die "this changes what henki runs, and it runs inside a tool call; fix: run it at the prompt with /mods"
+}
+
+# search [TERM]: one line per package of every index in use, filtered by TERM in its name or summary.
+cmd_search() {
+  local term="${1:-}" i n kind latest rec tier b badge sum hits=0
+  [ $# -le 1 ] || usage
+  busy
+  lock_check
+  scratch
+  index_sync_all || die "$ERR"
+  for i in $(index_names); do
+    [ -f "$STAGE/ix/$i/pkgs" ] || continue
+    index_again "$i"
+    index_say
+    printf '  %-16s %-24s %-9s %-9s %-12s %s\n' NAME TIER LATEST PROMPT BADGE SUMMARY
+    sort "$STAGE/ix/$i/pkgs" | while IFS="$tab" read -r n kind latest; do
+      sum=$(rget "$STAGE/ix/$i/r/$n" summary)
+      if [ -n "$term" ] && ! HM_T="$term" HM_S="$n $sum" awk 'BEGIN { exit !index(tolower(ENVIRON["HM_S"]), tolower(ENVIRON["HM_T"])) }'; then continue; fi
+      [ "$i" = "$INDEX_DEFAULT" ] || ! name_kept "$n" || continue
+      rec="$STAGE/ix/$i/r/$n@$latest"
+      b=- badge=-
+      if [ "$kind" = official ]; then
+        official_dir "$n" >/dev/null || continue
+        tier=official
+      elif [ ! -f "$rec" ]; then
+        tier="(latest unreadable)"
+      else
+        tier_of "$i" "$rec"
+        case "$T_kind" in listed) tier=UNREVIEWED ;; source) tier="reviewed (source only)" ;; *) tier=reviewed ;; esac
+        b="$(num "$(rget "$rec" prompt_bytes)") B"
+      fi
+      [ ! -f "$rec" ] || ! rget "$rec" eval_on >/dev/null || badge="$(rget "$rec" eval_on) vs $(rget "$rec" eval_off)"
+      printf '  %-16s %-24s %-9s %-9s %-12s %s\n' "$n" "$tier" "$latest" "$b" "$badge" "$sum"
+    done
+    hits=1
+  done
+  [ "$hits" = 1 ] || die "no index could be read; fix: henki-mods sync says why"
+}
+
+# info NAME[@INDEX]: the package and each of its versions, newest first, with the install line.
+cmd_info() {
+  local i n rec v y k x pkg
+  [ $# = 1 ] || usage
+  busy
+  lock_check
+  scratch
+  index_sync_all || die "$ERR"
+  index_find "$1"
+  i=$F_index n=${1%@*}
+  pkg="$STAGE/ix/$i/r/$n"
+  index_again "$i"
+  index_say
+  say "$n: $(rget "$pkg" summary)"
+  if [ "$(rget "$pkg" kind)" = official ]; then
+    say "  kind     official: a record about the module henki ships (henki-mods add $n installs that one)"
+  else
+    say "  repo     $(rget "$pkg" repo)$(x=$(rget "$pkg" path) && [ -n "$x" ] && printf '#%s' "$x")"
+  fi
+  say "  by       $(rget "$pkg" maintainer) · license $(rget "$pkg" license) · added $(rget "$pkg" added) · latest $(rget "$pkg" latest)"
+  x=$(HM_N="$n" awk -F '\t' '$1 == ENVIRON["HM_N"] { print $2 "\t" $3 }' "$STAGE/ix/$i/removed")
+  [ -z "$x" ] || say "  $(red "removed  ${x%%"$tab"*}: ${x#*"$tab"}")"
+  for v in $(HM_N="$n" awk -F '\t' '$1 == ENVIRON["HM_N"] { print $2 }' "$STAGE/ix/$i/vers" | sort -t . -k1,1nr -k2,2nr -k3,3nr); do
+    rec="$STAGE/ix/$i/r/$n@$v"
+    say ""
+    if [ "$(rget "$pkg" kind)" = official ]; then
+      say "$n $v (henki $v)"
+    else
+      tier_of "$i" "$rec"
+      say "$n $v · $(tier_paint)"
+      say "  commit   $(rget "$rec" commit)"
+    fi
+    say "  hd1      $(rget "$rec" hd1)"
+    for k in requires contracts os ports conform commands bins observers ctx; do
+      x=$(rget "$rec" "$k") || continue
+      say "  $(printf '%-8s ' "$k")${x:--}" | tr '\t' ' '
+    done
+    x=$(rget "$rec" prompt_bytes) && say "  prompt   $(num "$x") B as the first module on · card $(num "$(rget "$rec" card_bytes)") B · network $(rget "$rec" caps_net) (declared, NOT enforced)"
+    for k in $(awk -F '\t' '$1 ~ /^asset_/ && $1 !~ /^asset_check_/ { print $1 }' "$rec"); do
+      x=$(rget "$rec" "$k" | tr '\t' ' ')
+      say "  ${k#asset_}: $x ($(rget "$rec" "asset_check_${k#asset_}" || echo "not checked"))"
+    done
+    y=$(rget "$rec" yanked) && say "  $(red "yanked   $y")"
+    if rget "$rec" eval_effect >/dev/null; then
+      say "  badge    $(rget "$rec" eval_suite) on $(rget "$rec" eval_model): $(rget "$rec" eval_effect)"
+      say "           general suite: $(rget "$rec" eval_general); by $(rget "$rec" eval_by); not recomputed by this henki-mods"
+    fi
+  done
+  say ""
+  x=""
+  [ "$(index_names | wc -l | tr -d ' ')" = 1 ] || x="@$i"
+  if [ "$(rget "$pkg" kind)" = official ]; then say "install: henki-mods add $n"; else say "install: henki-mods add $n$x"; fi
+}
+
+# sync: every index in use, then the yanks applied to the lock.
+cmd_sync() {
+  local i
+  [ $# = 0 ] || usage
+  busy
+  lock_check
+  scratch
+  index_sync_all || die "$ERR"
+  for i in $(index_names); do
+    [ -f "$STAGE/ix/$i/v" ] || continue
+    index_again "$i"
+    index_say
+  done
+}
+
+# A warning per index whose verified commit is over INDEX_AGE_MAX days old (list, doctor).
+index_age_warning() {
+  local i
+  for i in $(index_names); do
+    index_conf "$i" || continue
+    X_V=$(index_v) || continue
+    index_age
+    [ "$X_days" -le "$INDEX_AGE_MAX" ] || warn "index $i: its verified commit is $X_days days old; a frozen index stops showing yanks; fix: henki-mods sync, or report it"
+  done
+}
+
+# --- doctor --------------------------------------------------------------------------------------------------------------
+
+# doctor: everything henki-mods and the modules depend on, one line each: "ok", "note" or "FAIL ...; fix: ...". Exit 1
+# when any line fails. Reads only: no network, no change.
+cmd_doctor() {
+  local x v h n d f p live=0 out stray=0 py=0
+  [ $# = 0 ] || usage
+  BAD=0
+  scratch
+  dok() { say "ok    $*"; }
+  dnote() { say "note  $*"; }
+  dbad() {
+    say "FAIL  $*"
+    BAD=$((BAD + 1))
+  }
+  dok "bash $BASH_VERSION"
+  v=$(git --version 2>/dev/null | sed -n 's/^git version \([0-9][0-9.]*\).*/\1/p')
+  if [ -z "$v" ]; then dbad "git is not on PATH; fix: install git (every URL install and the index need it)"; elif version_ge "$v" 2.34; then dok "git $v"; else dnote "git $v: the index needs 2.34 or later (SSH signatures); URL and path installs work"; fi
+  for n in $(index_names); do index_conf "$n" && live=1; done
+  if command -v ssh-keygen >/dev/null 2>&1; then
+    dok "ssh-keygen $(command -v ssh-keygen)"
+  elif [ "$live" = 1 ]; then
+    dbad "ssh-keygen is not on PATH, and an index is in use; fix: install OpenSSH"
+  else
+    dnote "no ssh-keygen: the index needs it once it is live"
+  fi
+  if command -v sha256sum >/dev/null 2>&1; then dok "sha256sum"; else dok "shasum"; fi
+  command -v openssl >/dev/null 2>&1 && dok "openssl (key fingerprints)" || dnote "no openssl: index screens cannot show key fingerprints"
+  command -v curl >/dev/null 2>&1 && dok "curl" || dnote "no curl: modules with prebuilt binaries cannot be installed"
+  # henki and the author tools beside this program.
+  h=""
+  for x in ${HENKI_BIN:-} "$SELF/henki" "$(command -v henki 2>/dev/null)"; do [ -n "$x" ] && [ -x "$x" ] && [ ! -d "$x" ] && h=$x && break; done
+  if [ -z "$h" ]; then dbad "no henki beside henki-mods or on PATH; fix: install henki"; elif x=$("$h" --version 2>/dev/null); then dok "$x ($h)"; else dbad "$h --version fails; fix: reinstall henki"; fi
+  [ -x "$SELF/henki-mods-dev" ] && dok "henki-mods-dev beside henki-mods" || dnote "no henki-mods-dev beside henki-mods: the author tools (henki mods entry, ...) are missing"
+  # The dirs henki trusts: the person's own, written by nobody else.
+  for d in "$CONF" "$STORE" "$IDXD"; do
+    [ -d "$d" ] || continue
+    if [ ! -O "$d" ]; then
+      dbad "$(shown "$d") is not yours; fix: chown it to $(id -un)"
+    elif [ -n "$(find "$d" -maxdepth 0 \( -perm -020 -o -perm -002 \) -print)" ]; then
+      dbad "$(shown "$d") can be written by others; fix: chmod go-w $(shown "$d")"
+    else
+      dok "$(shown "$d")"
+    fi
+  done
+  # The port links (and a yanked module's marker).
+  for p in $(port_names); do
+    x=$(target "$CONF/port/$p")
+    if [ "$x" = yanked ]; then
+      dbad "$p is stopped: the module bound to it was yanked as malicious, and henki will not start; fix: henki-mods swap $p std (or another package)"
+    elif [ -f "$CONF/port/$p" ] && [ -x "$CONF/port/$p" ]; then
+      dok "$p bound: $x"
+    else
+      dbad "$(shown "$CONF/port/$p") names no program; fix: henki-mods swap $p std"
+    fi
+  done
+  # A bin/bash or bin/sh of a module on would stand in for the shell of every call.
+  for n in $(ext_names); do
+    for x in bash sh; do
+      [ ! -x "$EXT/$n/bin/$x" ] || {
+        if [ -L "$CONF/port/exec" ]; then dbad "$(red "$n has bin/$x, and exec is bound"); fix: henki-mods off $n"; else dnote "$n has bin/$x: the model's commands named $x run it"; fi
+      }
+    done
+  done
+  # The lock, the store copies, the links and the cards.
+  if out=$(cmd_verify 2>&1); then dok "${out##*"$nl"}"; else printf '%s\n' "$out" | sed 's/^henki-mods: /FAIL  /' && BAD=$((BAD + 1)); fi
+  for n in $(lock_names); do
+    lock_get "$n"
+    ! flag_has yanked=malicious || dbad "$n was yanked as malicious and is still in the store; fix: henki-mods rm $n"
+    case "$(printf '%s\n' "$(cat "$(store_of)/.henki/module.toml" 2>/dev/null)" | sed -n 's/^needs *=//p')" in *'"python3"'*) py=1 ;; esac
+  done
+  [ "$py" = 0 ] || { command -v python3 >/dev/null 2>&1 && dok "python3 (a module needs it)" || dbad "a module needs python3, which is not on PATH; fix: install python3"; }
+  if [ -d "$STORE" ]; then
+    for d in "$STORE"/*/*; do
+      [ -d "$d" ] || continue
+      n=${d%/*}
+      n=${n##*/}
+      lock_get "$n" && [ "$(store_of)" = "$d" ] || stray=$((stray + 1))
+    done
+  fi
+  [ "$stray" = 0 ] || dnote "$stray store copies the lock does not name (kept for a rollback)"
+  # The indexes: who signs each one, from where, how old.
+  [ -z "${HENKI_SHARE:-}" ] || dnote "$(yellow "HENKI_SHARE is set: the default index's anchor comes from $HENKI_SHARE/index")"
+  for n in $(index_names); do
+    if ! index_conf "$n"; then
+      dnote "$ERR"
+      continue
+    fi
+    x="index $n: $X_principal, key $X_fp, $X_url"
+    [ -z "$X_where" ] || x="$x, anchor $X_where"
+    [ -n "$X_ck" ] || x="$x, no checkpoint"
+    if X_V=$(index_v); then
+      index_age
+      x="$x, verified $(short "$X_V") ($X_age)"
+      if [ "$X_days" -gt "$INDEX_AGE_MAX" ]; then dbad "$x: over $INDEX_AGE_MAX days old; fix: henki-mods sync"; else dok "$x"; fi
+    else
+      dok "$x, never synced"
+    fi
+  done
+  # What a sandbox binding can use here.
+  if command -v bwrap >/dev/null 2>&1; then
+    x=bubblewrap
+  elif [ "$OS" = linux ] && command -v unshare >/dev/null 2>&1 && unshare -Ur true 2>/dev/null; then
+    x="user namespaces"
+  elif [ "$OS" = macos ] && command -v sandbox-exec >/dev/null 2>&1; then
+    x=Seatbelt
+  else
+    x=none
+  fi
+  dok "sandbox backend: $x"
+  dok "prompt: $(num "$(total_on)") B from the modules on"
+  [ "$BAD" = 0 ] || die "doctor: $BAD problems (above); fix: as each one says"
+  say "doctor: ok"
 }
 
 # --- eval/1: a module's tasks, run with the module on and off -------------------------------------------------------
@@ -2331,9 +3516,19 @@ cmd_allow() {
   [ -z "${HENKI_NEXT:-}" ] || restart
 }
 
+# henki-mods-dev sources this file for its functions: it stops here.
+(return 0 2>/dev/null) && return 0
 setup
 case "${1:-list}" in
   list) shift $(($# > 0 ? 1 : 0)) && cmd_list "$@" ;;
+  search) shift && cmd_search "$@" ;;
+  info) shift && cmd_info "$@" ;;
+  sync) shift && cmd_sync "$@" ;;
+  doctor) shift && cmd_doctor "$@" ;;
+  entry)
+    [ -x "$SELF/henki-mods-dev" ] || die "henki-mods-dev is not beside henki-mods; fix: reinstall henki"
+    exec "$SELF/henki-mods-dev" "$@"
+    ;;
   add) shift && cmd_add "$@" ;;
   on | off) cmd_onoff "$@" ;;
   rm) shift && cmd_rm "$@" ;;

@@ -1,0 +1,3 @@
+# Key blobs (base64, one per line) whose signatures never verify in any index: development keys, and keys
+# rotated out after a compromise. henki-mods drops every signers line holding one before it checks a signature.
+AAAAC3NzaC1lZDI1NTE5AAAAIGbRieBzlT3ROmmDhciyBfIVeH1WqyBtBE0Odt+zuvzt
