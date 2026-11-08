@@ -1,12 +1,16 @@
 #![allow(clippy::disallowed_methods, clippy::print_stdout, clippy::print_stderr, clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::string_slice)]
 //! Forks: `--resume=ID@N` on std and on a history binding (with and without cap `fork`), what the model sees after
-//! one, and a refused fork that leaves nothing behind.
+//! one, a refused fork that leaves nothing behind, and `resume ID@N` handed back by a command.
 use crate::harness::*;
 use crate::mock::*;
+use crate::pty::Pty;
 use serde_json::{Value, json};
 use std::fs;
 use std::os::unix::fs::{PermissionsExt, symlink};
 use std::path::{Path, PathBuf};
+use std::time::Duration;
+
+const W: Duration = Duration::from_secs(15);
 
 /// The 1-based line of the `k`th (from 0) `user` record of `all`.
 fn user_line(all: &[Value], k: usize) -> usize {
@@ -131,4 +135,39 @@ fn e2e_fork_refused() {
     let d = r.cmd(&["--json", "--resume", "again"]).go();
     d.finish();
     assert_eq!((d.code, d.journal.as_ref()), (Some(0), Some(&parent)), "{}", d.diag());
+}
+
+/// A command hands back `resume ID@N`: henki asks `fork session ID at line N?`, and on y starts again on the fork, whose
+/// first request holds the parent's history before line N, then the new message.
+#[test]
+fn pty_fork_handoff() {
+    let m = Mock::start(vec![say("one"), say("two"), say("forked")]);
+    let r = Run::new(&m.url());
+    for args in [&["--json", "first"][..], &["--json", "--resume", "second"]] {
+        r.cmd(args).go().finish();
+    }
+    let parent = r.journals()[0].clone();
+    let (id, n) = (stem(&parent), user_line(&lines(&fs::read_to_string(&parent).unwrap()), 1));
+    let x = r.config_dir().join("ext/kit");
+    fs::create_dir_all(x.join("cmd")).unwrap();
+    fs::write(x.join("doc.md"), "kit: commands for the user\n").unwrap();
+    fs::write(x.join("cmd/branch"), format!("#!/bin/sh\necho 'resume {id}@{n}' >\"$HENKI_NEXT\"\n")).unwrap();
+    fs::set_permissions(x.join("cmd/branch"), fs::Permissions::from_mode(0o755)).unwrap();
+    let mut p = Pty::spawn(&r, &[], 24, 80);
+    p.prompt(W);
+    p.line("/branch");
+    p.expect(&format!("fork session {id} at line {n}? [y/N] "), W);
+    p.line("y");
+    p.expect(&format!("forked from session {id} at line {n}"), W);
+    p.prompt(W);
+    p.renew(&r);
+    p.line("instead");
+    p.expect("forked", W);
+    p.prompt(W);
+    p.line("/exit");
+    let d = p.wait(W);
+    d.finish();
+    assert_eq!(d.code, Some(0), "{}", d.diag());
+    assert_eq!(m.log()[2].contents("user").len(), 2, "first, then instead");
+    assert_eq!(r.journals().len(), 2, "the parent and the fork; the REPL that handed back left none");
 }

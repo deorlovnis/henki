@@ -178,17 +178,17 @@ fn handoff_trust_changes() {
     assert_eq!(d.out().matches("[y/N]").count(), 1, "{}", d.out());
 }
 
-/// HN6: ids a resume refuses (a path, a flag, a fork), and a verb henki does not know: a notice, nothing else.
+/// HN6: ids a resume refuses (a path, a flag, a fork point that is no number), and a verb henki does not know: a notice, nothing else.
 #[test]
 fn handoff_resume_refused() {
     let m = Mock::start(vec![say("still here")]);
     let r = Run::new(&m.url());
-    let cmds: Vec<(String, String)> = ["../x", "-x", "a@3", ""].iter().enumerate().map(|(i, id)| (format!("r{i}"), format!("echo 'resume {id}' >\"$HENKI_NEXT\""))).collect();
+    let cmds: Vec<(String, String)> = ["../x", "-x", "a@x", "a@", ""].iter().enumerate().map(|(i, id)| (format!("r{i}"), format!("echo 'resume {id}' >\"$HENKI_NEXT\""))).collect();
     let mut cmds: Vec<(&str, &str)> = cmds.iter().map(|(a, b)| (a.as_str(), b.as_str())).collect();
     cmds.push(("odd", "echo 'fork me' >\"$HENKI_NEXT\""));
     module(&r, "kit", &cmds);
     let p = start(&r, &[]);
-    for (i, id) in ["../x", "-x", "a@3", ""].iter().enumerate() {
+    for (i, id) in ["../x", "-x", "a@x", "a@", ""].iter().enumerate() {
         p.line(&format!("/r{i}"));
         p.expect(&format!("henki: /r{i}: cannot resume {id:?}\r\n"), W);
         p.prompt(W);

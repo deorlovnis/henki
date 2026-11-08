@@ -439,7 +439,7 @@ or else on the user's PATH (never a module's), with ARGS split at spaces. A past
 |---|---|
 | (empty, or no file) | nothing |
 | `send`, then TEXT | shows `[from /CMD]` and the whole TEXT, asks `send? [Y/n]` (Enter or y sends it as the next message); refused when TEXT holds a code point henki escapes |
-| `resume ID` | ID as history/1's id rule (`ID@N` is refused); asks `switch to session ID? [y/N]`, then closes the session as `/exit` does and starts `henki ... --resume=ID` in its place |
+| `resume ID` | ID as history/1's id rule, or `ID@N` (N a number: a fork, journal/1); asks `switch to session ID? [y/N]` (`fork session ID at line N? [y/N]`), then closes the session as `/exit` does and starts `henki ... --resume=ID` (`--resume=ID@N`) in its place |
 | `new` | closes the session and starts `henki ...` without `--resume`, no question |
 | `restart` | as `new` with `--resume=THIS`, or as `new` while the session has no message, or after the command changed `CONFIG_DIR/port/history` (the session stays in the history it was kept in, which a notice names) |
 | anything else | a notice naming the verb |

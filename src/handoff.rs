@@ -1,8 +1,9 @@
 //! `handoff/1`: a typed command, `/NAME REST` (a module's `cmd/NAME`) or `/mods ARGS` (the shipped manager), run on the
-//! terminal, and what it hands back in the file `HENKI_NEXT` names: nothing, `send` + TEXT, `resume ID`, `new` or
-//! `restart`. No text is sent once a trust file changed; a new henki (new, resume, restart) on trust files the command
-//! changed is asked for, naming them; after a change from before the command there is no one-key restart. A `restart`
-//! after a change to the history link starts a new session: the old one stays in the store it was kept in.
+//! terminal, and what it hands back in the file `HENKI_NEXT` names: nothing, `send` + TEXT, `resume ID` (`resume
+//! ID@N`: a fork), `new` or `restart`. No text is sent once a trust file changed; a new henki (new, resume, restart) on
+//! trust files the command changed is asked for, naming them; after a change from before the command there is no
+//! one-key restart. A `restart` after a change to the history link starts a new session: the old one stays in the store
+//! it was kept in.
 use crate::{allow, port, sys, term, turn::Session, types::Stop};
 use std::{ffi::OsString, fs, io::Read, os::unix::fs::MetadataExt, path::Path, path::PathBuf};
 
@@ -44,6 +45,7 @@ pub fn run(s: &mut Session, name: &str, prog: &Path, module: Option<&Path>, args
     let text = text.unwrap_or_default();
     let (line, body) = text.split_once('\n').unwrap_or((&text, ""));
     let (verb, arg) = line.trim().split_once(' ').map_or((line.trim(), ""), |(v, a)| (v, a.trim()));
+    let (p, n) = arg.split_once('@').map_or((arg, None), |(p, n)| (p, Some(n))); // `resume ID@N` forks ID at its line N
     let (stale, to) = (pre || !changed.is_empty(), if changed.is_empty() { "" } else { " on these changes" });
     let stay = if stale { Next::Tripped } else { Next::Stay };
     // A history binding keeps its own sessions: after a change to the history link `restart` starts a new session (a
@@ -58,9 +60,8 @@ pub fn run(s: &mut Session, name: &str, prog: &Path, module: Option<&Path>, args
         "send" if body.contains(term::escaped) => (s.out().note(&format!("/{name} handed back invisible characters; nothing is sent")), stay).1,
         "send" => Next::Send(body.to_string()),
         "new" | "resume" | "restart" if pre => (s.out().note("a trust file changed before; restart henki yourself (henki --resume continues this session)"), Next::Tripped).1,
-        // `ID@N` (a fork) waits for a history binding that can fork.
-        "resume" if !port::session_id(arg) => (s.out().note(&format!("/{name}: cannot resume {:?}", term::escape(arg))), stay).1,
-        "resume" if !s.yes(&format!("switch to session {arg}{to}? [y/N] "))? => stay,
+        "resume" if !port::session_id(p) || n.is_some_and(|n| n.parse::<u64>().is_err()) => (s.out().note(&format!("/{name}: cannot resume {:?}", term::escape(arg))), stay).1,
+        "resume" if !s.yes(&n.map_or(format!("switch to session {arg}{to}? [y/N] "), |n| format!("fork session {p} at line {n}{to}? [y/N] ")))? => stay,
         "new" | "restart" if !changed.is_empty() && !s.yes("restart on these changes? [y/N] ")? => stay,
         "restart" if moved => (s.resumable().iter().for_each(|i| s.out().note(&kept(i))), Next::Exec(again(None))).1,
         "new" | "resume" | "restart" => Next::Exec(again(id)),
