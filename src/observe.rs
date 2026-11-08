@@ -65,7 +65,8 @@ impl Observers {
     }
 
     /// Runs `event`'s observers, the event numbered `seq`; their output goes to the kernel log, or /dev/null without
-    /// one. Each wait run sends `Ev::Observed { tag }` once it is reaped: returns how many will, and the notices.
+    /// one. Each wait run sends `Ev::Observed { tag }` once it is reaped (another run tag 0, which the session end's
+    /// grace waits on): returns how many will send `tag`, and the notices.
     pub fn emit(&mut self, event: &str, session: &str, data: &Value, tag: u32) -> (usize, Vec<String>) {
         let (mut waits, mut notes, mut line) = (0, Vec::new(), None);
         self.seq += 1;
@@ -93,7 +94,7 @@ impl Observers {
                         sys::exited(pid);
                         supervise::kernel_end(Some(child), false);
                         lock(&live).retain(|l| l.1 != pid);
-                        let _ = wait.then(|| tx.send(Ev::Observed { tag }));
+                        let _ = tx.send(Ev::Observed { tag: if wait { tag } else { 0 } });
                     });
                 }
                 Err(e) => notes.push(format!("observer {}/on/{event} did not start: {e}", o.module)),

@@ -92,7 +92,7 @@ fn observe_emit_runs_once_per_event() {
     assert_eq!(o.emit("turn_end", "s1", &json!({}), 9), (0, Vec::new()));
     until("the turn_end run", || d.join("state/turn_end.out").exists() && o.running().is_empty());
     assert!(fs::read_to_string(d.join("state/turn_end.out")).unwrap().contains(r#""seq":3"#), "seq counts every event");
-    assert!(rx.try_recv().is_err(), "a plain run sent an event");
+    assert!(matches!(rx.recv_timeout(Duration::from_secs(5)), Ok(Ev::Observed { tag: 0 })), "a plain run reports tag 0");
     assert_eq!(fs::read_to_string(d.join("state/spill/.kernel-test.log")).unwrap(), "logged\nlogged\n");
     let left: Vec<_> = fs::read_dir(d.join("state/spill")).unwrap().flatten().map(|e| e.file_name()).collect();
     assert_eq!(left, [std::ffi::OsString::from(".kernel-test.log")], "an event file was left");

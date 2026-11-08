@@ -132,6 +132,7 @@ impl Session {
     pub fn close(&mut self, result: Option<Value>) -> Result<(), Outcome> {
         self.finishing = true;
         let (_, n) = self.stop_all(false);
+        // A run that ends sends tag 0; the slices also catch one whose waiter thread did not start.
         let (end, until) = (self.end(n, result), Instant::now() + supervise::GRACE);
         while !self.obs.running().is_empty() && Instant::now() < until && self.wait(0, Some(until.min(Instant::now() + SLICE))).is_ok() {}
         supervise::kernel_kill(&self.obs.running());
