@@ -221,6 +221,12 @@ t_checkpoints() {
   run "$m/on/call_start.wait" <"$D/ev"
   rc_is 1
   err_has "no plain path in the event"
+  # A target that is not UTF-8 comes as null: nothing is kept, and nothing named after a lossy path.
+  event write "" >"$D/ev"
+  run "$m/on/call_start.wait" <"$D/ev"
+  rc_is 1
+  err_has "cannot keep the target"
+  [ -z "$(ls "$HENKI_STATE/checkpoints/$HENKI_SESSION")" ] || fail "a null target was kept"
   HENKI_SESSION="" run env "$m/cmd/checkpoints"
   rc_is 1
   err_has "no session (HENKI_SESSION)"

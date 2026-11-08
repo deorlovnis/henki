@@ -6,6 +6,7 @@ use crate::mock::*;
 use crate::pty::Pty;
 use serde_json::{Value, json};
 use std::fs;
+use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{PermissionsExt, symlink};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -302,4 +303,22 @@ fn copy(src: &Path, dst: &Path) {
             fs::set_permissions(&to, fs::Permissions::from_mode(mode)).unwrap();
         }
     }
+}
+
+/// A file tool's target that is not UTF-8 (the cwd's name here) is null in `call_start`; the calls run as before.
+#[test]
+fn observe_non_utf8_target_is_null() {
+    let m = Mock::start(vec![call("read", json!({"path": "x.txt"})), call("write", json!({"path": "y.txt", "content": "y"})), say("done")]);
+    let r = Run::new(&m.url());
+    module(&r, "watch", &[("call_start", &format!("cat >>{}", r.dir.join("events").display()))]);
+    let dir = r.cwd.join(std::ffi::OsStr::from_bytes(b"\xfe"));
+    fs::create_dir(&dir).unwrap();
+    fs::write(dir.join("x.txt"), "x\n").unwrap();
+    let d = r.cmd(&["--json", "hi"]).cwd(&dir).go();
+    d.finish();
+    assert_eq!(d.code, Some(0), "{}", d.diag());
+    assert!(d.results().iter().all(|r| r["is_error"] == false), "{}", d.diag());
+    assert_eq!(fs::read_to_string(dir.join("y.txt")).unwrap(), "y");
+    let targets: Vec<_> = lines(&fs::read_to_string(r.dir.join("events")).unwrap()).iter().map(|e| e["data"]["target"].clone()).collect();
+    assert_eq!(targets, [Value::Null, Value::Null]);
 }

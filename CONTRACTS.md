@@ -427,7 +427,8 @@ NAME/on/EVENT.wait       turn_start and call_start only: henki waits for it, up 
 | `record` | every record a turn journals, after the record's own event; not observer notices | the record |
 
 `call_start`'s `verdict` is the `approval` record's (`auto`, `rule`, `yes`, `always`), `rule` the rule's number or
-null, `target` the resolved path of a file tool's target or null. No event comes before `session_start`.
+null, `target` the resolved path of a file tool's target, or null (a shell call, or a path that is not UTF-8, which
+JSON cannot hold). No event comes before `session_start`.
 
 - **The run.** The program with no arguments, in the session's working directory, in a process group and session of
   its own, with the tool environment (journal/1 "Files") plus `HENKI_EVENT` (the event), `HENKI_MODULE` (the module

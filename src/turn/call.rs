@@ -64,7 +64,8 @@ impl Session {
                 None => return self.answer(c, DENIED, true, None, None),
             },
         };
-        self.observe("call_start", &json!({"call": {"args": c.args, "id": c.id, "name": c.name}, "rule": rule, "target": t.as_ref().map(|t| &t.path), "verdict": verdict}))?;
+        let target = t.as_ref().and_then(|t| t.path.to_str()); // null for a path JSON cannot hold (not UTF-8)
+        self.observe("call_start", &json!({"call": {"args": c.args, "id": c.id, "name": c.name}, "rule": rule, "target": target, "verdict": verdict}))?;
         // Again right before the call starts: the question, and a `call_start.wait` observer, can take time.
         self.tripwire()?;
         self.call(c, t, head)?;

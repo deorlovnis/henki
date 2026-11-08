@@ -7,7 +7,7 @@ An observer and commands for you, not for the model (they cost no prompt bytes):
   `refs/henki/checkpoints/SESSION/N`. It goes through a temporary index: your work tree, your index and HEAD are not
   touched, and `git log` does not show it. Outside git it copies the target of a `write` or `edit` to
   `$XDG_STATE_HOME/henki/checkpoints/SESSION/N/` (or notes that it did not exist); a `shell` call there has no
-  snapshot.
+  snapshot, nor has a target whose path is not UTF-8 (henki sends no path for it).
 - `/checkpoints`: this session's snapshots, oldest first.
 - `/undo`: shows what changed since the newest snapshot (`git diff --stat`), asks, puts those files back, and drops the
   snapshot, so the next `/undo` goes one call further back. Files made since then are removed.
