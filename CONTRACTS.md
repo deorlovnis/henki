@@ -90,7 +90,7 @@ values of `args` and `blocks` are opaque JSON.
 | `elide` | `t` `ts` `ids` |
 | `turn_end` | `t` `ts` `status` `steps` `usage` `usage.cached` `usage.in` `usage.out` `reason?` |
 | `result` | `t` `ts?` `status` `exit` `text` `usage` `usage.cached` `usage.in` `usage.out` `session` `steps` `duration_s` `reason?` `error?` `error.kind?` `error.message?` `call?` `call.args?` `call.id?` `call.name?` |
-| `close` | `t` `ts` `bytes` |
+| `close` | `t` `ts` `bytes?` |
 
 - `session` starts a segment (a run of henki on the file). `v` is the journal major, `1`. `henki` is henki's version,
   `id` the session id, `cwd` the working directory, `model` and `dialect` (`openai` or `anthropic`) the model in use,
@@ -100,7 +100,8 @@ values of `args` and `blocks` are opaque JSON.
   `pass_env` the variable names passed to tools, `shell` the bash that runs calls, `ctx` the context window in tokens.
   The `*_hash` fields are FNV-1a 64 hashes of the bytes of the config file, the allow file and the global `AGENTS.md`
   as read, or `null` when absent or not read; `project_agents_hash` is always `null` in this version. `resumed` is
-  `null` for a new session, else `{"from_bytes": N}`: the file's length when this segment began.
+  `null` for a new session, else `{"from_bytes": N}`: the file's length when this segment began (`{}` in a session a
+  history binding keeps: history/1).
 - `user` is a message from the user; `msg.role` is `user`. A session's first task starts with
   `cwd: DIR\nos: OS ARCH\ndate: YYYY-MM-DD\n\n`; later ones do not.
 - `assistant` is one model reply; `msg.role` is `assistant`, `msg.content` its text. Each `msg.tool_calls` entry is a
@@ -125,7 +126,8 @@ values of `args` and `blocks` are opaque JSON.
 - `turn_end`: the end of one turn: `status` (see json/1), `steps` (model replies in the turn), `usage` (the turn's),
   `reason` when the status is `gave_up`.
 - `result`: the end of a `henki run` (a REPL session has none): see json/1. In the journal it always has `ts`.
-- `close`: the session ended cleanly; `bytes` is the file's length before this line.
+- `close`: the session ended cleanly; `bytes` is the file's length before this line (absent in a session a history
+  binding keeps: history/1).
 
 ### Segments, close and resume
 
@@ -584,13 +586,16 @@ has one binding: the std one built into henki, or a program that `CONFIG_DIR/por
 ## history/1
 
 The history port over port/1: where sessions are kept. Records are journal/1 objects; a binding keeps them as given
-(it may add fields named `x-*`). Session ids follow journal/1's rule for any id henki makes, and any id is 1 to 64 of
+(it may add fields named `x-*`). henki sends them as the std binding gets them, before std fills the fields of its own
+file: `close` without `bytes`, and a resumed `session` with `resumed` `{}` (journal/1 marks both). A store exported
+to std goes through std's `append`, which fills them; a binding's file copied into std's sessions dir is no journal/1
+file and is refused. Session ids follow journal/1's rule for any id henki makes, and any id is 1 to 64 of
 `A-Z a-z 0-9 . _ -`, not starting with `.` or `-`. A session is held by one binding process at a time, from `create`
 or `open` until another `create` or `open`, `bye`, or the process's end (a kill included).
 
 | Method | Params | Result | Errors |
 |---|---|---|---|
-| `create` | `scope`, `hint` (an id or null) | `{"session":ID}`, held; `hint` is used when free | `invalid`, `exists`, `io` |
+| `create` | `scope`, `hint` (an id or null) | `{"session":ID}`, held; a `hint` that is not null is the id | `invalid`, `exists` (the hint is taken), `io` |
 | `open` | `scope`, `session` (an id, looked up in every scope, or null: the newest session of `scope` nothing holds) | `{"session":ID}`, held; the id asked | `not_found`, `busy`, `corrupt`, `io` |
 | `read` | `session`, `from` (a record index) | `{"records":[...],"next"?:N,"notices"?:[...]}`; `next` (the count so far) asks for another page | `not_found`, `tampered`, `corrupt`, `io` |
 | `append` | `session` (held), `record` | `null`, once the record is durable (it survives a kill of the binding and of henki) | `not_found`, `invalid`, `tampered`, `io` |

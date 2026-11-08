@@ -108,12 +108,18 @@ fn contracts_record_fields() {
     let mut r = Run::new(&m.url());
     r.set("dialect", "\"anthropic\"");
     runs.push(("anthropic", r.json("hello")));
-    // History bound to the bash binding of the conformance suite: `session.ports`.
-    let m = Mock::start(vec![say("kept outside")]);
+    // History bound to the bash binding of the conformance suite: `session.ports`; the records as henki sends them, so
+    // without std's `close.bytes` and `resumed.from_bytes`.
+    let m = Mock::start(vec![say("kept outside"), say("again")]);
     let r = Run::new(&m.url());
     std::fs::create_dir_all(r.config_dir().join("port")).unwrap();
     std::os::unix::fs::symlink(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/ports/toy-history"), r.config_dir().join("port/history")).unwrap();
     runs.push(("bound", r.json("hello")));
+    let d = r.cmd(&["--json", "--resume", "again"]).go();
+    let all = d.journal_all();
+    assert!(all.iter().filter(|x| x["t"] == "close").all(|x| x.get("bytes").is_none()), "{}", d.diag());
+    assert_eq!(d.of("session")[0]["resumed"], json!({}), "{}", d.diag());
+    runs.push(("bound resumed", d));
     // Policy bound to the bash binding of its suite, with rules: an allow (`by`), a deny (`reason`), `session.ports`.
     let m = Mock::start(vec![shell("echo allowed"), shell("rm -rf nothing"), say("decided")]);
     let mut r = Run::new(&m.url());
@@ -140,10 +146,7 @@ fn contracts_record_fields() {
             _ => "ok",
         };
         assert_eq!(d.status(), want, "{name}\n{}", d.diag());
-        // A binding's store is not a journal/1 file (`close.bytes` is std's), so only its stdout is held to the tables.
-        if *name != "bound" {
-            d.journal_all().iter().for_each(|x| seen.check(&kinds, x, &format!("{name} journal")));
-        }
+        d.journal_all().iter().for_each(|x| seen.check(&kinds, x, &format!("{name} journal")));
         d.records().iter().for_each(|x| seen.check(&kinds, x, &format!("{name} stdout")));
     }
     seen.covers(&kinds);
