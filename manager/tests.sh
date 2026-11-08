@@ -53,6 +53,14 @@ run() {
   OUT=$($RUN "$MODS" "$@" 2>"$SCRATCH/err") || RC=$?
   ERR=$(cat "$SCRATCH/err")
 }
+# As run, in the directory DIR.
+run_in() { # DIR ARGS
+  local d="$1"
+  shift
+  RC=0
+  OUT=$(cd "$d" && $RUN "$MODS" "$@" 2>"$SCRATCH/err") || RC=$?
+  ERR=$(cat "$SCRATCH/err")
+}
 
 fail() {
   FAILS=$((FAILS + 1))
@@ -1479,7 +1487,7 @@ t_ports() {
   rc_is 0
   out_has "history: std -> tree 0.1.0 ("
   out_has "conformance: passed (history/1, 29 checks) · it runs with your rights and stores every session record"
-  out_has "henki --port history=std --resume reaches them"
+  out_has "henki --port history=std --resume reaches them, and henki-mods history import copies them into tree"
   local store id
   store=$(readlink "$CONF/ext/tree")
   id=${store##*/}
@@ -1569,6 +1577,193 @@ t_port_toy() {
     out_has "FAIL $want: got"
   done
 }
+
+# The std scope dir of a directory: FNV-1a 64 of its realpath (journal/1).
+fnv() {
+  local h=-3750763034362895579 b
+  for b in $(printf '%s' "$1" | od -An -v -tu1); do h=$(((h ^ b) * 1099511628211)); done
+  printf '%016x\n' "$h"
+}
+
+# A std journal FILE made in CWD: a session record, one user record per TEXT (the first with henki's head), a close.
+hj() { # FILE CWD TEXT...
+  local f="$1" c="$2" t first=1
+  shift 2
+  mkdir -p "${f%/*}"
+  printf '{"agents_hash":null,"allow_hash":null,"approve":"ask","approve_from":"default","base_url":"http://127.0.0.1:9/v1","base_url_from":"config","config":null,"config_hash":null,"ctx":8192,"cwd":"%s","dialect":"openai","exts":[],"henki":"0.2.0","id":"x","model":"m","pass_env":[],"project_agents_hash":null,"resumed":null,"shell":"/bin/bash","t":"session","tools":["shell"],"ts":"2026-11-08T10:00:00Z","v":1}\n' "$c" >"$f"
+  for t in "$@"; do
+    [ "$first" = 0 ] || t="cwd: $c\\nos: linux x\\ndate: 2026-11-08\\n\\n$t"
+    printf '{"msg":{"content":"%s","role":"user"},"t":"user","ts":"2026-11-08T10:00:00Z"}\n{"finish":"stop","msg":{"content":"ok","role":"assistant","tool_calls":[]},"t":"assistant","ts":"2026-11-08T10:00:01Z","usage":{"cached":0,"in":1,"out":1}}\n' "$t" >>"$f"
+    first=0
+  done
+  printf '{"bytes":%s,"t":"close","ts":"2026-11-08T10:00:02Z"}\n' "$(wc -c <"$f" | tr -d ' ')" >>"$f"
+}
+
+# history list, show and import on std: journals in the scope dirs, read only; no binding to import into.
+t_history() {
+  case_ "history list, show: std; import needs a binding"
+  local w="$W/proj" st="$XDG_STATE_HOME/henki/sessions" sc f
+  mkdir -p "$w"
+  sc=$(fnv "$(cd -P "$w" && pwd)")
+  hj "$st/$sc/20261108T080000Z-aaaa.jsonl" "$w" 'fix the \"parser\"\nand more' 'second'
+  hj "$st/$sc/20261108T090000Z-bbbb.jsonl" "$w" 'newer one'
+  touch -t 202611080800 "$st/$sc/20261108T080000Z-aaaa.jsonl"
+  hj "$st/0123456789abcdef/20261108T100000Z-cccc.jsonl" /elsewhere 'elsewhere'
+  : >"$st/$sc/20261108T110000Z-eeee.jsonl" # empty: no session
+  # A session whose sources counted, then a torn line.
+  f="$st/$sc/20261108T090000Z-bbbb.jsonl"
+  sed 's/,"shell":/,"sources":[{"bytes":1234,"hash":"00ff","name":"project\/project"},{"bytes":5,"hash":"aa","name":"x\/y"}],"shell":/' "$f" >"$W/s" && sed -n 1p "$W/s" >>"$f"
+  printf '{"msg":{"content":"torn","role":"user"},"t":"us' >>"$f"
+  touch -t 202611080900 "$f"
+  run_in "$w" history list
+  rc_is 0
+  out_has " 1   20261108T090000Z-bbbb 2026-11-08 09:00  newer one"
+  out_has " 2   20261108T080000Z-aaaa 2026-11-08 08:00  fix the \"parser\""
+  out_lacks "cccc"
+  out_lacks "eeee"
+  out_lacks "and more"
+  HENKI_SESSION=20261108T080000Z-aaaa run history list --scope "$w"
+  out_has " 2 * 20261108T080000Z-aaaa"
+  run history list --scope "$W"
+  rc_is 0
+  out_has "no sessions of $W in std"
+  run history list --scope "$W/nope"
+  refused "$W/nope is not a directory"
+  run history show 20261108T080000Z-aaaa
+  rc_is 0
+  out_has "session 20261108T080000Z-aaaa in std; fork it at a line with henki --resume=20261108T080000Z-aaaa@LINE"
+  out_has "     2  fix the \"parser\"$nl     4  second"
+  out_lacks "context at"
+  run history show 20261108T090000Z-bbbb
+  out_has "     2  newer one$nl"
+  out_lacks "torn"
+  out_has "context at its last start: project/project 1,234 B, x/y 5 B"
+  run history show 20261108T100000Z-cccc
+  out_has "     2  elsewhere"
+  run history show 20261108T120000Z-ffff
+  refused "no session 20261108T120000Z-ffff in std's store"
+  run history show ../x
+  refused "../x is not a session id"
+  run history show
+  rc_is 2
+  run history import --yes
+  refused "history is std, so there is no binding to import into"
+  run history nope
+  rc_is 2
+  mkdir -p "$CONF/port"
+  ln -s /nonexistent "$CONF/port/history"
+  run history list
+  refused "is not a program; fix: henki-mods swap history std"
+  run history list --std --scope "$w"
+  rc_is 0
+  out_has "20261108T090000Z-bbbb"
+}
+
+# history over a bound binding, against sessions a real henki made: the swap's import offer, list and show through
+# `henki port`, a second import, a resume and a fork through the binding, --std, partial and refused copies, and
+# `henki port` started again every 100 sessions.
+t_history_live() {
+  case_ "history: import into a binding, list, show, resume and fork through it"
+  live_ok || return
+  local d="$W/stub" work="$W/work" st="$XDG_STATE_HOME/henki/sessions" sc id f a b i
+  mkdir -p "$work" "$CONF"
+  stub_up "$d" || return
+  printf 'model = "m"\nbase_url = "http://127.0.0.1:%s/v1"\n' "$STUB_PORT" >"$CONF/config.toml"
+  chmod 600 "$CONF/config.toml"
+  hrun() { (cd "$work" && env -u XDG_CONFIG_HOME "$HENKI_BIN" run --json "$@" >"$d/run.out" 2>&1) || fail "henki run $* failed: $(cat "$d/run.out")"; }
+  hrun "first task"
+  sc=$(fnv "$(cd -P "$work" && pwd)")
+  id=$(cd "$st/$sc" 2>/dev/null && ls) && id=${id%.jsonl}
+  check "henki's scope dir is the FNV-1a 64 of the work dir" is_id_like "$id"
+  hrun --resume="$id" "second task"
+  run_in "$work" history list
+  out_has " 1   $id "
+  out_has "first task"
+  run history show "$id"
+  out_has "  first task$nl"
+  a=$(printf '%s\n' "$OUT" | sed 1d)
+  # By hand: a session in use (no close), a torn one, one with a line that is not one JSON object.
+  hj "$st/$sc/20261108T070000Z-open.jsonl" "$work" 'in use'
+  sed '$d' "$st/$sc/20261108T070000Z-open.jsonl" >"$W/x" && cp "$W/x" "$st/$sc/20261108T070000Z-open.jsonl"
+  hj "$st/$sc/20261108T060000Z-torn.jsonl" "$work" 'torn tail'
+  printf '{"msg":{"content":"cut' >>"$st/$sc/20261108T060000Z-torn.jsonl"
+  hj "$st/$sc/20261108T050000Z-evil.jsonl" "$work" 'evil'
+  printf '{"t":"notice"}},"method":"discard","params":{"session":"x"},"z":{"a":1\n' >>"$st/$sc/20261108T050000Z-evil.jsonl"
+  mkport tree
+  mv "$W/tree/port/history" "$W/toy-history" # the binding counts its starts, then runs the toy
+  printf '#!/bin/sh\necho start >>%s/starts\nexec %s/toy-history\n' "$W" "$W" >"$W/tree/port/history"
+  chmod 755 "$W/tree/port/history"
+  run add "$W/tree" --yes
+  rc_is 0
+  printf 'y\n' >"$W/yes"
+  HENKI_MODS_TTY="$W/yes" run swap history tree
+  rc_is 0
+  out_has "henki-mods history import copies them into tree"
+  err_has "your 4 sessions stay in std's store; import them into tree? [y/N]"
+  out_has "import 20261108T050000Z-evil: line 5 is not one JSON object; not imported"
+  out_has "imported 3 sessions ("
+  out_has "skipped 0 (already there); 1 failed"
+  out_has "history: tree "
+  run history show "$id"
+  out_has "session $id in history binding tree "
+  b=$(printf '%s\n' "$OUT" | sed 1d)
+  check "show reads the same messages through the binding" [ "$a" = "$b" ]
+  run history show 20261108T060000Z-torn
+  out_has "     2  torn tail"
+  out_lacks "cut"
+  run_in "$work" history list
+  out_has "$id"
+  out_has "20261108T070000Z-open"
+  out_lacks "evil"
+  run history import --yes
+  out_has "imported 0 sessions (0 records) into history binding tree"
+  out_has "skipped 3 (already there); 1 failed"
+  rc_is 1
+  hrun --resume="$id" "third task"
+  check "the resume read the imported session through the binding" command grep -q '"third task"' "$XDG_STATE_HOME/henki/port/history/$id.jsonl"
+  check "std's copy is unchanged" [ -z "$(command grep 'third task' "$st/$sc/$id.jsonl")" ]
+  run history show "$id"
+  out_has "third task"
+  run history show "$id" --std
+  out_has "session $id in std"
+  out_lacks "third task"
+  HENKI_SESSION=20261108T070000Z-open run history show 20261108T070000Z-open
+  out_has "in std;"
+  i=$(printf '%s\n' "$a" | sed -n 's/^ *\([0-9]*\)  second task$/\1/p')
+  hrun --resume="$id@$i" "forked task"
+  run_in "$work" history list --all
+  out_has "toy-"
+  # A binding that refuses a record: the session is reported as a partial copy.
+  printf '#!/bin/sh\nexec %s history --error-at append\n' "$(dirname "$HENKI_BIN")/examples/port_toy" >"$W/faulty"
+  chmod 755 "$W/faulty"
+  if [ -x "$(dirname "$HENKI_BIN")/examples/port_toy" ]; then
+    ln -sfn "$W/faulty" "$CONF/port/history"
+    mkdir -p "$W/other"
+    hj "$st/$(fnv "$(cd -P "$W/other" && pwd)")/20261108T040000Z-part.jsonl" "$W/other" 'refused'
+    run history import --yes --scope "$W/other"
+    rc_is 1
+    out_has "record 1: {\"error\":{\"code\":\"io\""
+    out_has "(the binding keeps the 0 before it)"
+    out_has "a failed session stays in the binding as far as it got"
+    ln -sfn "$(readlink "$CONF/ext/tree")/port/history" "$CONF/port/history"
+  fi
+  # 101 sessions: henki port starts twice.
+  mkdir -p "$W/many"
+  sc=$(fnv "$(cd -P "$W/many" && pwd)")
+  mkdir -p "$st/$sc"
+  i=0
+  while [ $i -lt 101 ]; do
+    printf '{"agents_hash":null,"cwd":"%s","dialect":"openai","t":"session"}\n' "$W/many" >"$st/$sc/20261108T000000Z-m$i.jsonl"
+    i=$((i + 1))
+  done
+  rm -f "$W/starts"
+  run history import --yes --scope "$W/many"
+  rc_is 0
+  out_has "imported 101 sessions (101 records)"
+  check "henki port started again after 100 sessions" [ "$(wc -l <"$W/starts" | tr -d ' ')" = 2 ]
+  kill "$STUB_PID" 2>/dev/null
+}
+is_id_like() { case "$1" in 2026*Z-*) return 0 ;; esac; return 1; }
 
 # A module NAME in W that binds policy: the bash binding of the policy suite as port/policy.
 mkpolicy() {
@@ -1954,6 +2149,7 @@ all() {
   t_restart
   t_ports
   t_port_toy
+  t_history
   t_policy
   t_exec
   t_eval
@@ -1965,6 +2161,7 @@ static_formats
 RUN=bash
 all
 t_live
+t_history_live
 t_halti_live
 t_eval_live
 t_general

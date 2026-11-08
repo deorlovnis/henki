@@ -429,7 +429,7 @@ or else on the user's PATH (never a module's), with ARGS split at spaces. A past
 - **The environment.** The tool environment (ext/1: every module's `bin/` first on `PATH`), plus `HENKI_CONFIG` (the
   config dir), `HENKI_STATE` (the state dir), `HENKI_BIN` (henki's path), `HENKI_MODULE` (the module dir; not for the
   manager) and `HENKI_NEXT`. A std session's journal is `$HENKI_STATE/sessions/*/$HENKI_SESSION.jsonl` (journal/1);
-  none is found when history is bound to another store. Tools, bindings, observers and context sources never get
+  none is found when history is bound to another store; `henki mods history list` and `show` read either. Tools, bindings, observers and context sources never get
   `HENKI_NEXT`.
 - **`HENKI_NEXT`** names an empty file henki made (0600, `STATE/spill/.next-PID-RAND`). Afterwards henki reads it only
   if it is still that regular file, at most 64 KiB of UTF-8; anything else is a notice and ignored. It is removed
@@ -652,6 +652,12 @@ henki checks every answer as it checks its own journal: the id rule, `read` reco
 the pairing of calls and results at start. A history failure in a session ends the turn `error journal` (exit 2) with
 the fix `henki --port history=std for this session, or henki mods swap history std`; henki never falls back to std in
 a session. `list` is for tools (henki-mods, an import); henki itself does not call it.
+
+`henki-mods history list` and `history show` read a binding through `henki port`'s `list` and `read`.
+`henki-mods history import` copies std's sessions into a binding: for each journal, `create` with its id as the
+`hint` (`exists`: the binding has it, skipped) in the scope of the working directory the journal belongs to, then each
+complete line through `append`, as it is in the file. So an imported `close` keeps its `bytes` and a resumed `session`
+its `from_bytes`; henki reads neither in a binding's session. std's files are only read.
 
 `henki --resume=ID@N` forks (journal/1): henki reads session ID, checks its records 1 to N-1 (the dialect, tampering,
 the pairing) and only then calls `fork`; it then appends `close` and the new segment's `session` record with
