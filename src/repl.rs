@@ -33,6 +33,7 @@ fn banner(s: &Session) {
     out.line(&format!("henki {} · {} · {url} ({}) · ctx {}", env!("CARGO_PKG_VERSION"), c.model, c.dialect, term::num(c.window)));
     out.line(&if c.auto { format!("approval: AUTO (from {})", c.approve_from) } else { "approval: ask".into() });
     out.line(&c.file.as_ref().map_or_else(|| "config: none (HENKI_MODEL and HENKI_BASE_URL)".into(), |f| format!("config: {}", allow::shown(f, &c.home))));
+    (c.exts.is_empty()).then(|| out.line("no modules on; /mods (or henki mods) lists the official mods"));
     for e in &c.exts {
         let cmds = if e.cmds.is_empty() { "doc only".into() } else { e.cmds.join(", ") };
         let shadows = e.shadows.iter().map(|p| allow::shown(p, &c.home)).collect::<Vec<_>>().join(", ");

@@ -390,6 +390,19 @@ fn config_key_non_loopback() {
     assert_eq!(t.load("model = \"m\"\nbase_url = \"http://10.1.2.3/v1\"\napi_key = \"\"\n").unwrap().url.host, "10.1.2.3");
 }
 
+/// A host that is not a loopback literal gets a notice at every start: the session's text goes over the network.
+#[test]
+fn config_remote_base_url_notice() {
+    let t = T::new();
+    for host in ["10.1.2.3", "model.example", "127.1"] {
+        let c = t.load(&format!("model = \"m\"\nbase_url = \"http://{host}:8080/v1\"\ncontext_window = 8192\n")).unwrap();
+        assert_eq!(c.notices, [format!("requests leave this machine: prompts, files and command output go to {host}, unencrypted")]);
+    }
+    for host in ["localhost", "127.9.8.7", "[::1]"] {
+        assert!(t.load(&format!("model = \"m\"\nbase_url = \"http://{host}:8080/v1\"\ncontext_window = 8192\n")).unwrap().notices.is_empty(), "{host}");
+    }
+}
+
 #[test]
 fn config_henki_base_url_non_loopback() {
     let t = T::new();
@@ -475,7 +488,7 @@ fn config_env_only_start() {
     assert_eq!((c.model.as_str(), c.url.port, c.url_from), ("qwen", 8080, "HENKI_BASE_URL"));
     assert_eq!((c.file, c.hash, c.explicit, c.auto), (None, None, false, false));
     assert_eq!(c.dir, t.cfg_dir());
-    assert_eq!(c.protected, [t.cfg_dir(), t.cfg_dir().join("AGENTS.md"), t.home.join(".local/state/henki"), t.cfg_dir().join("ext")]);
+    assert_eq!(c.protected, [t.cfg_dir(), t.cfg_dir().join("AGENTS.md"), t.home.join(".local/state/henki"), t.home.join(".local/share/henki"), t.cfg_dir().join("ext")]);
 }
 
 #[test]
@@ -830,6 +843,16 @@ fn config_state_protected() {
     }
 }
 
+/// The data dir holds the module store that the ext links point into: protected like the state dir.
+#[test]
+fn config_data_protected() {
+    let t = T::new();
+    let xdg = t.dir.join("xdg-data");
+    assert!(t.load_env(BASE, &[("XDG_DATA_HOME", xdg.to_str().unwrap())]).unwrap().protected.contains(&xdg.join("henki")), "absent, by its path");
+    let c = t.load_env(BASE, &[("XDG_DATA_HOME", "relative/data")]).unwrap();
+    assert!(c.protected.contains(&t.home.join(".local/share/henki")), "only an absolute XDG_DATA_HOME counts: {:?}", c.protected);
+}
+
 #[test]
 fn config_ext_paths_protected() {
     let t = T::new();
@@ -1135,7 +1158,16 @@ fn config_protected_realpaths() {
     symlink(&real, t.cfg_dir()).unwrap();
     let c = t.load(BASE).unwrap();
     let real = fs::canonicalize(&real).unwrap();
-    let want = [t.cfg(), real.join("config.toml"), t.cfg_dir(), real.clone(), t.cfg_dir().join("AGENTS.md"), t.home.join(".local/state/henki"), t.cfg_dir().join("ext")];
+    let want = [
+        t.cfg(),
+        real.join("config.toml"),
+        t.cfg_dir(),
+        real.clone(),
+        t.cfg_dir().join("AGENTS.md"),
+        t.home.join(".local/state/henki"),
+        t.home.join(".local/share/henki"),
+        t.cfg_dir().join("ext"),
+    ];
     assert_eq!(c.protected, want);
     assert_eq!((c.file, c.dir), (Some(t.cfg()), t.cfg_dir()));
 }

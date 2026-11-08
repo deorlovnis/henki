@@ -63,7 +63,7 @@ pub struct Config {
     pub agents: Option<String>, // <config dir>/AGENTS.md, trailing newlines trimmed
     pub agents_hash: Option<String>,
     pub allow: allow::Allow,     // <config dir>/allow, read only in ask mode
-    pub protected: Vec<PathBuf>, // the config file and dir, AGENTS.md, the state dir, the ext paths and the link targets in them; each also as its realpath
+    pub protected: Vec<PathBuf>, // the config file and dir, AGENTS.md, the state and data dirs, the ext paths and the link targets in them; each also as its realpath
     pub trust: Vec<PathBuf>,     // what the tripwire stamps, absent files included
     /// The stamps of `trust` as `load` found them: what the tripwire compares with.
     pub snap: Vec<(PathBuf, (sys::Stamp, sys::Stamp))>,
@@ -155,9 +155,13 @@ pub fn load(f: &Flags, env: &Env, cwd: &Path) -> Result<Config, String> {
     if let Some((at, ..)) = at("api_key").filter(|_| !c.api_key.is_empty() && !http::loopback_literal(&c.url.host)) {
         return Err(format!("{at}: api_key is sent only to a loopback host, not to {}; fix: remove api_key or use a loopback base_url", c.url.host));
     }
+    let remote = format!("requests leave this machine: prompts, files and command output go to {}, unencrypted", c.url.host);
+    c.notices.extend((!http::loopback_literal(&c.url.host)).then_some(remote));
     let unknown = env.0.iter().filter_map(|(k, _)| k.to_str()).filter(|k| k.starts_with("HENKI_") && !KNOWN.contains(k));
     c.notices.extend(unknown.map(|k| format!("ignoring {k}: henki does not read it")));
-    c.state = env.get("XDG_STATE_HOME").map(Path::new).filter(|p| p.is_absolute()).map_or_else(|| home.join(".local/state"), Path::to_path_buf).join("henki");
+    // `$XDG_..._HOME/henki` when that is absolute, else `~/DEFAULT/henki`.
+    let xdg = |var: &str, default: &str| env.get(var).map(Path::new).filter(|p| p.is_absolute()).map_or_else(|| home.join(default), Path::to_path_buf).join("henki");
+    c.state = xdg("XDG_STATE_HOME", ".local/state");
     let listed = at("ext");
     let paths = listed.map_or_else(|| vec![c.dir.join("ext")], |l| l.2.as_array().into_iter().flatten().filter_map(Value::as_str).map(|p| expand(p, &home)).collect());
     let from = listed.map(|l| l.0.clone()).or_else(|| c.file.as_ref().map(|f| f.display().to_string()));
@@ -195,7 +199,9 @@ pub fn load(f: &Flags, env: &Env, cwd: &Path) -> Result<Config, String> {
         c.window = 32_768;
         c.notices.push("context_window is unknown; using 32,768 tokens".into());
     }
-    let own = c.file.iter().chain([&c.dir, &agents, &c.state]).chain(&paths).chain(c.exts.iter().flat_map(|e| &e.targets));
+    // The data dir holds the module store, which the ext links point into.
+    let data = xdg("XDG_DATA_HOME", ".local/share");
+    let own = c.file.iter().chain([&c.dir, &agents, &c.state, &data]).chain(&paths).chain(c.exts.iter().flat_map(|e| &e.targets));
     c.protected = own.flat_map(|p| [Some(p.clone()), fs::canonicalize(p).ok().filter(|r| r != p)]).flatten().collect();
     // Absent files too: creating one is a change.
     let exts = paths.into_iter().chain(c.exts.iter().flat_map(|e| e.paths.iter().cloned()));

@@ -79,7 +79,19 @@ fn pty_banner_and_prompt() {
     let p = Pty::spawn(&r, &[], 24, 80);
     p.expect(&format!("henki {VERSION} · mock-model · {} (openai) · ctx 32,768\r\n", m.url()), W);
     p.expect("approval: ask\r\n", W);
-    p.expect("config: ~/.config/henki/config.toml\r\n", W);
+    p.expect("config: ~/.config/henki/config.toml\r\nno modules on; /mods (or henki mods) lists the official mods\r\n", W);
+    p.prompt(W);
+    exit(p);
+}
+
+/// A base_url that is not a loopback literal is named in the banner: the session's text leaves the machine.
+#[test]
+fn pty_remote_base_url_notice() {
+    let m = Mock::start(vec![]);
+    let mut r = asking(&m);
+    r.at("http://192.0.2.1:9/v1");
+    let p = Pty::spawn(&r, &[], 24, 80);
+    p.expect("henki: requests leave this machine: prompts, files and command output go to 192.0.2.1, unencrypted\r\n", W);
     p.prompt(W);
     exit(p);
 }
@@ -412,7 +424,7 @@ fn pty_mods_never_a_module() {
     p.expect("henki: /mods needs henki-mods next to henki or on PATH; fix: reinstall henki\r\n", W);
     p.prompt(W);
     let d = exit(p);
-    assert!(!d.out().contains("module ran"), "{}", d.out());
+    assert!(!d.out().contains("module ran") && !d.out().contains("no modules on"), "{}", d.out());
 }
 
 #[test]
