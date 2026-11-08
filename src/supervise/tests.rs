@@ -523,6 +523,8 @@ fn kernel_observer_run_reaped_by_its_waiter() {
     kernel_kill(&[slow]);
     assert!(sys::exited(slow));
     kernel_end(Some(c), false);
-    until("the slow run's session to die", || !sys::procs().iter().any(|p| p.sid == slow));
+    // Killed by now, but its orphan may die after kernel_kill's sweeps saw nothing left: a zombie until the next one.
+    until("the slow run's session to die", || !sys::procs().iter().any(|p| p.sid == slow && !p.zombie));
     sweep_pass();
+    assert!(!sys::procs().iter().any(|p| p.sid == slow), "the sweep left the orphan's zombie");
 }
