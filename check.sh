@@ -1,14 +1,16 @@
 #!/usr/bin/env bash
 # Everything a change must pass that needs no human, in order, stopping at the first failure:
-# no private references, the gates' self-test, formatting, lints, the tests, the size budgets (lines of code, crates
-# in the dependency tree, release binary bytes), then the release gates: the tests marked
-# #[ignore = "release gate"] (timing and memory limits), built and run with the release profile.
+# no private references, a sign-off on every commit not yet pushed, the gates' self-test, formatting, lints, the
+# tests, the module manager's tests and the official modules, the size budgets (lines of code, crates in the
+# dependency tree, release binary bytes), then the release gates: the tests marked #[ignore = "release gate"]
+# (timing and memory limits), built and run with the release profile.
 # Run it before pushing. Bash on macOS and Linux.
 #
 # Each budget gate is a function of its input (gate_lines DIR, gate_crates TREE LOCK, gate_bytes
-# FILE, and refs). `./check.sh selftest` runs every one against fixtures it makes: an
+# FILE, gate_mods DIR, and refs and dco). `./check.sh selftest` runs every one against fixtures it makes: an
 # over-budget fixture must fail with the gate's own message, a within-budget one must pass. The
-# full check runs it right after the reference check, so a gate that stops failing fails the check.
+# full check runs it right after the reference and sign-off checks, so a gate that stops failing
+# fails the check.
 #
 # Environment:
 #   CARGO_BUILD_JOBS  parallel jobs (default 2; release builds with LTO need the memory)
@@ -25,8 +27,11 @@
 # `HEAD`, or `B --not --remotes`) it searches every commit message in it and every line those
 # commits add, so a reference added and later removed is still found. In a range a matched line
 # is shown as "COMMIT: +LINE", so a pattern anchored with ^ only matches in files.
-# `./check.sh install-hook` makes every git push run the full check, then the reference check on
-# the commits it pushes; it refuses to install without the pattern file.
+# `./check.sh dco [RANGE]` runs only the sign-off check: every commit in RANGE (default
+# `HEAD --not --remotes`, the commits no remote has yet) must carry a `Signed-off-by:` trailer with its author's email, the
+# Developer Certificate of Origin sign-off of CONTRIBUTING.md. A range with no commits passes.
+# `./check.sh install-hook` makes every git push run the full check, then the reference and
+# sign-off checks on the commits it pushes; it refuses to install without the pattern file.
 set -euo pipefail
 cd "$(dirname "$0")"
 
@@ -72,6 +77,26 @@ refs() {
   case "$rc" in 0) found=1 ;; 1) ;; *) return "$rc" ;; esac
   if [ "$found" = 1 ]; then
     echo "check.sh: the lines above match $file" >&2
+    return 1
+  fi
+}
+
+# The sign-off gate over RANGE (git log arguments, default the commits on no remote). Git's own trailer parser
+# decides, so only a trailer counts (the message's last paragraph, where `git commit -s` puts it), not the words
+# anywhere in a body. The trailer must carry the commit author's email (CONTRIBUTING.md: "the email of the commit"),
+# as DCO checkers do: a sign-off is the author's own, not anyone's. Merges too: a merge brings no code of its own,
+# but the DCO is per commit, and `git merge --signoff` costs nothing. Commits a remote already has are history.
+dco() {
+  local log bad
+  # %x01 marks a commit, then the author's email and the subject; the trailer lines, if any, follow it.
+  # shellcheck disable=SC2086 # RANGE is several git arguments on purpose.
+  log="$(git log --no-color --format='%x01%h%x02%ae%x02%s%n%(trailers:key=Signed-off-by)' ${1:-HEAD --not --remotes})" || return $?
+  bad="$(LC_ALL=C awk -F '\002' '/^\001/ { if (c != "" && !s) print c; c = substr($1, 2) " " $3; ae = "<" tolower($2) ">"; s = 0; next }
+    tolower($0) ~ /^signed-off-by: *[^ ]/ && index(tolower($0), ae) { s = 1 }
+    END { if (c != "" && !s) print c }' <<<"$log")"
+  if [ -n "$bad" ]; then
+    printf '%s\n' "$bad"
+    say "the commits above have no Signed-off-by: line with their author's email; fix: git rebase --signoff BASE (or git commit --amend -s --no-edit for the last one) as the author, see CONTRIBUTING.md"
     return 1
   fi
 }
@@ -250,6 +275,21 @@ packages() {
   awk -v n="$1" 'BEGIN { for (i = 1; i <= n; i++) print "p" i " v1.0.0" }'
 }
 
+# The mods gate over DIR: every DIR/*/ (the official modules) passes `henki-mods verify --dir`, which checks the
+# layout henki loads and the manifest. No DIR, or an empty one, is no module and passes.
+gate_mods() {
+  local m n=0
+  for m in "$1"/*/; do
+    [ -d "$m" ] || continue
+    if ! manager/henki-mods verify --dir "${m%/}"; then
+      say "mods: ${m%/} does not pass henki-mods verify --dir"
+      return 1
+    fi
+    n=$((n + 1))
+  done
+  echo "$n official modules"
+}
+
 # Every budget gate against fixtures made in a scratch directory, removed at the end.
 selftest() {
   local t bad=0 clean
@@ -282,6 +322,16 @@ selftest() {
   expect "bytes: $((max_bytes + 1))" "over $max_bytes" gate_bytes "$t/big.bin" || bad=1
   expect "bytes: $max_bytes" pass gate_bytes "$t/ok.bin" || bad=1
 
+  # A module that henki loads passes; one with an entry henki refuses fails, and so does a dir holding both.
+  mkdir -p "$t/mods/good/bin" "$t/mods-bad/good" "$t/mods-bad/bad/lib" "$t/mods-none"
+  printf 'good: a fixture module\n' >"$t/mods/good/doc.md"
+  printf '#!/bin/sh\n' >"$t/mods/good/bin/good" && chmod 755 "$t/mods/good/bin/good"
+  printf 'good: a fixture module\n' >"$t/mods-bad/good/doc.md"
+  printf 'bad: a fixture module\n' >"$t/mods-bad/bad/doc.md"
+  expect "mods: a module henki loads" pass gate_mods "$t/mods" || bad=1
+  expect "mods: an unknown entry lib/" "does not pass henki-mods verify --dir" gate_mods "$t/mods-bad" || bad=1
+  expect "mods: no modules" pass gate_mods "$t/mods-none" || bad=1
+
   # A scratch repository with its own pattern file; a hook runs with GIT_DIR set, which must not lead back here.
   # Commits there use a fixed identity and no signing or hooks, whatever the user's git config says.
   (
@@ -305,6 +355,23 @@ selftest() {
     expect "refs HEAD~1..HEAD: a clean commit" pass refs HEAD~1..HEAD || rc=1
     rm .git/info/private-patterns
     CHECK_FROM_HOOK=1 expect "refs: no pattern file, from the hook" "does not pass without them" refs || rc=1
+
+    # Sign-offs, in a second repository whose "remote" is a remote-tracking ref set by hand.
+    cd "$t" && git init -q dco && cd dco || exit 1
+    commit --allow-empty -m 'pushed, unsigned' && git update-ref refs/remotes/origin/main HEAD || exit 1
+    expect "dco: every commit on a remote" pass dco || rc=1
+    commit --allow-empty -s -m 'signed' || exit 1
+    expect "dco: a signed commit" pass dco || rc=1
+    commit --allow-empty -m 'unsigned' || exit 1
+    expect "dco: an unsigned commit" "no Signed-off-by: line" dco || rc=1
+    expect "dco HEAD~1..HEAD: only the unsigned commit" "no Signed-off-by: line" dco HEAD~1..HEAD || rc=1
+    expect "dco HEAD~2..HEAD~1: only the signed commit" pass dco HEAD~2..HEAD~1 || rc=1
+    commit --allow-empty -m $'mid-body\n\nSigned-off-by: a b <a@b.invalid>\n\nis not a trailer' || exit 1
+    expect "dco: the words in a body, not a trailer" "no Signed-off-by: line" dco HEAD~1..HEAD || rc=1
+    commit --allow-empty -m $'signed by another\n\nSigned-off-by: Someone Else <else@example.invalid>' || exit 1
+    expect "dco: a sign-off that is not the author's" "no Signed-off-by: line with their author's email" dco HEAD~1..HEAD || rc=1
+    commit --allow-empty -m $'author in capitals, and a second sign-off\n\nSigned-off-by: Someone Else <else@example.invalid>\nSigned-off-by: Fixture <Fixture@Example.invalid>' || exit 1
+    expect "dco: the author's among several, any case" pass dco HEAD~1..HEAD || rc=1
     exit "$rc"
   ) || bad=1
 
@@ -322,6 +389,10 @@ case "${1:-}" in
     refs "${2:-}"
     exit
     ;;
+  dco)
+    dco "${2:-}"
+    exit
+    ;;
   selftest)
     selftest
     exit
@@ -337,8 +408,8 @@ case "${1:-}" in
 #!/usr/bin/env bash
 # Installed by `./check.sh install-hook`: run the full check on the working tree, then refuse a
 # push whose commits (messages or added lines) match the private references in
-# .git/info/private-patterns. Checks every pushed commit that no remote-tracking branch of this
-# remote already has. Without the pattern file the push fails.
+# .git/info/private-patterns, or that lack a sign-off. Checks every pushed commit that no
+# remote-tracking branch of this remote already has. Without the pattern file the push fails.
 set -euo pipefail
 cd "$(git rev-parse --show-toplevel)"
 export CHECK_FROM_HOOK=1
@@ -349,6 +420,7 @@ while read -r _ local_sha _ remote_sha; do
   range="$local_sha --not --remotes=$1"
   if [ "$remote_sha" != "$zero" ] && git cat-file -e "$remote_sha^{commit}" 2>/dev/null; then range="$range $remote_sha"; fi
   ./check.sh refs "$range"
+  ./check.sh dco "$range"
 done
 HOOK
     chmod +x "$hook"
@@ -357,7 +429,7 @@ HOOK
     ;;
   "") ;;
   *)
-    echo "usage: ./check.sh [refs [RANGE] | selftest | install-hook]" >&2
+    echo "usage: ./check.sh [refs [RANGE] | dco [RANGE] | selftest | install-hook]" >&2
     exit 2
     ;;
 esac
@@ -370,6 +442,9 @@ target="$CARGO_TARGET_DIR"
 step "no private references"
 refs
 
+step "signed off (commits on no remote)"
+dco
+
 step "gate self-test"
 selftest
 
@@ -381,6 +456,12 @@ cargo clippy --locked --all-targets -- -D warnings
 
 step tests
 cargo test --locked
+
+# The module manager: its own suite (hermetic, with a live prompt check against the henki the tests just built),
+# then the official modules.
+step "mods (manager/tests.sh, mods/*/)"
+MODS_TEST_HENKI="$target/debug/henki" manager/tests.sh
+gate_mods mods
 
 step "lines of code (src/, non-test)"
 gate_lines src

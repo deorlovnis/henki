@@ -1,0 +1,46 @@
+#!/bin/sh
+# macOS security as the model's calls see it: a seatbelt, not a boundary. It refuses the commands that print or
+# export Keychain values, take a password on the command line, or let other programs read items without asking, and
+# runs the real security for the rest (certificates, code signing, listing keychains). /usr/bin/security by its path
+# gets past it: the boundary is the Keychain's own prompt.
+#
+# The command is the first argument after the options security takes before it (-h -i -l -q -v, and -p PROMPT).
+c="" skip=0
+for a in "$@"; do
+  if [ "$skip" = 1 ]; then skip=0 && continue; fi
+  case "$a" in
+    -p) skip=1 ;;
+    -*i*) c=-i && break ;;
+    -*) ;;
+    *) c=$a && break ;;
+  esac
+done
+case "$c" in
+  '' | -i)
+    # Interactive mode reads commands from stdin, past this check; bare security enters it too. -h alone lists the
+    # commands, so it goes on to the real one.
+    if [ "$c$*" != -h ]; then
+      echo "henki: interactive security reads its commands past henki's check; fix: name one command, like security list-keychains" >&2
+      exit 126
+    fi
+    ;;
+  find-generic-password | find-internet-password | find-key | dump-keychain | export | export-*)
+    echo "henki: 'security $c' reads Keychain items, whose values are secrets; fix: use halti, or ask the user to run it with !" >&2
+    exit 126
+    ;;
+  add-generic-password | add-internet-password | unlock-keychain | set-keychain-password | *-partition-list | import)
+    echo "henki: 'security $c' takes a secret or changes who may read Keychain items; fix: ask the user to run it with !" >&2
+    exit 126
+    ;;
+esac
+# The real security is on the user's PATH, which henki passes in HENKI_USER_PATH (set even when empty). Outside
+# henki, the PATH without this directory, so the wrapper never runs itself.
+if [ -z "${HENKI_USER_PATH+x}" ]; then
+  here=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd) && real=$(cd -- "$here" && pwd -P) || exit 126
+  HENKI_USER_PATH=$(printf '%s\n' "$PATH" | tr ':' '\n' | command grep -vxF -e "$here" -e "$real" | paste -sd: -)
+fi
+PATH=$HENKI_USER_PATH command -v security >/dev/null 2>&1 || {
+  echo "henki: security is not on the user's PATH; fix: it is the macOS Keychain's tool, so use it on a Mac" >&2
+  exit 127
+}
+PATH=$HENKI_USER_PATH exec security "$@"

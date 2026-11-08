@@ -1,0 +1,24 @@
+: a comment is a keep-alive
+
+data: {"choices":[{"delta":{"content":null,"role":"assistant"},"finish_reason":null,"index":0}],"created":1762500000,"id":"chatcmpl-contracts","model":"mock-model","object":"chat.completion.chunk"}
+
+data: {"choices":[{"delta":{"reasoning_content":"Let me look."},"finish_reason":null,"index":0}],"created":1762500000,"id":"chatcmpl-contracts","model":"mock-model","object":"chat.completion.chunk"}
+
+data: {"choices":[{"delta":{"content":"Looking"},"finish_reason":null,"index":0}],"created":1762500000,"id":"chatcmpl-contracts","model":"mock-model","object":"chat.completion.chunk"}
+
+data:
+
+data: {"choices":[{"delta":{"tool_calls":[{"function":{"arguments":"","name":"sh"},"id":"call_w1","index":0,"type":"function"}]},"finish_reason":null,"index":0}],"created":1762500000,"id":"chatcmpl-contracts","model":"mock-model","object":"chat.completion.chunk"}
+
+data: {"choices":[{"delta":{"tool_calls":[{"function":{"arguments":"{\"command\":","name":"ell"},"index":0}]},"finish_reason":null,"index":0}],"created":1762500000,"id":"chatcmpl-contracts","model":"mock-model","object":"chat.completion.chunk"}
+
+data: {"choices":[{"delta":{"tool_calls":[{"function":{"arguments":" \"echo wire-ok\"}"},"index":0}]},"finish_reason":null,"index":0}],"created":1762500000,"id":"chatcmpl-contracts","model":"mock-model","object":"chat.completion.chunk"}
+
+data: {"choices":[{"delta":{"tool_calls":[{"function":{"arguments":{"path":"a.txt"},"name":"read"},"id":"call_w2","index":1,"type":"function"}]},"finish_reason":null,"index":0}],"created":1762500000,"id":"chatcmpl-contracts","model":"mock-model","object":"chat.completion.chunk"}
+
+data: {"choices":[{"delta":{},"finish_reason":"tool_calls","index":0}],"created":1762500000,"id":"chatcmpl-contracts","model":"mock-model","object":"chat.completion.chunk"}
+
+data: {"choices":[],"created":1762500000,"id":"chatcmpl-contracts","model":"mock-model","object":"chat.completion.chunk","usage":{"completion_tokens":7,"prompt_tokens":100,"prompt_tokens_details":{"cached_tokens":64},"total_tokens":107}}
+
+data: [DONE]
+

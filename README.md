@@ -5,8 +5,9 @@ henki is a small terminal agent in early development. It gives your task to a mo
 ## Usage
 
 ```sh
-mkdir -p ~/.config/henki && cp profiles/config.mac.toml ~/.config/henki/config.toml   # then set model and base_url
-cp profiles/halti-card.md ~/.config/henki/AGENTS.md   # if you use halti: its card goes into every request (1.1 KB)
+mkdir -p ~/.config/henki && cp $(brew --prefix)/share/henki/config.mac.toml ~/.config/henki/config.toml   # then set model and base_url
+                                        # (from a tarball: share/henki/config.mac.toml; from a checkout: profiles/)
+henki-mods add halti                    # if you use halti: its doc, wrappers and card (1.1 KB into every request)
 henki                                   # the REPL
 henki run "why does the build fail?"    # one task, headless
 henki run --json --approve auto --max-seconds 600 "fix the failing test"
@@ -74,6 +75,12 @@ The config file, the allow file, `AGENTS.md` in the config dir, the bash henki r
 
 An extension is a directory that teaches the model a command-line tool: `NAME/doc.md`, whose first line goes into the system prompt (the model reads the rest of it when it needs to, without asking), and an optional `NAME/bin/`, whose executables come first on the PATH of the calls. Besides those it may hold only `README*`, `LICENSE*`, `CHANGELOG*` and dot files. Extensions live in `~/.config/henki/ext`, or in the directories the `ext` key lists. An extension command with the name of a command on your PATH loads only when the `shadow` key lists it as `EXT/NAME`; the calls see your own PATH in `HENKI_USER_PATH`. Every entry of `bin/` must be a file you can run, or henki does not start; only a dot file that cannot run (Finder's `.DS_Store`, the `._NAME` files a copy from a Mac leaves) is no command there, and it is a trust file like the rest. henki does not check who owns the extension files or who may write them, so keep them writable only by you.
 
+The official modules are extensions in this repository's `mods/`, off until you add one with `henki-mods add NAME` (from a checkout, `manager/henki-mods`), which shows what it installs and asks first. `halti` teaches the model halti's verbs, puts its card into `AGENTS.md`, and wraps `halti`, `pbpaste` and `security` so the calls cannot reach secret values through them (a seatbelt: a command named by its full path gets past it). On a Mac, where all three are on your PATH, henki starts with it on only once `config.toml` has `shadow = ["halti/halti", "halti/pbpaste", "halti/security"]`, as `profiles/config.mac.toml` does; the install screen prints that line when it is missing. `itse` is a doc only: itse's verbs and exit codes, run through its CLI.
+
+### Writing a module
+
+A module is an extension with an optional manifest, `.henki/module.toml`, that `henki-mods` shows on its install screen and checks first. The module template, `github.com/deorlovnis/henki-module-template` (to be published), is a working module with a guide from copying it to sharing your own. `henki-mods verify --dir DIR` checks a module as an install would, `henki-mods add ./DIR` installs it from a directory, and `henki-mods add URL[@REF]#DIR` from a git repository, which is how you share one: henki-mods pins the commit and runs nothing from the repository, and its install screen marks such a module unreviewed.
+
 ### In an isolated environment
 
 `profiles/config.box.toml` runs `henki run` with `dialect = "anthropic"`: the Anthropic Messages API through the environment's model gateway, with a stand-in key that the gateway replaces. An Anthropic session cannot be resumed after its system prompt (the global `AGENTS.md`, an extension's first doc line) or its tools changed, because the API refuses the replayed history; start a new session instead. When the model declines a request (`stop_reason` `refusal`), the run ends with `error provider`, and the text that streamed before the refusal is not kept in the session.
@@ -84,6 +91,7 @@ An extension is a directory that teaches the model a command-line tool: `NAME/do
 - Every session is journaled under `~/.local/state/henki`; `--resume[=ID]` continues one. A REPL that quits before its first message leaves no session.
 - When a session ends, every process it started is stopped (on macOS, except a `!CMD &` job or a process that started a session of its own).
 - Exit codes: 0 answered (or the REPL quit), 1 gave up (step limit, stuck, empty answer), 2 error, 3 needs approval, 124 out of time, 130 interrupted (or TERM, HUP or the terminal closing), 141 stdout closed or not read in time.
+- The journal, the `--json` records, what henki sends to a model server and the extension layout are specified, with their versions and the stability rule, in [CONTRACTS.md](CONTRACTS.md).
 
 ## Build and check
 
@@ -95,15 +103,12 @@ cargo build --release
 ./check.sh install-hook  # check the commits of every git push
 ```
 
-`check.sh` holds henki to its budgets: at most 3,600 lines of non-test Rust (400 per file), at most 10 crates in the dependency tree, and a release binary of at most 1,000,000 bytes, including the static musl build on Linux when that target is installed.
+`check.sh` holds henki to its budgets: at most 3,600 lines of non-test Rust (400 per file), at most 10 crates in the dependency tree, and a release binary of at most 1,000,000 bytes, including the static musl build on Linux when that target is installed. It also refuses a commit not yet pushed that has no `Signed-off-by:` line (`git commit -s`); [CONTRIBUTING.md](CONTRIBUTING.md) says why and lists the style rules.
+
+`release/release.sh VERSION` builds, from a clean checkout, `dist/henki-VERSION-TARGET.tar.gz` for this host (static musl on Linux) and `dist/SHA256SUMS`. A tarball holds `bin/henki`, `bin/henki-mods`, the official modules in `share/henki/official` (off until added), LICENSE, README.md and CONTRACTS.md; unpack it anywhere and put its `bin/` on your PATH. `release/release.sh --formula VERSION TAP` writes the Homebrew formula from `SHA256SUMS`, and `release/release.sh --selftest` builds, unpacks and runs one tarball.
 
 ## License
 
-Licensed under either of
+Licensed under the Apache License, Version 2.0 ([LICENSE](LICENSE) or <https://www.apache.org/licenses/LICENSE-2.0>).
 
-- Apache License, Version 2.0 ([LICENSE-APACHE](LICENSE-APACHE) or <https://www.apache.org/licenses/LICENSE-2.0>)
-- MIT license ([LICENSE-MIT](LICENSE-MIT) or <https://opensource.org/license/mit>)
-
-at your option.
-
-Unless you explicitly state otherwise, any contribution intentionally submitted for inclusion in the work by you, as defined in the Apache-2.0 license, shall be dual licensed as above, without any additional terms or conditions.
+Contributions are accepted under the same license, signed off under the Developer Certificate of Origin; see [CONTRIBUTING.md](CONTRIBUTING.md).

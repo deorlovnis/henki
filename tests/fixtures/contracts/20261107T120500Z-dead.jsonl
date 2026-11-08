@@ -1,0 +1,5 @@
+{"agents_hash":null,"allow_hash":null,"approve":"auto","approve_from":"/home/u/.config/henki/config.toml:3","base_url":"http://127.0.0.1:9/v1","base_url_from":"config","config":"/home/u/.config/henki/config.toml","config_hash":"0123456789abcdef","ctx":32768,"cwd":"/tmp/henki-contracts-golden","dialect":"openai","exts":[],"henki":"0.1.0","id":"20261107T120500Z-dead","model":"mock-model","pass_env":[],"project_agents_hash":null,"resumed":null,"shell":"/bin/bash","t":"session","tools":["shell","read","write","edit"],"ts":"2026-11-07T12:05:00Z","v":1}
+{"msg":{"content":"cwd: /tmp/henki-contracts-golden\nos: linux x86_64\ndate: 2026-11-07\n\nsleep a while","role":"user"},"t":"user","ts":"2026-11-07T12:05:00Z"}
+{"finish":"tool_calls","msg":{"content":"","role":"assistant","tool_calls":[{"args":{"command":"sleep 600"},"id":"call_z","name":"shell"}]},"t":"assistant","ts":"2026-11-07T12:05:01Z","usage":{"cached":0,"in":500,"out":20}}
+{"id":"call_z","t":"approval","ts":"2026-11-07T12:05:01Z","verdict":"auto"}
+{"t":"tool_result","id":"call_z","na

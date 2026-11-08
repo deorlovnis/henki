@@ -125,10 +125,11 @@ fn first_request_gate_fires() {
     assert!(e.ends_with("bytes, over the 2048-byte gate"), "{e}");
 }
 
-/// The halti card (`profiles/halti-card.md`) as the global AGENTS.md, as the README sets it up: it goes into every
+/// The halti mod's card in the global AGENTS.md, inside the block `henki-mods add halti` writes: it goes into every
 /// request, so the first one stays within 3,200 bytes.
 #[test]
 fn first_request_halti_card_le_3200() {
     let m = Mock::start(vec![say("ready")]);
-    first_request(&with_agents_md(&m, include_str!("../../profiles/halti-card.md")), &m, 3200).unwrap();
+    let block = format!("# >>> mods cards\n{}# <<< mods cards\n", include_str!("../../mods/halti/.henki/card.md"));
+    first_request(&with_agents_md(&m, &block), &m, 3200).unwrap();
 }
