@@ -245,8 +245,8 @@ fn e2e_ext_bin_dot_file_made_runnable_trips() {
     assert_eq!(m.log().len(), 1, "the call that runs it was never asked for\n{}", d.diag());
 }
 
-/// henki checks who may write doc.md (it steers the model as AGENTS.md does), not the other extension files (a
-/// documented limit): an extension whose directories and commands anyone may write still loads and runs. Pinned, so
+/// henki checks who may write doc.md (it steers the model as AGENTS.md does) and on/ (it runs unasked), not the other
+/// extension files (a documented limit): an extension whose directories and commands anyone may write still loads and runs. Pinned, so
 /// that changing it is a decision and not an accident.
 #[test]
 fn e2e_ext_writable_by_others_loads() {
