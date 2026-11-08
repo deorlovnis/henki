@@ -15,7 +15,7 @@ cd "$(dirname "$0")" || exit 1
 HERE=$(pwd -P)
 MODS="$HERE/henki-mods"
 HENKI_BIN=${MODS_TEST_HENKI:-}
-unset MODS_TEST_HENKI HENKI_SHARE HENKI_MODS_TTY GIT_DIR GIT_WORK_TREE
+unset MODS_TEST_HENKI HENKI_SHARE HENKI_MODS_TTY HENKI_CONFIG GIT_DIR GIT_WORK_TREE
 export GIT_CONFIG_NOSYSTEM=1 GIT_AUTHOR_NAME=fixture GIT_AUTHOR_EMAIL=fixture@example.invalid
 export GIT_COMMITTER_NAME=fixture GIT_COMMITTER_EMAIL=fixture@example.invalid
 SCRATCH=$(mktemp -d "${TMPDIR:-/tmp}/henki-mods-tests.XXXXXX") || exit 1
@@ -42,7 +42,7 @@ case_() {
   W="$d/w"
   CONF="$HOME/.config/henki"
   STORE="$XDG_DATA_HOME/henki/mods"
-  unset HENKI_SHARE HENKI_MODS_TTY
+  unset HENKI_SHARE HENKI_MODS_TTY HENKI_CONFIG
 }
 
 # Runs the manager; OUT, ERR, RC.
@@ -1110,6 +1110,111 @@ t_live() {
   wait "$STUB_PID" 2>/dev/null
 }
 
+# henki's allow file, as henki listed and removed rules before the manager did.
+# FILE holds exactly the bytes of the printf FORMAT (for \t, \r, \033 and \377); WANT is a file of the same.
+bytes_are() { # DESCRIPTION FILE FORMAT
+  printf "$3" >"$SCRATCH/want"
+  cmp -s "$2" "$SCRATCH/want" || fail "$1: $(od -c <"$2" | head -n 5)"
+}
+
+t_allow() {
+  case_ "allow: list and rm"
+  local f="$CONF/allow"
+  mkdir -p "$CONF"
+  printf '# my rules\n/src/app\tgit status\n\n/src/app\tmake test\n%s/proj\tls -la\n%s\tpwd\n*\tmake\n' "$HOME" "$HOME" >"$f"
+  chmod 600 "$f"
+  run allow
+  rc_is 0
+  check "the list" [ "$OUT" = "$f${nl}1  /src/app  git status${nl}2  /src/app  make test${nl}3  ~/proj  ls -la${nl}4  ~  pwd${nl}5  *  make" ]
+  run allow rm 1
+  rc_is 0
+  check "the removed rule" [ "$OUT" = "removed rule 1: /src/app  git status" ]
+  bytes_are "everything else byte for byte" "$f" "# my rules\n\n/src/app\tmake test\n$HOME/proj\tls -la\n$HOME\tpwd\n*\tmake\n"
+  check "0600" [ "$(ls -l "$f" | cut -c1-10)" = "-rw-------" ]
+  check "no temp file left" [ "$(ls -A "$CONF")" = allow ]
+  run allow rm 004
+  rc_is 0
+  check "leading zeros" [ "$OUT" = "removed rule 4: *  make" ]
+  rm "$f"
+  run allow
+  rc_is 0
+  check "no file: the path alone" [ "$OUT" = "$f" ]
+  run allow rm 1
+  refused "no rule 1 in $f"
+
+  case_ "allow: invalid lines are listed, numbered and removable, in any mode"
+  f="$CONF/allow"
+  mkdir -p "$CONF"
+  printf '# c\n/a\tok1\nbad line\n\n# c2\n/a\033[31m\tls\n/b\377\tls\r\n/a\tls \303\244\n/a\342\200\213b\tls\n/a\tok2' >"$f"
+  chmod 666 "$f"
+  run allow
+  rc_is 0
+  check "invalid lines, escaped" [ "$OUT" = "$f${nl}1  /a  ok1${nl}2  !bad line  (invalid: no TAB between ROOT and COMMAND)${nl}3  !/a\\x1b[31m${tab}ls  (invalid: ROOT is not * or an absolute path)${nl}4  !/b$(printf '\357\277\275')${tab}ls  (invalid: ROOT is not * or an absolute path)${nl}5  !/a${tab}ls $(printf '\303\244')  (invalid: COMMAND is not one printable-ASCII line of 1 to 200 bytes)${nl}6  !/a\\u{200b}b${tab}ls  (invalid: ROOT is not * or an absolute path)${nl}7  /a  ok2" ]
+  run allow rm 2
+  rc_is 0
+  check "an invalid rule goes" [ "$OUT" = "removed rule 2: !bad line  (invalid: no TAB between ROOT and COMMAND)" ]
+  run allow rm 3
+  rc_is 0
+  bytes_are "the CR goes with its line" "$f" '# c\n/a\tok1\n\n# c2\n/a\033[31m\tls\n/a\tls \303\244\n/a\342\200\213b\tls\n/a\tok2'
+  run allow rm 5
+  rc_is 0
+  bytes_are "a last line without a newline takes the one before it" "$f" '# c\n/a\tok1\n\n# c2\n/a\033[31m\tls\n/a\tls \303\244\n/a\342\200\213b\tls'
+  printf '/a\tone' >"$f"
+  run allow rm 1
+  rc_is 0
+  bytes_are "the only line" "$f" ''
+
+  case_ "allow: refusals and usage"
+  f="$CONF/allow"
+  mkdir -p "$CONF"
+  printf '/src/app\tgit status\n' >"$f"
+  for n in 9 0 000; do
+    run allow rm "$n"
+    refused "no rule $((10#$n)) in $f"
+  done
+  for args in "rm x" "rm" "rm -1" "rm 1 2" "clear" "--config"; do
+    run allow $args
+    rc_is 2
+    err_has "usage: henki-mods"
+  done
+  bytes_are "nothing removed" "$f" '/src/app\tgit status\n'
+  mkfifo "$W/fifo"
+  mv "$W/fifo" "$f"
+  run allow
+  rc_is 0
+  check "a FIFO is named, never opened" [ "$OUT" = "$f${nl}cannot read it: not a regular file" ]
+  run allow rm 1
+  refused "$f: not a regular file"
+  rm "$f"
+  awk 'BEGIN { for (i = 0; i < 6554; i++) print "#234567890" }' >"$f"
+  run allow
+  check "over 64 KiB" [ "$OUT" = "$f${nl}cannot read it: over 65,536 bytes" ]
+  HOME="" run allow
+  refused "HOME is not set"
+
+  case_ "allow: --config FILE, HENKI_CONFIG, a linked config dir"
+  mkdir -p "$CONF" "$W/alt" "$W/real"
+  printf '/src/app\techo home\n' >"$CONF/allow"
+  printf '/src/app\techo alt\n' >"$W/alt/allow"
+  run allow --config "$W/alt/henki.toml"
+  check "beside --config" [ "$OUT" = "$W/alt/allow${nl}1  /src/app  echo alt" ]
+  OUT=$(cd "$W" && $RUN "$MODS" allow --config alt/henki.toml rm 1 2>&1) || fail "relative --config"
+  check "relative --config, from the working directory" [ "$OUT" = "removed rule 1: /src/app  echo alt" ]
+  bytes_are "removed there" "$W/alt/allow" ''
+  bytes_are "the default file untouched" "$CONF/allow" '/src/app\techo home\n'
+  HENKI_CONFIG="$W/alt" run allow
+  check "HENKI_CONFIG names the config dir" [ "$OUT" = "$W/alt/allow" ]
+  HENKI_CONFIG="alt" run allow
+  refused "HENKI_CONFIG is not an absolute path"
+  printf '/x\tone\n/x\ttwo\n' >"$W/real/allow"
+  ln -s "$W/real" "$W/linked"
+  HENKI_CONFIG="$W/linked" run allow rm 1
+  rc_is 0
+  check "the link stays" [ -L "$W/linked" ]
+  bytes_are "the file behind it" "$W/real/allow" '/x\ttwo\n'
+  check "no temp file left" [ "$(ls -A "$W/real")" = allow ]
+}
+
 all() {
   t_add_path
   t_ask
@@ -1129,6 +1234,7 @@ all() {
   t_shadow
   t_official
   t_halti
+  t_allow
 }
 
 static_bash32
