@@ -41,23 +41,41 @@ out_has() { case "$OUT" in *"$1"*) ;; *) fail "stdout lacks: $1" ;; esac; }
 err_has() { case "$ERR" in *"$1"*) ;; *) fail "stderr lacks: $1" ;; esac; }
 next_is() { [ "$(cat "$HENKI_NEXT")" = "$1" ] || fail "HENKI_NEXT is not: $1"; }
 
+# The std scope dir of a directory: FNV-1a 64 of its realpath (journal/1).
+fnv() {
+  local h=-3750763034362895579 b
+  for b in $(printf '%s' "$1" | od -An -v -tu1); do h=$(((h ^ b) * 1099511628211)); done
+  printf '%016x\n' "$h"
+}
+
 # A std journal for session ID in scope dir S, its first user record holding TEXT (JSON-escaped already), its mtime T
 # (touch -t form).
 journal() { # S ID TEXT T
   local f="$HENKI_STATE/sessions/$1/$2.jsonl"
+  mkdir -p "${f%/*}"
   printf '{"t":"session","v":1}\n' >"$f"
   [ -z "$3" ] || printf '{"msg":{"content":"%s","role":"user"},"t":"user","ts":"2026-11-08T10:00:00Z"}\n' "$3" >>"$f"
   touch -t "$4" "$f"
 }
 
+# The sessions mod reads sessions through `henki mods history`: HENKI_BIN is a stand-in that runs this checkout's
+# manager, with a HOME of its own (no history link: std) and the work dir W as the session's folder.
 t_sessions() {
-  case_ "sessions: list, resume, new, reload"
-  local s="$MODS_DIR/sessions/cmd"
-  export HENKI_MODULE="$MODS_DIR/sessions"
-  journal scope1 20261108T080000Z-aaaa 'cwd: /w\nos: linux x\ndate: 2026-11-08\n\nfix the \"parser\" please\nand more' 202611080800
-  journal scope1 20261108T090000Z-bbbb 'cwd: /w\nos: linux x\ndate: 2026-11-08\n\n'"$(printf 'x%.0s' 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30 31 32 33 34 35 36 37 38 39 40 41 42 43 44 45 46 47 48 49 50 51 52 53 54 55 56 57 58 59 60 61 62 63 64 65 66 67 68 69 70)" 202611080900
-  journal scope1 "$HENKI_SESSION" '' 202611081000
+  case_ "sessions: list, resume, new, reload, fork"
+  local s="$MODS_DIR/sessions/cmd" w="$D/w" here bad sc home=$HOME
+  mkdir -p "$w" "$D/home"
+  printf '#!/bin/sh\n[ "$1" = mods ] && shift\nexec bash %s/../manager/henki-mods "$@"\n' "$MODS_DIR" >"$D/bin/henki"
+  chmod 755 "$D/bin/henki"
+  export HENKI_MODULE="$MODS_DIR/sessions" HENKI_BIN="$D/bin/henki" HOME="$D/home"
+  sc=$(fnv "$(cd -P "$w" && pwd)")
+  journal "$sc" 20261108T080000Z-aaaa 'cwd: /w\nos: linux x\ndate: 2026-11-08\n\nfix the \"parser\" please\nand more' 202611080800
+  journal "$sc" 20261108T090000Z-bbbb 'cwd: /w\nos: linux x\ndate: 2026-11-08\n\n'"$(printf 'x%.0s' 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30 31 32 33 34 35 36 37 38 39 40 41 42 43 44 45 46 47 48 49 50 51 52 53 54 55 56 57 58 59 60 61 62 63 64 65 66 67 68 69 70)" 202611080900
+  journal "$sc" "$HENKI_SESSION" '' 202611081000
+  printf '{"t":"notice","text":"n","ts":"2026-11-08T10:00:00Z"}\n{"msg":{"content":"second","role":"user"},"t":"user","ts":"2026-11-08T10:00:00Z"}\n' >>"$HENKI_STATE/sessions/$sc/20261108T080000Z-aaaa.jsonl"
+  touch -t 202611080800 "$HENKI_STATE/sessions/$sc/20261108T080000Z-aaaa.jsonl"
   journal scope2 20261108T110000Z-dddd 'cwd: /v\nos: linux x\ndate: 2026-11-08\n\nelsewhere' 202611081100
+  here=$(pwd)
+  cd "$w" || return
   run "$s/sessions"
   rc_is 0
   out_has " 1 * 20261108T100000Z-cccc 2026-11-08 10:00"
@@ -84,17 +102,44 @@ t_sessions() {
   next_is new
   run "$s/reload"
   next_is restart
+  # /fork: the messages by line; N alone is this session's, ID@N another's; a line that is no user record is refused.
+  : >"$HENKI_NEXT"
+  run "$s/fork" 20261108T080000Z-aaaa@4
+  rc_is 0
+  next_is "resume 20261108T080000Z-aaaa@4"
+  : >"$HENKI_NEXT"
+  for bad in 20261108T080000Z-aaaa@3 20261108T080000Z-aaaa@1 20261108T080000Z-aaaa@x 20261108T080000Z-aaaa@02; do
+    run "$s/fork" "$bad"
+    rc_is 1
+  done
+  err_has 'fork: "02" is not a line'
+  run "$s/fork" 20261108T080000Z-aaaa@3
+  err_has "fork: line 3 of session 20261108T080000Z-aaaa is not a message of yours; fix: /fork lists them"
+  run "$s/fork" nope@2
+  rc_is 1
+  err_has "no session nope in std's store"
+  next_is ""
+  printf '4\n' >"$D/answer"
+  RC=0
+  OUT=$(HENKI_SESSION=20261108T080000Z-aaaa PATH=/usr/bin:/bin "$s/fork" <"$D/answer" 2>"$SCRATCH/err") || RC=$?
+  rc_is 0
+  out_has "     2  fix the \"parser\" please"
+  out_has "     4  second"
+  out_has "fork at line? "
+  next_is "resume 20261108T080000Z-aaaa@4"
+  RC=0
+  OUT=$(HENKI_NEXT='' HENKI_SESSION=20261108T080000Z-aaaa PATH=/usr/bin:/bin "$s/fork" 2 2>"$SCRATCH/err") || RC=$?
+  rc_is 0
+  out_has "henki --resume=20261108T080000Z-aaaa@2"
   # One session only: /resume has nothing to switch to.
-  rm -f "$HENKI_STATE"/sessions/scope1/*-aaaa.jsonl "$HENKI_STATE"/sessions/scope1/*-bbbb.jsonl
+  rm -f "$HENKI_STATE/sessions/$sc"/*-aaaa.jsonl "$HENKI_STATE/sessions/$sc"/*-bbbb.jsonl
   : >"$HENKI_NEXT"
   run "$s/resume"
   rc_is 1
   err_has "no session other than this one"
-  # History bound to another store: no std file for this session.
-  export HENKI_SESSION=elsewhere-1
-  run "$s/sessions"
-  rc_is 1
-  err_has "history is bound to another store; use its commands"
+  cd "$here" || return
+  unset HENKI_BIN
+  export HOME="$home"
 }
 
 t_prompts() {

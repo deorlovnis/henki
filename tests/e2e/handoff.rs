@@ -294,12 +294,14 @@ fn handoff_official_mods() {
         std::os::unix::fs::symlink(Path::new(env!("CARGO_MANIFEST_DIR")).join("mods").join(n), ext.join(n)).unwrap();
     }
     r.set("ext", &format!("[\"{}\"]", ext.display()));
+    // sessions reads them through `henki mods history`: the checkout's manager on PATH.
+    r.env("PATH", &format!("{}/manager:/usr/local/bin:/usr/bin:/bin", env!("CARGO_MANIFEST_DIR")));
     let mut p = Pty::spawn(&r, &[], 24, 80);
     p.expect("ext clip: clip-get, clip-put\r\next prompts: no tools\r\next sessions: no tools\r\n", W);
     p.prompt(W);
     p.line("/help");
     p.expect("this terminal; the model is told you ran it", W);
-    p.expect("\r\n/commit-msg  (prompts)\r\n/explain  (prompts)\r\n/fix-test  (prompts)\r\n/review  (prompts)\r\n/new  (sessions)\r\n", W);
+    p.expect("\r\n/commit-msg  (prompts)\r\n/explain  (prompts)\r\n/fix-test  (prompts)\r\n/review  (prompts)\r\n/fork  (sessions)\r\n/new  (sessions)\r\n", W);
     p.prompt(W);
     message(&p, "first task", "one");
     p.line("/new");
@@ -308,7 +310,7 @@ fn handoff_official_mods() {
     message(&p, "second task", "two");
     p.line("/sessions");
     p.expect(" 2   ", W);
-    p.expect("B  first task\r\n", W);
+    p.expect("  first task\r\n", W);
     p.prompt(W);
     // Two sessions started in one second sort by their random part: the first is the one holding the first task.
     let first = r.journals().into_iter().find(|j| fs::read_to_string(j).unwrap().contains("first task")).unwrap();
