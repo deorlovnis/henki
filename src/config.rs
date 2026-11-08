@@ -182,10 +182,7 @@ pub fn load(f: &Flags, env: &Env, cwd: &Path) -> Result<Config, String> {
     c.bash = which("bash", Some(c.user_path.as_ref()), false).ok_or("bash is not on PATH; fix: install bash, or add its directory to PATH")?;
     let agents = c.dir.join("AGENTS.md");
     if agents.exists() {
-        let text = read(&agents, 4 << 10)?;
-        if let Some((i, ch)) = text.split('\n').enumerate().find_map(|(i, l)| Some((i, l.chars().find(|&ch| term::escaped(ch))?))) {
-            return Err(format!("{}:{}: holds U+{:04X}, which a terminal does not show; fix: remove it", agents.display(), i + 1, ch as u32));
-        }
+        let text = text(&agents, 4 << 10)?;
         (c.agents_hash, c.agents) = (Some(sys::fnv(text.as_bytes())), Some(text.trim_end_matches('\n').to_string()).filter(|a| !a.is_empty()));
     }
     let allow = c.dir.join("allow");
@@ -306,6 +303,16 @@ fn read(path: &Path, max: u64) -> Result<String, String> {
     }
     owner_mode(path, m.mode(), m.uid(), sys::euid(), false)?;
     String::from_utf8(b).map_err(|_| format!("{}: not UTF-8; fix: save it as UTF-8", path.display()))
+}
+
+/// `read`, then no code point a terminal does not show, which would steer the model unseen: AGENTS.md, and a module's
+/// doc.md and cmd/*.md.
+pub fn text(path: &Path, max: u64) -> Result<String, String> {
+    let text = read(path, max)?;
+    if let Some((i, ch)) = text.split('\n').enumerate().find_map(|(i, l)| Some((i, l.chars().find(|&ch| term::escaped(ch))?))) {
+        return Err(format!("{}:{}: holds U+{:04X}, which a terminal does not show; fix: remove it", path.display(), i + 1, ch as u32));
+    }
+    Ok(text)
 }
 
 /// The config file (`dir` false) may be owned by the euid or root, its directory only by the euid; neither may be

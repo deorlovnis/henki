@@ -35,7 +35,7 @@
 set -euo pipefail
 cd "$(dirname "$0")"
 
-max_lines=4015      # non-test lines in src/
+max_lines=4019      # non-test lines in src/
 max_file_lines=400  # per file; a module is one file
 max_crates=10       # packages in the normal dependency tree, henki included
 max_bytes=1000000   # release binary
