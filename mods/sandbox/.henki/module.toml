@@ -1,0 +1,11 @@
+# The sandbox mod: henki's official exec binding. Every shell call of the model runs in a sandbox: your home hidden,
+# writes kept to the project and the temp dir. bwrap or user namespaces on Linux, sandbox-exec on macOS.
+henki_module = 1
+name = "sandbox"
+version = "0.1.0"
+license = "Apache-2.0"
+requires = ["henki >= 0.3"]
+contracts = ["ext/2", "exec/1"]
+os = ["linux", "macos"]
+caps_net = "any"                 # the sandbox leaves the network on: local model servers listen on loopback
+ports = ["exec"]

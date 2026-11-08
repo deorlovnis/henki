@@ -237,3 +237,35 @@ fn e2e_exec_sandbox() {
     assert!(["1\n", "2\n"].iter().any(|p| content(&d, 0).starts_with(p)), "{body}: {}", content(&d, 0));
     assert!(content(&d, 1).ends_with("[timed out after 1 s; process group killed]"), "{}", content(&d, 1));
 }
+
+/// Linux: the official `sandbox` module's program as the binding, unchanged from mods/. A call cannot read the home
+/// (inside, a scratch dir with no file) or the agent socket, its writes reach the project and not the home, and its
+/// background process ends with the call. When no backend runs here the test fails, as above.
+#[test]
+#[cfg(target_os = "linux")]
+fn e2e_exec_official_sandbox() {
+    let prog = concat!(env!("CARGO_MANIFEST_DIR"), "/mods/sandbox/port/exec");
+    let (mut r, _m) = scripted(|r| {
+        vec![
+            shell("cat ~/.ssh/k; printf '[%s] %s\\n' \"${SSH_AUTH_SOCK-unset}\" \"$(find ~ -mindepth 1 ! -type d | wc -l)\""),
+            shell(&format!("echo x >made-here && echo x >\"$HOME/out\"; sleep {} & echo started", r.marker)),
+            say("done"),
+        ]
+    });
+    let ok = Command::new(prog).args(["/bin/sh", "-c", "true"]).current_dir(&r.cwd).stdin(Stdio::null()).stderr(Stdio::piped()).output().unwrap();
+    assert!(ok.status.success(), "the sandbox runs nothing here: {}", String::from_utf8_lossy(&ok.stderr));
+    fs::create_dir_all(r.home.join(".ssh")).unwrap();
+    fs::write(r.home.join(".ssh/k"), "secret-key\n").unwrap();
+    r.env("SSH_AUTH_SOCK", &r.dir.join("agent.sock").display().to_string());
+    let port = r.config_dir().join("port");
+    fs::create_dir_all(&port).unwrap();
+    fs::set_permissions(r.config_dir(), fs::Permissions::from_mode(0o700)).unwrap();
+    symlink(prog, port.join("exec")).unwrap();
+    let d = r.json("look around");
+    d.finish();
+    assert_eq!(d.code, Some(0), "{}", d.diag());
+    assert_eq!((&d.of("session")[0]["ports"]["exec"], &d.of("session")[0]["tools"]), (&json!(prog), &json!(["shell"])), "{}", d.diag());
+    let (seen, wrote) = (content(&d, 0), content(&d, 1));
+    assert!(!seen.contains("secret-key") && seen.contains("No such file") && seen.contains("[unset] 0\n"), "{seen}");
+    assert!(wrote.starts_with("started\n") && r.cwd.join("made-here").is_file() && !r.home.join("out").exists(), "{wrote}");
+}

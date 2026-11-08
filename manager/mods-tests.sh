@@ -661,6 +661,200 @@ PY
   [ "$RC" = 0 ] || { FAILS=$((FAILS + 1)) && printf '%s\n' "$OUT" >&2; }
 }
 
+# sandbox, the exec binding: per backend that works here (bwrap, user namespaces, Seatbelt), exec/1's checks and the
+# sandbox's own (the home and henki's dirs hidden, writes kept to the project and the temp dir, control sockets, the
+# host's terminals, /dev/shm, IPC and processes out of reach, a TERM during the setup, the refusals), then the bwrap
+# argv from a stand-in bwrap. A Linux machine with neither backend fails the case: the sandbox would run nothing there.
+t_sandbox() {
+  case_ "sandbox: exec/1's checks and what a call can reach, per backend"
+  local b="" why=""
+  if [ "$(uname -s)" = Darwin ]; then
+    b=seatbelt
+  else
+    if command -v bwrap >/dev/null 2>&1; then
+      if bwrap --ro-bind / / --dev /dev --proc /proc --unshare-pid true 2>/dev/null; then b=bwrap; else why="bwrap cannot mount a /proc here"; fi
+    fi
+    if unshare -Urm true 2>/dev/null; then b="$b ns"; fi
+  fi
+  [ -n "$why" ] && echo "sandbox: the bwrap backend not run ($why)"
+  if [ -z "$b" ]; then
+    FAILS=$((FAILS + 1))
+    echo "FAIL $CASE: no backend works here (no bwrap, no user namespaces)" >&2
+    return
+  fi
+  cat >"$D/sandbox-tests.sh" <<'SH'
+#!/bin/bash
+# The sandbox's checks inside one call per check, per backend: sandbox-tests.sh PORT_EXEC HENKI_MODS BACKEND...
+# Hermetic: a scratch HOME, XDG dirs, agent socket dir and TMPDIR under one temp root; the real home is only counted.
+set -u
+exe=$1 mods=$2
+shift 2
+bash_abs=$(command -v bash)
+fails=0
+saved=$(export -p | command grep -E "^(declare -x|export) (HOME|TMPDIR|XDG_STATE_HOME|XDG_RUNTIME_DIR|SSH_AUTH_SOCK|TMUX|TMUX_TMPDIR)=")
+ok() { printf 'ok   %s %s\n' "$be" "$1"; }
+bad() { printf 'FAIL %s %s\n' "$be" "$1"; fails=$((fails + 1)); }
+check() { # NAME EXPECT(0=must succeed, 1=must fail) COMMAND: COMMAND runs inside, in $proj
+  r=$(cd "$proj" && HENKI_SANDBOX=$be "$exe" "$bash_abs" --noprofile --norc -c "$3" 2>&1 </dev/null); s=$?
+  if [ "$2" = 0 ]; then [ "$s" = 0 ] && ok "$1" || bad "$1 (exit $s: $r)"
+  else [ "$s" != 0 ] && [ "$s" != 126 ] && ok "$1" || bad "$1 (exit $s, want a failure of the command: $r)"
+  fi
+}
+inside() { (cd "$proj" && HENKI_SANDBOX=$be "$exe" "$bash_abs" --noprofile --norc -c "$1" 2>&1 </dev/null); }
+# A same-uid unix socket server on the host (python, never run inside); `conn PATH` is the client run inside.
+serve() { python3 -I -c 'import socket, sys, time
+s = socket.socket(socket.AF_UNIX); s.bind(sys.argv[1]); s.listen(8); time.sleep(600)' "$1" & srv="$srv $!"
+  n=0; while [ ! -S "$1" ] && [ "$n" -lt 40 ]; do sleep 0.05; n=$((n + 1)); done; }
+conn() { printf "python3 -I -c 'import socket, sys; socket.socket(socket.AF_UNIX).connect(sys.argv[1])' '%s'" "$1"; }
+uid=$(id -u)
+
+for be in "$@"; do
+  root=$(mktemp -d "${TMPDIR:-/tmp}/sandbox-test.XXXXXX"); root=$(cd -P "$root" && pwd)
+  H=$root/home
+  mkdir -p "$H/.ssh" "$H/.config/henki" "$H/.local/state/henki" "$H/code/projB" "$root/projA" "$root/other" \
+    "$root/xstate/henki" "$root/run" "$root/agent" "$root/tmp"
+  echo secret-kh >"$H/.ssh/known_hosts"; echo 'model = "x"' >"$H/.config/henki/config.toml"
+  echo secret-state >"$root/xstate/henki/s"; echo secret-run >"$root/run/r"; echo sock >"$root/agent/sock"
+  # The real home's entries are counted only, never read.
+  # Inside, it holds no file: at most the empty dirs that hide what lay under it (bwrap makes them; so does ns-setup).
+  realhome_n=$(HOME=$HOME; cd "$root/projA" && HENKI_SANDBOX=$be "$exe" "$bash_abs" --noprofile --norc -c 'find "$HOME" -mindepth 1 ! -type d | wc -l' 2>&1 </dev/null)
+  [ "$(echo $realhome_n)" = 0 ] && ok "the real home holds no file inside" || bad "the real home is not empty inside: $realhome_n"
+  # Control sockets: tmux by $TMUX and by TMUX_TMPDIR, an agent socket right in TMPDIR, a server under /tmp outside TMPDIR.
+  srv=; hostt=$(mktemp -d /tmp/sandbox-test-host.XXXXXX)
+  mkdir -p "$root/tmuxdir/tmux-$uid" "$root/tmuxenv"
+  serve "$root/tmuxdir/tmux-$uid/default"; serve "$root/tmuxenv/default"; serve "$root/tmp/agent.sock"
+  serve "$hostt/sock"
+  export HOME=$H TMPDIR=$root/tmp XDG_STATE_HOME=$root/xstate XDG_RUNTIME_DIR=$root/run SSH_AUTH_SOCK=$root/agent/sock \
+    TMUX_TMPDIR=$root/tmuxdir TMUX=$root/tmuxenv/default,4242,0
+  for proj in "$root/projA" "$H/code/projB"; do
+    case $proj in "$H"/*) where="project in home" ;; *) where="project outside home" ;; esac
+    printf -- '-- %s %s\n' "$be" "$where"
+    r=$(cd "$proj" && HENKI_SANDBOX=$be bash "$mods" test --port exec "$exe" 2>&1 </dev/null); s=$?
+    [ "$s" = 0 ] && ok "exec/1 R01-R07 ($where)" || bad "exec/1 R01-R07 ($where): $r"
+    check "cat ~/.ssh/known_hosts fails" 1 'cat ~/.ssh/known_hosts'
+    check "henki's config is hidden" 1 'cat ~/.config/henki/config.toml'
+    check "henki state under XDG_STATE_HOME hidden" 1 'cat "$XDG_STATE_HOME/henki/s"'
+    check "XDG_RUNTIME_DIR hidden" 1 'cat "$XDG_RUNTIME_DIR/r"'
+    check "the agent socket's dir hidden" 1 "cat '$root/agent/sock'"
+    check "SSH_AUTH_SOCK is unset" 0 '[ -z "${SSH_AUTH_SOCK+x}" ]'
+    check "a write to /etc/x fails" 1 'echo x >/etc/x'
+    check "a write outside the project fails" 1 "echo x >'$root/other/x'"
+    check "a write to the project works" 0 'echo x >in-project && [ -s in-project ]'
+    check "a write to TMPDIR works" 0 'echo x >"$TMPDIR/in-tmp"'
+    [ -f "$proj/in-project" ] && [ -f "$root/tmp/in-tmp" ] && ok "project and TMPDIR writes reach the host" || bad "project or TMPDIR write lost"
+    inside 'echo x >~/x' >/dev/null; [ ! -e "$H/x" ] && ok "a write to ~/x does not reach the home" || bad "~/x reached the home"
+    check "the uid is the person's" 0 "[ \"\$(id -u)\" = $(id -u) ]"
+    if [ "$be" != seatbelt ]; then
+      check "umount of the home fails" 1 'umount "$HOME" 2>&1 && ls -A "$HOME" | command grep -q .ssh'
+      check "a nested namespace cannot unmount it" 1 'unshare -rm sh -c "umount \"\$HOME\" 2>/dev/null; ls -A \"\$HOME\"" | command grep -q .ssh'
+      check "a remount read-write fails" 1 "mount -o remount,rw / 2>/dev/null || unshare -rm sh -c 'mount -o remount,bind,rw $root/other' 2>/dev/null; echo x >'$root/other/y'"
+      sleep 300 & hp=$!
+      check "a host process's environ is unreadable" 1 "cat /proc/$hp/environ"
+      check "a host process's root is unreadable" 1 "ls /proc/$hp/root/"
+      check "a host process cannot be signalled" 1 "kill -0 $hp"
+      kill "$hp"; wait "$hp" 2>/dev/null
+    fi
+    check "tmux's socket under TMUX_TMPDIR unreachable" 1 "$(conn "$root/tmuxdir/tmux-$uid/default")"
+    check "the socket named by TMUX unreachable" 1 "$(conn "$root/tmuxenv/default")"
+    check "a host socket under /tmp outside TMPDIR unreachable" 1 "$(conn "$hostt/sock")"
+    SSH_AUTH_SOCK=$root/tmp/agent.sock check "an agent socket right in TMPDIR unreachable" 1 "$(conn "$root/tmp/agent.sock")"
+    if [ "$be" != seatbelt ]; then
+      pf=$(mktemp "$root/pty.XXXXXX")
+      python3 -I -c 'import os, pty, sys, time; m, s = pty.openpty(); print(os.ttyname(s), flush=True); time.sleep(600)' >"$pf" &
+      srv="$srv $!"; n=0; while [ ! -s "$pf" ] && [ "$n" -lt 40 ]; do sleep 0.05; n=$((n + 1)); done
+      if [ -s "$pf" ]; then check "the host's terminal $(cat "$pf") cannot be opened" 1 "exec 7<>$(cat "$pf")"
+      else bad "no host terminal to try"; fi
+      m=sandbox-test-$$-$RANDOM
+      inside "echo x >/dev/shm/$m; echo x >/dev/mqueue/$m" >/dev/null
+      [ ! -e "/dev/shm/$m" ] && [ ! -e "/dev/mqueue/$m" ] && ok "/dev/shm and /dev/mqueue writes stay private" ||
+        { bad "a /dev/shm or /dev/mqueue write reached the host"; rm -f "/dev/shm/$m" "/dev/mqueue/$m"; }
+      [ "$(inside 'readlink /proc/self/ns/ipc')" != "$(readlink /proc/self/ns/ipc)" ] && ok "an IPC namespace of its own" ||
+        bad "the IPC namespace is the host's"
+      check "/dev/null, /dev/urandom and a new pty work" 0 \
+        'echo x >/dev/null && [ "$(head -c 8 /dev/urandom | wc -c)" = 8 ] && python3 -I -c "import pty; pty.openpty()"'
+      touch /tmp/"$m"-host
+      r=$(cd "$proj" && env -u TMPDIR HENKI_SANDBOX=$be "$exe" "$bash_abs" --noprofile --norc -c \
+        "[ ! -e /tmp/$m-host ] && echo x >/tmp/$m-in && [ -s /tmp/$m-in ] && [ ! -e /var/tmp/$m-host ] && echo ok" 2>&1 </dev/null)
+      [ "$r" = ok ] && [ ! -e /tmp/"$m"-in ] && ok "TMPDIR unset: a private, writable /tmp" || bad "TMPDIR unset: /tmp not private ($r)"
+      rm -f /tmp/"$m"-host /tmp/"$m"-in
+      mkdir -p /tmp/"$m"-home/.ssh && echo secret-k >/tmp/"$m"-home/.ssh/k
+      r=$(cd "$proj" && env -u TMPDIR HOME=/tmp/"$m"-home HENKI_SANDBOX=$be "$exe" "$bash_abs" --noprofile --norc -c \
+        'cat ~/.ssh/k 2>/dev/null; echo x >~/y && ls -A ~' 2>&1 </dev/null)
+      [ "$r" = y ] && [ ! -e /tmp/"$m"-home/y ] && ok "TMPDIR unset, a home under /tmp: empty and writable, gone after" ||
+        bad "TMPDIR unset, a home under /tmp: $r"
+      rm -rf /tmp/"$m"-home
+      # a TERM to the call's group while the sandbox is still being set up ends it too: at once, and (ns) once its
+      # pid 1 runs plus 0 to 8 ms
+      late=0
+      for d in now 0 0.001 0.002 0.004 0.008; do
+        (cd "$proj" && exec setsid "$exe" "$bash_abs" --noprofile --norc -c 'sleep 30' </dev/null >/dev/null 2>&1) & cp=$!
+        if [ "$d" != now ] && [ "$be" = ns ]; then
+          n=0; until pgrep -g "$cp" -f '^/bin/sh [^ ]*/ns-setup ' >/dev/null || [ "$n" -ge 400 ]; do n=$((n + 1)); done; sleep "$d"
+        fi
+        kill -TERM -- "-$cp" 2>/dev/null || kill -TERM "$cp" 2>/dev/null
+        n=0; while kill -0 "$cp" 2>/dev/null && [ "$n" -lt 20 ]; do sleep 0.05; n=$((n + 1)); done
+        kill -0 "$cp" 2>/dev/null && { late="$late $d"; kill -9 -- "-$cp" 2>/dev/null; }
+        wait "$cp" 2>/dev/null
+      done
+      [ "$late" = 0 ] && ok "a SIGTERM during the setup ends the call within 1 s" || bad "a SIGTERM during the setup was lost (after${late#0} s)"
+    fi
+    mark=sandbox-bg-$$-$RANDOM
+    inside "(exec -a $mark sleep 1000) >/dev/null 2>&1 &" >/dev/null
+    n=0; while pgrep -f "$mark" >/dev/null && [ "$n" -lt 20 ]; do sleep 0.05; n=$((n + 1)); done
+    if pgrep -f "$mark" >/dev/null; then
+      ok "a background job outlives its call (the session sweep ends it)"; pkill -9 -f "$mark"
+    else ok "a background job ends with its call ($((n * 50)) ms)"
+    fi
+  done
+  proj=$H; r=$(inside 'echo ran'); s=$?
+  [ "$s" = 126 ] && ok "refused in the home itself" || bad "ran in the home itself (exit $s: $r)"
+  proj=/; r=$(inside 'echo ran'); s=$?
+  [ "$s" = 126 ] && ok "refused in /" || bad "ran in / (exit $s: $r)"
+  proj=$root; check "a project that holds the home: the home stays hidden" 1 'cat ~/.ssh/known_hosts'
+  # An eval arm's layout: HOME under TMPDIR. The home stays hidden although TMPDIR is bound writable.
+  mkdir -p "$root/tmp/arm/home/.ssh" "$root/tmp/arm/work"; echo secret-arm >"$root/tmp/arm/home/.ssh/k"
+  proj=$root/tmp/arm/work
+  HOME=$root/tmp/arm/home check "a home under TMPDIR stays hidden" 1 'cat ~/.ssh/k'
+  # The temp dir must not be / or a system dir; a run through a link to port/exec finds its own files.
+  proj=$root/projA
+  r=$(cd "$proj" && TMPDIR=/ HENKI_SANDBOX=$be "$exe" "$bash_abs" --noprofile --norc -c 'echo ran' 2>&1 </dev/null); s=$?
+  [ "$s" = 126 ] && ok "refused with TMPDIR=/" || bad "ran with TMPDIR=/ (exit $s: $r)"
+  r=$(cd "$proj" && TMPDIR=/usr HENKI_SANDBOX=$be "$exe" "$bash_abs" --noprofile --norc -c 'echo ran' 2>&1 </dev/null); s=$?
+  [ "$s" = 126 ] && ok "refused with TMPDIR=/usr" || bad "ran with TMPDIR=/usr (exit $s: $r)"
+  mkdir -p "$root/cfg/port"; ln -s "$exe" "$root/cfg/port/exec"
+  r=$(cd "$proj" && HENKI_SANDBOX=$be "$root/cfg/port/exec" "$bash_abs" --noprofile --norc -c 'echo ran' 2>&1 </dev/null); s=$?
+  [ "$s" = 0 ] && [ "$r" = ran ] && ok "runs through a link to port/exec" || bad "a link to port/exec fails (exit $s: $r)"
+  for p in $srv; do kill "$p" 2>/dev/null; done; wait 2>/dev/null; rm -rf "$hostt"
+  unset HOME TMPDIR XDG_STATE_HOME XDG_RUNTIME_DIR SSH_AUTH_SOCK TMUX TMUX_TMPDIR
+  eval "$saved"
+  rm -rf "$root"
+done
+# The bwrap layout, from its argv (a stand-in bwrap that prints it; Linux, whether or not bwrap is here).
+if [ "$(uname -s)" = Linux ]; then
+  be=bwrap-argv root=$(mktemp -d "${TMPDIR:-/tmp}/sandbox-test.XXXXXX"); root=$(cd -P "$root" && pwd)
+  mkdir -p "$root/fake" "$root/home" "$root/proj" "$root/tmp"
+  printf '#!/bin/sh\nfor a in "$@"; do printf "%%s\\n" "$a"; done\n' >"$root/fake/bwrap"; chmod +x "$root/fake/bwrap"
+  srv=; serve "$root/tmp/agent.sock"
+  a=$(cd "$root/proj" && HOME=$root/home TMPDIR=$root/tmp SSH_AUTH_SOCK=$root/tmp/agent.sock HENKI_SANDBOX=bwrap \
+    HENKI_USER_PATH=$root/fake PATH=/usr/bin:/bin "$exe" "$bash_abs" --noprofile --norc -c 'echo "a b"' x 'y z' | tr '\n' ' ')
+  for p in $srv; do kill "$p" 2>/dev/null; done; wait 2>/dev/null
+  case $a in "--ro-bind / / --dev /dev --proc /proc --unshare-pid --unshare-ipc "*) ok "starts with the read-only root, a /dev and IPC of its own" ;;
+    *) bad "unexpected start: $a" ;; esac
+  case $a in *" --tmpfs /tmp "*"--tmpfs $root/home "*"--bind $root/tmp $root/tmp "*"--bind $root/proj $root/proj "*"--ro-bind-try /dev/null $root/tmp/agent.sock "*) ok "a private /tmp, then the home hidden, the temp dir and project bound, the agent socket masked" ;;
+    *) bad "unexpected layout: $a" ;; esac
+  case $a in *" -- $bash_abs --noprofile --norc -c echo \"a b\" x y z ") ok "the command's arguments come last" ;; *) bad "the command is not last: $a" ;; esac
+  rm -rf "$root"
+fi
+
+echo "sandbox tests: $fails failed"
+[ "$fails" = 0 ]
+SH
+  RC=0
+  # shellcheck disable=SC2086 # b is a list of backends
+  OUT=$(bash "$D/sandbox-tests.sh" "$MODS_DIR/sandbox/port/exec" "$MODS_DIR/../manager/henki-mods" $b 2>&1 </dev/null) || RC=$?
+  [ "$RC" = 0 ] || { FAILS=$((FAILS + 1)) && printf '%s\n' "$OUT" >&2; }
+}
+
 t_sessions
 t_prompts
 t_project
@@ -670,6 +864,7 @@ t_checkpoints_missed
 t_checkpoints_kept
 t_notify
 t_compact
+t_sandbox
 if [ "$FAILS" != 0 ]; then
   echo "mods-tests.sh: $FAILS checks failed in $CASES cases" >&2
   exit 1

@@ -1,0 +1,118 @@
+#!/bin/sh
+c= pend=; trap 'fwd TERM' TERM; trap 'fwd INT' INT; trap 'fwd HUP' HUP # first: pid 1 drops a signal it has no trap for
+fwd() { # a child still named as this shell is a fork that may not have dropped this shell's traps: send it again later
+  if [ -n "$c" ]; then read -r _cc <"/proc/$c/comm" && [ "$_cc" = "$me" ] && again=$1; kill "-$1" "$c" 2>/dev/null
+  else pend=$1; fi
+}
+# The namespace backend's setup. port/exec runs it as
+#   unshare --user --map-root-user --mount --pid --ipc --fork --kill-child -- sh ns-setup UNSHARE PROJECT TMP OP... -- COMMAND...
+# so it starts as pid 1 of a new pid namespace and uid 0 of a new user namespace (the person outside), in a mount and
+# IPC namespace of its own. OP is `hide:PATH` (an empty tmpfs over PATH), `bind:PATH` (PATH, which is PROJECT or TMP,
+# from the host, writable) or `mask:PATH` (/dev/null over a file), an ancestor before what lies under it.
+# 1. Every mount but the kernel's (/proc, /sys, /dev) becomes read-only. 2. The ops. 3. A /dev of its own: a tmpfs with
+# null, zero, full, random, urandom and tty from the host, a new devpts instance (the host's terminals are not there),
+# and a private /dev/shm and /dev/mqueue. 4. COMMAND runs in a nested user and mount namespace as the person's uid with
+# no capabilities: there every mount above is locked, so the command cannot unmount the tmpfs over the home or make a
+# mount writable again. 5. This shell stays pid 1, forwards SIGTERM, SIGINT and SIGHUP (a pid 1 without a handler
+# ignores them; one that comes during the setup ends the call) and exits with the command's status; when it exits, the
+# kernel kills every process left in the namespace. A signal in the moment between the fork and this file's first line
+# is lost (pid 1 has no trap yet); henki's SIGKILL after the timeout's grace still ends the call.
+set -uf
+again= me=; read -r me </proc/self/comm
+die() { printf 'sandbox: %s\n' "$*" >&2; exit 126; }
+us=$1 proj=$2 tmp=$3; shift 3
+read -r _ uid _ </proc/self/uid_map && read -r _ gid _ </proc/self/gid_map || die "cannot read the uid map"
+exec 3<"$proj" 4<"$tmp" 5<&0 6</dev || die "cannot open the project ($proj), the temp dir ($tmp) or /dev"
+userpath=${PATH-}; PATH=/usr/bin:/bin:/usr/sbin:/sbin
+
+# 1. Read-only: one `mount` per writable mount, all at once (a desktop has dozens of mounts; one after the other they
+# cost about 1 ms each). A mount at or under a dir that step 2 hides is skipped: nothing reaches it after step 2.
+# mountinfo field 5 is the mount point (octal escapes for space, tab, newline, backslash; decoded by awk when a line
+# has one), 6 its options.
+nl='
+'
+hidden=
+for o in "$@"; do case $o in --) break ;; hide:*) hidden="$hidden$nl${o#hide:}" ;; esac; done
+mi= esc=0
+while read -r _ _ _ _ m o _; do
+  case $m in *\\*) esc=1; break ;; esac
+  mi="$mi${o%%,*} $m
+"
+done </proc/self/mountinfo
+[ "$esc" = 0 ] || mi=$(awk '{ p = $5; out = ""
+       while (match(p, /\\[0-7][0-7][0-7]/)) {
+         out = out substr(p, 1, RSTART - 1) sprintf("%c", (substr(p, RSTART + 1, 1) * 64) + (substr(p, RSTART + 2, 1) * 8) + substr(p, RSTART + 3, 1))
+         p = substr(p, RSTART + 4) }
+       split($6, o, ","); print o[1] " " out p }' /proc/self/mountinfo) || die "cannot read the mount table"
+bad=$(
+  while IFS= read -r l; do
+    m=${l#* }
+    case $m in '' | /proc | /proc/* | /sys | /sys/* | /dev | /dev/*) continue ;; esac
+    [ "${l%% *}" = ro ] && continue
+    skip=0 IFS=$nl; for h in $hidden; do case $m in "$h" | "$h"/*) skip=1; break ;; esac; done; IFS=' 	'"$nl"
+    [ "$skip" = 1 ] && continue
+    { mount -n --no-canonicalize -o remount,bind,ro "$m" 2>/dev/null || printf ' %s' "$m"; } &
+  done <<EOF2
+$mi
+EOF2
+  wait
+)
+[ -z "$bad" ] || die "cannot make$bad read-only; fix: install bubblewrap, or henki mods swap exec std"
+
+# 2. The ops.
+while [ $# -gt 0 ] && [ "$1" != -- ]; do
+  case $1 in
+  hide:*) # a dir under a hidden one (a home under a private /tmp) is made again, empty, as bwrap's --tmpfs makes it
+    p=${1#hide:}; [ -d "$p" ] || mkdir -p "$p" 2>/dev/null
+    [ ! -d "$p" ] || mount -n -t tmpfs -o mode=0755,nosuid,nodev sandbox "$p" || die "cannot hide $p" ;;
+  bind:*)
+    p=${1#bind:}; if [ "$p" = "$proj" ]; then fd=3; else fd=4; fi
+    mkdir -p "$p" 2>/dev/null; mount -n --no-canonicalize --bind "/proc/self/fd/$fd" "$p" || die "cannot bind $p"
+    mount -n --no-canonicalize -o remount,bind,rw "$p" 2>/dev/null || : # a mount read-only on the host stays so
+    ;;
+  mask:*) p=${1#mask:}; { [ -e "$p" ] || [ -S "$p" ]; } && { mount -n --no-canonicalize --bind /dev/null "$p" || die "cannot hide $p"; } ;;
+  esac
+  shift
+done
+[ $# -gt 1 ] || die "nothing to run"
+shift
+
+# 3. /dev. The host's stays reachable through fd 6 only while the binds are made. Only the six devices are needed:
+# without devpts or mqueue those dirs are empty and private.
+mount -n -t tmpfs -o mode=0755,nosuid,noexec sandbox-dev /dev || die "cannot mount a tmpfs on /dev"
+: >/dev/null && : >/dev/zero && : >/dev/full && : >/dev/random && : >/dev/urandom && : >/dev/tty &&
+  mkdir /dev/shm /dev/pts /dev/mqueue || die "cannot set up /dev"
+bad=$(
+  for d in null zero full random urandom tty; do
+    { mount -n --no-canonicalize --bind "/proc/self/fd/6/$d" "/dev/$d" 2>/dev/null || printf ' /dev/%s' "$d"; } &
+  done
+  { mount -n -t devpts -o newinstance,ptmxmode=0666,mode=0620 devpts /dev/pts && ln -s pts/ptmx /dev/ptmx; } 2>/dev/null &
+  mount -n -t tmpfs -o mode=1777,nosuid,nodev shm /dev/shm 2>/dev/null &
+  mount -n -t mqueue -o nosuid,nodev,noexec mqueue /dev/mqueue 2>/dev/null &
+  ln -s /proc/self/fd /dev/fd & ln -s /proc/self/fd/0 /dev/stdin & ln -s /proc/self/fd/1 /dev/stdout &
+  ln -s /proc/self/fd/2 /dev/stderr &
+  wait
+)
+[ -z "$bad" ] || die "cannot set up$bad; fix: install bubblewrap, or henki mods swap exec std"
+exec 3<&- 4<&- 6<&-
+cd "$proj" || die "cannot enter the project ($proj)"
+unset SSH_AUTH_SOCK
+PATH=$userpath
+
+# 4. and 5. A signal that comes before the command has started ends the call: pid 1 exits, and with it every process
+# in the namespace (forwarding it could hit the forked child before it drops this shell's traps, which would swallow it).
+gone() { case $pend in TERM) exit 143 ;; INT) exit 130 ;; HUP) exit 129 ;; esac; }
+gone
+"$us" --user --mount --map-user="$uid" --map-group="$gid" -- "$@" <&5 5<&- &
+c=$!
+gone
+exec 5<&-
+while :; do
+  wait "$c"; st=$?
+  kill -0 "$c" 2>/dev/null || break # a trapped signal ends `wait` early: wait again for the status
+  if [ -n "$again" ]; then # the fork lived on: send the signal again once it runs its own program
+    n=0; while read -r _cc <"/proc/$c/comm" && [ "$_cc" = "$me" ] && [ "$n" -lt 2000 ]; do n=$((n + 1)); done
+    kill "-$again" "$c" 2>/dev/null; again=
+  fi
+done
+exit "$st"

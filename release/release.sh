@@ -291,8 +291,8 @@ EOF
     <<~TEXT
       henki reads ~/.config/henki/config.toml; start from a profile, then set model and base_url:
         mkdir -p ~/.config/henki && cp #{HOMEBREW_PREFIX}/share/henki/config.mac.toml ~/.config/henki/config.toml
-      The official modules (checkpoints, clip, compact, halti, itse, notify, project, prompts, sessions) ship off. henki-mods
-      (also henki mods) manages modules:
+      The official modules (checkpoints, clip, compact, halti, itse, notify, project, prompts, sandbox, sessions) ship off.
+      henki-mods (also henki mods) manages modules:
         henki-mods list        what is added, on, and what each adds to the prompt
         henki-mods add halti   shows what it installs, then asks
     TEXT
@@ -324,7 +324,7 @@ expect() {
 }
 
 selftest() {
-  local t version target name x got want bad=0 commit
+  local t version target name x x_exec got want bad=0 commit
   t=$SCRATCH
   version=$(cargo_version)
   target=$(host_target)
@@ -386,7 +386,7 @@ selftest() {
   [ "$got" = "henki-mods $version" ] || { say "selftest: bin/henki-mods --version said \"$got\""; bad=1; }
   # The official modules are found in the tarball's share/ (no HENKI_SHARE, no repo checkout next to it).
   got=$(env -i HOME="$t/home" PATH=/usr/bin:/bin "$x/bin/henki-mods" list 2>&1) || got="(exit $?) $got"
-  case "$got" in *"official, not added: checkpoints clip compact halti itse notify project prompts sessions "*) ;; *)
+  case "$got" in *"official, not added: checkpoints clip compact halti itse notify project prompts sandbox sessions "*) ;; *)
     say "selftest: bin/henki-mods list said: $got"
     bad=1
     ;;
@@ -402,6 +402,12 @@ selftest() {
   if PATH=/usr/bin:/bin command -v python3 >/dev/null 2>&1; then
     got=$(env -i HOME="$t/home" PATH=/usr/bin:/bin "$x/bin/henki-mods" test --port context "$x/share/henki/official/compact/port/context" 2>&1) ||
       { say "selftest: test --port context compact: $got"; bad=1; }
+  fi
+  # sandbox, the official exec binding, passes exec/1's checks from the tarball where one of its backends runs.
+  x_exec="$x/share/henki/official/sandbox/port/exec"
+  if (cd "$t" && env -i HOME="$t/home" PATH=/usr/bin:/bin "$x_exec" /bin/sh -c true) >/dev/null 2>&1; then
+    got=$(env -i HOME="$t/home" PATH=/usr/bin:/bin "$x/bin/henki-mods" test --port exec "$x_exec" 2>&1) ||
+      { say "selftest: test --port exec sandbox: $got"; bad=1; }
   fi
   got=$(env -i HOME="$t/home" PATH=/usr/bin:/bin "$x/bin/henki-mods" eval --check "$x/share/henki/eval/general" 2>&1) || { say "selftest: eval --check: $got"; bad=1; }
   [ "$(cd "$x/share/henki/eval/general" && ls)" = "$(cd eval/general && ls)" ] || { say "selftest: share/henki/eval/general holds other tasks than eval/general"; bad=1; }

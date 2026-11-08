@@ -1,0 +1,69 @@
+;; The sandbox mod's macOS backend: a Seatbelt profile for sandbox-exec, which port/exec runs as
+;;   env -u SSH_AUTH_SOCK sandbox-exec -f macos.sb -D PROJECT=P -D TMP=T -D HOME=H -D CONFIG=C -D STATE=S -D DATA=D BASH ...
+;; Every parameter is a real path (no symlinks: /private/var, not /var). Rules later in the file win over earlier ones.
+;; Reads: everything except the listed secrets and henki's own dirs (a list, not a proof). Writes: the project, the
+;; temp dirs and the call's own terminal only. Network: on (local model servers listen on loopback), but no unix
+;; socket outside the project and the temp dirs (the ssh-agent, tmux, docker), and no way to hand a command to
+;; something outside the sandbox through LaunchServices, Apple Events or launchd. Processes: as the person; Seatbelt
+;; hides none.
+(version 1)
+(allow default)
+
+;; Writes only where the command's work belongs.
+(deny file-write*)
+(allow file-write*
+  (subpath (param "PROJECT"))
+  (subpath (param "TMP"))
+  (subpath "/private/tmp")
+  (literal "/dev/null")
+  (literal "/dev/zero")
+  (literal "/dev/dtracehelper")
+  (literal "/dev/tty")
+  (regex #"^/dev/fd/[0-9]+$"))
+
+;; Hidden: secrets in the home, the Keychains, henki's config, state and data (also when they lie in the project).
+(deny file-read* file-write*
+  (subpath (string-append (param "HOME") "/.ssh"))
+  (subpath (string-append (param "HOME") "/.config"))
+  (subpath (string-append (param "HOME") "/.aws"))
+  (subpath (string-append (param "HOME") "/.gnupg"))
+  (subpath (string-append (param "HOME") "/.docker"))
+  (subpath (string-append (param "HOME") "/.kube"))
+  (literal (string-append (param "HOME") "/.netrc"))
+  (literal (string-append (param "HOME") "/.git-credentials"))
+  (subpath (string-append (param "HOME") "/Library/Keychains"))
+  (subpath (string-append (param "HOME") "/Library/Cookies"))
+  (subpath "/Library/Keychains")
+  (subpath (param "CONFIG"))
+  (subpath (param "STATE"))
+  (subpath (param "DATA")))
+
+;; Unix sockets: a connect is a network operation, not a file read, so the hidden list above does not stop it. None
+;; outside the project and the temp dirs, except the system's name resolver and log. This shuts out the ssh-agent
+;; (SSH_AUTH_SOCK is unset too; the launchd socket's path is guessable), tmux and screen (in /private/tmp), Docker
+;; Desktop and every editor or terminal control socket. The project's and the temp dir's own sockets (a test server,
+;; git's fsmonitor) still work.
+(deny network-outbound (remote unix-socket (path-regex #"^/")))
+(allow network-outbound
+  (remote unix-socket (subpath (param "PROJECT")))
+  (remote unix-socket (subpath (param "TMP")))
+  (remote unix-socket (path-literal "/private/var/run/mDNSResponder"))
+  (remote unix-socket (path-literal "/private/var/run/syslog")))
+(deny network-outbound
+  (remote unix-socket (path-regex #"^/private/tmp/com\.apple\.launchd\.[^/]+/Listeners$"))
+  (remote unix-socket (path-regex #"^/private/tmp/tmux-[0-9]+/")))
+
+;; Running something outside the sandbox: `open` (LaunchServices starts apps, Terminal.app included, as the person),
+;; Apple Events (`tell application "Terminal" to do script`), launchd jobs (`launchctl submit`), Shortcuts and
+;; Automator. The tools are denied by path and the services they use are denied too, so a copy of a tool fails as well.
+(deny mach-lookup
+  (global-name "com.apple.coreservices.launchservicesd")
+  (global-name "com.apple.coreservices.appleevents")
+  (global-name "com.apple.lsd.open"))
+(deny job-creation)
+(deny process-exec
+  (literal "/usr/bin/open")
+  (literal "/bin/launchctl")
+  (literal "/usr/bin/osascript")
+  (literal "/usr/bin/shortcuts")
+  (literal "/usr/bin/automator"))
