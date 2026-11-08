@@ -469,25 +469,36 @@ fn ext_on_rules() {
     assert_eq!(err(&[t.p("e")]), format!("ext {}: more than 16 observers (on/ files) over all modules; fix: turn a module off", t.p("e/b5").display()));
 }
 
-/// No on/ that another user can write: its files run unasked on each event. bin/ and cmd/ are not checked (only by
-/// the user's action do they run).
+/// No on/ that another user can write, nor any directory from an observer's real file up to the module's: its files
+/// run unasked on each event. bin/ and cmd/ are not checked when no observer is in them (only by the user's action do
+/// they run), nor is the ext path above the module.
 #[test]
 fn ext_on_writable_by_others_refused() {
     let t = T::new();
     t.ext("e/a", "# a: watches");
     let (o, b, c) = (t.exe("e/a/on/turn_end"), t.exe("e/a/bin/x"), t.exe("e/a/cmd/y"));
-    for p in [t.p("e/a/on"), o] {
-        let m = fs::metadata(&p).unwrap().mode() & 0o7777;
-        for bits in [0o020, 0o002] {
-            fs::set_permissions(&p, fs::Permissions::from_mode(m | bits)).unwrap();
-            assert_eq!(err(&[t.p("e")]), format!("ext {0} is group- or world-writable; fix: chmod go-w {0}", p.display()));
+    let refused = |paths: &[PathBuf]| {
+        for p in paths {
+            let m = fs::metadata(p).unwrap().mode() & 0o7777;
+            for bits in [0o020, 0o002] {
+                fs::set_permissions(p, fs::Permissions::from_mode(m | bits)).unwrap();
+                assert_eq!(err(&[t.p("e")]), format!("ext {0} is group- or world-writable; fix: chmod go-w {0}", p.display()));
+            }
+            fs::set_permissions(p, fs::Permissions::from_mode(m)).unwrap();
         }
-        fs::set_permissions(&p, fs::Permissions::from_mode(m)).unwrap();
-    }
-    for p in [t.p("e"), t.p("e/a"), t.p("e/a/bin"), b, t.p("e/a/cmd"), c] {
+    };
+    refused(&[t.p("e/a"), t.p("e/a/on"), o]);
+    for p in [t.p("e"), t.p("e/a/bin"), b.clone(), t.p("e/a/cmd"), c] {
         fs::set_permissions(&p, fs::Permissions::from_mode(0o777)).unwrap();
     }
     assert_eq!(ok(&[t.p("e")]).exts[0].on, ["turn_end"]);
+    // A link into bin/: the file it names and bin/ are an observer's now.
+    symlink("../bin/x", t.p("e/a/on/call_end")).unwrap();
+    fs::set_permissions(t.p("e/a/bin"), fs::Permissions::from_mode(0o755)).unwrap();
+    assert_eq!(err(&[t.p("e")]), format!("ext {0} is group- or world-writable; fix: chmod go-w {0}", b.display()));
+    fs::set_permissions(&b, fs::Permissions::from_mode(0o755)).unwrap();
+    refused(&[t.p("e/a/bin"), b]);
+    assert_eq!(ok(&[t.p("e")]).exts[0].on, ["call_end", "turn_end"]);
 }
 
 #[test]

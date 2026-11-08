@@ -117,9 +117,11 @@ fn one(dir: &Path, name: &str) -> Result<Ext, String> {
         return Err(bad(p, "a link that leaves the module", "copy the file in"));
     }
     // Observers run unasked on each event, as a port binding does, so on/ and its files are held to a binding's owner
-    // and mode rule. One planted through a directory above is another user's file, so it fails the owner check.
-    let mode = |p: &&PathBuf| fs::metadata(p).map_or(Ok(()), |m| config::owner_mode(p, m.mode(), m.uid(), sys::euid(), false)).map_err(|e| format!("ext {e}"));
-    paths.iter().filter(|p| p.starts_with(dir.join("on"))).try_for_each(|p| mode(&p))?;
+    // and mode rule: the real file and every directory from it up to the module's, or another user could swap one in
+    // (a link into a writable bin/, a writable module dir's on/) after this check, to run with no tripwire before it.
+    let mode = |p: &Path| fs::metadata(p).map_or(Ok(()), |m| config::owner_mode(p, m.mode(), m.uid(), sys::euid(), false)).map_err(|e| format!("ext {e}"));
+    let chain = |p: &PathBuf| fs::canonicalize(p).map_or(vec![p.clone()], |r| r.ancestors().take_while(|a| a.starts_with(&real)).map(Path::to_path_buf).collect());
+    paths.iter().filter(|p| p.starts_with(dir.join("on"))).flat_map(chain).try_for_each(|p| mode(&p))?;
     let targets = paths.iter().filter(|p| p.is_symlink()).filter_map(|p| fs::canonicalize(p).ok()).collect();
     let prompt = bin.is_some() || ["cmd", "on", "port"].iter().all(|d| has(d).is_none());
     Ok(Ext { name: name.into(), line: line.into(), dir: dir.to_path_buf(), doc, bin, cmds, user, on, prompt, shadows: Vec::new(), paths, targets })
