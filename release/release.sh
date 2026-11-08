@@ -4,17 +4,24 @@
 #
 #   bin/henki                    the static binary (musl on Linux)
 #   bin/henki-mods               the module manager; it finds the official modules at ../share/henki/official
+#   bin/henki-mods-dev           the module author's tools (new, test, try, publish, ...); manager/testdata/ stays out
 #   share/henki/official/NAME/   every module in mods/, as git tracks it (off until `henki-mods add NAME`)
 #   share/henki/conform/         the conformance suites of manager/conform/ (henki-mods test --port, swap)
 #   share/henki/eval/general/    the general eval suite of eval/general/ (henki-mods eval --suite general)
+#   share/henki/index/           the default module index's anchor from manager/index/: its URL, signers, checkpoint
+#                                and the refused keys (henki-mods search, info, add NAME, sync)
+#   share/henki/mod-profiles/    the module profiles of manager/mod-profiles/ (henki-mods init)
 #   share/henki/config.*.toml    the config profiles in profiles/ (henki's no-config message names config.mac.toml)
-#   LICENSE README.md CONTRACTS.md
+#   LICENSE README.md CONTRACTS.md SECURITY.md EXTENDING.md
 #
 # Usage:
-#   release/release.sh VERSION [TARGET...]   VERSION must be Cargo.toml's (else --version and the file name disagree);
+#   release/release.sh [--index-not-live] VERSION [TARGET...]
+#                                            VERSION must be Cargo.toml's (else --version and the file name disagree);
 #                                            TARGET defaults to this host's: ARCH-unknown-linux-musl on Linux,
 #                                            ARCH-apple-darwin on macOS. A target of the other OS is refused (no
-#                                            cross linker is assumed).
+#                                            cross linker is assumed). The index anchor must be live: a key that is
+#                                            not a refused one, and a checkpoint; --index-not-live packs the anchor
+#                                            with no key instead (henki-mods then says the index is not live yet).
 #   release/release.sh --formula VERSION TAP [BASE_URL]
 #                                            writes TAP/Formula/henki.rb from dist/SHA256SUMS: one url and sha256
 #                                            per target in it. BASE_URL defaults to the GitHub release of vVERSION.
@@ -150,6 +157,34 @@ hd1_of() {
   printf '%s\n' "$out" | sed -n 's/.*\(hd1:[0-9a-f]*\).*/\1/p'
 }
 
+# anchor_check DIR NOT_LIVE: the index anchors in DIR (NAME.url, NAME.signers, NAME.checkpoint, refused.keys), as a
+# release ships them. Each signers line's key must not be a refused one (a development key: refused.keys, matched
+# as a fixed string, as henki-mods matches it), and an anchor with a key needs its checkpoint, the full commit a first
+# sync must find on the index's first-parent line. An anchor with no key line is the placeholder of an index not
+# live yet: refused unless NOT_LIVE is 1.
+anchor_check() {
+  local d=$1 f n keys blob ck
+  [ -f "$d/refused.keys" ] || die "$d/refused.keys is missing; fix: restore it from git (it lists the development keys)"
+  for f in "$d"/*.url; do
+    [ -f "$f" ] || die "$d holds no index URL (NAME.url); fix: restore manager/index/ from git"
+    n=$(basename "$f" .url)
+    [ -f "$d/$n.signers" ] || die "$d/$n.signers is missing; fix: restore it from git"
+    keys=$(command grep -v -e '^#' -e '^[[:space:]]*$' "$d/$n.signers" || true)
+    if [ -z "$keys" ]; then
+      [ "$2" = 1 ] || die "index $n: $d/$n.signers holds no key, so the index is not live; fix: add its signing key's line and $n.checkpoint, or release with --index-not-live"
+      continue
+    fi
+    for blob in $(printf '%s\n' "$keys" | awk '{ b = "-"; for (i = 2; i < NF; i++) if ($i ~ /^(ssh-|sk-|ecdsa-)/) { b = $(i + 1); break } print b }'); do
+      [ "$blob" != - ] || die "index $n: a line of $d/$n.signers names no key; fix: write it as allowed_signers does (PRINCIPAL namespaces=\"git\" TYPE KEY)"
+      ! command grep -v '^#' "$d/refused.keys" | tr -d ' \t\r' | command grep -qxF -e "$blob" ||
+        die "index $n: $d/$n.signers holds a refused key (in refused.keys: a development key); fix: put the index's own signing key there"
+    done
+    ck=$(sed -n 1p "$d/$n.checkpoint" 2>/dev/null) || ck=""
+    case "$ck" in *[!0-9a-f]* | "") ck="" ;; esac
+    [ ${#ck} = 40 ] || die "index $n: $d/$n.checkpoint does not hold a full commit; fix: write the commit the index's main is at (40 hex digits) there"
+  done
+}
+
 # Lays out STAGE/henki-VERSION-TARGET from BIN and the repo.
 stage() {
   local dir="$1/henki-$2-$3" bin=$4 m n
@@ -157,7 +192,8 @@ stage() {
   mkdir -p "$dir/bin" "$dir/share/henki/official" "$dir/share/henki/conform" "$dir/share/henki/eval"
   cp "$bin" "$dir/bin/henki" && chmod 755 "$dir/bin/henki"
   cp manager/henki-mods "$dir/bin/henki-mods" && chmod 755 "$dir/bin/henki-mods"
-  for n in LICENSE README.md CONTRACTS.md; do cp "$n" "$dir/$n" && chmod 644 "$dir/$n"; done
+  cp manager/henki-mods-dev "$dir/bin/henki-mods-dev" && chmod 755 "$dir/bin/henki-mods-dev"
+  for n in LICENSE README.md CONTRACTS.md SECURITY.md EXTENDING.md; do cp "$n" "$dir/$n" && chmod 644 "$dir/$n"; done
   # The profiles, where henki's no-config message sends a Homebrew user: $(brew --prefix)/share/henki/.
   for n in $(git ls-files 'profiles/config.*.toml'); do cp "$n" "$dir/share/henki/${n#profiles/}" && chmod 644 "$dir/share/henki/${n#profiles/}"; done
   for n in $(git ls-files 'manager/conform/*.tsv'); do cp "$n" "$dir/share/henki/conform/" && chmod 644 "$dir/share/henki/conform/${n##*/}"; done
@@ -167,6 +203,11 @@ stage() {
     mkdir -p "$dir/share/henki/$(dirname "$n")"
     cp "$n" "$dir/share/henki/$n" || die "cannot copy $n; fix: make it readable and check the free space in TMPDIR"
     case "${m%% *}" in 100755) chmod 755 "$dir/share/henki/$n" ;; 100644) chmod 644 "$dir/share/henki/$n" ;; *) die "$n: git mode ${m%% *}; fix: the suite holds files only" ;; esac
+  done
+  # The index anchor (checked by anchor_check before the build) and the module profiles, as data.
+  mkdir -p "$dir/share/henki/index" "$dir/share/henki/mod-profiles"
+  for n in $(git ls-files 'manager/index/*' 'manager/mod-profiles/*.lock'); do
+    cp "$n" "$dir/share/henki/${n#manager/}" && chmod 644 "$dir/share/henki/${n#manager/}" || die "cannot copy $n; fix: check the free space in TMPDIR"
   done
   for m in mods/*/; do
     n=$(basename "$m")
@@ -209,10 +250,11 @@ sums() {
   mv "$dist/SHA256SUMS.tmp" "$dist/SHA256SUMS"
 }
 
-# release VERSION DIRTY_OK TARGET...: the whole build. DIRTY_OK=1 only from the selftest.
+# release VERSION DIRTY_OK NOT_LIVE TARGET...: the whole build. DIRTY_OK=1 only from the selftest; NOT_LIVE=1 packs
+# an index anchor with no key (--index-not-live, and the selftest).
 release() {
-  local version=$1 dirty_ok=$2 t bin commit epoch want
-  shift 2
+  local version=$1 dirty_ok=$2 not_live=$3 t bin commit epoch want
+  shift 3
   want=$(cargo_version)
   [ "$version" = "$want" ] || die "VERSION $version is not Cargo.toml's $want; fix: set version = \"$version\" in Cargo.toml and commit, or release $want"
   [ $# -gt 0 ] || set -- "$(host_target)"
@@ -222,6 +264,7 @@ release() {
     [ "$dirty_ok" = 1 ] || die "the working tree has changes (git status); fix: commit or stash them, a release is built from a commit"
     ;;
   esac
+  anchor_check manager/index "$not_live"
   epoch=$(git log -1 --format=%ct HEAD)
   mkdir -p "$DIST" "$SCRATCH/stage"
   for t in "$@"; do
@@ -278,10 +321,10 @@ EOF
     done
     cat <<'EOF'
   def install
-    bin.install "bin/henki", "bin/henki-mods"
+    bin.install "bin/henki", "bin/henki-mods", "bin/henki-mods-dev"
     # henki-mods finds the official modules at ../share/henki/official from its own (symlink-resolved) dir.
     share.install "share/henki"
-    doc.install "README.md", "CONTRACTS.md"
+    doc.install "README.md", "CONTRACTS.md", "SECURITY.md", "EXTENDING.md"
   end
 
   def caveats
@@ -337,9 +380,31 @@ selftest() {
   git clone -q "$ROOT" "$t/clone" && mkdir -p "$t/clone/release" && cp "$0" "$t/clone/release/release.sh" && : >"$t/clone/untracked" ||
     die "cannot clone $ROOT into $t; fix: check TMPDIR"
   expect "a working tree with changes" "the working tree has changes" "$t/clone/release/release.sh" "$version" || bad=1
+  # The index anchor: a release refuses one that is not live, a refused (development) key, a missing checkpoint.
+  anchor_fixture() { # DIR SIGNERS_LINE CHECKPOINT
+    mkdir -p "$1" && printf 'https://example.invalid/index\n' >"$1/x.url" && printf '# signers\n%s\n' "$2" >"$1/x.signers" &&
+      cp manager/index/refused.keys "$1/refused.keys" && { [ -z "$3" ] || printf '%s\n' "$3" >"$1/x.checkpoint"; }
+  }
+  x=$(command grep -v '^#' manager/index/refused.keys | head -n 1)
+  anchor_fixture "$t/a-none" "" ""
+  anchor_fixture "$t/a-dev" "henki-index namespaces=\"git\" ssh-ed25519 $x dev" "$(printf '%040d' 0)"
+  anchor_fixture "$t/a-nock" "henki-index namespaces=\"git\" ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOther live" ""
+  anchor_fixture "$t/a-live" "henki-index namespaces=\"git\" ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOther live" "$(printf '%040d' 0)"
+  expect "an anchor with no key" "so the index is not live" anchor_check "$t/a-none" 0 || bad=1
+  expect "an anchor with no key, --index-not-live" pass anchor_check "$t/a-none" 1 || bad=1
+  expect "an anchor with a refused key" "holds a refused key" anchor_check "$t/a-dev" 1 || bad=1
+  expect "an anchor without a checkpoint" "does not hold a full commit" anchor_check "$t/a-nock" 1 || bad=1
+  expect "a live anchor" pass anchor_check "$t/a-live" 0 || bad=1
+  rm "$t/a-live/refused.keys"
+  expect "no refused keys" "refused.keys is missing" anchor_check "$t/a-live" 0 || bad=1
+  # In a clean clone whose anchor has no key, a release stops before it builds anything.
+  git clone -q "$ROOT" "$t/clean" && cp "$0" "$t/clean/release/release.sh" && printf '# no key\n' >"$t/clean/manager/index/deorlovnis.signers" &&
+    git -C "$t/clean" -c user.name=selftest -c user.email=selftest@example.invalid -c commit.gpgsign=false commit -q -a --no-verify -m selftest ||
+    die "cannot make a clean clone of $ROOT in $t; fix: check TMPDIR"
+  expect "a release whose anchor has no key" "so the index is not live" "$t/clean/release/release.sh" "$version" || bad=1
 
   DIST="$t/dist"
-  release "$version" 1 >/dev/null
+  release "$version" 1 1 >/dev/null
   [ "$(cd "$DIST" && ls)" = SHA256SUMS$'\n'"$name.tar.gz" ] || { say "selftest: dist holds $(cd "$DIST" && ls | tr '\n' ' ')"; bad=1; }
   [ "$(awk '{ print $1 }' "$DIST/SHA256SUMS")" = "$(sha_of "$DIST/$name.tar.gz")" ] || { say "selftest: SHA256SUMS does not match"; bad=1; }
 
@@ -359,6 +424,8 @@ selftest() {
           x=$(dirname "$x")
         done
       done
+      for x in /bin/henki-mods-dev /SECURITY.md /EXTENDING.md /share/henki/index /share/henki/mod-profiles; do echo "$name$x"; done
+      git ls-files 'manager/index/*' 'manager/mod-profiles/*.lock' | sed "s,^manager/,$name/share/henki/,"
       git ls-files mods | sed "s,^mods/,$name/share/henki/official/," | while read -r x; do
         while [ "$x" != "$name/share/henki/official" ]; do
           echo "$x"
@@ -397,13 +464,23 @@ selftest() {
   got=$(env -i HOME="$t/home" PATH=/usr/bin:/bin "$x/bin/henki-mods" test --port history std 2>&1) || { say "selftest: test --port history std: $got"; bad=1; }
   got=$(env -i HOME="$t/home" PATH=/usr/bin:/bin "$x/bin/henki-mods" eval --check "$x/share/henki/eval/general" 2>&1) || { say "selftest: eval --check: $got"; bad=1; }
   [ "$(cd "$x/share/henki/eval/general" && ls)" = "$(cd eval/general && ls)" ] || { say "selftest: share/henki/eval/general holds other tasks than eval/general"; bad=1; }
-  # eval finds that suite: it gets as far as the screen (no terminal to ask on, so nothing runs).
-  got=$(env -i HOME="$t/home" PATH=/usr/bin:/bin HENKI_MODS_TTY="$t/no-tty" "$x/bin/henki-mods" eval sessions --suite general 2>&1) && got="(exit 0) $got"
-  case "$got" in *"on general, 12 tasks"*"no terminal to ask on"*) ;; *)
+  # eval finds that suite: it gets as far as the screen (no terminal to ask on, so nothing runs). --unsandboxed, so
+  # this holds where the sandbox has no backend.
+  got=$(env -i HOME="$t/home" PATH=/usr/bin:/bin HENKI_MODS_TTY="$t/no-tty" "$x/bin/henki-mods" eval sessions --suite general --unsandboxed 2>&1) && got="(exit 0) $got"
+  case "$got" in *"suite general: 12 tasks"*"no terminal to ask on"*) ;; *)
     say "selftest: eval sessions --suite general said: $got"
     bad=1
     ;;
   esac
+  # The module profiles, the index anchor and the author's tools are found beside the tarball's henki-mods.
+  got=$(env -i HOME="$t/home" PATH=/usr/bin:/bin "$x/bin/henki-mods" init 2>&1) || got="(exit $?) $got"
+  case "$got" in *"module profiles"*starter*) ;; *) say "selftest: henki-mods init said: $got" && bad=1 ;; esac
+  if ! command grep -qv -e '^#' -e '^[[:space:]]*$' "$x/share/henki/index/deorlovnis.signers"; then
+    got=$(env -i HOME="$t/home" PATH=/usr/bin:/bin "$x/bin/henki-mods" search 2>&1) && got="(exit 0) $got"
+    case "$got" in *"is not live yet"*) ;; *) say "selftest: henki-mods search said: $got" && bad=1 ;; esac
+  fi
+  got=$(cd "$t" && env -i HOME="$t/home" PATH=/usr/bin:/bin "$x/bin/henki-mods" new probe --dir "$t/new" 2>&1 &&
+    env -i HOME="$t/home" PATH=/usr/bin:/bin "$x/bin/henki-mods" verify --dir "$t/new/probe" 2>&1) || { say "selftest: henki-mods new and verify --dir: $got"; bad=1; }
 
   # Unpacked and packed again, it is the same bytes: the packing depends on nothing but the files and the commit.
   pack "$t/x" "$name" "$t/again.tar.gz" "$(git log -1 --format=%ct HEAD)"
@@ -438,13 +515,19 @@ case "${1:-}" in
     shift
     formula "$@"
     ;;
+  --index-not-live)
+    [ $# -ge 2 ] || die "--index-not-live needs VERSION; fix: release/release.sh --index-not-live VERSION [TARGET...]"
+    v=$2
+    shift 2
+    release "$v" 0 1 "$@"
+    ;;
   "" | -*)
-    echo "usage: release/release.sh VERSION [TARGET...] | --formula VERSION TAP [BASE_URL] | --selftest" >&2
+    echo "usage: release/release.sh [--index-not-live] VERSION [TARGET...] | --formula VERSION TAP [BASE_URL] | --selftest" >&2
     exit 2
     ;;
   *)
     v=$1
     shift
-    release "$v" 0 "$@"
+    release "$v" 0 0 "$@"
     ;;
 esac
