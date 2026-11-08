@@ -2,6 +2,39 @@
 
 henki is a small terminal agent in early development. It gives your task to a model and lets the model act through four tools (`shell`, `read`, `write`, `edit`) until it answers. On your machine it is a line REPL that talks to a local model server (plain HTTP, OpenAI-compatible) and asks before a command runs; in an isolated Linux environment it runs headless, one static binary with no install step.
 
+## Quick start
+
+```sh
+v=0.3.0 t=aarch64-apple-darwin          # or x86_64-apple-darwin, aarch64-unknown-linux-musl, x86_64-unknown-linux-musl
+curl -fLO https://github.com/deorlovnis/henki/releases/download/v$v/henki-$v-$t.tar.gz && tar -xzf henki-$v-$t.tar.gz
+export PATH="$PWD/henki-$v-$t/bin:$PATH" # henki, henki-mods and henki-mods-dev
+llama-server -m Qwen3.5-2B-Q8_0.gguf -c 32768 --port 8080 &   # a local model server (Ollama: base_url :11434/v1)
+mkdir -p ~/.config/henki && cp henki-$v-$t/share/henki/config.mac.toml ~/.config/henki/config.toml   # then set model
+henki                                   # the REPL; /exit quits
+henki mods                              # the modules: none is on yet
+henki mods init starter                 # sessions, prompts and project, after a screen and one question
+```
+
+henki starts with no modules on. The standard library (the six ports: model, history, context, exec, policy, frontend) is built in; everything else is a module you add: `henki mods` lists them, `henki mods init` offers sets of the official ones, and `henki mods add NAME` adds one, showing what it installs before it asks. [EXTENDING.md](EXTENDING.md) shows how to write your own; [SECURITY.md](SECURITY.md) says what henki protects and what it does not.
+
+What works today (each row names a test that shows it):
+
+| Feature | Status | Test |
+|---|---|---|
+| the REPL, `henki run` and `--json` | works | `tests/e2e/repl.rs`, `tests/contracts.rs` |
+| approvals, allow rules, protected paths, the tripwire | works | `e2e_allow_rule_runs`, `write_protected_config`, `e2e_tripwire_run_exit2` |
+| the journal, `--resume`, forks (`--resume=ID@N`) | works | `e2e_fork_std` |
+| modules: official, from a path or a git URL, Agent Skills | works | `t_add_path`, `t_git`, `t_skill_add` |
+| updates, rollbacks, packs for a machine with no network, profiles | works | `t_update`, `t_pack`, `t_init` |
+| commands, templates, observers | works | `t_prompts`, `t_observe` |
+| context sources (the `project` module) | works (henki 0.3) | `ctx_sources_in_the_system_prompt`, `t_project` |
+| port swaps: history, policy, context, exec | works | `e2e_port_history_like_std`, `e2e_policy_allow_and_deny`, `e2e_context_shapes_requests`, `e2e_exec_runs_every_call` |
+| the `sandbox` exec binding (bubblewrap or user namespaces on Linux, `sandbox-exec` on macOS) | works | `e2e_exec_official_sandbox`, `t_sandbox` |
+| `henki serve` for a frontend program | works | `serve_send_and_eof` |
+| the signed module index | works; the public index is not published yet, so `henki mods search` says it is not live | `t_index_sync`, `t_index_add` |
+| eval runs and badges | works | `t_eval_live`, `t_stats` |
+| a binding of the model port, a full-screen frontend | planned | |
+
 ## Usage
 
 ```sh
