@@ -85,18 +85,29 @@ fn schema_filtered_order() {
 
 #[test]
 fn system_joins_part3() {
-    assert_eq!(system(None, ""), PART1);
-    assert_eq!(system(Some(""), ""), PART1);
-    assert_eq!(system(Some("Prefer small commits.\n\nKeep answers short."), ""), format!("{PART1}\n\nPrefer small commits.\n\nKeep answers short."));
+    assert_eq!(system(&TOOLS, None, ""), PART1);
+    assert_eq!(system(&TOOLS, Some(""), ""), PART1);
+    assert_eq!(system(&TOOLS, Some("Prefer small commits.\n\nKeep answers short."), ""), format!("{PART1}\n\nPrefer small commits.\n\nKeep answers short."));
+}
+
+/// Without `edit` (an exec binding offers `shell` only) part 1 drops its line on reading before editing, and nothing else.
+#[test]
+fn system_without_edit() {
+    let want: String = PART1.lines().filter(|l| !l.contains("edit")).map(|l| format!("{l}\n")).collect();
+    for tools in [&["shell"][..], &["shell", "read", "write"]] {
+        assert_eq!(system(tools, None, ""), want.trim_end());
+        assert_eq!(system(tools, Some("x"), ""), format!("{}\n\nx", want.trim_end()));
+    }
+    assert_eq!(PART1.len() - system(&["shell"], None, "").len(), "- Read a file before you edit it. edit replaces one exact span that occurs once.\n".len());
 }
 
 #[test]
 fn system_with_exts() {
     let exts = "Extensions are commands on PATH; read the doc in brackets before first use.\n- notes: keep notes per project [~/.config/henki/ext/notes/doc.md]";
-    assert_eq!(system(Some("Prefer small commits."), exts), format!("{PART1}\n\nPrefer small commits.\n\n{exts}"));
-    assert_eq!(system(None, exts), format!("{PART1}\n\n{exts}"));
-    assert_eq!(system(Some(""), exts), format!("{PART1}\n\n{exts}"));
-    assert_eq!(system(None, ""), PART1);
+    assert_eq!(system(&TOOLS, Some("Prefer small commits."), exts), format!("{PART1}\n\nPrefer small commits.\n\n{exts}"));
+    assert_eq!(system(&TOOLS, None, exts), format!("{PART1}\n\n{exts}"));
+    assert_eq!(system(&TOOLS, Some(""), exts), format!("{PART1}\n\n{exts}"));
+    assert_eq!(system(&TOOLS, None, ""), PART1);
 }
 
 #[test]

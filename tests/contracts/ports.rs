@@ -117,8 +117,8 @@ fn contracts_ext2_names_and_observers() {
     }
 }
 
-/// exec/1: the argv henki runs a shell call with (BASH by its absolute path, the first `bash` on the user PATH), and
-/// the start notice, as the section gives them.
+/// exec/1: the argv henki runs a shell call with (BASH by its absolute path, the first `bash` on the user PATH), the
+/// start notice, and the tools offered while a program is bound, as the section gives them.
 #[test]
 fn contracts_exec_argv() {
     let sec = section(&text(), "exec/1");
@@ -147,4 +147,7 @@ fn contracts_exec_argv() {
         .collect();
     assert_eq!(fs::read_to_string(&log).unwrap().lines().collect::<Vec<_>>(), want);
     assert!(d.notices().contains(&notice.replace("NAME ID", &p)), "{notice}\n{}", d.diag());
+    // The tools: `shell` only, as the `session` record says.
+    assert!(flat("exec/1").contains("henki offers the model the `shell` tool only: `read`, `write` and `edit` are off (the `session` record's `tools` shows it"));
+    assert_eq!(d.of("session")[0]["tools"], serde_json::json!(["shell"]));
 }

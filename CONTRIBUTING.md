@@ -20,7 +20,7 @@ cargo test              # the tests alone
 4. `cargo fmt --check` and `cargo clippy --all-targets -- -D warnings`.
 5. `cargo test`.
 6. **mods**: `manager/tests.sh`, the module manager's own suite (hermetic, run under `bash` and `bash --posix`, with a live check of the prompt bytes against the henki just built), then `henki-mods verify --dir` on every official module in `mods/`.
-7. **budgets**: at most 4,366 lines of non-test Rust in `src/` (400 per file; comments, blank lines and `#[cfg(test)]` code do not count), at most 10 crates in the normal dependency tree (no proc-macro crate, no C build dependency), and a release binary of at most 1,065,536 bytes, on Linux also the static musl build (`rustup target add $(uname -m)-unknown-linux-musl`).
+7. **budgets**: at most 4,369 lines of non-test Rust in `src/` (400 per file; comments, blank lines and `#[cfg(test)]` code do not count), at most 10 crates in the normal dependency tree (no proc-macro crate, no C build dependency), and a release binary of at most 1,065,536 bytes, on Linux also the static musl build (`rustup target add $(uname -m)-unknown-linux-musl`).
 8. **release gates**: the tests marked `#[ignore = "release gate"]` (timing and memory limits), built with the release profile.
 
 `release/release.sh --selftest` is not one of them, because it builds the release target and packs a tarball; run it when you change `release/`, `manager/` or `mods/`, the files a tarball ships.

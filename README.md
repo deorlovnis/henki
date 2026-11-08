@@ -52,7 +52,7 @@ An answer is a line you type at the question. What you typed before it appeared 
 
 A module can bring a policy binding, a program that decides every call in place of the above (`henki mods swap policy NAME`; `henki mods swap policy std` goes back). It may allow a call, ask, or deny it (the model is told why); henki shows each allow as `$ CMD  (allowed by policy NAME ID: REASON)`. henki still refuses every write to its own files before the binding is asked, asks you about any call the binding allows that reads or names them (a `read` of `config.toml`, a command with `~/.config/henki/` in it), and asks about every call once the binding fails. With a binding, henki reads no allow rules and refuses `approve = "auto"`; `henki --port policy=std` runs one session without it. See CONTRACTS.md `policy/1`.
 
-A module can also bring an exec binding, a program henki puts in front of every shell call, such as a sandbox (`henki mods swap exec NAME`): each call runs as `PROGRAM BASH --noprofile --norc -c COMMAND`, and henki still times out, kills and sweeps it as its own. Your `!cmd`, module commands, observers and the other bindings do not run through it. `henki --port exec=std` runs one session without it. See CONTRACTS.md `exec/1`.
+A module can also bring an exec binding, a program henki puts in front of every shell call, such as a sandbox (`henki mods swap exec NAME`): each call runs as `PROGRAM BASH --noprofile --norc -c COMMAND`, and henki still times out, kills and sweeps it as its own. While it is bound the model gets the `shell` tool only (`read`, `write` and `edit` would run outside it), so `tools` must hold `shell`. Your `!cmd`, module commands, observers and the other bindings do not run through it. `henki --port exec=std` runs one session without it. See CONTRACTS.md `exec/1`.
 
 ### Allow rules
 
@@ -116,7 +116,7 @@ cargo build --release
 ./check.sh install-hook  # check the commits of every git push
 ```
 
-`check.sh` holds henki to its budgets: at most 4,366 lines of non-test Rust (400 per file), at most 10 crates in the dependency tree, and a release binary of at most 1,065,536 bytes, including the static musl build on Linux when that target is installed. It also refuses a commit not yet pushed that has no `Signed-off-by:` line (`git commit -s`); [CONTRIBUTING.md](CONTRIBUTING.md) says why and lists the style rules.
+`check.sh` holds henki to its budgets: at most 4,369 lines of non-test Rust (400 per file), at most 10 crates in the dependency tree, and a release binary of at most 1,065,536 bytes, including the static musl build on Linux when that target is installed. It also refuses a commit not yet pushed that has no `Signed-off-by:` line (`git commit -s`); [CONTRIBUTING.md](CONTRIBUTING.md) says why and lists the style rules.
 
 `release/release.sh VERSION` builds, from a clean checkout, `dist/henki-VERSION-TARGET.tar.gz` for this host (static musl on Linux) and `dist/SHA256SUMS`. A tarball holds `bin/henki`, `bin/henki-mods`, the official modules in `share/henki/official` (off until added), the conformance suites in `share/henki/conform`, the general eval suite in `share/henki/eval/general`, the config profiles, LICENSE, README.md and CONTRACTS.md; unpack it anywhere and put its `bin/` on your PATH. `release/release.sh --formula VERSION TAP` writes the Homebrew formula from `SHA256SUMS`, and `release/release.sh --selftest` builds, unpacks and runs one tarball.
 

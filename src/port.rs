@@ -145,8 +145,11 @@ pub fn bind(cfg: &mut Config, deadline: Option<Instant>) -> Result<Ports, Outcom
     let bad = |e: String| Outcome::error("config", e);
     for (p, exe, name) in cfg.links.clone() {
         if p == "exec" {
-            // Not started here: every shell call runs as `PROGRAM BASH --noprofile --norc -c CMD` (turn/call.rs).
-            cfg.notices.push(format!("exec: {name} (exec/1) runs every shell call; henki --port exec=std runs a session without it"));
+            // Not started here: every shell call runs as `PROGRAM BASH --noprofile --norc -c CMD` (turn/call.rs). The file
+            // tools would run on the host, outside the program, so only `shell` is offered.
+            let no_shell = || bad(format!("exec: {name} runs shell calls, and tools has no shell; fix: add \"shell\" to tools, or start with --port exec=std"));
+            cfg.tools = cfg.tools.contains(&"shell").then(|| vec!["shell"]).ok_or_else(no_shell)?;
+            cfg.notices.push(format!("exec: {name} (exec/1) runs every shell call (read, write and edit are off); henki --port exec=std runs a session without it"));
             (cfg.exec, _) = (Some(exe), ports.bound.push((p, name)));
             continue;
         }

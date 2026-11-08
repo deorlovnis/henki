@@ -670,14 +670,17 @@ It should pass the environment henki gives through, except `SSH_AUTH_SOCK`, whic
 person opts in (an agent socket lets anything inside sign with the person's keys). It gets no arguments of its own:
 a program that needs settings (a workspace name) reads its own config file.
 
-Not run through it: the person's `!cmd`, module commands, observers and port bindings: they run on the host with the
-person's rights. Files the model writes inside the program's view of the project (AGENTS.md, git hooks, scripts) are
+While a program is bound, henki offers the model the `shell` tool only: `read`, `write` and `edit` are off (the
+`session` record's `tools` shows it, and the system prompt drops its line on reading a file before editing it), so no
+tool runs on the host outside the program. A config whose `tools` lacks `shell` cannot start with exec bound (`error
+config`, with the fix). Not run through it: the person's `!cmd`, module commands, observers and port bindings: they run
+on the host with the person's rights. Files the model writes inside the program's view of the project (AGENTS.md, git hooks, scripts) are
 read or run later by code on the host (git, the person). A sandbox confines the model's calls, not what later reads
 their results.
 
 A `CONFIG_DIR/port/exec` link that names nothing runnable stops the start with its fix, as port/1's link rules say. The
-binding is a notice at start (`exec: NAME ID (exec/1) runs every shell call; henki --port exec=std runs a session
-without it`), the `session` record names it in `ports` (`{"exec":"NAME ID"}`), and `henki --port exec=std` runs a
+binding is a notice at start (`exec: NAME ID (exec/1) runs every shell call (read, write and edit are off); henki
+--port exec=std runs a session without it`), the `session` record names it in `ports` (`{"exec":"NAME ID"}`), and `henki --port exec=std` runs a
 session without it. `henki port` does not take `exec`. `henki-mods test --port exec NAME` runs the checks R01 to R07
 against a program, each as `PROGRAM BASH --noprofile --norc -c COMMAND`: R01 `echo ok` prints `ok` and exits 0; R02
 `exit 7` exits 7; R03 the arguments after COMMAND arrive intact; R04 stdin is at EOF at once; R05 stdout and stderr

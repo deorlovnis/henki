@@ -1636,7 +1636,7 @@ t_exec() {
   run swap exec box --yes
   rc_is 0
   out_has "exec: std -> box 0.1.0 ("
-  out_has "checks: passed (exec/1, 7 checks) · it runs with your rights and runs every shell call"
+  out_has "checks: passed (exec/1, 7 checks) · it runs with your rights and runs every shell call; read, write and edit are off while it is bound"
   out_has "a program that hands commands to a daemon (a box, ssh) takes them out of henki's kill and sweep"
   out_has "bash has bin/sh: henki runs its own bash for shell calls, but the model can call bash's by name"
   check "the link to the store copy's port/exec" [ "$(readlink "$CONF/port/exec")" = "$(readlink "$CONF/ext/box")/port/exec" ]

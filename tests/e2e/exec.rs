@@ -78,9 +78,51 @@ fn e2e_exec_runs_every_call() {
     assert_eq!(logged(&log), [want("echo one; pwd"), want("printf '%s' \"$HENKI_SESSION\"; exit 3")]);
     assert!(content(&d, 0).starts_with(&format!("one\n{}\n[exit 0", fs::canonicalize(&r.cwd).unwrap().display())), "{}", content(&d, 0));
     assert!(content(&d, 1).starts_with(&format!("{}\n[exit 3", d.id())) && d.results()[1]["is_error"] == true, "{}", d.results()[1]);
-    let notice = format!("exec: {w} (exec/1) runs every shell call; henki --port exec=std runs a session without it");
+    let notice = format!("exec: {w} (exec/1) runs every shell call (read, write and edit are off); henki --port exec=std runs a session without it");
     d.check(d.notices().contains(&notice), "no exec notice");
     d.check(d.of("session")[0]["ports"] == json!({"exec": w}), "no session.ports.exec");
+}
+
+/// While a program is bound only `shell` is offered: the request's tools, the `session` record's and the system prompt
+/// say so (part 1 without its line on reading before editing), and a `read` call is an unknown tool that never runs.
+#[test]
+fn e2e_exec_shell_only() {
+    let m = Mock::start(vec![call("read", json!({"path": "notes.txt"})), say("done"), say("ok")]);
+    let mut r = Run::new(&m.url());
+    r.set("tools", "[\"shell\", \"read\", \"edit\"]");
+    fs::write(r.path("notes.txt"), "secret\n").unwrap();
+    let log = toy(&r);
+    let d = r.json("read it");
+    d.finish();
+    assert_eq!(d.code, Some(0), "{}", d.diag());
+    let body: Value = serde_json::from_str(m.log()[0].text()).unwrap();
+    assert_eq!(offered(&body), ["shell"]);
+    assert_eq!(d.of("session")[0]["tools"], json!(["shell"]));
+    let system = m.log()[0].system();
+    assert!(system.starts_with("You are henki") && !system.contains("Read a file") && !system.contains("edit"), "{system}");
+    assert_eq!((content(&d, 0).as_str(), d.results()[0]["is_error"].as_bool()), ("unknown tool read; available: shell", Some(true)), "{}", d.diag());
+    assert!(logged(&log).is_empty());
+    // Unbound, the same config offers its three tools and part 1 is whole.
+    let d = r.cmd(&["--json", "--port", "exec=std", "x"]).go();
+    d.finish();
+    assert_eq!(offered(&serde_json::from_str(m.log()[2].text()).unwrap()), ["shell", "read", "edit"]);
+    assert!(m.log()[2].system().contains("- Read a file before you edit it."));
+}
+
+/// A config whose `tools` has no `shell` cannot start with a program bound; the fix names both ways out.
+#[test]
+fn e2e_exec_needs_shell() {
+    let m = Mock::start(vec![say("never")]);
+    let mut r = Run::new(&m.url());
+    r.set("tools", "[\"read\"]");
+    let w = bind(&r, "exec \"$@\"");
+    let d = r.json("x");
+    d.finish();
+    let e = &d.result()["error"];
+    assert_eq!((d.code, e["kind"].as_str()), (Some(2), Some("config")), "{}", d.diag());
+    let want = format!("exec: {} runs shell calls, and tools has no shell; fix: add \"shell\" to tools, or start with --port exec=std", w.display());
+    assert_eq!(e["message"], want.as_str());
+    assert!(m.log().is_empty());
 }
 
 /// A call past its timeout is killed with the program, and nothing of it is left.
