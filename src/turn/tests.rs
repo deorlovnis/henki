@@ -806,8 +806,19 @@ fn free_read_ext_doc_auto_approval() {
     std::fs::write(&doc, "# tool: does things\n").unwrap();
     std::fs::write(&other, "notes\n").unwrap();
     let mut c = in_app(&d, 9);
-    let ext =
-        Ext { name: "tool".into(), line: "tool: does things".into(), doc: doc.clone(), bin: None, cmds: Vec::new(), shadows: Vec::new(), paths: Vec::new(), targets: Vec::new() };
+    let ext = Ext {
+        name: "tool".into(),
+        line: "tool: does things".into(),
+        dir: d.join("ext/tool"),
+        doc: doc.clone(),
+        bin: None,
+        cmds: Vec::new(),
+        user: Vec::new(),
+        prompt: true,
+        shadows: Vec::new(),
+        paths: Vec::new(),
+        targets: Vec::new(),
+    };
     c.exts = vec![ext];
     let (mut s, _, _) = open(c, Mode::Json, None);
     // Ask mode and outside the root: the doc is approved and started; the wait then ends at the deadline, so nothing is

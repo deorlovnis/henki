@@ -171,5 +171,5 @@ pub fn kernel_log(cfg: &Config) -> PathBuf {
 //   `supervise::spawn`, so the child stays in its own session, in the ledger, killed and swept. `spawn` takes eight
 //   arguments already: bundle bash, cwd, env and the prefix into one struct first.
 // - frontend: `enum Front { Repl, Headless(Option<String>), Serve }`; the frontends stay built in, and `Serve` reads a
-//   command stream and writes the `--json` records. Once a command can hand back a restart, `repl::run` returns the
-//   exit code and the argv to exec.
+//   command stream and writes the `--json` records. `repl::run` returns the exit code and, when a command handed back
+//   a new henki (`handoff`), the argv `main` execs.

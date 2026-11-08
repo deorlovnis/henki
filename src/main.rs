@@ -6,6 +6,7 @@ mod anthropic;
 mod config;
 mod ext;
 mod files;
+mod handoff;
 mod http;
 mod journal;
 mod openai;
@@ -172,9 +173,13 @@ fn run(a: Args, out: Out, tx: Sender<Ev>, rx: Receiver<Ev>, t0: Instant, early: 
     head.iter().for_each(|r| out.record(r));
     let mut s = Session::new(cfg, ports, sid, hist, out, (tx, rx), deadline, reader);
     if repl {
-        let code = repl::run(&mut s);
+        let (code, next) = repl::run(&mut s);
         s.into_out().flush(Instant::now() + Duration::from_secs(5));
-        return code;
+        // A command handed back a new henki (`handoff`): this one is closed, its bindings ended, so it becomes that one.
+        let Some((exe, args)) = next.as_deref().and_then(<[OsString]>::split_first) else { return code };
+        let e = supervise::exec(exe.as_ref(), args, &Env::os().0);
+        term::panic_line(&format!("cannot start {}: {e}", exe.to_string_lossy()));
+        return 2;
     }
     // A finished turn whose stdout reader went away never gave the reader what it waited for.
     let o = s.turn(task);

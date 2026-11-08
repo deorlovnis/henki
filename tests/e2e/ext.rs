@@ -104,7 +104,7 @@ fn e2e_ext_unknown_entry_refused() {
         let d = r.json("hi");
         d.finish();
         let e = config_error(&d);
-        assert!(e.contains(&format!("unknown entry {}; v1 extensions hold doc.md and bin/ only", p.display())), "{e}");
+        assert!(e.contains(&format!("unknown entry {}; ext/2 modules hold doc.md, bin/, cmd/, port/ and eval/", p.display())), "{e}");
         if entry == "tool" { fs::remove_dir(&p) } else { fs::remove_file(&p) }.unwrap();
     }
     assert!(m.log().is_empty());
@@ -245,14 +245,19 @@ fn e2e_ext_bin_dot_file_made_runnable_trips() {
     assert_eq!(m.log().len(), 1, "the call that runs it was never asked for\n{}", d.diag());
 }
 
-/// henki does not check who may write the extension files (a documented limit): an extension whose directories and files
-/// anyone may write still loads and runs. Pinned, so that changing it is a decision and not an accident.
+/// henki checks who may write doc.md (it steers the model as AGENTS.md does), not the other extension files (a
+/// documented limit): an extension whose directories and commands anyone may write still loads and runs. Pinned, so
+/// that changing it is a decision and not an accident.
 #[test]
 fn e2e_ext_writable_by_others_loads() {
     let m = Mock::start(vec![shell("xopen"), say("ok")]);
     let r = Run::new(&m.url());
     let x = ext(&r, None, "open", "an open extension\n", &[("xopen", "open-ran")]);
-    for (p, mode) in [(x.parent().unwrap().to_path_buf(), 0o777), (x.clone(), 0o777), (x.join("bin"), 0o777), (x.join("doc.md"), 0o666), (x.join("bin/xopen"), 0o777)] {
+    fs::set_permissions(x.join("doc.md"), fs::Permissions::from_mode(0o666)).unwrap();
+    let d = r.json("hi");
+    d.finish();
+    assert!(config_error(&d).contains(&format!("{} is group- or world-writable", x.join("doc.md").display())), "{}", d.diag());
+    for (p, mode) in [(x.parent().unwrap().to_path_buf(), 0o777), (x.clone(), 0o777), (x.join("bin"), 0o777), (x.join("doc.md"), 0o644), (x.join("bin/xopen"), 0o777)] {
         fs::set_permissions(&p, fs::Permissions::from_mode(mode)).unwrap();
     }
     let d = r.json("hi");

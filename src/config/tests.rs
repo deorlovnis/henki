@@ -524,6 +524,7 @@ fn config_ignores_xdg_config_home() {
 fn config_unknown_henki_env_notice() {
     let t = T::new();
     let silent = [("HENKI_DEPTH", "1"), ("HENKI_SESSION", "x"), ("HENKI_USER_PATH", "/bin"), ("HENKI_VERSION", "0.1.0"), ("HENKI_CONFIG", "/x"), ("HENKI_BIN", "/y")];
+    let silent = [&silent[..], &[("HENKI_STATE", "/s"), ("HENKI_MODULE", "/m"), ("HENKI_NEXT", "/n")]].concat();
     let c = t.load_env(&format!("{BASE}context_window = 8192\n"), &[&silent[..], &[("HENKI_FOO", "1"), ("HENKI_JOURNAL", "/x")]].concat()).unwrap();
     assert_eq!(c.notices, ["ignoring HENKI_FOO: henki does not read it", "ignoring HENKI_JOURNAL: henki does not read it"]);
     assert!(t.load_env(&format!("{BASE}context_window = 8192\n"), &silent).unwrap().notices.is_empty());
@@ -871,15 +872,16 @@ fn config_ext_symlink_target_protected() {
     let t = T::new();
     let ext = t.cfg_dir().join("ext");
     fs::create_dir_all(&ext).unwrap();
-    // The extension dir is a link to a checkout, and one of its commands a link to a file elsewhere.
+    // The extension dir is a link to a checkout, and one of its commands a relative link to a file elsewhere in it.
     let src = t.dir.join("src");
     add_ext(&src, "halti-checkout", &["halti"]);
-    put(&t.dir.join("tool-real"), "#!/bin/sh\n", 0o755);
-    symlink(t.dir.join("tool-real"), src.join("halti-checkout/bin/tool")).unwrap();
+    fs::create_dir_all(src.join("halti-checkout/.henki")).unwrap();
+    put(&src.join("halti-checkout/.henki/tool-real"), "#!/bin/sh\n", 0o755);
+    symlink("../.henki/tool-real", src.join("halti-checkout/bin/tool")).unwrap();
     symlink(src.join("halti-checkout"), ext.join("halti")).unwrap();
     let c = t.load(BASE).unwrap();
     assert_eq!(c.exts[0].name, "halti");
-    for p in [src.join("halti-checkout"), t.dir.join("tool-real")] {
+    for p in [src.join("halti-checkout"), src.join("halti-checkout/.henki/tool-real")] {
         assert!(c.exts[0].targets.contains(&p) && c.protected.contains(&p), "{p:?} not in {:?}", c.protected);
     }
 }
@@ -1040,12 +1042,13 @@ fn config_trust_paths_symlinked_ext() {
     let t = T::new();
     let ext = t.cfg_dir().join("ext");
     fs::create_dir_all(&ext).unwrap();
-    // The NAME dir is a link to a checkout, and its one command a link to a file elsewhere.
-    let (src, tool) = (t.dir.join("src/checkout"), t.dir.join("tool-real"));
+    // The NAME dir is a link to a checkout, and its one command a relative link to a file elsewhere in it.
+    let (src, tool) = (t.dir.join("src/checkout"), t.dir.join("src/checkout/.henki/tool-real"));
     add_ext(&t.dir.join("src"), "checkout", &[]);
     fs::create_dir_all(src.join("bin")).unwrap();
+    fs::create_dir_all(src.join(".henki")).unwrap();
     put(&tool, "#!/bin/sh\n", 0o755);
-    symlink(&tool, src.join("bin/tool")).unwrap();
+    symlink("../.henki/tool-real", src.join("bin/tool")).unwrap();
     symlink(&src, ext.join("halti")).unwrap();
     let c = t.load(BASE).unwrap();
     // The tripwire stamps the names discovery used, through the links; write and edit refuse what the links reach.

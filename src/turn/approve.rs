@@ -53,16 +53,28 @@ impl Session {
 
     /// The answer to `prompt`, trimmed and in lower case; INT and QUIT give "". A paste is never an answer: it gives "", a
     /// no, with a note, so no call ever runs on pasted text and the turn goes on as after any other no. EOF (Ctrl-D) ends
-    /// the turn, and the REPL then quits. After Ctrl-C, which leaves the cursor after the question, what follows starts
-    /// on its own row.
+    /// the turn, and the REPL then quits.
     fn typed(&mut self, prompt: &str) -> Result<String, Outcome> {
+        let a = self.reply(prompt)?;
+        if self.eof { Err(Outcome::Interrupted) } else { Ok(a.unwrap_or_default()) }
+    }
+
+    /// The typed answer to `prompt`, trimmed and in lower case. None, a no, for a paste (with a note), INT, QUIT and
+    /// EOF (the REPL then quits at its next prompt). After Ctrl-C, which leaves the cursor after the question, what
+    /// follows starts on its own row. Err: TERM, HUP or a closed stdout.
+    pub fn reply(&mut self, prompt: &str) -> Result<Option<String>, Stop> {
         match self.line(prompt) {
-            Ok(Some((a, true))) => Ok(a.trim().to_ascii_lowercase()),
-            Ok(Some(_)) => Ok(String::new()).inspect(|_| self.out.note("a paste is not an answer; taken as no")),
-            Ok(None) => Err(Outcome::Interrupted),
-            Err(Stop::Signal(libc::SIGINT | libc::SIGQUIT)) => Ok(String::new()).inspect(|_| self.out.line("")),
-            Err(s) => Err(s.into()),
+            Ok(Some((a, true))) => Ok(Some(a.trim().to_ascii_lowercase())),
+            Ok(Some(_)) => Ok(None).inspect(|_| self.out.note("a paste is not an answer; taken as no")),
+            Ok(None) => Ok(None),
+            Err(Stop::Signal(libc::SIGINT | libc::SIGQUIT)) => Ok(None).inspect(|_| self.out.line("")),
+            Err(s) => Err(s),
         }
+    }
+
+    /// `reply` is y or yes.
+    pub fn yes(&mut self, prompt: &str) -> Result<bool, Stop> {
+        Ok(matches!(self.reply(prompt)?.as_deref(), Some("y" | "yes")))
     }
 
     /// Journals the verdict; true unless it is `no`.

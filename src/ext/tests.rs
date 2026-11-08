@@ -1,11 +1,12 @@
 #![allow(clippy::disallowed_methods, clippy::print_stdout, clippy::print_stderr, clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::string_slice)]
 use super::*;
+use crate::sys;
 use std::os::unix::fs::{PermissionsExt, symlink};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::{sync::mpsc, time::Duration};
 
 const DOC_FIX: &str = "fix: write doc.md with a summary of the extension on line 1";
-const LINE_RULE: &str = "line 1 must be a summary of 1 to 160 bytes with no invisible characters";
+const LINE_RULE: &str = "line 1 must be a summary of 1 to 160 bytes";
 
 /// A fresh directory under the temp dir (its realpath), removed when dropped.
 struct T(PathBuf);
@@ -128,7 +129,7 @@ fn ext_entry_not_dir_fails() {
 #[test]
 fn ext_doc_line_cleaned() {
     let t = T::new();
-    t.ext("e/a", "## #  Title: does x  \r\nbody\n");
+    t.ext("e/a", "## #  Title: does x  \nbody\n");
     t.ext("e/b", "plain line");
     t.ext("e/c", &format!("# {}\n", "x".repeat(160)));
     t.ext("e/d", "#\tkept tab\n");
@@ -140,21 +141,40 @@ fn ext_doc_line_cleaned() {
 #[test]
 fn ext_doc_line_rules() {
     let t = T::new();
-    for doc in ["#  \nbody", "", &format!("# {}", "x".repeat(161)), "a\u{200b}b", "red \x1b[31m", "a\rb"] {
+    for doc in ["#  \nbody", "", &format!("# {}", "x".repeat(161))] {
         let d = t.ext("e/a", doc);
         assert_eq!(err(&[t.p("e")]), format!("ext {}/doc.md: {LINE_RULE}; {DOC_FIX}", d.display()), "{doc:?}");
     }
     let d = t.p("e/a");
-    t.file("e/a/doc.md", b"\xff\xfe summary\n");
-    assert_eq!(err(&[t.p("e")]), format!("ext {}/doc.md: {LINE_RULE}; {DOC_FIX}", d.display()));
+    let missing = format!("ext {0}/doc.md: No such file or directory (os error 2); fix: make {0}/doc.md a readable regular file", d.display());
     fs::remove_file(d.join("doc.md")).unwrap();
-    let missing = format!("ext {0}: {0}/doc.md: No such file or directory (os error 2); {DOC_FIX}", d.display());
     assert_eq!(err(&[t.p("e")]), missing);
-    symlink(t.p("gone"), d.join("doc.md")).unwrap();
+    symlink("gone", d.join("doc.md")).unwrap();
     assert_eq!(err(&[t.p("e")]), missing, "a broken symlink");
     fs::remove_file(d.join("doc.md")).unwrap();
     t.dir("e/a/doc.md");
-    assert_eq!(err(&[t.p("e")]), format!("ext {0}: not a regular file: {0}/doc.md (directory); {DOC_FIX}", d.display()));
+    assert_eq!(err(&[t.p("e")]), format!("ext not a regular file: {0}/doc.md (directory); fix: make {0}/doc.md a readable regular file", d.display()));
+}
+
+/// The whole doc.md is held to AGENTS.md's rules: at most 16 KiB of UTF-8, no character a terminal does not show on
+/// any line, and no other user may change it.
+#[test]
+fn ext_doc_whole_rules() {
+    let t = T::new();
+    let doc = t.p("e/a/doc.md");
+    for (text, line, u) in [("a\u{200b}b", 1, 0x200B), ("red \x1b[31m", 1, 0x1B), ("a\rb", 1, 0xD), ("summary\n\nbody \u{202e}", 3, 0x202E)] {
+        t.ext("e/a", text);
+        let want = format!("ext {}:{line}: holds U+{u:04X}, which a terminal does not show; fix: remove it", doc.display());
+        assert_eq!(err(&[t.p("e")]), want, "{text:?}");
+    }
+    t.file("e/a/doc.md", b"\xff\xfe summary\n");
+    assert_eq!(err(&[t.p("e")]), format!("ext {}: not UTF-8; fix: save it as UTF-8", doc.display()));
+    t.ext("e/a", &format!("a: summary\n{}", "x".repeat(16 << 10)));
+    assert_eq!(err(&[t.p("e")]), format!("ext {}: over 16,384 bytes; fix: shorten it", doc.display()));
+    t.ext("e/a", &format!("a: summary\n{}", "x".repeat((16 << 10) - 11)));
+    assert_eq!(ok(&[t.p("e")]).exts[0].line, "a: summary", "exactly 16 KiB");
+    fs::set_permissions(&doc, fs::Permissions::from_mode(0o664)).unwrap();
+    assert_eq!(err(&[t.p("e")]), format!("ext {0} is group- or world-writable; fix: chmod go-w {0}", doc.display()));
 }
 
 #[test]
@@ -200,9 +220,9 @@ fn ext_ignored_entries() {
 fn ext_unknown_entry_fails() {
     let t = T::new();
     let d = t.ext("e/a", "# a");
-    for n in ["notes.txt", "lib", "tool", "gate", "tools.json", "transport"] {
+    for n in ["notes.txt", "lib", "tool", "gate", "tools.json", "transport", "on", "ctx", "cmds", "binary", "evals"] {
         let p = if n.contains('.') { t.file(&format!("e/a/{n}"), "x") } else { t.dir(&format!("e/a/{n}")) };
-        let want = format!("ext {}: unknown entry {}; v1 extensions hold doc.md and bin/ only; fix: move it out of the extension", d.display(), p.display());
+        let want = format!("ext {}: unknown entry {}; ext/2 modules hold doc.md, bin/, cmd/, port/ and eval/; fix: move it out of the extension", d.display(), p.display());
         assert_eq!(err(&[t.p("e")]), want);
         let _ = fs::remove_file(&p).or_else(|_| fs::remove_dir(&p));
     }
@@ -328,16 +348,91 @@ fn ext_symlink_targets() {
     t.exe("real/a/bin/x");
     t.dir("e");
     symlink(t.p("real/a"), t.p("e/a")).unwrap();
-    t.dir("e/b");
-    symlink(t.file("real/b-doc.md", "# b"), t.p("e/b/doc.md")).unwrap();
     t.dir("e/b/bin");
-    symlink(t.exe("real/y"), t.p("e/b/bin/y")).unwrap();
+    t.file("e/b/.henki/doc.md", "# b");
+    symlink(".henki/doc.md", t.p("e/b/doc.md")).unwrap();
+    t.exe("e/b/.henki/y");
+    symlink("../.henki/./y", t.p("e/b/bin/y")).unwrap();
     let f = ok(&[t.p("e")]);
     let (a, b) = (&f.exts[0], &f.exts[1]);
     assert_eq!(a.paths, [t.p("e/a"), t.p("e/a/doc.md"), t.p("e/a/bin"), t.p("e/a/bin/x")]);
     assert_eq!(a.targets, [t.p("real/a")]);
     assert_eq!((b.line.as_str(), &b.doc), ("b", &t.p("e/b/doc.md")));
-    assert_eq!(b.targets, [t.p("real/b-doc.md"), t.p("real/y")]);
+    assert_eq!(b.targets, [t.p("e/b/.henki/doc.md"), t.p("e/b/.henki/y")]);
+}
+
+/// Inside a module a link must be relative and stay in it: an absolute one, or one that leaves through `..` or through
+/// another link, names a file the manager's copy does not pin.
+#[test]
+fn ext_link_rule() {
+    let t = T::new();
+    t.ext("e/a", "# a");
+    t.exe("e/a/.henki/tool");
+    let outside = t.exe("elsewhere/tool");
+    t.dir("e/a/bin");
+    let link = t.p("e/a/bin/tool");
+    let want = format!("ext {}: a link that leaves the module; fix: copy the file in", link.display());
+    symlink("../../../elsewhere", t.p("e/a/.henki/out")).unwrap();
+    for target in [outside.to_str().unwrap(), t.p("e/a/.henki/tool").to_str().unwrap(), "../../../elsewhere/tool", "../.henki/out/tool"] {
+        symlink(target, &link).unwrap();
+        assert_eq!(err(&[t.p("e")]), want, "{target}");
+        fs::remove_file(&link).unwrap();
+    }
+    symlink("../.henki/tool", &link).unwrap();
+    assert_eq!(ok(&[t.p("e")]).exts[0].cmds, ["tool"]);
+    // The module dir itself may be a link (the manager links the store copy); doc.md may not leave it.
+    fs::remove_file(t.p("e/a/doc.md")).unwrap();
+    symlink(t.file("doc.md", "# a"), t.p("e/a/doc.md")).unwrap();
+    assert_eq!(err(&[t.p("e")]), format!("ext {}: a link that leaves the module; fix: copy the file in", t.p("e/a/doc.md").display()));
+}
+
+/// cmd/: runnable entries are the user's commands, NAME.md files their data (held to doc.md's rules), names henki keeps
+/// for itself are refused, and a module with cmd/ or port/ but no bin/ is not in the prompt.
+#[test]
+fn ext_cmd_rules() {
+    let t = T::new();
+    t.ext("e/a", "# a: commands");
+    let (r, md) = (t.exe("e/a/cmd/review"), t.file("e/a/cmd/review.md", "Review this.\n"));
+    let dot = t.file("e/a/cmd/.DS_Store", "x");
+    let f = ok(&[t.p("e")]);
+    let a = &f.exts[0];
+    assert_eq!((&a.user, a.cmds.is_empty(), a.prompt, &a.dir), (&vec!["review".to_string()], true, false, &t.p("e/a")));
+    assert_eq!(a.paths, [t.p("e/a"), t.p("e/a/doc.md"), t.p("e/a/cmd"), dot, r.clone(), md.clone()]);
+    assert_eq!(prompt(&f.exts, &t.0), "", "a module of commands costs no prompt bytes");
+    t.file("e/a/cmd/review.md", "Review \u{202e}this.\n");
+    assert_eq!(err(&[t.p("e")]), format!("ext {}:1: holds U+202E, which a terminal does not show; fix: remove it", md.display()));
+    t.file("e/a/cmd/review.md", "x".repeat((16 << 10) + 1));
+    assert_eq!(err(&[t.p("e")]), format!("ext {}: over 16,384 bytes; fix: shorten it", md.display()));
+    fs::remove_file(&md).unwrap();
+    let plain = t.file("e/a/cmd/notes.txt", "x");
+    let refused =
+        |p: &Path| format!("ext {}: a command is a file you can run, named with A-Z, a-z, 0-9, ., _ and -; fix: rename it or chmod u+x it, or move it out of cmd/", p.display());
+    assert_eq!(err(&[t.p("e")]), refused(&plain));
+    fs::remove_file(&plain).unwrap();
+    for n in ["exit", "help", "mods", "allow"] {
+        let p = t.exe(&format!("e/a/cmd/{n}"));
+        assert_eq!(err(&[t.p("e")]), format!("ext {}: a name henki keeps for its own command; fix: rename it", p.display()));
+        fs::remove_file(&p).unwrap();
+    }
+    t.exe("e/a/bin/tool");
+    assert!(ok(&[t.p("e")]).exts[0].prompt, "with bin/ the model needs the doc");
+    // A command name in two modules stops the start.
+    t.ext("e/b", "# b");
+    t.exe("e/b/cmd/review");
+    assert_eq!(err(&[t.p("e")]), "ext b: cmd/review is also in ext a; fix: turn one of them off");
+}
+
+/// port/: programs named for a port, stamped; a module of bindings only is not in the prompt.
+#[test]
+fn ext_port_rules() {
+    let t = T::new();
+    t.ext("e/a", "# a: a store");
+    let h = t.exe("e/a/port/history");
+    t.dir("e/a/eval/x");
+    let f = ok(&[t.p("e")]);
+    assert_eq!((f.exts[0].prompt, &f.exts[0].paths[2..]), (false, &[t.p("e/a/port"), h][..]));
+    let p = t.exe("e/a/port/journal");
+    assert_eq!(err(&[t.p("e")]), format!("ext {}: not a port; ports are model, history, context, exec, policy, frontend; fix: rename it, or move it out of port/", p.display()));
 }
 
 #[test]
@@ -368,10 +463,11 @@ fn ext_doc_fifo_or_device_no_hang() {
         std::thread::spawn(move || tx.send(find(&paths, &[], "").err()).unwrap());
         rx.recv_timeout(Duration::from_secs(30)).expect("discovery blocked")
     };
-    assert_eq!(in_time(vec![t.p("e")]).unwrap(), format!("ext {0}: not a regular file: {0}/doc.md (fifo); {DOC_FIX}", d.display()));
+    let fix = format!("fix: make {}/doc.md a readable regular file", d.display());
+    assert_eq!(in_time(vec![t.p("e")]).unwrap(), format!("ext not a regular file: {}/doc.md (fifo); {fix}", d.display()));
     fs::remove_file(d.join("doc.md")).unwrap();
     symlink("/dev/zero", d.join("doc.md")).unwrap();
-    assert_eq!(in_time(vec![t.p("e")]).unwrap(), format!("ext {0}: not a regular file: {0}/doc.md (char device); {DOC_FIX}", d.display()));
+    assert_eq!(in_time(vec![t.p("e")]).unwrap(), format!("ext not a regular file: {}/doc.md (char device); {fix}", d.display()));
 }
 
 #[test]

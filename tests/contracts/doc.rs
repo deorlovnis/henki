@@ -108,6 +108,8 @@ fn contracts_index() {
         ("json/1", "henki"),
         ("wire/1", "henki"),
         ("ext/1", "henki"),
+        ("ext/2", "henki"),
+        ("handoff/1", "henki"),
         ("port/1", "henki"),
         ("history/1", "henki"),
         ("conform/1", "henki"),

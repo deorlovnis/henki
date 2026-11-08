@@ -31,7 +31,9 @@ A program reads the contracts this henki ships from the rows of this table: each
 | `journal/1` | henki | the session journal: files, records, identity, resume, repair |
 | `json/1` | henki | the record stream of `henki run --json` |
 | `wire/1` | henki | what henki sends to and accepts from a model server, in both dialects |
-| `ext/1` | henki | the extension directory layout henki loads |
+| `ext/1` | henki | the extension directory layout henki loaded first; valid under ext/2 |
+| `ext/2` | henki | the module directory layout henki loads: doc, tools, user commands, bindings |
+| `handoff/1` | henki | a user command's environment, and what it hands back to henki in `HENKI_NEXT` |
 | `port/1` | henki | how henki talks to a port binding: a program it starts, JSON lines both ways |
 | `history/1` | henki | the history port's methods over port/1: where sessions are kept |
 | `conform/1` | henki | the conformance suite files a binding is held to |
@@ -318,8 +320,7 @@ default config). henki runs nothing while it loads them; a violation of any rule
   `[A-Za-z0-9._-]+`. A dot file that cannot run is ignored (but watched); any other entry is refused. bin/'s path holds
   no `:` and is UTF-8. A command name in two extensions is refused.
 - Names starting with `README`, `LICENSE`, `CHANGELOG` or `.` are ignored (so `.henki/module.toml` and `.henki/card.md`
-  may be there), and so is `port/`, which holds port bindings (port/1); henki runs one only through a link in
-  `CONFIG_DIR/port/`. Any other entry is refused (`unknown entry PATH; v1 extensions hold doc.md and bin/ only`).
+  may be there). Any other entry is refused (`unknown entry PATH; ...`), unless ext/2 names it.
 - A command with the name of an executable on the user's PATH loads only when the config's `shadow` list holds
   `NAME/COMMAND`.
 - The system prompt gets, when any extension is loaded, the line
@@ -331,6 +332,73 @@ default config). henki runs nothing while it loads them; a violation of any rule
   session id), `HENKI_VERSION` and `HENKI_DEPTH` (1 inside a call of a top-level henki).
 - The extension directory, doc.md, bin/ and each bin/ entry are trust files: when one changes during a session, the
   turn ends `error changed`.
+
+## ext/2
+
+ext/2 is ext/1 with user commands and bindings, and stricter text and link rules. henki loads every module under it;
+an ext/1 module stays valid unless it holds a link out of itself or a doc.md that fails the text rules below.
+
+```
+NAME/doc.md              required: line 1 the summary; the whole file a text (below)
+NAME/bin/CMD             tools: commands first on the calls' PATH (ext/1)
+NAME/cmd/CMD             a user command /CMD (handoff/1); CMD as for bin/, not exit, help, mods or allow
+NAME/cmd/CMD.md          data for a command: a text (below)
+NAME/port/PORT           a binding program (port/1); run only through a link in CONFIG_DIR/port/
+NAME/eval/...            the manager's; henki ignores it
+NAME/README* LICENSE* CHANGELOG* .*   ignored
+```
+
+- **Texts.** doc.md and each `cmd/*.md` are at most 16 KiB of UTF-8 without a code point henki escapes (on any line),
+  regular files (or links to them) owned by the user or root and not group- or world-writable, as AGENTS.md is. A
+  failure names the file and the line (`PATH:LINE: holds U+202E, which a terminal does not show; fix: remove it`).
+- **Entries.** `bin/`, `cmd/` and `port/` hold files their owner can run, named `[A-Za-z0-9._-]+`; in `port/` the name
+  is a port (`model`, `history`, `context`, `exec`, `policy`, `frontend`). A dot file that cannot run is ignored but
+  watched; in `cmd/` a `NAME.md` that cannot run is data. Anything else there is refused. `ctx/`, `on/` and any other
+  name are refused (`unknown entry PATH; ext/2 modules hold doc.md, bin/, cmd/, port/ and eval/`).
+- **Links.** Inside a module every link must be relative and lead to a path inside it (`a link that leaves the module;
+  fix: copy the file in`); the module directory itself may be a link (the manager's store copy).
+- **Names across modules.** A `bin/` or a `cmd/` name in two modules stops the start.
+- **Trust.** The module directory, doc.md, `bin/`, `cmd/`, `port/` and every entry of them are trust files; the
+  realpaths of the links among them are protected.
+- **The prompt.** A module enters the system prompt (ext/1's line) only with `bin/`, or with neither `cmd/` nor
+  `port/`: a module of commands or bindings costs no prompt bytes. The banner says `ext NAME: CMDS` (its `bin/` names),
+  `doc only` or `no tools`; `/help` lists every user command as `/CMD  (NAME)`.
+
+## handoff/1
+
+A typed line `/CMD REST` runs the module command `cmd/CMD`, with REST (trimmed) as one argument and none when empty;
+`/mods ARGS` and `/allow ARGS` (as `/mods allow ARGS`) run the shipped manager, `henki-mods` next to henki's realpath
+or else on the user's PATH (never a module's), with ARGS split at spaces. A pasted line is never a command.
+
+- **The run.** On the terminal, in henki's process group, in the session's working directory, as `!CMD` runs: INT and
+  QUIT reach it (henki waits on), TERM, HUP and a closed stdout kill it and end henki. The model is not told.
+- **The environment.** The tool environment (ext/1: every module's `bin/` first on `PATH`), plus `HENKI_CONFIG` (the
+  config dir), `HENKI_STATE` (the state dir), `HENKI_BIN` (henki's path), `HENKI_MODULE` (the module dir; not for the
+  manager) and `HENKI_NEXT`. A std session's journal is `$HENKI_STATE/sessions/*/$HENKI_SESSION.jsonl` (journal/1);
+  none is found when history is bound to another store. Tools, bindings and observers never get `HENKI_NEXT`.
+- **`HENKI_NEXT`** names an empty file henki made (0600, `STATE/spill/.next-PID-RAND`). Afterwards henki reads it only
+  if it is still that regular file, at most 64 KiB of UTF-8; anything else is a notice and ignored. It is removed
+  then. Line 1 is `VERB [ARG]`; the rest of the file is the text of `send`.
+
+| Line 1 | henki |
+|---|---|
+| (empty, or no file) | nothing |
+| `send`, then TEXT | shows `[from /CMD]` and the whole TEXT, asks `send? [Y/n]` (Enter or y sends it as the next message); refused when TEXT holds a code point henki escapes |
+| `resume ID` | ID as history/1's id rule (`ID@N` is refused); asks `switch to session ID? [y/N]`, then closes the session as `/exit` does and starts `henki ... --resume=ID` in its place |
+| `new` | closes the session and starts `henki ...` without `--resume`, no question |
+| `restart` | as `new` with `--resume=THIS`, or as `new` while the session has no message |
+| anything else | a notice naming the verb |
+
+- **Trust files.** A trust file the command changed is listed (`changed while /CMD ran: PATH`). Then no text is sent,
+  the REPL refuses messages until a restart, and `new`, `resume` and `restart` ask `restart on these changes? [y/N]`
+  (`switch to session ID on these changes? [y/N]`; n refuses messages). After a change from before the command, no
+  verb starts a new henki: `restart henki yourself`.
+- **The new henki** is `henki` (its realpath) with this henki's arguments without `--resume` and `--resume=ID`, so
+  `--config`, `--approve`, `--model`, `--nested` and every `--port` stay, then `--resume=ID`; it gets the environment
+  henki started with. `henki run` has no hand-off.
+- **The manager** writes `restart` into `HENKI_NEXT` after every change (add, on, off, rm, swap, allow rm), and without
+  `HENKI_NEXT` prints `restart henki (or /exit and start again) to load the change`. `HENKI_CONFIG`, when set, is the
+  config dir it changes.
 
 ## module/1
 
@@ -354,9 +422,9 @@ ports = ["history"]              # optional; exactly the programs in port/ (port
 ```
 
 A module without a manifest is unmanaged (allowed for path and URL installs, and listed as such). `port/PORT` is a
-program its owner can run (a file, or a link inside the module), PORT one that henki binds (`history`). The directories
-`cmd/`, `ctx/` and `on/` are reserved for later layouts: henki-mods refuses them unless `requires` names a henki that
-has them (`needs henki >= X`).
+program its owner can run (a file, or a link inside the module), PORT one that henki binds (`history`). `cmd/` and
+`eval/` are ext/2's; `.henki/template` may hold a program that `cmd/` links run. The directories `ctx/` and `on/` are
+reserved for later layouts: henki-mods refuses them.
 
 A git source (`URL[@REF][#SUBDIR]`) is cloned only over `https`, `http`, `ssh`, `git` or `file` URLs, or scp's
 `USER@HOST:PATH`; a remote helper (`ext::`, `fd::`, any other `SCHEME::` or unknown `SCHEME://`) is refused before

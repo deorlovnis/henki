@@ -322,8 +322,9 @@ fn pty_always_refused_shapes() {
     assert!(!r.allow().exists());
 }
 
-/// `/allow` and `/allow rm N` run the manager on the terminal; the removal is a change to a trust file, so the
-/// session stops until a restart reads the rules again.
+/// `/allow` and `/allow rm N` run the manager on the terminal; the removal is a change to a trust file, which the manager
+/// hands back as `restart`: henki names the file and asks, and n leaves the session stopped until a restart reads the
+/// rules again.
 #[test]
 fn pty_allow_list_and_rm() {
     let m = Mock::start(vec![say("never")]);
@@ -336,7 +337,8 @@ fn pty_allow_list_and_rm() {
     p.prompt(W);
     p.line("/allow rm 1");
     p.expect(&format!("removed rule 1: {root}  echo one\r\n"), W);
-    p.expect(&format!("henki: {} changed by /allow; restart henki to apply it (henki --resume continues this session)\r\n", r.allow().display()), W);
+    p.expect("henki: changed while /allow ran: ~/.config/henki/allow\r\nrestart on these changes? [y/N] ", W);
+    p.line("n");
     p.prompt(W);
     p.line("/allow");
     p.expect(&format!("{}\r\n1  {root}  echo two\r\n", r.allow().display()), W);
@@ -349,8 +351,27 @@ fn pty_allow_list_and_rm() {
     assert!(m.log().is_empty(), "commands never reach the model");
 }
 
+/// y to the restart question: henki closes the session and starts again with its arguments, the rules read anew.
+#[test]
+fn pty_allow_rm_restart() {
+    let m = Mock::start(vec![say("after the restart")]);
+    let r = managed(asking(&m));
+    let root = r.root();
+    r.write_allow(&format!("{root}\techo one\n{root}\techo two\n"));
+    let p = start(&r, &["--model", "mock-model"]);
+    p.line("/allow rm 1");
+    p.expect("restart on these changes? [y/N] ", W);
+    p.line("y");
+    p.expect("allow:   1  echo two\r\n", W);
+    p.prompt(W);
+    message(&p, "hello", "after the restart");
+    let d = exit(p);
+    assert_eq!(r.journals().len(), 1, "the first session had no message: it was discarded\n{}", d.diag());
+    assert_eq!(m.log().len(), 1);
+}
+
 /// The allow file changed outside henki since it was loaded, then `/allow rm` removed a rule: the change from before
-/// is named as such, never blamed on the command, and the session stops.
+/// is named as such, never blamed on the command, and no one-key restart is offered.
 #[test]
 fn pty_allow_rm_after_outside_change_trips() {
     let m = Mock::start(vec![say("never")]);
@@ -360,7 +381,8 @@ fn pty_allow_rm_after_outside_change_trips() {
     let p = start(&r, &[]);
     fs::write(r.allow(), format!("{text}*\techo two\n")).unwrap();
     p.line("/allow rm 1");
-    p.expect(&format!("removed rule 1: {}  echo one\r\nhenki: trust file changed: {}\r\n", r.root(), r.allow().display()), W);
+    p.expect(&format!("henki: trust file changed: {}\r\nremoved rule 1: {}  echo one\r\n", r.allow().display(), r.root()), W);
+    p.expect("henki: a trust file changed before; restart henki yourself (henki --resume continues this session)\r\n", W);
     p.prompt(W);
     assert_eq!(fs::read_to_string(r.allow()).unwrap(), "*\techo two\n");
     p.line("hello");
@@ -368,7 +390,7 @@ fn pty_allow_rm_after_outside_change_trips() {
     p.prompt(W);
     let d = exit(p);
     assert!(m.log().is_empty());
-    assert!(!d.out().contains("changed by /allow"), "{}", d.out());
+    assert!(!d.out().contains("changed while /allow") && !d.out().contains("[y/N]"), "{}", d.out());
 }
 
 /// `/allow` and `/mods` with arguments the manager refuses: its usage on the terminal, nothing removed, no trip.

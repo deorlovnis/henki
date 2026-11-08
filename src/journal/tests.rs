@@ -372,7 +372,10 @@ fn journal_session_record_fields() {
     let ext = |name: &str| crate::ext::Ext {
         name: name.into(),
         line: "a CLI".into(),
+        dir: PathBuf::from(format!("/e/{name}")),
         doc: PathBuf::from(format!("/e/{name}/doc.md")),
+        user: vec![],
+        prompt: true,
         bin: None,
         cmds: vec![],
         shadows: vec![],

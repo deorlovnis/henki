@@ -229,10 +229,18 @@ impl Session {
         Ok(done.and_then(|ev| if let Ev::BangDone { code, .. } = ev { Some(code) } else { None }))
     }
 
-    /// A typed command's environment (`/mods`): the tool child's, plus HENKI_CONFIG (the config dir) and HENKI_BIN.
-    pub fn command_env(&self) -> Vec<(OsString, OsString)> {
-        let bin = std::env::current_exe().unwrap_or_default();
-        self.env.iter().cloned().chain([("HENKI_CONFIG".into(), self.cfg.dir.clone().into()), ("HENKI_BIN".into(), bin.into())]).collect()
+    /// A typed command's environment (`/NAME`, `/mods`): the tool child's (every module's bin/ first on PATH, and no
+    /// name in two of them), plus HENKI_CONFIG (the config dir), HENKI_STATE, HENKI_NEXT, HENKI_BIN and HENKI_MODULE
+    /// (the module dir; none for `/mods`).
+    pub fn command_env(&self, module: Option<&Path>, next: &Path) -> Vec<(OsString, OsString)> {
+        let (bin, module) = (std::env::current_exe().unwrap_or_default(), module.map(|m| ("HENKI_MODULE", m.to_path_buf())));
+        let named = [("HENKI_CONFIG", self.cfg.dir.clone()), ("HENKI_STATE", self.cfg.state.clone()), ("HENKI_NEXT", next.into()), ("HENKI_BIN", bin)];
+        self.env.iter().cloned().chain(named.into_iter().chain(module).map(|(k, v)| (k.into(), v.into()))).collect()
+    }
+
+    /// The session to resume in a new henki: none before the first message (the session is discarded at close).
+    pub fn resumable(&self) -> Option<String> {
+        self.hist.iter().any(|r| r["t"] == "user").then(|| self.sid.clone())
     }
 
     /// Every trust file whose stamps differ from the snapshot, in `cfg.trust` order.

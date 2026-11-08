@@ -62,12 +62,12 @@ fn contracts_ext_refuses() {
     type Setup = fn(&Path);
     let cases: Vec<(&str, Setup, &str)> = vec![
         (
-            "a cmd/ directory",
+            "a ctx/ directory",
             |x| {
                 file(&x.join("demo"), "doc.md", "a summary\n", 0o644);
-                fs::create_dir_all(x.join("demo/cmd")).unwrap();
+                fs::create_dir_all(x.join("demo/ctx")).unwrap();
             },
-            "v1 extensions hold doc.md and bin/ only",
+            "ext/2 modules hold doc.md, bin/, cmd/, port/ and eval/",
         ),
         (
             "a stray file",
@@ -80,10 +80,39 @@ fn contracts_ext_refuses() {
         ("an upper-case name", |x| file(&x.join("Demo"), "doc.md", "a summary\n", 0o644), "a name is 1 to 32 of a-z, 0-9, _ and -"),
         ("a 33-byte name", |x| file(&x.join("a".repeat(33)), "doc.md", "a summary\n", 0o644), "a name is 1 to 32 of a-z, 0-9, _ and -"),
         ("a name starting with -", |x| file(&x.join("-demo"), "doc.md", "a summary\n", 0o644), "a name is 1 to 32 of a-z, 0-9, _ and -"),
-        ("no doc.md", |x| file(&x.join("demo"), "README", "", 0o644), "write doc.md with a summary of the extension on line 1"),
+        ("no doc.md", |x| file(&x.join("demo"), "README", "", 0o644), "doc.md: No such file or directory"),
         ("a 161-byte line 1", |x| file(&x.join("demo"), "doc.md", &"y".repeat(161), 0o644), "line 1 must be a summary of 1 to 160 bytes"),
         ("an empty line 1", |x| file(&x.join("demo"), "doc.md", "#\nthe summary is not here\n", 0o644), "line 1 must be a summary of 1 to 160 bytes"),
-        ("an invisible character", |x| file(&x.join("demo"), "doc.md", "a\u{200b}summary\n", 0o644), "with no invisible characters"),
+        ("an invisible character", |x| file(&x.join("demo"), "doc.md", "a\u{200b}summary\n", 0o644), "doc.md:1: holds U+200B, which a terminal does not show"),
+        ("an invisible character below line 1", |x| file(&x.join("demo"), "doc.md", "a summary\n\n\u{202e}\n", 0o644), "doc.md:3: holds U+202E"),
+        ("a doc.md over 16 KiB", |x| file(&x.join("demo"), "doc.md", &format!("a summary\n{}", "y".repeat(16 << 10)), 0o644), "over 16,384 bytes"),
+        (
+            "a link out of the module",
+            |x| {
+                file(x.parent().unwrap(), "elsewhere.md", "a summary\n", 0o644);
+                fs::create_dir_all(x.join("demo")).unwrap();
+                std::os::unix::fs::symlink("../../elsewhere.md", x.join("demo/doc.md")).unwrap();
+            },
+            "a link that leaves the module",
+        ),
+        (
+            "a reserved command name",
+            |x| {
+                file(&x.join("demo"), "doc.md", "a summary\n", 0o644);
+                file(&x.join("demo"), "cmd/mods", "#!/bin/sh\n", 0o755);
+            },
+            "a name henki keeps for its own command",
+        ),
+        (
+            "a user command in two modules",
+            |x| {
+                for n in ["one", "two"] {
+                    file(&x.join(n), "doc.md", "a summary\n", 0o644);
+                    file(&x.join(n), "cmd/go", "#!/bin/sh\n", 0o755);
+                }
+            },
+            "ext two: cmd/go is also in ext one",
+        ),
         (
             "a command that cannot run",
             |x| {

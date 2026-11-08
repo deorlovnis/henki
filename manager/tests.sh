@@ -365,10 +365,10 @@ t_refusals() {
   refused "henki_module = 2 needs henki >= 0.2"
 
   rm -rf "$m" && mkmod "$m"
-  mkdir -p "$m/cmd" && printf '#!/bin/sh\n' >"$m/cmd/go"
+  mkdir -p "$m/on" && printf '#!/bin/sh\n' >"$m/on/turn_end"
   run add "$m" --yes
-  refused "cmd/: a later module layout"
-  rm -rf "$m/cmd" && mkdir "$m/lib" && printf 'x\n' >"$m/lib/x"
+  refused "on/: a later module layout"
+  rm -rf "$m/on" && mkdir "$m/lib" && printf 'x\n' >"$m/lib/x"
   run add "$m" --yes
   refused "lib: unknown entry"
 
@@ -468,7 +468,7 @@ t_refusals() {
   rm -rf "$m" && mkmod "$m"
   printf 'x\n' >"$m/.henki/notes"
   run add "$m" --yes
-  refused ".henki holds module.toml and card.md"
+  refused ".henki holds module.toml, card.md and template"
 
   # Nothing of a refused add stays behind.
   check "no link after refusals" [ ! -e "$CONF/ext" ] || [ -z "$(ls "$CONF/ext")" ]
@@ -726,7 +726,7 @@ want_bytes() { local s="
 t_list_bytes() {
   case_ "list: prompt bytes by the formula of ext::prompt"
   mkmod "$W/alpha"
-  printf '  ## alpha: line one, \tpadded  \r\nbody\n' >"$W/alpha/doc.md"
+  printf '  ## alpha: line one, \tpadded  \nbody\n' >"$W/alpha/doc.md"
   mkmod "$W/beta"
   run list
   rc_is 0
@@ -1121,6 +1121,100 @@ t_live() {
   wait "$STUB_PID" 2>/dev/null
 }
 
+# ext/2: user commands in cmd/ (with their .md data), eval/, the whole-doc text rules, links inside the module, and the
+# prompt rule (a module of commands without bin/ costs no prompt bytes), as henki's ext.rs loads them.
+t_ext2() {
+  case_ "ext/2: cmd/, eval/, texts, links, prompt bytes"
+  local m="$W/kit"
+  mkmod "$m"
+  rm -rf "$m/bin"
+  mkdir -p "$m/cmd" "$m/eval/task-1"
+  printf '#!/bin/sh\nexec "$HENKI_MODULE/.henki/template" "$@"\n' >"$m/cmd/go"
+  printf '#!/bin/sh\necho template\n' >"$m/.henki/template"
+  chmod 755 "$m/cmd/go" "$m/.henki/template"
+  ln -s ../.henki/template "$m/cmd/review"
+  printf 'Review the change.\n' >"$m/cmd/review.md"
+  printf 'x\n' >"$m/cmd/.DS_Store"
+  printf 'a task\n' >"$m/eval/task-1/task.md"
+  run verify --dir "$m"
+  rc_is 0
+  out_has "0 B of prompt"
+  run add "$m" --yes
+  rc_is 0
+  out_has "prompt   +0 B on every request (total on after: 0 B)"
+  run list
+  out_has "on: nothing (0 B of prompt)"
+  # With bin/ the doc is for the model again.
+  mkmod "$W/both"
+  mkdir -p "$W/both/cmd" && cp "$m/cmd/go" "$W/both/cmd/go"
+  run verify --dir "$W/both"
+  out_lacks " 0 B of prompt"
+  for bad in mods exit help allow; do
+    rm -rf "$W/r" && mkmod "$W/r" && mkdir -p "$W/r/cmd" && cp "$m/cmd/go" "$W/r/cmd/$bad"
+    run verify --dir "$W/r"
+    refused "cmd/$bad: a name henki keeps for its own command"
+  done
+  rm -rf "$W/r" && mkmod "$W/r" && mkdir -p "$W/r/cmd" && printf 'x\n' >"$W/r/cmd/notes.txt"
+  run verify --dir "$W/r"
+  refused "cmd/notes.txt: a command is a file you can run"
+  printf 'Review \342\200\256 this.\n' >"$W/r/cmd/notes.md" && rm "$W/r/cmd/notes.txt"
+  run verify --dir "$W/r"
+  refused "cmd/notes.md: holds U+202E, which a terminal does not show"
+  head -c 16385 /dev/zero | tr '\0' x >"$W/r/cmd/notes.md"
+  run verify --dir "$W/r"
+  refused "cmd/notes.md: 16,385 bytes, over 16,384"
+  rm -rf "$W/r" && mkmod "$W/r"
+  printf 'r: a summary\n\nbody \342\200\256 here\n' >"$W/r/doc.md"
+  run verify --dir "$W/r"
+  refused "doc.md: holds U+202E"
+  printf 'r: a summary\r\n' >"$W/r/doc.md"
+  run verify --dir "$W/r"
+  refused "doc.md: holds U+000D"
+  { printf 'r: a summary\n'; head -c 16384 /dev/zero | tr '\0' x; } >"$W/r/doc.md"
+  run verify --dir "$W/r"
+  refused "doc.md: 16,397 bytes, over 16,384"
+  rm -rf "$W/r" && mkmod "$W/r" && mkdir -p "$W/r/cmd"
+  printf '#!/bin/sh\n' >"$W/elsewhere" && chmod 755 "$W/elsewhere"
+  ln -s ../../elsewhere "$W/r/cmd/out"
+  run verify --dir "$W/r"
+  refused "leaves the module"
+}
+
+# After a change the manager writes `restart` to the hand-off file a henki gives it (/mods), and prints the restart
+# line without one; listing writes nothing.
+t_restart() {
+  case_ "restart to HENKI_NEXT"
+  local next="$W/next"
+  mkmod "$W/one"
+  : >"$next"
+  HENKI_NEXT=$next run add "$W/one" --yes
+  rc_is 0
+  out_lacks "restart henki"
+  check "add hands back restart" [ "$(cat "$next")" = restart ]
+  for verb in "off one" "on one" "rm one"; do
+    : >"$next"
+    HENKI_NEXT=$next run $verb
+    rc_is 0
+    check "$verb hands back restart" [ "$(cat "$next")" = restart ]
+  done
+  : >"$next"
+  HENKI_NEXT=$next run list
+  check "list hands back nothing" [ ! -s "$next" ]
+  printf '/src\tmake\n' >"$CONF/allow"
+  HENKI_NEXT=$next run allow rm 1
+  rc_is 0
+  check "allow rm hands back restart" [ "$(cat "$next")" = restart ]
+  run allow
+  check "allow lists, nothing more" [ "$OUT" = "$CONF/allow" ]
+  mkmod "$W/two"
+  ln -s "$W/elsewhere" "$W/link"
+  HENKI_NEXT=$W/link run add "$W/two" --yes
+  out_has "restart henki (or /exit and start again) to load the change"
+  check "a link is not written through" [ ! -e "$W/elsewhere" ]
+  run off two
+  out_has "restart henki (or /exit and start again) to load the change"
+}
+
 # henki's allow file, as henki listed and removed rules before the manager did.
 # FILE holds exactly the bytes of the printf FORMAT (for \t, \r, \033 and \377); WANT is a file of the same.
 bytes_are() { # DESCRIPTION FILE FORMAT
@@ -1345,6 +1439,8 @@ all() {
   t_official
   t_halti
   t_allow
+  t_ext2
+  t_restart
   t_ports
   t_port_toy
 }

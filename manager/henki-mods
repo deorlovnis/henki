@@ -16,7 +16,8 @@
 #
 # Environment: HOME (required), XDG_DATA_HOME, HENKI_SHARE (the dir holding official/NAME, the official modules),
 # HENKI_MODS_TTY (the terminal the question is asked on; default /dev/tty), HENKI_CONFIG (the config dir; henki sets
-# it for /mods), HENKI_BIN (the henki whose `henki port` runs the conformance suites; henki sets it).
+# it for /mods), HENKI_BIN (the henki whose `henki port` runs the conformance suites; henki sets it), HENKI_NEXT (the
+# hand-off file of a henki that runs this as /mods: a change writes `restart` there, and henki asks to restart on it).
 set -u
 export LC_ALL=C
 umask 022
@@ -38,7 +39,7 @@ nl='
 # ext::prompt's header line; henki joins it to the rest of the system prompt with a blank line ("\n\n").
 HEADER='Extensions are commands on PATH; read the doc in brackets before first use.'
 # The named formats this henki ships (CONTRACTS.md); a module's `contracts` must all be here.
-CONTRACTS_KNOWN='journal/1 json/1 wire/1 ext/1 module/1 lock/1 hd1 port/1 history/1 conform/1 bind/1'
+CONTRACTS_KNOWN='journal/1 json/1 wire/1 ext/1 ext/2 handoff/1 module/1 lock/1 hd1 port/1 history/1 conform/1 bind/1'
 # The ports a package may bind (henki's port::LINKED), and what each one gets to see, for the swap screen.
 PORTS_KNOWN='history'
 PORT_SEES_history='stores every session record'
@@ -49,6 +50,9 @@ CARDS_END='# <<< mods cards'
 # file), and the awk of macOS refuses a -v value holding a newline, then runs nothing ("newline in string").
 export HM_B="$CARDS_BEGIN" HM_E="$CARDS_END"
 RESTART='restart henki (or /exit and start again) to load the change'
+DOC_MAX=16384 # doc.md and cmd/*.md (ext/2)
+# The names henki keeps for its own commands; a module's cmd/ may not use them.
+RESERVED='exit help mods allow'
 LICENSE_BAD='*[!A-Za-z0-9.+ ()-]*' # an SPDX expression: ids, AND/OR/WITH, parentheses
 NAME_RULE='a name is 1 to 32 of a-z, 0-9, _ and -, starting with a-z or 0-9'
 
@@ -58,6 +62,11 @@ die() {
 }
 warn() { printf 'henki-mods: warning: %s\n' "$*" >&2; }
 say() { printf '%s\n' "$*"; }
+# After a change: the henki that runs this as /mods asks to restart on it (handoff/1); else the line says how.
+restart() {
+  if [ -n "${HENKI_NEXT:-}" ] && [ -f "$HENKI_NEXT" ] && [ ! -L "$HENKI_NEXT" ] && printf 'restart\n' >"$HENKI_NEXT"; then return 0; fi
+  say "$RESTART"
+}
 usage() {
   cat >&2 <<'EOF'
 usage: henki-mods [list]              modules: state, version, source, prompt bytes
@@ -190,6 +199,21 @@ invisible_check() {
         for (j = 1; j in r; j += 2) if (c >= r[j] + 0 && c <= r[j + 1] + 0) { printf "U+%04X\n", c; exit 1 }
       }
     }'
+}
+
+# A doc.md or cmd/NAME.md as henki takes it (config::text): at most DOC_MAX bytes of UTF-8 without a code point it
+# escapes; else 1 with ERR.
+text_ok() {
+  local n why
+  n=$(wc -c <"$1") || n=0
+  if [ "$n" -gt "$DOC_MAX" ]; then
+    ERR="$1: $(num "$n") bytes, over $(num "$DOC_MAX"); fix: shorten it"
+    return 1
+  fi
+  why=$(invisible_check "$1") || {
+    ERR="$1: holds $why, which a terminal does not show; fix: remove it"
+    return 1
+  }
 }
 
 # Each line of a .gitattributes file that sets an attribute changing what a checkout or archive holds against the
@@ -522,13 +546,13 @@ docline() {
 # A top-level NAME henki takes (anything but doc.md and bin, which inspect checks itself); else 1 with ERR.
 top_ok() {
   case "$2" in
-    cmd | ctx | on)
-      ERR="$1/$2/: a later module layout (commands, context, observers) that this henki does not load; fix: remove it, or set henki_module and requires for the henki that loads it"
+    ctx | on)
+      ERR="$1/$2/: a later module layout (context, observers) that this henki does not load; fix: remove it, or set henki_module and requires for the henki that loads it"
       return 1
       ;;
     README* | LICENSE* | CHANGELOG* | .*) ;;
     *)
-      ERR="$1/$2: unknown entry; an extension holds doc.md, bin/, README*, LICENSE*, CHANGELOG* and dot files only; fix: move it out of the module"
+      ERR="$1/$2: unknown entry; a module holds doc.md, bin/, cmd/, port/, eval/, README*, LICENSE*, CHANGELOG* and dot files only; fix: move it out of the module"
       return 1
       ;;
   esac
@@ -554,14 +578,14 @@ inspect() {
   while IFS= read -r p; do
     [ -n "$p" ] || continue
     p=${p#"$dir"/}
-    case "$p" in bin/.* | doc.md | bin | port) ;; bin/* | port/*) p="$p/x" ;; *) top_ok "$dir" "$p" || return 1 ;; esac
-    case "$p" in bin/*/x | port/*/x)
+    case "$p" in bin/.* | cmd/.* | doc.md | bin | cmd | port | eval | eval/*) ;; bin/* | cmd/* | port/*) p="$p/x" ;; *) top_ok "$dir" "$p" || return 1 ;; esac
+    case "$p" in bin/*/x | cmd/*/x | port/*/x)
       ERR="$dir/${p%/x}: a directory; fix: a command or a port binding is a file you can run, so move it out of ${p%%/*}/"
       return 1
       ;;
     esac
   done <<EOF
-$(find "$dir" -mindepth 1 -maxdepth 1 -print; for x in bin port; do [ ! -d "$dir/$x" ] || [ -L "$dir/$x" ] || find "$dir/$x" -mindepth 1 -maxdepth 1 -type d -print; done)
+$(find "$dir" -mindepth 1 -maxdepth 1 -print; for x in bin cmd port; do [ ! -d "$dir/$x" ] || [ -L "$dir/$x" ] || find "$dir/$x" -mindepth 1 -maxdepth 1 -type d -print; done)
 EOF
   while IFS= read -r p; do
     kind=${p##*"$tab"}
@@ -610,6 +634,38 @@ EOF
             ;;
         esac
         ;;
+      cmd)
+        # cmd/NAME: the user's /NAME (handoff/1), henki's test as for bin/, and not a name henki keeps; cmd/NAME.md:
+        # its data, held to doc.md's rules.
+        case "$rest" in
+          '')
+            ERR="$dir/cmd: not a directory; fix: make cmd a directory of commands"
+            return 1
+            ;;
+          .*/*) ;;
+          */*)
+            ERR="$dir/cmd/${rest%%/*}: a directory; fix: a command is a file you can run, so move it out of cmd/"
+            return 1
+            ;;
+          *)
+            x=0
+            [ -n "$(find -L "$dir/$p" -prune -type f -perm -100 -print 2>/dev/null)" ] && x=1
+            if [ "$x" = 1 ] && is_cmd "$rest"; then
+              case " $RESERVED " in *" $rest "*)
+                ERR="$dir/$p: a name henki keeps for its own command; fix: rename it"
+                return 1
+                ;;
+              esac
+            elif [ "$x" = 0 ] && [ "${rest%.md}" != "$rest" ]; then
+              text_ok "$dir/$p" || return 1
+            elif [ "$x" = 1 ] || [ "${rest#.}" = "$rest" ]; then
+              ERR="$dir/$p: a command is a file you can run, named with A-Z, a-z, 0-9, ., _ and -; fix: rename it or chmod u+x it, or move it out of cmd/"
+              return 1
+            fi
+            ;;
+        esac
+        ;;
+      eval) ;; # eval/1 tasks: henki ignores them
       port)
         # port/PORT: a program henki runs as that port's binding, once a swap links it (henki's test, as for bin/).
         x=0
@@ -624,9 +680,9 @@ EOF
         ;;
       .henki)
         case "$rest:$kind" in
-          module.toml:644 | module.toml:755 | card.md:644 | card.md:755) ;;
+          module.toml:644 | module.toml:755 | card.md:644 | card.md:755 | template:755) ;;
           *)
-            ERR="$dir/$p: .henki holds module.toml and card.md (regular files) only; fix: remove it"
+            ERR="$dir/$p: .henki holds module.toml, card.md and template (a program cmd/ links run; regular files) only; fix: remove it"
             return 1
             ;;
         esac
@@ -649,6 +705,7 @@ EOF
     ERR="$dir/.henki/module.toml: ports must name exactly the programs in port/ ($(printf '%s' "$I_ports" | tr '\n' ' ')); fix: correct ports"
     return 1
   fi
+  text_ok "$dir/doc.md" || return 1
   I_line=$(docline "$dir/doc.md")
   printf '%s' "$I_line" >"$STAGE_LIST.line"
   why=$(invisible_check "$STAGE_LIST.line") || {
@@ -922,9 +979,14 @@ bind_get() {
 
 # --- prompt bytes and cards --------------------------------------------------------------------------------------------
 
-# What NAME's module adds to the system prompt (ext::prompt): "\n- NAME: LINE [DOC]", DOC as henki shows it.
+# What NAME's module adds to the system prompt (ext::prompt): "\n- NAME: LINE [DOC]", DOC as henki shows it; nothing
+# for a module of commands or bindings without bin/, whose doc is not for the model.
 prompt_bytes() { # NAME DIR
   local l
+  if [ ! -d "$2/bin" ] && { [ -e "$2/cmd" ] || [ -L "$2/cmd" ] || [ -e "$2/port" ] || [ -L "$2/port" ]; }; then
+    echo 0
+    return 0
+  fi
   l=$(docline "$2/doc.md") || return 1
   l="$nl- $1: $l [$(shown "$EXT/$1/doc.md")]"
   printf '%s\n' "${#l}"
@@ -1202,7 +1264,7 @@ cmd_add() {
   bytes=$(prompt_bytes "$n" "$STAGE/m")
   total=$(total_on)
   x=""
-  if [ "$total" = 0 ]; then
+  if [ "$total" = 0 ] && [ "$bytes" != 0 ]; then
     x=" with the $((${#HEADER} + 2)) B header, as the first module on"
     bytes=$((bytes + ${#HEADER} + 2))
   fi
@@ -1270,7 +1332,7 @@ EOF
   say "added $n: on, $(shown "$store")"
   [ -z "$line" ] || say "add to $(shown "$CONF/config.toml"): $line"
   ext_path_warning
-  say "$RESTART"
+  restart
 }
 
 # The prompt bytes of everything on now: the header and each module in the ext dir (managed or not).
@@ -1322,7 +1384,7 @@ cmd_onoff() { # on|off NAME
   cards_write 0 || die "$ERR"
   say "$n: $verb"
   [ "$verb" = off ] || ext_path_warning
-  say "$RESTART"
+  restart
 }
 
 cmd_rm() {
@@ -1345,7 +1407,7 @@ cmd_rm() {
   lock_put "$n" ""
   cards_write 0 || die "$ERR"
   say "removed $n; its store copy stays in $(shown "$store") for a rollback"
-  say "$RESTART"
+  restart
 }
 
 cmd_lock() {
@@ -1691,7 +1753,7 @@ cmd_swap() {
     rm -f "$CONF/port/$port" || die "cannot remove $(shown "$CONF/port/$port"); fix: make it writable"
     lock_write bind/1 "$port" ""
     say "$port: std"
-    say "$RESTART"
+    restart
     return 0
   fi
   lock_get "$n" || die "$n is not added; fix: henki-mods add SRC first (henki-mods list shows what is)"
@@ -1728,7 +1790,7 @@ cmd_swap() {
   }
   lock_write bind/1 "$port" "$(printf 'bind/1\t%s\t%s\t%s\t%s\t%s' "$port" "$n" "$id" "$(date -u +%Y-%m-%dT%H:%MZ)" "$how")"
   say "$port: $n $id"
-  say "$RESTART"
+  restart
 }
 
 # The ports linked into NAME's store copies, one per line (rm refuses while there is one).
@@ -1874,6 +1936,7 @@ cmd_allow() {
     die "cannot write $file; fix: make $dir writable"
   fi
   printf 'removed rule %s: %b\n' "$n" "${hit#*"$tab"}"
+  [ -z "${HENKI_NEXT:-}" ] || restart
 }
 
 setup

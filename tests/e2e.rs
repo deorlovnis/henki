@@ -9,6 +9,8 @@ mod allow;
 mod anthropic;
 #[path = "e2e/ext.rs"]
 mod ext;
+#[path = "e2e/handoff.rs"]
+mod handoff;
 #[path = "e2e/harness.rs"]
 mod harness;
 #[path = "e2e/inert.rs"]
