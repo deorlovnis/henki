@@ -196,6 +196,19 @@ fn observe_session_end_run_killed() {
     assert!(d.elapsed < Duration::from_secs(2), "the run took {:?}", d.elapsed);
 }
 
+/// A session_end run that leaves a daemon of its own and exits within the grace: the daemon, an orphan of henki's by
+/// then, goes in the last sweep.
+#[test]
+fn observe_session_end_daemon_swept() {
+    let mut r = Run::new("");
+    let m = Mock::start(vec![say("done")]);
+    r.at(&m.url());
+    module(&r, "d", &[("session_end", &format!("( setsid sh -c '{}' </dev/null >/dev/null 2>&1 & ); exit 0", r.sleep()))]);
+    let d = r.json("hi");
+    d.finish();
+    assert_eq!(d.code, Some(0), "{}", d.diag());
+}
+
 /// The REPL: no event before the first message (none at all without one); `session_start` once, `turn_start` per
 /// message; an observer that cannot start is a notice, journaled.
 #[test]

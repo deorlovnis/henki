@@ -139,10 +139,11 @@ pub fn kernel_end(c: Option<Child>, kill: bool) {
 }
 
 /// Session end: SIGKILL each of `pids` that is still a kernel child, with its session (its owner reaps it; the others
-/// were reaped already), then one sweep for what they left (Linux: an orphan of theirs is henki's child).
+/// were reaped already), then up to five sweeps for what they left (Linux: an orphan of theirs is henki's child). The
+/// sweeps run even when nothing was killed: a run that ended in the grace may have left a daemon.
 pub fn kernel_kill(pids: &[i32]) {
-    let killed = lock(&KERNEL).iter().filter(|p| pids.contains(p)).map(|&p| kill_call(p)).count();
-    _ = killed > 0 && sweep_pass() > 0;
+    lock(&KERNEL).iter().filter(|p| pids.contains(p)).for_each(|&p| kill_call(p));
+    _ = (0..5).all(|_| sweep_pass() > 0);
 }
 
 /// Sends `sig` (0 probes) to every group in the ledger, drops the groups that are gone (ESRCH), returns how many remain.
