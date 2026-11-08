@@ -1661,10 +1661,30 @@ t_history() {
   refused "history is std, so there is no binding to import into"
   run history nope
   rc_is 2
+  # list's context line: with a module of sources on, what they added at the last start of this dir's newest session.
+  run_in "$w" list
+  out_lacks "context sources"
+  mkmod "$W/notes" 'contracts = ["ext/2"]\n'
+  rm -rf "$W/notes/bin" && mkdir -p "$W/notes/ctx" && printf '#!/bin/sh\necho notes\n' >"$W/notes/ctx/notes"
+  chmod 755 "$W/notes/ctx/notes"
+  run add "$W/notes" --yes
+  rc_is 0
+  run_in "$w" list
+  rc_is 0
+  out_has "context sources in $w, at the last start of 20261108T090000Z-bbbb: project/project 1,234 B, x/y 5 B"
+  touch "$st/$sc/20261108T080000Z-aaaa.jsonl"
+  run_in "$w" list
+  out_has "context sources in $w, at the last start of 20261108T080000Z-aaaa: none counted"
+  touch -t 202611080800 "$st/$sc/20261108T080000Z-aaaa.jsonl"
+  run_in "$W" list
+  out_has "context sources: their bytes are shown at session start (no session of $W to read them from)"
   mkdir -p "$CONF/port"
   ln -s /nonexistent "$CONF/port/history"
   run history list
   refused "is not a program; fix: henki-mods swap history std"
+  run_in "$w" list
+  rc_is 0
+  out_has "context sources: their bytes are shown at session start (the history did not answer)"
   run history list --std --scope "$w"
   rc_is 0
   out_has "20261108T090000Z-bbbb"
@@ -1744,6 +1764,19 @@ t_history_live() {
   hrun --resume="$id@$i" "forked task"
   run_in "$work" history list --all
   out_has "toy-"
+  # list's context line through the binding: a session started with a source on records what it added.
+  mkmod "$W/notes" 'contracts = ["ext/2"]\n'
+  rm -rf "$W/notes/bin" && mkdir -p "$W/notes/ctx" && printf '#!/bin/sh\necho notes\n' >"$W/notes/ctx/notes"
+  chmod 755 "$W/notes/ctx/notes"
+  run add "$W/notes" --yes
+  rc_is 0
+  hrun "with notes"
+  run_in "$work" list
+  rc_is 0
+  out_has "context sources in $work, at the last start of toy-"
+  out_has ": notes/notes 5 B"
+  run rm notes
+  rc_is 0
   # A binding that refuses a record: the session is reported as a partial copy.
   printf '#!/bin/sh\nexec %s history --error-at append\n' "$(dirname "$HENKI_BIN")/examples/port_toy" >"$W/faulty"
   chmod 755 "$W/faulty"

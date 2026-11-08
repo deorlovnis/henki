@@ -2471,7 +2471,7 @@ cmd_lock() {
 }
 
 cmd_list() {
-  local n b on_b=0 on_n=0 cards=0 c src mods=0 off_names x d agents_now agents_none state
+  local n b on_b=0 on_n=0 cards=0 c src mods=0 off_names x d agents_now agents_none state ctx_n=0
   [ $# = 0 ] || usage
   lock_check
   STAGE=$(mktemp -d "${TMPDIR:-/tmp}/henki-mods.XXXXXX") || die "cannot make a scratch dir; fix: check TMPDIR"
@@ -2503,6 +2503,7 @@ cmd_list() {
     else
       d="$EXT/$n" state=on x=- src="not added by henki-mods ($(shown "$EXT/$n"))"
     fi
+    [ "$state" != on ] || [ ! -d "$d/ctx" ] || ctx_n=$((ctx_n + 1))
     if b=$(prompt_bytes "$n" "$d" 2>/dev/null); then
       [ "$state" != on ] || on_b=$((on_b + b)) on_n=$((on_n + 1))
       b="$(num "$b") B"
@@ -2512,6 +2513,7 @@ cmd_list() {
     printf '%-16s %-5s %-10s %s%s  %s\n' "$n" "$state" "$x" "$b" "$c" "$src"
   done
   [ "$mods" != 0 ] || say "no modules; henki-mods add NAME | ./DIR | URL adds one, off until you say yes; henki-mods init offers sets of them"
+  [ "$ctx_n" = 0 ] || list_sources
   off_names=""
   for d in ${HENKI_SHARE:+"$HENKI_SHARE/official"} "$SELF/../share/henki/official" "$SELF/../mods"; do
     [ -d "$d" ] || continue
@@ -4324,6 +4326,25 @@ hist_show() {
     awk '{ n = split($0, s, "},{"); for (i = 1; i <= n; i++) { b = s[i]; sub(/.*"bytes":/, "", b); sub(/[,}].*/, "", b); m = s[i]; sub(/.*"name":"/, "", m); sub(/".*/, "", m); print m, b } }' >"$HP/src"
   while read -r m b; do src="${src:+$src, }$m $(num "$b") B"; done <"$HP/src"
   [ -z "$src" ] || say "context at its last start: $src"
+}
+
+# list's line for the context sources: what they added at the last start of this dir's newest session (history list,
+# then history show, from the bound history or std's). Their bytes depend on the dir, so with no session here, or a
+# history that does not answer, the line says where they are shown instead. N: the modules on with ctx/.
+list_sources() {
+  local id x why="no session of $(shown "$PWD") to read them from"
+  if x=$( (hist_list) 2>/dev/null); then
+    id=$(printf '%s\n' "$x" | awk 'NR == 1 && $1 == 1 { print ($2 == "*" ? $3 : $2) }')
+    if [ -n "$id" ] && x=$( (hist_show "$id") 2>/dev/null); then
+      x=$(printf '%s\n' "$x" | sed -n 's/^context at its last start: //p')
+      say "context sources in $(shown "$PWD"), at the last start of $id: ${x:-none counted}"
+      return 0
+    fi
+    [ -z "$id" ] || why="session $id could not be read"
+  else
+    why="the history did not answer"
+  fi
+  say "context sources: their bytes are shown at session start ($why)"
 }
 
 # The scope (a JSON string, as written) of a std journal in FILE, kept in the scope dir SCOPEDIR: the cwd of its first

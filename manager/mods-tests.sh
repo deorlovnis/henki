@@ -483,6 +483,26 @@ t_project() {
     HOME="$h" HENKI_CONFIG="" run "$src" </dev/null
     [ "$RC:$OUT" = "0:" ] || fail "a repo at or above HOME=$h: $OUT"
   done
+  # Through henki with a --config profile: HENKI_CONFIG is the profile's dir, so the profile's AGENTS.md (here the
+  # project's own, by a hard link) is henki's global one, never printed again; henki counts the git line only.
+  if [ -n "${MODS_TEST_HENKI:-}" ]; then
+    local p="$D/profile" want n
+    mkdir -p "$p/ext" "$D/home"
+    cp -R "$MODS_DIR/project" "$p/ext/project"
+    printf 'model = "m"\nbase_url = "http://127.0.0.1:9/v1"\n' >"$p/config.toml" && chmod 600 "$p/config.toml"
+    printf 'Profile rules.\n' >"$p/AGENTS.md"
+    rm -f "$repo/AGENTS.md" "$repo/CLAUDE.md" && ln "$p/AGENTS.md" "$repo/AGENTS.md"
+    want=$(HENKI_CONFIG="$p" "$src" </dev/null)
+    case "$want" in "git: $repo on "*) ;; *) fail "the profile's AGENTS.md, by a hard link: not the git line alone: $want" ;; esac
+    OUT=$(env -u HENKI_CONFIG HOME="$D/home" XDG_STATE_HOME="$D/home/state" "$MODS_TEST_HENKI" run --json --config "$p/config.toml" hi 2>&1 </dev/null)
+    n=$(printf '%s' "$want" | wc -c | tr -d ' ')
+    out_has "\"context project/project: $n bytes\""
+    case "$OUT" in *"Profile rules"*) fail "henki's records show the profile's AGENTS.md twice" ;; esac
+    rm "$repo/AGENTS.md" && printf 'Use make.\n' >"$repo/CLAUDE.md"
+    OUT=$(env -u HENKI_CONFIG HOME="$D/home" XDG_STATE_HOME="$D/home/state" "$MODS_TEST_HENKI" run --json --config "$p/config.toml" hi 2>&1 </dev/null)
+    n=$(HENKI_CONFIG="$p" "$src" </dev/null | wc -c | tr -d ' ')
+    out_has "\"context project/project: $((n - 1)) bytes\""
+  fi
   cd "$here" || exit 1
   unset GIT_CEILING_DIRECTORIES HENKI_CONFIG
 }
