@@ -2168,6 +2168,25 @@ t_index_add() {
   run rm hello
   run add hello@deorlovnis --yes
   refused "is gone from file://$W/hello (rewritten history?); fix: tell the module's maintainer"
+  # doctor: HENKI_SHARE in the warning form.
+  run doctor
+  out_has "WARN  HENKI_SHARE is set: the default index's anchor comes from $W/share/index"
+  # A git too old for SSH signatures: with an index synced, a path install and on are refused, and the message says
+  # so; with none synced, a path install works.
+  mkdir -p "$W/oldgit"
+  printf '#!/bin/sh\n[ "$1" != --version ] || { echo "git version 2.30.0"; exit 0; }\nexec "%s" "$@"\n' "$(command -v git)" >"$W/oldgit/git"
+  chmod 755 "$W/oldgit/git"
+  mkmod "$W/plain"
+  PATH="$W/oldgit:$PATH" run add "$W/plain" --yes
+  refused "(this git is 2.30.0), and index deorlovnis is synced here, so installs, on and swap are refused; fix: upgrade git, or rm -rf"
+  err_lacks "still work"
+  run off lean
+  rc_is 0
+  PATH="$W/oldgit:$PATH" run on lean
+  refused "so installs, on and swap are refused"
+  rm -rf "$XDG_DATA_HOME/henki/index"
+  PATH="$W/oldgit:$PATH" run add "$W/plain" --yes
+  rc_is 0
 }
 
 t_index_yank() {

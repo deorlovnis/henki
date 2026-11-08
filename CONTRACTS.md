@@ -588,9 +588,10 @@ apply yanks.
   rollback, and no branch grafted by a key since rotated out. Then the chain is checked for the commits after it, and
   `refs/henki/verified` moves to the fetched commit; on any refusal, or offline, the verified commit stays in use.
   `DATA/henki/index/NAME.synced` holds the time of the last good sync.
-- **Reading.** Entries are read with git from the verified commit only, never from a checkout, and that commit is
-  checked against the chain again once per run before the first read. An entry henki-mods cannot read is skipped with
-  a warning; a version file it parses but skips (an unknown key or value, a later `index`) still yanks, and an install
+- **Reading.** Entries are read with git from the verified commit only, never from a checkout. Once per run before
+  the first read, that commit's own signature is checked again against the `.signers` of its first parent: a ref
+  edited to point at an unsigned commit is refused, but a history crafted by someone who can write `DATA` is not
+  (only a sync checks the chain from the anchor). An entry henki-mods cannot read is skipped with a warning; a version file it parses but skips (an unknown key or value, a later `index`) still yanks, and an install
   that finds no version names the skipped ones. A verified commit over 30 days old is a warning on every index screen.
 - **Tiers.** A version with `reviewed` and `reviewer` shows `reviewed by REVIEWER (signed index PRINCIPAL, DATE)`,
   PRINCIPAL being the anchor's; `source only` is added when the asset for this machine has `asset_check = "none"`;

@@ -2202,15 +2202,20 @@ index_conf() {
 }
 
 # The tools an index needs: git 2.34 or later (SSH signatures) and ssh-keygen. Exit 1 with ERR without them.
+# Once index X_name is synced, every install, on and swap checks its yanks, so none of them works without the tools.
 index_tools() {
-  local v
+  local v a="" f="; URL and path installs still work"
+  [ ! -d "$X_git" ] || {
+    a=", and index $X_name is synced here, so installs, on and swap are refused"
+    f=", or rm -rf $(shown "$X_git") to stop using it"
+  }
   v=$(git --version 2>/dev/null | sed -n 's/^git version \([0-9][0-9.]*\).*/\1/p')
   version_ge "${v:-0}" 2.34 || {
-    ERR="the index needs git 2.34 or later for SSH signatures (this git is ${v:-not found}); fix: upgrade git; URL and path installs still work"
+    ERR="the index needs git 2.34 or later for SSH signatures (this git is ${v:-not found})$a; fix: upgrade git$f"
     return 1
   }
   command -v ssh-keygen >/dev/null 2>&1 || {
-    ERR="the index needs ssh-keygen (OpenSSH) to check signatures; fix: install OpenSSH; URL and path installs still work"
+    ERR="the index needs ssh-keygen (OpenSSH) to check signatures$a; fix: install OpenSSH$f"
     return 1
   }
 }
@@ -2481,8 +2486,9 @@ index_sync() {
   fi
 }
 
-# Index NAME for reading, with no network: X_* and X_V, the verified commit checked again once per run (an edited clone
-# or a moved ref is refused). Exit 2 when there is nothing to read (never synced, or not live), 1 with ERR when the
+# Index NAME for reading, with no network: X_* and X_V, the verified commit's own signature checked again once per run
+# against its first parent's .signers (a ref moved to an unsigned commit is refused; a history crafted by someone who
+# can write DATA is not: only a sync checks the chain from the anchor). Exit 2 when there is nothing to read (never synced, or not live), 1 with ERR when the
 # commit does not verify.
 index_ready() {
   local out
@@ -2986,6 +2992,7 @@ cmd_doctor() {
   scratch
   dok() { say "ok    $*"; }
   dnote() { say "note  $*"; }
+  dwarn() { say "WARN  $*"; }
   dbad() {
     say "FAIL  $*"
     BAD=$((BAD + 1))
@@ -3057,7 +3064,7 @@ cmd_doctor() {
   fi
   [ "$stray" = 0 ] || dnote "$stray store copies the lock does not name (kept for a rollback)"
   # The indexes: who signs each one, from where, how old.
-  [ -z "${HENKI_SHARE:-}" ] || dnote "$(yellow "HENKI_SHARE is set: the default index's anchor comes from $HENKI_SHARE/index")"
+  [ -z "${HENKI_SHARE:-}" ] || dwarn "$(yellow "HENKI_SHARE is set: the default index's anchor comes from $HENKI_SHARE/index")"
   for n in $(index_names); do
     if ! index_conf "$n"; then
       dnote "$ERR"
