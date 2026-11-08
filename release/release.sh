@@ -368,7 +368,7 @@ selftest() {
   [ "$got" = "henki-mods $version" ] || { say "selftest: bin/henki-mods --version said \"$got\""; bad=1; }
   # The official modules are found in the tarball's share/ (no HENKI_SHARE, no repo checkout next to it).
   got=$(env -i HOME="$t/home" PATH=/usr/bin:/bin "$x/bin/henki-mods" list 2>&1) || got="(exit $?) $got"
-  case "$got" in *"official, not added: clip halti itse prompts sessions "*) ;; *)
+  case "$got" in *"official, not added: checkpoints clip halti itse notify prompts sessions "*) ;; *)
     say "selftest: bin/henki-mods list said: $got"
     bad=1
     ;;
