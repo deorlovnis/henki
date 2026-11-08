@@ -561,9 +561,10 @@ apply yanks.
   `main`, git's allowed_signers format), and the index's own gate and docs. Entries are in module/1's grammar; an
   unknown key is refused, and `index = 2` is a later format (`this index is newer than this henki-mods`).
 - **A package**: `index = 1`, `name` (the file's), `kind` (`git`, or `official` for a record about a module henki
-  ships, never installed from the index), for `git` a `repo` (an https URL) and a `path` (the module's directory in
-  it, `""` for the root), `summary` (at most 160 bytes), `maintainer`, `license`, `latest` (an indexed version, not
-  yanked) and `added` (`YYYY-MM-DD`).
+  ships, never installed from the index), for `git` a `repo` (an https URL; henki-mods also reads a `file:///` one,
+  which the index's own gate refuses, for an index on a local disk: hd1 binds the files either way) and a `path` (the
+  module's directory in it, `""` for the root), `summary` (at most 160 bytes), `maintainer`, `license`, `latest` (an
+  indexed version, not yanked) and `added` (`YYYY-MM-DD`).
 - **A version**: `index = 1`, `version` (the file's), `commit` (40 hex digits), `hd1` (of the module's directory at
   that commit, from its raw blobs), the keys the module itself decides (`requires`, `contracts`, `os`, `ports`,
   `commands`, `bins`, `observers`, `ctx`, `prompt_bytes`, `card_bytes`, `caps_net`; `henki-mods-dev entry derive`
@@ -572,21 +573,25 @@ apply yanks.
   the `eval_*` keys of a badge, all or none.
 - **The signature chain.** Every commit on `main`'s first-parent line is SSH-signed (namespace `git`) by a key listed
   in the `.signers` of its first parent (at most 64 KiB), the root commit by a key of the anchor; a line whose key
-  blob is in the refused keys never counts. A key changes only through a commit, signed by a current key, that edits
-  `.signers`. At most 5,000 commits are on the line.
+  blob is in the refused keys never counts, and neither does an OpenPGP or X.509 signature, whatever the person's own
+  gpg says of it. A key changes only through a commit, signed by a current key, that edits `.signers`. At most 5,000
+  commits are on the line.
 - **Anchors.** The default index's are beside henki-mods (`share/henki/index/`, or `HENKI_SHARE/index/`, which every
-  index screen then names): `NAME.url`, `NAME.signers` (its root's keys; with no key line the index is not live
-  yet), `NAME.checkpoint` (a commit on its first-parent line) and `refused.keys` (key blobs that never verify, one per
+  index screen then names): `NAME.url`, `NAME.signers` (its root's keys; with no key line the index is not live yet),
+  `NAME.checkpoint` (a commit on its first-parent line) and `refused.keys` (key blobs that never verify, one per
   line). More indexes are `index/1<TAB>NAME<TAB>URL` lines in `CONFIG_DIR/mods.index`, each with its pinned
-  `CONFIG_DIR/index/NAME.signers` and, optionally, `NAME.checkpoint`. Index URLs are https, ssh or file.
+  `CONFIG_DIR/index/NAME.signers` and, optionally, `NAME.checkpoint`. Index URLs are https, ssh or file. A first sync
+  of the default index with no checkpoint beside henki-mods is refused; elsewhere (`HENKI_SHARE`, `mods.index`) it is
+  a warning.
 - **A sync** fetches `main` into the bare clone `DATA/henki/index/NAME.git` (`refs/henki/fetched`). The commit verified
   before (`refs/henki/verified`), or at a first sync the checkpoint, must be on the fetched first-parent line: no
   rollback, and no branch grafted by a key since rotated out. Then the chain is checked for the commits after it, and
   `refs/henki/verified` moves to the fetched commit; on any refusal, or offline, the verified commit stays in use.
   `DATA/henki/index/NAME.synced` holds the time of the last good sync.
 - **Reading.** Entries are read with git from the verified commit only, never from a checkout, and that commit is
-  checked against the chain again once per run before the first read. An entry henki-mods cannot read is skipped
-  with a warning. A verified commit over 30 days old is a warning on every index screen.
+  checked against the chain again once per run before the first read. An entry henki-mods cannot read is skipped with
+  a warning; a version file it parses but skips (an unknown key or value, a later `index`) still yanks, and an install
+  that finds no version names the skipped ones. A verified commit over 30 days old is a warning on every index screen.
 - **Tiers.** A version with `reviewed` and `reviewer` shows `reviewed by REVIEWER (signed index PRINCIPAL, DATE)`,
   PRINCIPAL being the anchor's; `source only` is added when the asset for this machine has `asset_check = "none"`;
   without a review it is red, `UNREVIEWED: listed in PRINCIPAL, but no reviewer has read this version`. A URL or path

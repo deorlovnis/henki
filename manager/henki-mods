@@ -1910,11 +1910,15 @@ cmd_swap() {
     return 0
   fi
   lock_get "$n" || die "$n is not added; fix: henki-mods add SRC first (henki-mods list shows what is)"
+  STAGE=$(mktemp -d "${TMPDIR:-/tmp}/henki-mods.XXXXXX") || die "cannot make a scratch dir; fix: check TMPDIR"
+  STAGE_LIST="$STAGE/list"
+  # A malicious yank is never undone by a swap: the flag a sync left, or the yank in the verified index, refuses.
+  ! flag_has yanked=malicious || die "$n $L_version was yanked as malicious; it stays off; fix: henki-mods swap $port std, or to another package"
+  index_local_all
+  yank_guard "$n" "$L_version" "$L_kind" "$L_source" "$L_hd1"
   store=$(store_of)
   exe="$store/port/$port"
   [ -f "$exe" ] && [ -x "$exe" ] || die "$n has no port/$port; fix: swap to a module that binds $port"
-  STAGE=$(mktemp -d "${TMPDIR:-/tmp}/henki-mods.XXXXXX") || die "cannot make a scratch dir; fix: check TMPDIR"
-  STAGE_LIST="$STAGE/list"
   inspect "$store" "$n" 0 || die "$n: $ERR"
   [ "$I_hd1" = "$L_hd1" ] || die "the store copy $store does not match the lock (it changed); fix: henki-mods rm $n and add it again"
   printf '%s\n' "$M_ports" | command grep -qx "$port" || die "$n's manifest does not list $port in ports; fix: swap to a module that declares it"
@@ -2320,7 +2324,10 @@ _ic_verify() {
     else
       cp "$t/s.raw" "$t/s"
     fi
+    # Git picks the verifier from the signature's armor: an OpenPGP or X.509 one would go to the person's own gpg or
+    # gpgsm and its keyring, so those verifiers are a program that always fails, and only SSH signatures can count.
     _ic_git -c gpg.format=ssh -c gpg.ssh.program=ssh-keygen -c gpg.ssh.allowedSignersFile="$t/s" \
+      -c gpg.program=false -c gpg.openpgp.program=false -c gpg.x509.program=false \
       log --no-walk=unsorted --stdin --format='%H %G?' <"$t/g.$key" >"$t/out" 2>/dev/null || {
       echo "$label: git log failed while checking signatures" >&2
       return 1
@@ -2428,6 +2435,13 @@ index_sync() {
     return 1
   }
   v=$(index_v) || v=""
+  # The default index's anchors beside this program are a release's, which ships a checkpoint: without one a first sync
+  # could take a branch grafted by a key since rotated out. HENKI_SHARE's (named on every screen) and the person's own
+  # indexes only warn.
+  [ -n "$v" ] || [ -n "$X_ck" ] || [ "$1" != "$INDEX_DEFAULT" ] || [ -n "$X_where" ] || {
+    ERR="index $1: no checkpoint beside henki-mods ($(shown "${X_anchor%.signers}.checkpoint")), so a first sync could take a branch grafted by a key since rotated out; fix: reinstall henki"
+    return 1
+  }
   if ! GIT_ALLOW_PROTOCOL=https:ssh:file _ix -c transfer.fsckObjects=true -c protocol.allow=never -c protocol.https.allow=always \
     -c protocol.ssh.allow=always -c protocol.file.allow=always fetch --quiet --no-tags --no-write-fetch-head -- "$X_url" \
     '+refs/heads/main:refs/henki/fetched' 2>"$STAGE/fetch.err" </dev/null; then
@@ -2485,11 +2499,13 @@ index_ready() {
 
 # Index NAME's entries at X_V into $STAGE/ix/NAME: pkgs (NAME KIND LATEST), vers (PACKAGE VERSION HD1 YANK REASON;
 # YANK malicious, buggy, withdrawn or -), removed (NAME YANK REASON), the records of each entry in r/NAME and
-# r/NAME@VERSION, and v (X_V). From git objects only. An entry this henki-mods cannot read is skipped with a warning.
+# r/NAME@VERSION, and v (X_V). From git objects only. An entry this henki-mods cannot read is skipped with a warning;
+# a skipped version file still yanks (ix_skipped).
 index_load() {
   local d="$STAGE/ix/$1" meta path oid n v k f out kind y pass
   [ ! -d "$d" ] || return 0
-  mkdir -p "$d/r" && : >"$d/pkgs" && : >"$d/vers" && : >"$d/removed" && printf '%s\n' "$X_V" >"$d/v" || die "cannot write $d; fix: check TMPDIR"
+  mkdir -p "$d/r" && : >"$d/pkgs" && : >"$d/vers" && : >"$d/removed" && : >"$d/yanks" && : >"$d/skipped" &&
+    printf '%s\n' "$X_V" >"$d/v" || die "cannot write $d; fix: check TMPDIR"
   _ix ls-tree -r --full-tree "$X_V" -- mods removed.toml >"$d/tree" 2>/dev/null || die "index $1: cannot list $(short "$X_V"); fix: henki-mods sync"
   for pass in pkg ver; do
     while IFS="$tab" read -r meta path; do
@@ -2529,17 +2545,22 @@ index_load() {
       esac
       if [ "$(rget "$f" index)" != 1 ]; then
         warn "index $1: $path: index = $(rget "$f" index): this index is newer than this henki-mods; skipped; fix: upgrade henki"
+        [ "$k" != ver ] || ix_skipped "$d" "$n" "$v" "$f"
         continue
       fi
       if [ "$k" = pkg ]; then
         out=$(HENKI_INDEX_ALLOW_FILE=1 lint_pkg "$f" "$n" "$path")
       else
         kind=$(HM_N="$n" awk -F '\t' '$1 == ENVIRON["HM_N"] { print $2 }' "$d/pkgs")
-        [ -n "$kind" ] || continue
+        [ -n "$kind" ] || {
+          ix_skipped "$d" "$n" "$v" "$f"
+          continue
+        }
         out=$(CK_PR=1 lint_ver "$f" "$v" "$kind" "$path")
       fi
       if [ -n "$out" ]; then
         warn "index $1: $(printf '%s' "$out" | head -n 1); skipped"
+        [ "$k" != ver ] || ix_skipped "$d" "$n" "$v" "$f"
         continue
       fi
       if [ "$k" = pkg ]; then
@@ -2552,6 +2573,20 @@ index_load() {
     done <"$d/tree"
   done
   printf '%s\t%s\n' "$X_principal" "$X_fp" >"$d/who"
+}
+
+# A version file index_load skipped (its records in F; D, NAME, VERSION): a later format or a lint this henki-mods
+# lacks must not drop a yank, so its `yanked` goes to D/yanks (vers' fields, read by yank_hit only, never offered for
+# an install); with none it is counted in D/skipped for pick_version.
+ix_skipped() { # D NAME VERSION F
+  local y h
+  y=$(rget "$4" yanked) || {
+    printf '%s\t%s\n' "$2" "$3" >>"$1/skipped"
+    return 0
+  }
+  h=$(rget "$4" hd1) || h=-
+  case "$h" in hd1:*) ;; *) h=- ;; esac
+  printf '%s\t%s\t%s\t%s\t%s\n' "$2" "$3" "$h" "${y%%:*}" "${y#*: }" >>"$1/yanks"
 }
 
 # Every index in use, synced (once per run) and loaded; then the yanks applied to the lock (with busy held). Each one
@@ -2672,7 +2707,7 @@ fit_why() {
 # The version of package N in index I to install into E_ver and E_rec: WANT, or the package's latest. A yanked version
 # is never taken; one this henki cannot run gives way to the newest older one it can, with a line saying so.
 pick_version() { # I N WANT
-  local d="$STAGE/ix/$1" v latest why y ny=0 nu=0
+  local d="$STAGE/ix/$1" v latest why y ny=0 nu=0 ns
   latest=$(HM_N="$2" awk -F '\t' '$1 == ENVIRON["HM_N"] { print $3 }' "$d/pkgs")
   E_ver=""
   for v in $(HM_N="$2" awk -F '\t' '$1 == ENVIRON["HM_N"] { print $2 }' "$d/vers" | sort -t . -k1,1nr -k2,2nr -k3,3nr); do
@@ -2693,8 +2728,18 @@ pick_version() { # I N WANT
     E_ver=$v E_rec="$d/r/$2@$v"
     return 0
   done
-  [ -z "$3" ] || die "index $1 has no version $3 of $2; fix: henki-mods info $2 lists them"
-  die "no version of $2 in index $1 can be installed here ($ny yanked, $nu not for this henki or system); fix: henki-mods info $2 says why"
+  # The versions index_load skipped (ix_skipped): with a yank they are yanked, else they cannot be read.
+  ns=$(HM_N="$2" HM_V="$3" awk -F '\t' '$1 == ENVIRON["HM_N"] && (ENVIRON["HM_V"] == "" || $2 == ENVIRON["HM_V"]) { n++ } END { print n + 0 }' "$d/skipped")
+  if [ -n "$3" ]; then
+    y=$(HM_N="$2" HM_V="$3" awk -F '\t' '$1 == ENVIRON["HM_N"] && $2 == ENVIRON["HM_V"] { print $4 ": " $5; exit }' "$d/yanks")
+    [ -z "$y" ] || die "$2 $3 was yanked ($y); not installed; fix: henki-mods info $2 lists the other versions"
+    [ "$ns" = 0 ] || die "$2 $3 in index $1 cannot be read by this henki-mods (the warning above); fix: upgrade henki, or tell the index's owner"
+    die "index $1 has no version $3 of $2; fix: henki-mods info $2 lists them"
+  fi
+  why=""
+  [ "$ns" = 0 ] || why=", $ns this henki-mods cannot read: the warnings above"
+  ny=$((ny + $(HM_N="$2" awk -F '\t' '$1 == ENVIRON["HM_N"] { n++ } END { print n + 0 }' "$d/yanks")))
+  die "no version of $2 in index $1 can be installed here ($ny yanked, $nu not for this henki or system$why); fix: henki-mods info $2 says why"
 }
 
 # The yank that applies to a module (lock fields KIND SOURCE VERSION HD1), from the indexes loaded this run, as
@@ -2716,7 +2761,7 @@ yank_hit() {
     $4 == "-" { next }
     ENVIRON["HM_X"] == "index" && $1 == ENVIRON["HM_S"] && $2 == ENVIRON["HM_V"] { hit($4, $5) }
     $3 == ENVIRON["HM_H"] { hit($4, $5) }
-    END { if (m != "") print m "\t" ENVIRON["HM_I"]; else if (o != "") print o "\t" ENVIRON["HM_I"] }' "$d/removed" "$d/vers"
+    END { if (m != "") print m "\t" ENVIRON["HM_I"]; else if (o != "") print o "\t" ENVIRON["HM_I"] }' "$d/removed" "$d/vers" "$d/yanks"
 }
 
 # At an install (add, on): a malicious yank refuses, any other one is a line of the screen.

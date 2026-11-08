@@ -1942,6 +1942,21 @@ t_index_sync() {
   err_has "is signed by a key that is not in the signers list"
   check "still the old commit" [ "$(ixv)" = "$v0" ]
   git -C "$IX" reset -q --hard HEAD~1
+  # An OpenPGP signature never counts, even one the person's own gpg calls good (a stand-in that says so to all).
+  printf '%s\n' '#!/bin/sh' 'cat >/dev/null' 'case " $* " in *" -bsau "*)' \
+    "  echo '[GNUPG:] SIG_CREATED D 22 8 00 1700000000 0123456789ABCDEF0123456789ABCDEF01234567' >&2" \
+    "  printf -- '-----BEGIN PGP SIGNATURE-----\\n\\nZm9yZ2Vk\\n-----END PGP SIGNATURE-----\\n' ;;" \
+    "*) printf '[GNUPG:] NEWSIG\\n[GNUPG:] GOODSIG 0123456789ABCDEF forger\\n[GNUPG:] VALIDSIG 0123456789ABCDEF0123456789ABCDEF01234567 2026-11-08 1700000000 0 4 0 22 8 00 0123456789ABCDEF0123456789ABCDEF01234567\\n[GNUPG:] TRUST_FULLY 0 pgp\\n' ;;" \
+    'esac' >"$W/gpg"
+  chmod 755 "$W/gpg"
+  git config --global gpg.program "$W/gpg"
+  git -C "$IX" -c user.signingkey=forger -c core.hooksPath=/dev/null commit -q --allow-empty -S -m pgp
+  check "the stand-in makes git call the commit good" [ "$(git -C "$IX" log -1 --format=%G?)" = G ]
+  run sync
+  err_has "is not signed (the .signers of its first parent, minus refused keys); refused"
+  check "still the old commit" [ "$(ixv)" = "$v0" ]
+  git config --global --unset gpg.program
+  git -C "$IX" reset -q --hard HEAD~1
   # A rotation: k1 signs .signers = k2, then k2 signs; a later commit by k1 is refused.
   signer k2 >"$IX/.signers"
   ixc "$IX" rotate k1
@@ -1977,6 +1992,16 @@ t_index_sync() {
   run sync
   rc_is 0
   err_has "no checkpoint to start from"
+  # The anchors beside the program are what a release ships: there, a missing checkpoint refuses a first sync.
+  rm -rf "$XDG_DATA_HOME/henki/index"
+  mkdir -p "$W/bin/index"
+  cp "$MODS" "$W/bin/henki-mods"
+  cp "$W/share/index/deorlovnis.url" "$W/share/index/deorlovnis.signers" "$W/share/index/refused.keys" "$W/bin/index/"
+  RC=0
+  OUT=$(unset HENKI_SHARE && $RUN "$W/bin/henki-mods" sync 2>"$SCRATCH/err") || RC=$?
+  ERR=$(cat "$SCRATCH/err")
+  refused "index deorlovnis: no checkpoint beside henki-mods"
+  check "nothing verified" [ -z "$(ixv)" ]
   # A key in refused.keys never verifies, even where .signers lists it.
   rm -rf "$XDG_DATA_HOME/henki/index"
   blob k1 >"$W/share/index/refused.keys"
@@ -2096,6 +2121,15 @@ t_index_add() {
   run add fresh --yes
   rc_is 0
   out_has "UNREVIEWED: listed in henki-index, but no reviewer has read this version"
+  # A version this henki-mods cannot read is counted as such, not hidden.
+  mkmodrepo odd 0.1.0
+  ixentry odd 0.1.0
+  setkey "$IX/mods/odd/0.1.0.toml" newkey '"x"'
+  ixc "$IX" "an entry in a later format"
+  run add odd --yes
+  refused "no version of odd in index deorlovnis can be installed here (0 yanked, 0 not for this henki or system, 1 this henki-mods cannot read: the warnings above)"
+  run add odd --version 0.1.0 --yes
+  refused "odd 0.1.0 in index deorlovnis cannot be read by this henki-mods (the warning above); fix: upgrade henki"
   # A URL install of files an index lists gets their review; others stay red.
   run add "file://$W/lean" --yes
   rc_is 0
@@ -2188,6 +2222,13 @@ t_index_yank() {
   rc_is 0
   run verify
   rc_is 0
+  # A swap never binds a malicious module again (a module with the port: below).
+  run swap history hello --yes
+  refused "hello 0.2.0 was yanked as malicious; it stays off; fix: henki-mods swap history std, or to another package"
+  check "history stays std" [ ! -L "$CONF/port/history" ]
+  run swap policy lean --yes
+  refused "lean 0.1.0 was yanked as malicious; it stays off; fix: henki-mods swap policy std, or to another package"
+  check "policy stays std" [ ! -L "$CONF/port/policy" ] && [ -z "$(awk -F '\t' '$2 == "policy"' "$CONF/mods.lock")" ]
   # A buggy yank is said once and changes nothing. Another index's yank of the same files, and its removal of a
   # name, act on nothing it did not provide.
   mkdir -p "$CONF/index"
@@ -2231,6 +2272,40 @@ t_index_yank() {
   run on hello
   rc_is 0
   out_has "yanked   as buggy (slow (2026-11-08)) by index deorlovnis"
+  # A version file this henki-mods cannot read (a key it does not know) is skipped, and its yank still applies.
+  setkey "$IX/mods/hello/0.2.0.toml" yanked '"malicious: steals keys (2026-11-08)"'
+  setkey "$IX/mods/hello/0.2.0.toml" newkey '"x"'
+  ixc "$IX" "a yank in a later format"
+  run sync
+  rc_is 0
+  err_has "unknown key newkey"
+  out_has "hello 0.2.0 was yanked as malicious (steals keys (2026-11-08)) by index deorlovnis: turned off"
+  check "hello off, flagged" [ "$(field hello 3):$(field hello 11)" = "off:yanked=malicious" ]
+  # A history module bound, yanked as malicious, then swapped to again: refused, flag or not; the port stays std.
+  mkport tree
+  mkrepo "$W/tree"
+  ixentry tree 0.1.0
+  setkey "$IX/mods/tree/0.1.0.toml" conform '"history/1 25/25"'
+  ixc "$IX" tree
+  run add tree --yes
+  rc_is 0
+  if [ -n "${HENKI_BIN:-}" ]; then
+    run swap history tree --yes
+    rc_is 0
+  fi
+  setkey "$IX/mods/tree/0.1.0.toml" yanked '"malicious: forges sessions (2026-11-08)"'
+  ixc "$IX" "tree malicious"
+  run sync
+  rc_is 0
+  out_has "tree 0.1.0 was yanked as malicious"
+  run swap history std
+  rc_is 0
+  run swap history tree --yes
+  refused "tree 0.1.0 was yanked as malicious; it stays off; fix: henki-mods swap history std, or to another package"
+  awk -F '\t' 'BEGIN { OFS = "\t" } $2 == "tree" { $11 = "" } { print }' "$CONF/mods.lock" >"$W/l" && cp "$W/l" "$CONF/mods.lock"
+  run swap history tree --yes
+  refused "tree 0.1.0 was yanked as malicious (forges sessions (2026-11-08)) by index deorlovnis"
+  check "history stays std" [ ! -L "$CONF/port/history" ] && [ -z "$(awk -F '\t' '$1 == "bind/1"' "$CONF/mods.lock")" ]
 }
 
 t_index_guard() {
