@@ -439,8 +439,8 @@ manifest() {
           return 1
           ;;
         esac
-        printf '%s\n' "$val" | awk -F '\t' 'NF == 3 && $1 ~ /^bin\/[A-Za-z0-9._-]+$/ && $2 ~ /^https:\/\/[^ ]+$/ && $3 ~ /^sha256:[0-9a-f]+$/ && length($3) == 71 { ok = 1 } END { exit !ok }' || {
-          ERR="$f: $key must be [\"bin/NAME\", \"https://...\", \"sha256:HEX\"] (an https URL, 64 lowercase hex digits); fix: correct it"
+        printf '%s\n' "$val" | awk -F '\t' 'NF == 3 && $1 ~ /^bin\/[A-Za-z0-9._-]+$/ && $1 !~ /^bin\/\.\.?$/ && $2 ~ /^https:\/\/[^ ]+$/ && $3 ~ /^sha256:[0-9a-f]+$/ && length($3) == 71 { ok = 1 } END { exit !ok }' || {
+          ERR="$f: $key must be [\"bin/NAME\", \"https://...\", \"sha256:HEX\"] (NAME not . or .., an https URL, 64 lowercase hex digits); fix: correct it"
           return 1
         }
         M_assets="$M_assets$x$tab$val$nl"
@@ -2403,13 +2403,15 @@ install_copy() { # DIR WHY
 
 # FILE's lock/1 lines checked as the lock is (lock_check), in a subshell: a pack's or a profile's. They come from
 # someone else, so more is checked: no control character in any field, COMMIT a full commit (the store copy's name is
-# made from it), HD1 an hd1. Exit 1 with the reason said.
+# made from it), HD1 an hd1, a path module's SOURCE an absolute path (outdated and update read it). Exit 1 with the
+# reason said.
 lines_check() { # FILE
   (LOCK=$1 && lock_check) || return 1
   HM_F="$1" awk -F '\t' '{ for (i = 1; i <= NF; i++) if ($i ~ /[[:cntrl:]]/) b = 1 }
     $7 != "-" && ($7 !~ /^[0-9a-f]+$/ || (length($7) != 40 && length($7) != 64)) { b = 1 }
     $8 != "-" && ($8 !~ /^hd1:[0-9a-f]+$/ || length($8) != 68) { b = 1 }
-    b { printf "henki-mods: %s:%d: not a lock/1 line (a control character, or a COMMIT or HD1 that is not one)\n", ENVIRON["HM_F"], NR; exit 1 }' "$1" >&2 || return 1
+    $5 == "path" && $6 !~ /^\// { b = 1 }
+    b { printf "henki-mods: %s:%d: not a lock/1 line (a control character, a COMMIT or HD1 that is not one, or a path SOURCE that is not absolute)\n", ENVIRON["HM_F"], NR; exit 1 }' "$1" >&2 || return 1
   ! command grep -q "^bind/1$tab" "$1" || {
     printf 'henki-mods: %s: holds a port binding (bind/1), which is not moved this way; fix: remove the line\n' "$1" >&2
     return 1
@@ -2556,9 +2558,10 @@ pack_members() { # FILE
   }
 }
 
-# The KIND of the pack line in L_*, checked rather than believed (it decides which yanks apply): `official` only for
-# the files of this henki's module of that name; `index:I` only for an index in use here and, once it is here, one that
-# lists these files as that version (until then it is unreviewed, and its yanks apply at the next sync).
+# The KIND of the pack line in L_*, checked rather than believed (it decides which yanks apply and what list, verify
+# and outdated say of it): `official` only for the files of this henki's module of that name; `index:I` only for an
+# index in use here that is loaded (its commit verified here, or the pack's bundle used) and lists these files as that
+# version.
 pack_kind() {
   local i
   case "$L_kind" in
@@ -2570,7 +2573,8 @@ pack_kind() {
     index:*)
       i=${L_kind#index:}
       index_names | command grep -qx "$i" || die "$L_name: the pack says it comes from index $i, which you do not use; fix: do not unpack it, or henki-mods index add $i first"
-      [ ! -f "$STAGE/ix/$i/vers" ] || hd1_hits "$L_hd1" | command grep -qxF "$i$tab$L_source$tab$L_version" ||
+      [ -f "$STAGE/ix/$i/vers" ] || die "$L_name: the pack says it comes from index $i, and nothing of index $i is here to check that against; fix: henki-mods sync, or pack it again with --with-index"
+      hd1_hits "$L_hd1" | command grep -qxF "$i$tab$L_source$tab$L_version" ||
         die "$L_name: index $i here does not list $L_source $L_version with these files; fix: henki-mods sync, then unpack again (if it says so again, do not unpack it)"
       ;;
   esac
@@ -2626,6 +2630,9 @@ EOF
     pack_kind "$x"
     inspect "$x" "$n" 3 || die "$n: $(printf '%s' "$ERR" | sed "s|$u/||g")"
     [ "$I_hd1" = "$L_hd1" ] && [ "$I_name" = "$n" ] || die "$n: the copy in $f is not the one its lock line names ($I_hd1); fix: do not unpack it"
+    for i in $(masks_of); do
+      [ -f "$x/cmd/$i" ] && [ -x "$x/cmd/$i" ] || die "$n: the pack masks /$i, which its copy has no command of; fix: pack it again"
+    done
     hd=$(HM_N="$n" awk -F '\t' '$2 == ENVIRON["HM_N"] { print $3 "\t" $4 }' "$STAGE/pack.assets")
     [ "$hd" = "$(printf '%s' "$I_asset" | cut -f 2,4)" ] || die "$n: the pack's asset/1 line does not match its prebuilt program; fix: pack it again on a machine of this kind"
     old=$(HM_N="$n" awk -F '\t' '$1 == "lock/1" && $2 == ENVIRON["HM_N"] { print $8 }' "$LOCK" 2>/dev/null)

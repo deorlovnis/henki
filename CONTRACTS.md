@@ -487,12 +487,12 @@ asset_aarch64_apple_darwin = ["bin/x", "https://...", "sha256:..."]   # optional
 
 `asset_TARGET` names a prebuilt program for one machine: TARGET is `aarch64_apple_darwin`, `x86_64_apple_darwin`,
 `aarch64_unknown_linux_musl`, `x86_64_unknown_linux_musl`, `aarch64_unknown_linux_gnu` or `x86_64_unknown_linux_gnu`
-(on Linux the musl one is taken first), and the array holds the program's place (`bin/NAME`), an https URL and the
-SHA-256 of its bytes (64 lowercase hex digits). At an install henki-mods downloads this machine's one (curl, https
-only, at most 64 MiB), refuses other bytes, and puts it at its place in the store copy, as a program; the module's own
-files must not hold that place. A module with assets but none for this machine is refused. The asset is left out of
-the hd1 (which stays the hash of the module's own files, the one an index lists) and is checked by its SHA-256 instead,
-whenever the store copy is (`verify`, `on`, a swap).
+(on Linux the musl one is taken first), and the array holds the program's place (`bin/NAME`, NAME not `.` or `..`),
+an https URL and the SHA-256 of its bytes (64 lowercase hex digits). At an install henki-mods downloads this machine's
+one (curl, https only, at most 64 MiB), refuses other bytes, and puts it at its place in the store copy, as a program;
+the module's own files must not hold that place. A module with assets but none for this machine is refused. The asset
+is left out of the hd1 (which stays the hash of the module's own files, the one an index lists) and is checked by its
+SHA-256 instead, whenever the store copy is (`verify`, `on`, a swap).
 
 A module without a manifest is unmanaged (allowed for path and URL installs, and listed as such). `port/PORT` is a
 program its owner can run (a file, or a link inside the module), PORT one that henki binds (`history` or `policy`).
@@ -646,8 +646,9 @@ line's hd1 and its asset's SHA-256, and fit this machine (module/1's `os`, `requ
 for an index in use here, checked from the anchor and checkpoint here (never a key or anchor in the pack), and only when
 its head has the commit verified here on its first-parent line (or nothing is verified here); it never moves
 `refs/henki/verified`, and the yanks and removals of the commit verified here apply after its own. A line's fields are
-checked, not believed: no control character, COMMIT a full commit or `-`, HD1 an hd1; KIND `official` only when this
-henki's module of that name has that hd1, `index:INDEX` only for an index in use here that, once it is here, lists that
+checked, not believed: no control character, COMMIT a full commit or `-`, HD1 an hd1, a `path` SOURCE an absolute
+path, each `mask=cmd/CMD` a command the copy has; KIND `official` only when this henki's module of that name has that
+hd1, `index:INDEX` only for an index in use here whose commit is verified here (or whose bundle is used) and lists that
 hd1 as the line's package and version (the default index's yanks of the same hd1 apply to it too). A malicious yank
 refuses the install. A module the lock holds with the same hd1 is left as it is; another one is replaced, its line
 going to the history (hist/1, `unpack`).

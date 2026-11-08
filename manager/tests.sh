@@ -2731,6 +2731,12 @@ t_assets() {
   mkmod "$W/plain" "asset_$t = [\"bin/tool\", \"http://127.0.0.1:1/tool\", \"sha256:$h\"]\n"
   run add "$W/plain" --yes
   refused "asset_$t must be [\"bin/NAME\", \"https://...\", \"sha256:HEX\"]"
+  local d
+  for d in bin/.. bin/.; do
+    mkmod "$W/dots" "asset_$t = [\"$d\", \"$ASSET_URL/tool\", \"sha256:$h\"]\n"
+    run add "$W/dots" --yes
+    refused "(NAME not . or .., an https URL"
+  done
   mkmod "$W/clash" "asset_$t = [\"bin/tool\", \"$ASSET_URL/tool\", \"sha256:$h\"]\n"
   cp "$W/www/tool" "$W/clash/bin/tool" && chmod 755 "$W/clash/bin/tool"
   run add "$W/clash" --yes
@@ -2784,15 +2790,21 @@ t_pack() {
   rc_is 0
   out_has "hello 0.1.0: already here, left as it is"
   out_has "nothing to install"
-  # A bundle signed by a key the anchor here does not hold: not used, so no review line.
+  # A bundle signed by a key the anchor here does not hold: not used, and with nothing synced here either the index
+  # line cannot be checked, so it is refused; the path module alone goes in, unreviewed.
   export HOME="$W/home3" XDG_DATA_HOME="$W/data3"
   CONF="$HOME/.config/henki"
   mkdir -p "$HOME"
   signer k2 >"$share2/index/deorlovnis.signers"
   run unpack "$W/a.tgz" --yes
-  rc_is 0
+  refused "hello: the pack says it comes from index deorlovnis, and nothing of index deorlovnis is here to check that against; fix: henki-mods sync, or pack it again with --with-index"
   out_has "not used: "
+  check "nothing installed" [ ! -f "$CONF/mods.lock" ]
+  repack "$W/a.tgz" "$W/a-pp.tgz" '$1 == "lock/1" && $2 == "hello" { next } { print }'
+  run unpack "$W/a-pp.tgz" --yes
+  rc_is 0
   out_has "UNREVIEWED: in no index you use"
+  out_has "installed pp 0.1.0: off"
   # A malicious yank made after the pack, verified here: the pack's older bundle cannot undo it.
   signer k1 >"$share2/index/deorlovnis.signers"
   printf 'file://%s\n' "$IX" >"$share2/index/deorlovnis.url"
@@ -2806,6 +2818,22 @@ t_pack() {
   run unpack "$W/a.tgz" --yes
   refused "hello 0.1.0 was yanked as malicious (steals keys (2026-11-08)) by index deorlovnis; not installed"
   out_has "no longer holds the verified commit"
+  check "nothing installed" [ ! -f "$CONF/mods.lock" ]
+  # The index takes the yank back in a newer signed commit, packed from a machine synced to it: the bundle is used, and
+  # the malicious yank verified here still applies after it.
+  unkey "$IX/mods/hello/0.1.0.toml" yanked
+  ixc "$IX" unyank
+  export HOME="$keep_home" XDG_DATA_HOME="$keep_data" HENKI_SHARE="$W/share"
+  CONF="$HOME/.config/henki"
+  run sync
+  rc_is 0
+  run pack --with-index -o "$W/c.tgz"
+  rc_is 0
+  export HOME="$W/home4" XDG_DATA_HOME="$W/data4" HENKI_SHARE="$share2"
+  CONF="$HOME/.config/henki"
+  run unpack "$W/c.tgz" --yes
+  refused "hello 0.1.0 was yanked as malicious (steals keys (2026-11-08)) by index deorlovnis; not installed"
+  out_has "verified from the anchor here"
   check "nothing installed" [ ! -f "$CONF/mods.lock" ]
   # Hostile archives: refused before anything is extracted.
   local k
@@ -2878,7 +2906,7 @@ t_pack_lines() {
   repack "$W/h.tgz" "$W/h-other.tgz" '$1 == "lock/1" { $5 = "index:other" } { print }'
   run unpack "$W/h-other.tgz" --yes
   refused "hello: the pack says it comes from index other, which you do not use"
-  repack "$W/h.tgz" "$W/h-path.tgz" '$1 == "lock/1" { $5 = "path" } { print }'
+  repack "$W/h.tgz" "$W/h-path.tgz" '$1 == "lock/1" { $5 = "path"; $6 = "/elsewhere/hello" } { print }'
   run unpack "$W/h-path.tgz" --yes
   refused "hello 0.1.0 was yanked as malicious"
   # The same package under the index's name, but another version than its files are.
@@ -2893,12 +2921,12 @@ t_pack_lines() {
   run unpack "$W/c-official.tgz" --yes
   refused "clip: the pack says it is henki's official clip, and this henki's clip is other files"
   check "the official clip stays" [ "$(field clip 5)" = official ]
-  # A commit that walks out of the store, a control character, an hd1 that is not one.
+  # A commit that walks out of the store, a control character, an hd1 that is not one, a relative path.
   repack "$W/h.tgz" "$W/h-dots.tgz" '$1 == "lock/1" { $7 = "../../index/" } { print }' hello "$id" index
   run unpack "$W/h-dots.tgz" --yes
   refused "its PACK is not lock/1 lines this henki-mods reads"
   check "no index dir made" [ ! -e "$XDG_DATA_HOME/henki/index/.henki" ]
-  for k in '$6 = $6 "\033[2J"' '$8 = "hd1:../x"' '$9 = $9 "\r"'; do
+  for k in '$6 = $6 "\033[2J"' '$8 = "hd1:../x"' '$9 = $9 "\r"' '$5 = "path"; $6 = "elsewhere/hello"'; do
     repack "$W/h.tgz" "$W/h-bad.tgz" '$1 == "lock/1" { '"$k"' } { print }'
     run unpack "$W/h-bad.tgz" --yes
     refused "its PACK is not lock/1 lines this henki-mods reads"
@@ -2912,6 +2940,39 @@ t_pack_lines() {
   run init "$W/p.lock" --yes
   refused "hello 0.1.0 was yanked as malicious (steals keys) by index deorlovnis; not installed"
   check "nothing added" [ -z "$(lockline hello)" ]
+  # Other code labelled as the index's package, on a machine that has not synced: nothing to check it against, so
+  # refused (else list, verify and outdated would call it the index's after the next sync).
+  export HOME="$W/home3" XDG_DATA_HOME="$W/data3"
+  CONF="$HOME/.config/henki"
+  mkdir -p "$HOME"
+  mkmod "$W/x/hello"
+  printf 'other code\n' >>"$W/x/hello/doc.md"
+  mkdir -p "$W/x/hello/cmd"
+  printf '#!/bin/sh\necho greet\n' >"$W/x/hello/cmd/greet"
+  chmod 755 "$W/x/hello/cmd/greet"
+  run add "$W/x/hello" --yes
+  rc_is 0
+  run off hello/greet
+  rc_is 0
+  run pack hello -o "$W/x.tgz"
+  rc_is 0
+  export HOME="$W/home4" XDG_DATA_HOME="$W/data4"
+  CONF="$HOME/.config/henki"
+  mkdir -p "$HOME"
+  repack "$W/x.tgz" "$W/x-ix.tgz" '$1 == "lock/1" { $4 = "0.2.0"; $5 = "index:deorlovnis"; $6 = "hello" } { print }'
+  run unpack "$W/x-ix.tgz" --yes
+  refused "hello: the pack says it comes from index deorlovnis, and nothing of index deorlovnis is here to check that against"
+  # A mask of a command the copy does not have.
+  repack "$W/x.tgz" "$W/x-mask.tgz" '$1 == "lock/1" { $11 = "mask=cmd/..,pin" } { print }'
+  run unpack "$W/x-mask.tgz" --yes
+  refused "hello: the pack masks /.., which its copy has no command of"
+  check "nothing installed" [ ! -f "$CONF/mods.lock" ]
+  # Its own mask goes along.
+  run unpack "$W/x.tgz" --yes
+  rc_is 0
+  check "the mask kept" [ "$(field hello 11)" = mask=cmd/greet ] && [ ! -e "$(readlink "$CONF/ext/hello")/cmd/greet" ]
+  run verify
+  rc_is 0
 }
 
 # Shipped profiles in W/share/mod-profiles (HENKI_SHARE): official modules sessions (no prompt bytes) and tooly.
