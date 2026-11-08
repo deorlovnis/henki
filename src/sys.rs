@@ -267,12 +267,25 @@ pub fn tree(ps: &[Proc], root: impl Fn(&Proc) -> bool) -> Vec<i32> {
 }
 
 /// Blocks until child `pid` has ended (or is no child of henki's), and leaves it unreaped (waitid WEXITED | WNOWAIT):
-/// its owner reaps it under supervise's lock.
-pub fn exited(pid: i32) {
+/// its owner reaps it under supervise's lock. false: waitid failed otherwise, and the child may still run (a reap
+/// would block under that lock).
+pub fn exited(pid: i32) -> bool {
     // SAFETY: an all-zero siginfo_t is a valid out value; waitid writes only into it.
     let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
-    // SAFETY: P_PID with a positive pid names one child; the pointer is to the live local above.
-    let _ = pid > 0 && unsafe { libc::waitid(libc::P_PID, pid as libc::id_t, &mut info, libc::WEXITED | libc::WNOWAIT) } == 0;
+    if pid <= 0 {
+        return false;
+    }
+    loop {
+        // SAFETY: P_PID with a positive pid names one child; the pointer is to the live local above.
+        if unsafe { libc::waitid(libc::P_PID, pid as libc::id_t, &mut info, libc::WEXITED | libc::WNOWAIT) } == 0 {
+            return true;
+        }
+        // ECHILD: reaped already, so a reap returns at once.
+        match io::Error::last_os_error().raw_os_error() {
+            Some(libc::EINTR) => {}
+            e => return e == Some(libc::ECHILD),
+        }
+    }
 }
 
 /// O_RDONLY|O_NONBLOCK|O_NOCTTY|O_CLOEXEC, then fstat. Never blocks on a FIFO or a device.

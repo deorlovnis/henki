@@ -91,7 +91,11 @@ impl Observers {
                     // supervise's lock, so a pid henki may signal is never a recycled one. Without the thread the run
                     // is killed at the session end, and a wait for it runs out.
                     let _ = thread::Builder::new().spawn(move || {
-                        sys::exited(pid);
+                        // Should waitid fail, the run is left as if the thread had not started: never reaped, so
+                        // its pid stays its own for the session end's kill.
+                        if !sys::exited(pid) {
+                            return;
+                        }
                         supervise::kernel_end(Some(child), false);
                         lock(&live).retain(|l| l.1 != pid);
                         let _ = tx.send(Ev::Observed { tag: if wait { tag } else { 0 } });

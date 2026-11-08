@@ -316,6 +316,19 @@ fn kill_esrch_false() {
     assert!(!reap(pid) && !reap(0) && !reap(-1));
 }
 
+/// `exited` sees the end and leaves the child for its owner's reap; a pid that is no child (any more) is no wait at
+/// all, and a pid that names no one child is false, so the caller reaps nothing.
+#[test]
+fn exited_leaves_child_unreaped() {
+    let mut child = std::process::Command::new("sh").args(["-c", "exit 3"]).spawn().unwrap();
+    let pid = child.id() as i32;
+    assert!(within_5s(move || exited(pid)));
+    assert_eq!(child.try_wait().unwrap().and_then(|s| s.code()), Some(3), "reaped by its owner, with its status");
+    assert!(exited(pid), "reaped already: a reap returns at once");
+    assert!(exited(1), "no child of henki's");
+    assert!(!exited(0) && !exited(-1));
+}
+
 #[test]
 fn isatty_dev_null_false() {
     let f = File::open("/dev/null").unwrap();
