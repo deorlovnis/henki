@@ -65,7 +65,8 @@ pub fn discover(paths: &[PathBuf], optional: bool, shadow: &[String], path: &OsS
 /// One extension directory: doc.md, an optional bin/, ignored names, nothing else.
 fn one(dir: &Path, name: &str) -> Result<Ext, String> {
     let entries = names(dir).map_err(|e| bad(dir, e, "make it an extension directory, or move it out of the ext path"))?;
-    let known = |n: &&OsString| *n == "doc.md" || *n == "bin" || ["README", "LICENSE", "CHANGELOG", "."].iter().any(|p| n.as_bytes().starts_with(p.as_bytes()));
+    // `port/` holds port bindings, which `CONFIG/port/` links name (a package's other parts are not read here).
+    let known = |n: &&OsString| *n == "doc.md" || *n == "bin" || *n == "port" || ["README", "LICENSE", "CHANGELOG", "."].iter().any(|p| n.as_bytes().starts_with(p.as_bytes()));
     if let Some(n) = entries.iter().find(|n| !known(n)) {
         return Err(bad(dir, format!("unknown entry {}; v1 extensions hold doc.md and bin/ only", dir.join(n).display()), "move it out of the extension"));
     }

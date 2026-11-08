@@ -19,6 +19,11 @@ static LEDGER: Mutex<Vec<i32>> = Mutex::new(Vec::new());
 /// The children henki had before its first call or `!cmd`, such as a launcher's background job that came along through
 /// exec. henki did not start them, so the count and the sweep leave them and their descendants alone.
 static INHERITED: OnceLock<Vec<i32>> = OnceLock::new();
+/// The children henki runs for itself (port bindings), by pid; each leads its own session. The per-call background
+/// count, a stop's kill and its sweep leave them and their trees alone, and `pass` never reaps them: a pid leaves this
+/// list only in `kernel_end`, under this lock and at the moment it is reaped, so a pid henki may still signal is never
+/// one the system could have given to another process.
+static KERNEL: Mutex<Vec<i32>> = Mutex::new(Vec::new());
 
 /// Where a call's full output goes once it passes the cap; `shown` is the path as the marker prints it (`$HOME` as `~`).
 pub struct Spill {
@@ -106,10 +111,36 @@ pub fn exec(prog: &Path, args: &[OsString], env: &[(OsString, OsString)]) -> io:
     c.exec()
 }
 
+/// MAIN thread only. A kernel child: `exe` with no arguments in its own session with the tool child's setup
+/// (`sys::child_setup`: setsid, signal defaults, PDEATHSIG and the ppid check on Linux), in `cwd`, with exactly `env`,
+/// and `io` as its stdin, stdout and stderr. In KERNEL before this returns.
+pub fn kernel_child(exe: &Path, cwd: &Path, env: &[(OsString, OsString)], io: [Stdio; 3]) -> io::Result<Child> {
+    let [i, o, e] = io;
+    let mut c = Command::new(exe);
+    c.current_dir(cwd).env_clear().envs(env.iter().map(|(k, v)| (k, v))).stdin(i).stdout(o).stderr(e);
+    sys::child_setup(&mut c, std::process::id());
+    INHERITED.get_or_init(|| children(&sys::procs()));
+    let mut k = lock(&KERNEL);
+    #[allow(clippy::disallowed_methods)] // henki's own helpers: port bindings
+    let child = c.spawn()?;
+    k.push(child.id() as i32);
+    Ok(child)
+}
+
+/// SIGKILL a kernel child's group and, on Linux, every process of its session (as `kill_call`), reap it, forget it.
+/// None: it was ended before.
+pub fn kernel_end(c: Option<Child>) {
+    let Some(mut c) = c else { return };
+    let mut k = lock(&KERNEL);
+    kill_call(c.id() as i32);
+    let _ = c.wait();
+    k.retain(|&p| p != c.id() as i32);
+}
+
 /// Sends `sig` (0 probes) to every group in the ledger, drops the groups that are gone (ESRCH), returns how many remain.
 pub fn signal_groups(sig: i32) -> usize {
     let mut g = lock(&LEDGER);
-    pass(&mut g, sig);
+    pass(&mut g, &lock(&KERNEL).clone(), sig);
     g.len()
 }
 
@@ -125,37 +156,40 @@ pub fn kill_call(pgid: i32) {
 /// background descendants (macOS: live ledger groups of earlier calls).
 pub fn reap() -> usize {
     let mut g = lock(&LEDGER);
-    let live = pass(&mut g, 0);
+    let live = pass(&mut g, &lock(&KERNEL).clone(), 0);
     if cfg!(target_os = "linux") { live.len() } else { g.len() }
 }
 
 /// One sweep pass: reap zombie children by pid, SIGKILL every live descendant of henki and every ledger group; returns
 /// how many it signalled (0: nothing is left). macOS: the groups only.
 pub fn sweep_pass() -> usize {
-    sweep(&mut lock(&LEDGER))
+    sweep(&mut lock(&LEDGER), &lock(&KERNEL).clone())
 }
 
-/// The panic hook's kill: try_lock the ledger, SIGKILL every group, sweep passes without waiting.
+/// The panic hook's kill: try_lock the kernel children and the ledger, SIGKILL each, sweep passes without waiting.
 pub fn panic_kill() {
-    // The panicking thread may hold the ledger itself; the sweep still finds every process through the process tree.
+    // The panicking thread may hold either lock itself; the sweep still finds every process through the process tree,
+    // kernel children included (an empty kernel list: everything goes).
+    KERNEL.try_lock().iter().flat_map(|k| k.iter()).for_each(|&p| kill_call(p));
     let mut g = LEDGER.try_lock().map(|g| g.clone()).unwrap_or_default();
-    _ = (0..5).all(|_| sweep(&mut g) > 0); // up to five passes, until one finds nothing
+    _ = (0..5).all(|_| sweep(&mut g, &[]) > 0); // up to five passes, until one finds nothing
 }
 
-fn sweep(groups: &mut Vec<i32>) -> usize {
-    let live = pass(groups, libc::SIGKILL);
+fn sweep(groups: &mut Vec<i32>, kernel: &[i32]) -> usize {
+    let live = pass(groups, kernel, libc::SIGKILL);
     if cfg!(target_os = "linux") { live.into_iter().filter(|&p| sys::kill(p, libc::SIGKILL)).count() } else { groups.len() }
 }
 
-/// Reaps henki's zombie children by pid, except group leaders (their waiters own them), then sends `sig` to every group
-/// and drops the gone ones (ESRCH); returns the live descendants (Linux; none elsewhere). The reap comes first because a
-/// zombie still answers for its group: a group whose members have all ended would never give ESRCH.
-fn pass(groups: &mut Vec<i32>, sig: i32) -> Vec<i32> {
+/// Reaps henki's zombie children by pid, except group leaders and kernel children (their owners reap them), then sends
+/// `sig` to every group and drops the gone ones (ESRCH); returns the live descendants (Linux; none elsewhere), kernel
+/// children and their trees left out. The reap comes first because a zombie still answers for its group: a group whose
+/// members have all ended would never give ESRCH.
+fn pass(groups: &mut Vec<i32>, kernel: &[i32], sig: i32) -> Vec<i32> {
     let (ps, me) = (sys::procs(), std::process::id() as i32);
     let inherited = INHERITED.get_or_init(|| children(&ps));
-    ps.iter().filter(|p| p.zombie && p.ppid == me && !groups.contains(&p.pid)).for_each(|p| _ = sys::reap(p.pid));
+    ps.iter().filter(|p| p.zombie && p.ppid == me && !groups.contains(&p.pid) && !kernel.contains(&p.pid)).for_each(|p| _ = sys::reap(p.pid));
     groups.retain(|&pg| sys::kill(-pg, sig));
-    sys::tree(&ps, |p| p.ppid == me && !inherited.contains(&p.pid))
+    sys::tree(&ps, |p| p.ppid == me && !inherited.contains(&p.pid) && !kernel.contains(&p.pid))
 }
 
 /// henki's direct children.

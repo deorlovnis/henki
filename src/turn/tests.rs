@@ -58,7 +58,7 @@ fn open(mut cfg: Config, mode: Mode, input: Option<std::io::PipeReader>) -> (Ses
 
 /// The std bindings, with a new session held in the history.
 fn std_ports(cfg: &Config) -> (Ports, String) {
-    let mut ports = Ports { history: Box::new(crate::journal::Journal::new(&cfg.state)), policy: Box::new(crate::allow::Std) };
+    let mut ports = Ports { history: Box::new(crate::journal::Journal::new(&cfg.state)), policy: Box::new(crate::allow::Std), bound: Vec::new() };
     let sid = ports.history.create(&cfg.cwd, None).unwrap();
     (ports, sid)
 }

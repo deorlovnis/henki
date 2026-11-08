@@ -19,6 +19,8 @@ mod input;
 mod journal;
 #[path = "e2e/outcomes.rs"]
 mod outcomes;
+#[path = "e2e/ports.rs"]
+mod ports;
 #[path = "e2e/processes.rs"]
 mod processes;
 #[path = "e2e/prompt.rs"]

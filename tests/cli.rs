@@ -1,6 +1,7 @@
 #![allow(clippy::disallowed_methods, clippy::print_stdout, clippy::print_stderr, clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::string_slice)]
 //! The command line: `--version`, `--help`, refused arguments, the argument errors of `run`, the REPL's refusal
-//! without a terminal, and `henki mods` (`henki allow`), which becomes the module manager without reading a config.
+//! without a terminal, `henki mods` (`henki allow`), which becomes the module manager without reading a config, and the
+//! hidden `henki port`, a port binding's pipe.
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
@@ -8,8 +9,8 @@ use std::process::{Command, Output, Stdio};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
-const USAGE: &str = "usage: henki [--config FILE] [--approve ask|auto] [--model NAME] [--resume[=ID]] [--nested]
-       henki run [--json] [--max-steps N] [--max-seconds N] [--approve ask|auto] [--config FILE] [--model NAME] [--resume[=ID]] [--nested] [TASK | -]
+const USAGE: &str = "usage: henki [--config FILE] [--approve ask|auto] [--model NAME] [--resume[=ID]] [--port PORT=std] [--nested]
+       henki run [--json] [--max-steps N] [--max-seconds N] [--approve ask|auto] [--config FILE] [--model NAME] [--resume[=ID]] [--port PORT=std] [--nested] [TASK | -]
        henki mods [ARGS] | henki allow [rm N]
        henki --version | --help
 ";
@@ -242,4 +243,82 @@ fn version_le_10ms() {
     times.sort();
     println!("--version: median {:?}, max {:?}", times[10], times[19]);
     assert!(times[10] <= Duration::from_millis(10), "median {:?}", times[10]);
+}
+
+/// `--port` takes PORT=std for the six ports, in the REPL's flags and in `run`'s, and nothing else.
+#[test]
+fn port_flag() {
+    for bad in ["history", "history=tree", "nope=std", "=std"] {
+        for args in [&["--port", bad][..], &["run", "--port", bad, "task"][..]] {
+            let out = henki(args);
+            assert_eq!(out.status.code(), Some(2), "{args:?}");
+            let want = "henki: --port takes PORT=std, PORT one of model, history, context, exec, policy, frontend\n";
+            assert!(text(&out.stderr).starts_with(want), "{args:?}: {}", text(&out.stderr));
+        }
+    }
+    // A broken link in CONFIG/port/ stops the start; `--port history=std` runs past it.
+    let h = Home::new();
+    fs::create_dir_all(h.0.join(".config/henki/port")).unwrap();
+    std::os::unix::fs::symlink("/nonexistent/binding", h.0.join(".config/henki/port/history")).unwrap();
+    let env = [("HENKI_BASE_URL", "http://127.0.0.1:9/v1"), ("HENKI_MODEL", "m")];
+    let out = h.run(&["run", "--max-seconds", "1", "task"], &env);
+    let link = h.0.join(".config/henki/port/history");
+    let want = format!("henki: {}: not a link to a program; fix: henki mods swap history std, or start with --port history=std\n", link.display());
+    assert_eq!((out.status.code(), text(&out.stderr)), (Some(2), want.as_str()));
+    let out = h.run(&["run", "--port", "history=std", "--port", "policy=std", "--max-seconds", "1", "task"], &env);
+    assert_eq!(out.status.code(), Some(124), "{}", text(&out.stderr));
+}
+
+/// A history binding in bash for `henki port`: hello (it checks the offer), then `create` and an echo of the request
+/// as an error; it writes its environment to its state dir.
+fn echo_binding(dir: &Path) -> PathBuf {
+    let b = dir.join("binding");
+    let text = r#"#!/bin/bash
+while IFS= read -r line; do
+  id=$(printf '%s' "$line" | sed -n 's/^{"id":\([0-9]*\),.*/\1/p')
+  case "$line" in
+    *'"method":"hello"'*'"versions":[1]'*) env >"$(printf '%s' "$line" | sed -n 's/.*"state":"\([^"]*\)".*/\1/p')/env"; printf '{"id":%s,"result":{"caps":["fork"],"impl":"2.0","name":"echo","protocol":1,"version":1}}\n' "$id" ;;
+    *'"method":"hello"'*) printf '{"id":%s,"error":{"code":"version","message":"history/1 only"}}\n' "$id" ;;
+    *'"method":"create"'*) printf '{"result":{"session":"e-1"},"id":%s}\n' "$id" ;;
+    *'"method":"bye"'*) printf '{"id":%s,"result":null}\n' "$id"; exit 0 ;;
+    *) printf '{"id":%s,"error":{"code":"x-said","message":"%s"}}\n' "$id" "$(printf '%s' "$line" | sed 's/"/~/g')" ;;
+  esac
+done
+"#;
+    write(&b, text, 0o700);
+    b
+}
+
+/// `henki port PORT [--offer V] -- PROGRAM`: no config read, the hello line, one canonical answer per request line, a
+/// binding error with its code (an unknown one as `other`), `kill`; the binding's state dir and environment.
+#[test]
+fn port_pipe() {
+    let h = Home::new();
+    let b = echo_binding(&h.0);
+    let mut c = Command::new(env!("CARGO_BIN_EXE_henki"));
+    c.args(["port", "history", "--", b.to_str().unwrap()]).current_dir(&h.0).env_clear().env("HOME", &h.0).env("PATH", "/usr/bin:/bin");
+    c.env("XDG_STATE_HOME", h.0.join("state")).env("HENKI_API_KEY", "secret").env("SOME_TOKEN", "t");
+    let mut child = c.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().unwrap();
+    let input = "{\"method\":\"create\",\"params\":{\"hint\":null,\"scope\":\"/\"}}\n{\"method\":\"x-up\",\"params\":{\"b\":1,\"a\":\"\u{202e}\"}}\n{\"kill\":true}\n{\"method\":\"create\"}\n";
+    std::io::Write::write_all(child.stdin.as_mut().unwrap(), input.as_bytes()).unwrap();
+    let out = child.wait_with_output().unwrap();
+    assert_eq!((out.status.code(), text(&out.stderr)), (Some(0), ""));
+    let lines: Vec<&str> = text(&out.stdout).lines().collect();
+    assert_eq!(lines[..2], ["{\"result\":{\"caps\":[\"fork\"],\"name\":\"echo 2.0\"}}", "{\"result\":{\"session\":\"e-1\"}}"]);
+    let said =
+        format!("{{\"error\":{{\"code\":\"other\",\"message\":\"history binding {}: x-said: {{~id~:2,~method~:~x-up~,~params~:{{~a~:~\\\\u{{202e}}~,~b~:1}}}}\"}}}}", b.display());
+    assert_eq!((lines[2], lines.len()), (said.as_str(), 3), "the request is canonical; kill ends the pipe");
+    let env = fs::read_to_string(h.0.join("state/henki/port/history/env")).unwrap();
+    for (k, v) in [("HENKI_DEPTH", Some("1")), ("HENKI_SESSION", Some("")), ("HENKI_API_KEY", None), ("SOME_TOKEN", None), ("HOME", Some(h.0.to_str().unwrap()))] {
+        assert_eq!(env.lines().find_map(|l| l.strip_prefix(&format!("{k}="))), v, "{k}: {env}");
+    }
+    // An offer the binding does not take: its version error as the first line, exit 2.
+    let out = h.run(&["port", "history", "--offer", "99", "--", b.to_str().unwrap()], &[]);
+    assert_eq!(out.status.code(), Some(2));
+    assert_eq!(text(&out.stdout), format!("{{\"error\":{{\"code\":\"version\",\"message\":\"history binding {}: version: history/1 only\"}}}}\n", b.display()));
+    for (args, says) in [(&["port", "policy", "--", "/x"][..], "henki port takes history, not policy"), (&["port", "history"][..], "henki port needs -- PROGRAM")] {
+        let out = h.run(args, &[]);
+        assert_eq!(out.status.code(), Some(2), "{args:?}");
+        assert!(text(&out.stderr).starts_with(&format!("henki: {says}\n")), "{args:?}: {}", text(&out.stderr));
+    }
 }

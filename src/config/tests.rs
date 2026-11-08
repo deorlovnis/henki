@@ -500,7 +500,7 @@ fn config_precedence() {
     let env = t.env(&[("HENKI_MODEL", "from-env")]);
     let c = load(&flags(), &env, &t.cwd).unwrap();
     assert_eq!(c.model, "from-env");
-    let f = Flags { model: Some("from-flag".into()), max_steps: Some(9), max_seconds: Some(0), approve: Some(false), config: None };
+    let f = Flags { model: Some("from-flag".into()), max_steps: Some(9), max_seconds: Some(0), approve: Some(false), config: None, ports: Vec::new() };
     let c = load(&f, &env, &t.cwd).unwrap();
     assert_eq!((c.model.as_str(), c.max_steps, c.max_seconds, c.auto, c.approve_from.as_str()), ("from-flag", 9, 0, false, "--approve"));
     assert_eq!((c.cwd, c.root, c.home), (t.cwd.clone(), t.cwd.clone(), t.home.clone()));
@@ -699,7 +699,7 @@ fn config_ext_empty_list() {
     assert!(c.exts.is_empty());
     assert!(!c.protected.contains(&ext), "{:?}", c.protected);
     let d = t.cfg_dir();
-    assert_eq!(c.trust, [t.cfg(), d.join("allow"), d.join("AGENTS.md"), t.bin.join("bash")]);
+    assert_eq!(c.trust, [t.cfg(), d.join("allow"), d.join("AGENTS.md"), t.bin.join("bash"), d.join("port"), d.join("port/history")]);
 }
 
 #[test]
@@ -1016,18 +1016,23 @@ fn config_trust_paths() {
     add_ext(&ext, "halti", &["halti"]);
     let c = t.load(BASE).unwrap();
     assert!(c.exts[0].paths.contains(&ext.join("halti/doc.md")) && c.exts[0].paths.contains(&ext.join("halti/bin/halti")));
-    let want: Vec<_> = [t.cfg(), d.join("allow"), d.join("AGENTS.md"), t.bin.join("bash"), ext.clone()].into_iter().chain(c.exts[0].paths.clone()).collect();
+    let want: Vec<_> = [t.cfg(), d.join("allow"), d.join("AGENTS.md"), t.bin.join("bash"), ext.clone()].into_iter().chain(c.exts[0].paths.clone()).chain(ports(&d)).collect();
     assert_eq!(c.trust, want);
     assert!(!d.join("allow").exists() && !d.join("AGENTS.md").exists(), "absent files are watched too");
     // Without a config file its default path is watched; with --config, the file named and the ext paths listed.
     fs::remove_dir_all(&ext).unwrap();
     fs::remove_file(t.cfg()).unwrap();
     let c = load(&flags(), &t.env(&[("HENKI_MODEL", "m"), ("HENKI_BASE_URL", "http://127.0.0.1:1/v1")]), &t.cwd).unwrap();
-    assert_eq!(c.trust, [t.cfg(), d.join("allow"), d.join("AGENTS.md"), t.bin.join("bash"), ext.clone()]);
+    assert_eq!(c.trust, [t.cfg(), d.join("allow"), d.join("AGENTS.md"), t.bin.join("bash"), ext.clone(), d.join("port"), d.join("port/history")]);
     fs::create_dir_all(t.home.join("exts")).unwrap();
     let c = t.explicit(&format!("{BASE}ext = [\"~/exts\"]\n")).unwrap();
     let cfg = t.dir.join("cfg");
-    assert_eq!(c.trust, [cfg.join("config.toml"), cfg.join("allow"), cfg.join("AGENTS.md"), t.bin.join("bash"), t.home.join("exts")]);
+    assert_eq!(c.trust, [cfg.join("config.toml"), cfg.join("allow"), cfg.join("AGENTS.md"), t.bin.join("bash"), t.home.join("exts"), cfg.join("port"), cfg.join("port/history")]);
+}
+
+/// The port links the tripwire stamps (absent ones too): `CONFIG/port/` and each port a link can bind.
+fn ports(d: &Path) -> [PathBuf; 2] {
+    [d.join("port"), d.join("port/history")]
 }
 
 #[test]
@@ -1048,7 +1053,7 @@ fn config_trust_paths_symlinked_ext() {
     let through = [dir.clone(), dir.join("doc.md"), dir.join("bin"), dir.join("bin/tool")];
     assert_eq!(c.exts[0].paths, through);
     let d = t.cfg_dir();
-    let want: Vec<_> = [t.cfg(), d.join("allow"), d.join("AGENTS.md"), t.bin.join("bash"), ext.clone()].into_iter().chain(through).collect();
+    let want: Vec<_> = [t.cfg(), d.join("allow"), d.join("AGENTS.md"), t.bin.join("bash"), ext.clone()].into_iter().chain(through).chain(ports(&d)).collect();
     assert_eq!(c.trust, want);
     for p in [src, tool] {
         assert!(c.protected.contains(&p) && !c.trust.contains(&p), "{p:?}: {:?}", c.protected);

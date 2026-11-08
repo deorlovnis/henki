@@ -435,9 +435,9 @@ t_refusals() {
   rm -rf "$m" && mkmod "$m" 'ports = ["history"]\n'
   run add "$m" --yes
   refused "ports must be empty"
-  rm -rf "$m" && mkmod "$m" 'contracts = ["ext/1", "port/1"]\n'
+  rm -rf "$m" && mkmod "$m" 'contracts = ["ext/1", "observe/1"]\n'
   run add "$m" --yes
-  refused "contract port/1 is not one this henki ships"
+  refused "contract observe/1 is not one this henki ships"
   rm -rf "$m" && mkmod "$m" 'caps_net = "lots"\n'
   sed '/^caps_net = "none"/d' "$m/.henki/module.toml" >"$W/t" && mv "$W/t" "$m/.henki/module.toml"
   run add "$m" --yes

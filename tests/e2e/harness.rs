@@ -667,11 +667,14 @@ pub fn changed_journal(state: &Path, before: &HashMap<PathBuf, u64>) -> Option<P
     changed.pop()
 }
 
+/// The std journals, and the sessions of a history binding that keeps one `.jsonl` file per session in its state dir
+/// (the toys of tests/e2e/ports.rs; an empty one there is a session refused at its start).
 fn journals_in(state: &Path) -> Vec<PathBuf> {
     let mut out = Vec::new();
-    for scope in fs::read_dir(state.join("sessions")).into_iter().flatten().flatten() {
+    let bound = fs::read_dir(state.join("port")).into_iter().flatten().flatten().map(|d| (d, true));
+    for (scope, toy) in fs::read_dir(state.join("sessions")).into_iter().flatten().flatten().map(|d| (d, false)).chain(bound) {
         for f in fs::read_dir(scope.path()).into_iter().flatten().flatten() {
-            if f.path().extension().is_some_and(|e| e == "jsonl") {
+            if f.path().extension().is_some_and(|e| e == "jsonl") && !(toy && f.metadata().is_ok_and(|m| m.len() == 0)) {
                 out.push(f.path());
             }
         }
@@ -797,7 +800,8 @@ impl Done {
             let mut recs = Vec::new();
             for l in bytes.split_inclusive(|&b| b == b'\n') {
                 let r: Value = serde_json::from_slice(l).unwrap_or_else(|e| panic!("journal line at {offset} does not parse: {e}\n{}", self.diag()));
-                if r["t"] == "close" {
+                // `bytes` is the std binding's; another binding keeps the record as henki sent it.
+                if r["t"] == "close" && self.journal.as_ref().is_some_and(|p| p.parent().and_then(Path::parent).is_some_and(|d| d.ends_with("sessions"))) {
                     self.check(r["bytes"].as_u64() == Some(offset as u64), &format!("close.bytes {} is not its offset {offset}", r["bytes"]));
                 }
                 offset += l.len();

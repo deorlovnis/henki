@@ -108,6 +108,12 @@ fn contracts_record_fields() {
     let mut r = Run::new(&m.url());
     r.set("dialect", "\"anthropic\"");
     runs.push(("anthropic", r.json("hello")));
+    // History bound to the bash binding of the conformance suite: `session.ports`.
+    let m = Mock::start(vec![say("kept outside")]);
+    let r = Run::new(&m.url());
+    std::fs::create_dir_all(r.config_dir().join("port")).unwrap();
+    std::os::unix::fs::symlink(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/ports/toy-history"), r.config_dir().join("port/history")).unwrap();
+    runs.push(("bound", r.json("hello")));
     // An end before a session: the result alone, `session` null, no `ts`.
     let r = Run::new("http://127.0.0.1:9/v1");
     let d = r.cmd(&["--json", "--max-steps", "0", "x"]).go();
@@ -125,7 +131,10 @@ fn contracts_record_fields() {
             _ => "ok",
         };
         assert_eq!(d.status(), want, "{name}\n{}", d.diag());
-        d.journal_all().iter().for_each(|x| seen.check(&kinds, x, &format!("{name} journal")));
+        // A binding's store is not a journal/1 file (`close.bytes` is std's), so only its stdout is held to the tables.
+        if *name != "bound" {
+            d.journal_all().iter().for_each(|x| seen.check(&kinds, x, &format!("{name} journal")));
+        }
         d.records().iter().for_each(|x| seen.check(&kinds, x, &format!("{name} stdout")));
     }
     seen.covers(&kinds);

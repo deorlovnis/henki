@@ -79,9 +79,9 @@ impl Journal {
         Ok(id)
     }
 
-    /// The held session `id`; `invalid` for any other.
+    /// The held session `id`; `not_found` for any other.
     fn held(&mut self, id: &str) -> Result<&mut Held, PortError> {
-        self.held.as_mut().filter(|h| h.id == id).ok_or_else(|| port::err("invalid", format!("session {id} is not held")))
+        self.held.as_mut().filter(|h| h.id == id).ok_or_else(|| port::err("not_found", format!("session {id} is not held")))
     }
 }
 
@@ -98,12 +98,12 @@ impl History for Journal {
         self.start(dir.join(format!("{id}.jsonl")), id)
     }
 
-    /// Through one `sys::open_append` fd, locked; `read` then reads through it.
+    /// Through one `sys::open_append` fd, locked; `read` then reads through it (and cuts a torn tail).
     fn open(&mut self, scope: &Path, session: Option<&str>) -> Result<String, PortError> {
         self.held = None; // its lock would make it busy
         let (path, file) = pick(&self.state, scope, session)?;
-        let id = path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
-        self.held = Some(Held { file, path, id: id.clone(), bytes: 0, from: 0, fresh: false, gone: false });
+        let (id, n) = (path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default(), file.metadata().map_err(|e| io(&path, e))?.len());
+        self.held = Some(Held { file, path, id: id.clone(), bytes: n, from: n, fresh: false, gone: false });
         Ok(id)
     }
 
@@ -112,7 +112,7 @@ impl History for Journal {
     /// file's length when it was written (else `tampered`).
     fn read(&mut self, session: &str) -> Result<Taken, PortError> {
         let (mut buf, mut notices) = (Vec::new(), Vec::new());
-        let path = match self.held.as_mut().filter(|h| h.id == session) {
+        let path = match self.held.as_mut().filter(|h| h.id == session && !h.gone) {
             Some(h) => {
                 (&h.file).rewind().and_then(|()| (&h.file).read_to_end(&mut buf)).map_err(|e| io(&h.path, e))?;
                 let keep = whole(&buf);
@@ -147,6 +147,7 @@ impl History for Journal {
     /// kind is `ask`, `approval` or `notice`. After `discard`, returns the record as it would have been.
     fn append(&mut self, session: &str, mut rec: Record) -> Result<Record, PortError> {
         let h = self.held(session)?;
+        rec.as_object().ok_or_else(|| port::err("invalid", "a record is a JSON object"))?;
         if rec["t"] == "close" {
             rec["bytes"] = h.bytes.into();
         }
@@ -342,15 +343,17 @@ pub mod rec {
     use serde_json::{Value, json};
     use std::path::Path;
 
-    /// `resumed`: an object the std binding fills with `from_bytes`.
-    pub fn session(cfg: &Config, id: &str, cwd: &Path, resumed: bool) -> Value {
+    /// `resumed`: an object the std binding fills with `from_bytes`; `ports`: (port, display name) of each one bound
+    /// outside std, only when there is one.
+    pub fn session(cfg: &Config, id: &str, cwd: &Path, resumed: bool, ports: &[(&str, String)]) -> Value {
         let u = &cfg.url;
-        json!({"t": "session", "v": 1, "henki": env!("CARGO_PKG_VERSION"), "id": id, "cwd": cwd.to_string_lossy(), "model": cfg.model,
+        let v = json!({"t": "session", "v": 1, "henki": env!("CARGO_PKG_VERSION"), "id": id, "cwd": cwd.to_string_lossy(), "model": cfg.model,
             "dialect": cfg.dialect, "base_url": format!("http://{}{}", crate::http::host_port(u), u.path), "base_url_from": cfg.url_from,
             "approve": if cfg.auto { "auto" } else { "ask" }, "approve_from": cfg.approve_from, "config": cfg.file.as_ref().map(|f| f.to_string_lossy()),
             "tools": cfg.tools, "shell": cfg.bash.to_string_lossy(), "exts": cfg.exts.iter().map(|e| &e.name).collect::<Vec<_>>(), "pass_env": cfg.pass_env, "ctx": cfg.window,
             "config_hash": cfg.hash, "allow_hash": cfg.allow.hash, "agents_hash": cfg.agents_hash, "project_agents_hash": null,
-            "resumed": resumed.then(|| json!({}))})
+            "resumed": resumed.then(|| json!({}))});
+        with(v, "ports", (!ports.is_empty()).then(|| ports.iter().map(|(p, n)| (p.to_string(), Value::from(n.as_str()))).collect::<serde_json::Map<_, _>>()))
     }
     pub fn user(content: &str) -> Value {
         json!({"t": "user", "msg": {"content": content, "role": "user"}})

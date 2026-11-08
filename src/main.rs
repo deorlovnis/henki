@@ -10,6 +10,7 @@ mod http;
 mod journal;
 mod openai;
 mod port;
+mod remote;
 mod repl;
 mod supervise;
 mod sys;
@@ -19,13 +20,13 @@ mod turn;
 mod types;
 
 use crate::types::{Ev, Outcome, Usage};
-use crate::{config::Config, config::Env, config::Flags, journal::Journal, journal::rec, port::Ports, term::Mode, term::Out, term::Reader, turn::Session, turn::outcome_line};
+use crate::{config::Config, config::Env, config::Flags, journal::rec, port::Ports, term::Mode, term::Out, term::Reader, turn::Session, turn::outcome_line};
 use serde_json::Value;
 use std::sync::mpsc::{self, Receiver, Sender};
-use std::{ffi::OsString, io, io::Read, process::ExitCode, time::Duration, time::Instant};
+use std::{ffi::OsString, io, io::Read, path::PathBuf, process::ExitCode, time::Duration, time::Instant};
 
-const USAGE: &str = "usage: henki [--config FILE] [--approve ask|auto] [--model NAME] [--resume[=ID]] [--nested]
-       henki run [--json] [--max-steps N] [--max-seconds N] [--approve ask|auto] [--config FILE] [--model NAME] [--resume[=ID]] [--nested] [TASK | -]
+const USAGE: &str = "usage: henki [--config FILE] [--approve ask|auto] [--model NAME] [--resume[=ID]] [--port PORT=std] [--nested]
+       henki run [--json] [--max-steps N] [--max-seconds N] [--approve ask|auto] [--config FILE] [--model NAME] [--resume[=ID]] [--port PORT=std] [--nested] [TASK | -]
        henki mods [ARGS] | henki allow [rm N]
        henki --version | --help";
 
@@ -38,6 +39,8 @@ struct Args {
     task: Option<String>,
     /// `henki mods ARGS`, and `henki allow ARGS` as `henki mods allow ARGS`: the manager's arguments, untouched.
     mods: Option<Vec<OsString>>,
+    /// `henki port PORT [--offer V]... -- PROGRAM`: the port, the versions offered, the program.
+    port: Option<(&'static str, Vec<u64>, PathBuf)>,
 }
 
 fn main() -> ExitCode {
@@ -50,13 +53,14 @@ fn main() -> ExitCode {
         sys::raw(false); // the terminal modes the REPL started with
         term::panic_line(&info.to_string());
     }));
-    let mut a = Args { mode: Mode::Plain, flags: Flags::default(), resume: None, nested: false, task: None, mods: None };
+    let mut a = Args { mode: Mode::Plain, flags: Flags::default(), resume: None, nested: false, task: None, mods: None, port: None };
     let cmd = parse(&mut a);
     let out = Out::start(a.mode, tx.clone());
     ExitCode::from(match cmd {
-        Ok(None) => match a.mods.take() {
-            Some(args) => mods(args, out),
-            None => run(a, out, tx, rx, t0, early),
+        Ok(None) => match (a.mods.take(), a.port.take()) {
+            (Some(args), _) => mods(args, out),
+            (_, Some(p)) => pipe(p, out, (tx, rx)),
+            _ => run(a, out, tx, rx, t0, early),
         },
         Ok(Some(text)) => {
             out.answer(&text);
@@ -84,6 +88,20 @@ fn parse(a: &mut Args) -> Result<Option<String>, lexopt::Error> {
             a.mods = Some((v == "allow").then_some(v).into_iter().chain(p.raw_args()?).collect());
             return Ok(None);
         }
+        Some(Value(v)) if v == "port" => {
+            let name = p.value()?.string()?;
+            let port = port::LINKED.into_iter().find(|k| *k == name).ok_or(format!("henki port takes {}, not {name}", port::LINKED.join(" or ")))?;
+            let (mut offer, mut exe) = (Vec::new(), None);
+            while let Some(arg) = p.next()? {
+                match arg {
+                    Long("offer") => offer.push(p.value()?.parse()?),
+                    Value(e) if exe.is_none() => exe = Some(PathBuf::from(e)),
+                    arg => return Err(arg.unexpected()),
+                }
+            }
+            a.port = Some((port, if offer.is_empty() { vec![1] } else { offer }, exe.ok_or("henki port needs -- PROGRAM")?));
+            return Ok(None);
+        }
         Some(Value(v)) if v == "run" => String::new(),
         // The REPL, whose flags start at the first argument.
         _ => {
@@ -108,6 +126,10 @@ fn parse(a: &mut Args) -> Result<Option<String>, lexopt::Error> {
             Long("model") => a.flags.model = Some(p.value()?.string()?),
             Long("resume") => a.resume = Some(p.optional_value().map(|v| v.string()).transpose()?),
             Long("nested") => a.nested = true,
+            Long("port") => match p.value()?.string()?.split_once('=') {
+                Some((n, "std")) if port::PORTS.contains(&n) => a.flags.ports.push(n.into()),
+                _ => return Err(format!("--port takes PORT=std, PORT one of {}", port::PORTS.join(", ")).into()),
+            },
             Value(v) if run && a.task.is_none() => a.task = Some(v.string()?),
             arg => return Err(arg.unexpected()),
         }
@@ -126,6 +148,15 @@ fn mods(args: Vec<OsString>, out: Out) -> u8 {
     let e = format!("henki mods needs henki-mods next to henki or on PATH: {e}; fix: reinstall henki");
     out.note(&e);
     code(out, &Outcome::error("config", e), None)
+}
+
+/// `henki port` (`remote::pipe`): no config is read and no nested check runs, because it is not a session. The
+/// binding gets the tool environment without extensions and the state dir `STATE/port/PORT`.
+fn pipe((port, offer, exe): (&'static str, Vec<u64>, PathBuf), out: Out, ch: (Sender<Ev>, Receiver<Ev>)) -> u8 {
+    let (env, home) = (Env::os(), std::env::var_os("HOME").map(PathBuf::from).unwrap_or_default());
+    let (path, state) = (env.get("PATH").unwrap_or_default().to_string_lossy(), config::xdg(&env, &home, "XDG_STATE_HOME", ".local/state").join("port").join(port));
+    let o = remote::pipe(port, &exe, &state, &supervise::child_env(&env, &[], &path, &path, ""), &offer, &out, ch);
+    code(out, &o, None)
 }
 
 /// `henki run` (startup, one turn, the `result`, the session end) and the REPL (startup, then `repl::run`).
@@ -194,10 +225,10 @@ fn start(a: Args, tx: &Sender<Ev>, rx: &Receiver<Ev>, t0: Instant, early: io::Re
     if deadline.is_some_and(|d| Instant::now() >= d) {
         return Err(Outcome::Budget);
     }
-    let mut ports = Ports { history: Box::new(Journal::new(&cfg.state)), policy: Box::new(allow::Std) };
+    let mut ports = port::bind(&mut cfg, *deadline)?;
     let (sid, hist, mut head, notices) = journal::start(ports.history.as_mut(), &a.resume, &cfg)?;
     cfg.notices.extend(notices);
-    head.push(journal::put(ports.history.as_mut(), &sid, rec::session(&cfg, &sid, &cfg.cwd, a.resume.is_some()))?);
+    head.push(journal::put(ports.history.as_mut(), &sid, rec::session(&cfg, &sid, &cfg.cwd, a.resume.is_some(), &ports.bound))?);
     Ok((cfg, ports, sid, hist, task, head, reader))
 }
 

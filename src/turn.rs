@@ -169,9 +169,14 @@ impl Session {
         rec::result(o, &self.t.text, self.usage_proc, Some(&self.sid), self.t.steps, duration_ms)
     }
 
-    /// For the bounded flush before exit.
+    /// For the bounded flush before exit: the bindings get `bye` and the kill first, then up to five sweeps take what
+    /// they left behind (Linux; an orphan of theirs is henki's child).
     pub fn into_out(self) -> Out {
-        self.out
+        let Session { out, ports, .. } = self;
+        let bound = !ports.bound.is_empty();
+        drop(ports);
+        _ = bound && (0..5).all(|_| supervise::sweep_pass() > 0);
+        out
     }
 
     /// `prompt`, then the line the user sends with Enter, read with the terminal in the editor's modes and bracketed paste

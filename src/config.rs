@@ -1,7 +1,7 @@
 //! The configuration: one TOML-subset file, two environment variables and the flags, checked so that anything wrong
 //! stops henki with the file, the line and the fix; then what it names: the extensions, the allow rules, and the files
 //! henki protects from the model and watches for changes.
-use crate::{allow, ext, http, sys, term, types::TOOLS, types::Url};
+use crate::{allow, ext, http, port, sys, term, types::TOOLS, types::Url};
 use serde_json::Value;
 use std::path::{Component, Path, PathBuf};
 use std::{ffi::OsStr, ffi::OsString, fs, io::Read, net::Ipv6Addr, os::unix::fs::MetadataExt};
@@ -28,6 +28,8 @@ pub struct Flags {
     pub model: Option<String>,
     pub max_steps: Option<u32>,
     pub max_seconds: Option<u64>,
+    /// `--port NAME=std`: the names, each run on std whatever `CONFIG/port/` links.
+    pub ports: Vec<String>,
 }
 
 #[derive(Default)]
@@ -68,6 +70,8 @@ pub struct Config {
     /// The stamps of `trust` as `load` found them: what the tripwire compares with.
     pub snap: Vec<(PathBuf, (sys::Stamp, sys::Stamp))>,
     pub notices: Vec<String>,
+    /// The port bindings `CONFIG/port/` links (`port::links`): (port, the program's realpath, its display name).
+    pub links: Vec<(&'static str, PathBuf, String)>,
 }
 
 /// The HENKI_* variables henki reads or sets for its children; any other gives a notice.
@@ -159,9 +163,7 @@ pub fn load(f: &Flags, env: &Env, cwd: &Path) -> Result<Config, String> {
     c.notices.extend((!http::loopback_literal(&c.url.host)).then_some(remote));
     let unknown = env.0.iter().filter_map(|(k, _)| k.to_str()).filter(|k| k.starts_with("HENKI_") && !KNOWN.contains(k));
     c.notices.extend(unknown.map(|k| format!("ignoring {k}: henki does not read it")));
-    // `$XDG_..._HOME/henki` when that is absolute, else `~/DEFAULT/henki`.
-    let xdg = |var: &str, default: &str| env.get(var).map(Path::new).filter(|p| p.is_absolute()).map_or_else(|| home.join(default), Path::to_path_buf).join("henki");
-    c.state = xdg("XDG_STATE_HOME", ".local/state");
+    c.state = xdg(env, &home, "XDG_STATE_HOME", ".local/state");
     let listed = at("ext");
     let paths = listed.map_or_else(|| vec![c.dir.join("ext")], |l| l.2.as_array().into_iter().flatten().filter_map(Value::as_str).map(|p| expand(p, &home)).collect());
     let from = listed.map(|l| l.0.clone()).or_else(|| c.file.as_ref().map(|f| f.display().to_string()));
@@ -200,16 +202,23 @@ pub fn load(f: &Flags, env: &Env, cwd: &Path) -> Result<Config, String> {
         c.notices.push("context_window is unknown; using 32,768 tokens".into());
     }
     // The data dir holds the module store, which the ext links point into.
-    let data = xdg("XDG_DATA_HOME", ".local/share");
+    c.links = port::links(&c.dir, &f.ports, &home)?;
+    let data = xdg(env, &home, "XDG_DATA_HOME", ".local/share");
     let own = c.file.iter().chain([&c.dir, &agents, &c.state, &data]).chain(&paths).chain(c.exts.iter().flat_map(|e| &e.targets));
-    c.protected = own.flat_map(|p| [Some(p.clone()), fs::canonicalize(p).ok().filter(|r| r != p)]).flatten().collect();
-    // Absent files too: creating one is a change.
+    c.protected = own.chain(c.links.iter().map(|l| &l.1)).flat_map(|p| [Some(p.clone()), fs::canonicalize(p).ok().filter(|r| r != p)]).flatten().collect();
+    // Absent files too: creating one is a change. A swap mid-session changes `port/` and a link.
     let exts = paths.into_iter().chain(c.exts.iter().flat_map(|e| e.paths.iter().cloned()));
-    c.trust = [file, allow, agents, c.bash.clone()].into_iter().chain(exts).collect();
+    let ports = [c.dir.join("port")].into_iter().chain(port::LINKED.map(|p| c.dir.join("port").join(p)));
+    c.trust = [file, allow, agents, c.bash.clone()].into_iter().chain(exts).chain(ports).collect();
     // Taken here, before startup waits for anything (a task on stdin, the journal), so that no change made meanwhile is
     // taken for the state henki read.
     c.snap = c.trust.iter().map(|p| (p.clone(), sys::stamp(p))).collect();
     Ok(c)
+}
+
+/// `$XDG_..._HOME/henki` when that is absolute, else `HOME/DEFAULT/henki`.
+pub fn xdg(env: &Env, home: &Path, var: &str, default: &str) -> PathBuf {
+    env.get(var).map(Path::new).filter(|p| p.is_absolute()).map_or_else(|| home.join(default), Path::to_path_buf).join("henki")
 }
 
 /// `name` next to henki's realpath when `near` (the release tarball's bin/), else the first executable `name` in the
@@ -301,7 +310,7 @@ fn read(path: &Path, max: u64) -> Result<String, String> {
 
 /// The config file (`dir` false) may be owned by the euid or root, its directory only by the euid; neither may be
 /// group- or world-writable. Pure, so a test can give it another owner.
-fn owner_mode(path: &Path, mode: u32, uid: u32, euid: u32, dir: bool) -> Result<(), String> {
+pub fn owner_mode(path: &Path, mode: u32, uid: u32, euid: u32, dir: bool) -> Result<(), String> {
     let p = path.display();
     if uid != euid && (dir || uid != 0) {
         Err(format!("{p} is owned by uid {uid}, not by you (uid {euid}); fix: use a {} you own", if dir { "directory" } else { "file" }))

@@ -1,0 +1,37 @@
+# conform/1: the history/1 suite (CONTRACTS.md). One step per line: NAME, INST, REQUEST, EXPECT and an optional SAVE,
+# TAB-separated. INST: `a` or `b`, an instance (`henki port history -- PROGRAM`, started on first use); `a!` kills a
+# (SIGKILL, no bye), and the next `a` step starts a fresh one; `+V` is a fresh instance offering version V. REQUEST:
+# `hello` (the instance's first line) or {"method": M, "params": P}. `@NAME@` is a saved value, `@SCOPE@` and
+# `@SCOPE2@` two empty dirs, `@BIG@` 1 MiB of text. EXPECT: the canonical answer line, where `*` is any text and
+# `@(A|B)` is A or B; every other character stands for itself. SAVE: NAME=KEY keeps the first string value of "KEY".
+# A step whose name ends in a letter prepares the next check; the checks are the names without one.
+H01	a	hello	{"result":{"caps":[*],"name":"* *"}}
+H02	+99	hello	{"error":{"code":"version",*
+H03	a	{"method":"x-none","params":{}}	{"error":{"code":"unsupported",*
+H04	a	{"method":"create","params":{"hint":null,"scope":"@SCOPE@"}}	{"result":{"session":"*"}}	s=session
+H05	b	{"method":"create","params":{"hint":"conform-1","scope":"@SCOPE@"}}	{"result":{"session":"conform-1"}}
+H06	b	{"method":"create","params":{"hint":"conform-1","scope":"@SCOPE@"}}	{"error":{"code":"exists",*
+H07	a	{"method":"append","params":{"record":{"id":"@s@","t":"session","v":1},"session":"@s@"}}	{"result":null}
+H08	a	{"method":"append","params":{"record":{"msg":{"content":"é \"x\"\n\u202e","role":"user"},"t":"user"},"session":"@s@"}}	{"result":null}
+H09	a	{"method":"append","params":{"record":{"msg":{"content":"","role":"assistant","tool_calls":[{"args":{"command":"true"},"id":"h1","name":"shell"}]},"t":"assistant"},"session":"@s@"}}	{"result":null}
+H09b	a	{"method":"append","params":{"record":{"content":"ok","id":"h1","is_error":false,"name":"shell","t":"tool_result"},"session":"@s@"}}	{"result":null}
+H10	a	{"method":"read","params":{"from":0,"session":"@s@"}}	{"result":{*"records":[{"id":"@s@","t":"session","v":1},{"msg":{"content":"é \"x\"\n\u202e","role":"user"},"t":"user"},{"msg":{"content":"","role":"assistant","tool_calls":[{"args":{"command":"true"},"id":"h1","name":"shell"}]},"t":"assistant"},{"content":"ok","id":"h1","is_error":false,"name":"shell","t":"tool_result"}]}}
+H11	a	{"method":"read","params":{"from":0,"session":"conform-none"}}	{"error":{"code":"not_found",*
+H12	b	{"method":"append","params":{"record":{"t":"notice","text":"n"},"session":"@s@"}}	{"error":{"code":"not_found",*
+H13	a	{"method":"append","params":{"record":"text","session":"@s@"}}	{"error":{"code":"invalid",*
+H14	a	{"method":"append","params":{"record":{"t":"notice","text":"n"},"session":"@s@","x-future":1}}	{"result":null}
+H15	a	{"method":"list","params":{"scope":"@SCOPE@"}}	{"result":{"sessions":[@(*"session":"@s@"*"session":"conform-1"*|*"session":"conform-1"*"session":"@s@"*)]}}
+H16	a	{"method":"list","params":{"scope":"@SCOPE2@"}}	{"result":{"sessions":[]}}
+H17	b	{"method":"open","params":{"scope":"@SCOPE@","session":"@s@"}}	{"error":{"code":"busy",*
+H18	a!	-	-
+H19	b	{"method":"open","params":{"scope":"@SCOPE@","session":"@s@"}}	{"result":{"session":"@s@"}}
+H20	b	{"method":"read","params":{"from":0,"session":"@s@"}}	{"result":{*"records":[{"id":"@s@","t":"session","v":1},{"msg":{"content":"é \"x\"\n\u202e","role":"user"},"t":"user"},{"msg":{"content":"","role":"assistant","tool_calls":[{"args":{"command":"true"},"id":"h1","name":"shell"}]},"t":"assistant"},{"content":"ok","id":"h1","is_error":false,"name":"shell","t":"tool_result"},{"t":"notice","text":"n"}]}}
+H21	b	{"method":"open","params":{"scope":"@SCOPE@","session":null}}	{"result":{"session":"@(@s@|conform-1)"}}
+H22a	b	{"method":"create","params":{"hint":"conform-2","scope":"@SCOPE@"}}	{"result":{"session":"conform-2"}}
+H22	b	{"method":"discard","params":{"session":"conform-2"}}	{"result":{"removed":true}}
+H23	b	{"method":"read","params":{"from":0,"session":"conform-2"}}	{"error":{"code":"not_found",*
+H24a	b	{"method":"open","params":{"scope":"@SCOPE@","session":"@s@"}}	{"result":{"session":"@s@"}}
+H24b	b	{"method":"append","params":{"record":{"msg":{"content":"@BIG@","role":"user"},"t":"user"},"session":"@s@"}}	{"result":null}
+H24	b	{"method":"read","params":{"from":5,"session":"@s@"}}	{"result":{*"records":[{"msg":{"content":"@BIG@","role":"user"},"t":"user"}]}}
+H25a	b	{"method":"append","params":{"record":{"t":"x-later","x":[1,{"y":null}]},"session":"@s@"}}	{"result":null}
+H25	b	{"method":"read","params":{"from":6,"session":"@s@"}}	{"result":{*"records":[{"t":"x-later","x":[1,{"y":null}]}]}}

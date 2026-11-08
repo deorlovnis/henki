@@ -37,7 +37,7 @@ nl='
 # ext::prompt's header line; henki joins it to the rest of the system prompt with a blank line ("\n\n").
 HEADER='Extensions are commands on PATH; read the doc in brackets before first use.'
 # The named formats this henki ships (CONTRACTS.md); a module's `contracts` must all be here.
-CONTRACTS_KNOWN='journal/1 json/1 wire/1 ext/1 module/1 lock/1 hd1'
+CONTRACTS_KNOWN='journal/1 json/1 wire/1 ext/1 module/1 lock/1 hd1 port/1 history/1 conform/1'
 AGENTS_MAX=4096 # henki refuses to start with a bigger AGENTS.md
 CARDS_BEGIN='# >>> mods cards'
 CARDS_END='# <<< mods cards'

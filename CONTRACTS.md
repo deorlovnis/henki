@@ -32,6 +32,9 @@ A program reads the contracts this henki ships from the rows of this table: each
 | `json/1` | henki | the record stream of `henki run --json` |
 | `wire/1` | henki | what henki sends to and accepts from a model server, in both dialects |
 | `ext/1` | henki | the extension directory layout henki loads |
+| `port/1` | henki | how henki talks to a port binding: a program it starts, JSON lines both ways |
+| `history/1` | henki | the history port's methods over port/1: where sessions are kept |
+| `conform/1` | henki | the conformance suite files a binding is held to |
 | `module/1` | henki-mods | the module manifest, `.henki/module.toml` |
 | `lock/1` | henki-mods | the module lock, `mods.lock` |
 | `hd1` | henki-mods | the tree hash that pins a module's files |
@@ -71,7 +74,7 @@ values of `args` and `blocks` are opaque JSON.
 
 | Kind | Fields |
 |---|---|
-| `session` | `t` `ts` `v` `henki` `id` `cwd` `model` `dialect` `base_url` `base_url_from` `approve` `approve_from` `config` `tools` `shell` `exts` `pass_env` `ctx` `config_hash` `allow_hash` `agents_hash` `project_agents_hash` `resumed` `resumed.from_bytes?` |
+| `session` | `t` `ts` `v` `henki` `id` `cwd` `model` `dialect` `base_url` `base_url_from` `approve` `approve_from` `config` `tools` `shell` `exts` `pass_env` `ctx` `config_hash` `allow_hash` `agents_hash` `project_agents_hash` `resumed` `resumed.from_bytes?` `ports?` `ports.history?` |
 | `user` | `t` `ts` `msg` `msg.content` `msg.role` |
 | `assistant` | `t` `ts` `msg` `msg.content` `msg.role` `msg.tool_calls` `msg.tool_calls[].args` `msg.tool_calls[].id` `msg.tool_calls[].name` `msg.tool_calls[].raw?` `finish` `usage` `usage.cached` `usage.in` `usage.out` `blocks?` |
 | `ask` | `t` `ts` `id` `name` `args` `target?` |
@@ -314,7 +317,8 @@ default config). henki runs nothing while it loads them; a violation of any rule
   `[A-Za-z0-9._-]+`. A dot file that cannot run is ignored (but watched); any other entry is refused. bin/'s path holds
   no `:` and is UTF-8. A command name in two extensions is refused.
 - Names starting with `README`, `LICENSE`, `CHANGELOG` or `.` are ignored (so `.henki/module.toml` and `.henki/card.md`
-  may be there). Any other entry is refused (`unknown entry PATH; v1 extensions hold doc.md and bin/ only`).
+  may be there), and so is `port/`, which holds port bindings (port/1); henki runs one only through a link in
+  `CONFIG_DIR/port/`. Any other entry is refused (`unknown entry PATH; v1 extensions hold doc.md and bin/ only`).
 - A command with the name of an executable on the user's PATH loads only when the config's `shadow` list holds
   `NAME/COMMAND`.
 - The system prompt gets, when any extension is loaded, the line
@@ -383,3 +387,91 @@ symbolic link, `MODE SHA256 PATH\n`, sorted bytewise (`LC_ALL=C`) by PATH:
   target string; PATH is relative to the module root, with `/`.
 - Directories are not listed. `.git` is left out. A link whose target is absolute, leaves the module, or goes through
   another link (a link as any name of the target but the last) is refused when the module is added.
+
+## port/1
+
+A port is a part without which there is no agent: `model`, `history`, `context`, `exec`, `policy`, `frontend`. Each
+has one binding: the std one built into henki, or a program that `CONFIG_DIR/port/PORT` links to. This henki binds
+`history` that way; `--port PORT=std` (repeatable, all six names) runs a session on std whatever the links say.
+
+- **The link.** henki reads `CONFIG_DIR/port/` at start: names starting with `.` are skipped; any other name must be a
+  port this henki binds, and a link to a regular file its owner can run, that file and its directory owned by the user
+  (or the file by root) and not group- or world-writable. Anything else stops the start (`error config`) with the fix
+  `henki mods swap PORT std, or start with --port PORT=std`. The directory, the link and the program are trust files,
+  and the program is protected from the model's write and edit tools. The binding's name in notices and records is
+  `NAME ID` for a program at `.../mods/NAME/ID/port/PORT`, else its path.
+- **The process.** Once per session, before the first record, henki runs the program with no arguments in the session's
+  working directory, in a session and process group of its own, without a terminal. Its environment is the tool
+  environment without the extensions' `bin/` (the allowlist and `pass_env`, `HENKI_DEPTH` one deeper, `HENKI_SESSION`
+  empty, no API key). Its stderr goes to henki's kernel log, `STATE/spill/.kernel-PID.log` (0600, removed with the
+  spill files after 24 hours). It must exit when its stdin closes, and leave no process behind: at the session's end
+  henki sends `bye`, waits 300 ms for the answer, then kills the process group and, on Linux, every process of the
+  binding's session.
+- **Lines.** UTF-8 JSON, one object per line, `\n` after it, at most 16 MiB each way. henki writes canonical lines
+  (compact, keys sorted, invisible code points escaped). A request is `{"id":N,"method":M,"params":P}`, ids from 0, one
+  at a time. An answer is `{"id":N,"result":R}` or `{"error":{"code":C,"message":S},"id":N}`. A line with another id
+  is dropped; a line without `id` (or with `"id":null`) is a notification, which this version reads and skips.
+- **hello**, the first request: params `henki` (its version), `port`, `protocol` (`[1]`), `versions` (the port's
+  method set majors henki offers, `[1]`), `scope` (the session's working directory) and `state`
+  (`STATE/port/PORT/`, 0700, the binding's own dir). The answer: `{"caps":[...],"impl":V,"name":N,"protocol":1,
+  "version":1}`, `name` and `impl` 1 to 64 bytes without spaces or invisible characters, at most 16 `caps`; or error
+  `version`. `NAME IMPL` is shown in parentheses in the binding notice.
+- **Codes** a binding may send: `invalid`, `unsupported` (a method it does not know), `io`, `not_found`, `busy`,
+  `exists`, `tampered`, `corrupt`, `version`; anything else arrives as `other`. henki adds `timeout`, `crashed`,
+  `protocol` and `interrupted`.
+- **Timeouts.** `hello` 5 s, `create` 2 s, `open` 5 s, `read` 10 s per page, `list` 5 s, `append` 2 s, `discard` 2 s,
+  `bye` 300 ms. A signal or the session deadline ends a wait for `hello`, `create`, `open`, `read` or `list` within 50
+  ms, never one for a method that changes state.
+- **The dead rule.** A timeout, a closed stdout, a line over the cap or cut at EOF, a non-object line, or an answer with
+  both or neither of `result` and `error` kills the binding for the rest of the session: every later call fails at once.
+  An error answer is one failed call; the binding lives on.
+- **Visibility.** A bound port is a notice at start (`history: NAME ID (port/1, N V); henki --port history=std runs a
+  session without it`), and the journal's `session` record names it in `ports` (`{"history":"NAME ID"}`).
+- **`henki port PORT [--offer V]... -- PROGRAM`** (not in the usage text): no config read, the same environment, the
+  state dir `STATE/port/PORT/`, the working directory as scope. It prints the hello result as `{"result":{"caps":[...],
+  "name":"N V"}}` (or the error, then exit 2), then for each request line on stdin, `{"method":M,"params":P}`, one
+  canonical answer line, `{"result":R}` or `{"error":{"code":C,"message":S}}`. `{"kill":true}` kills the binding
+  without `bye` and ends it. The conformance suites run through it.
+
+## history/1
+
+The history port over port/1: where sessions are kept. Records are journal/1 objects; a binding keeps them as given
+(it may add fields named `x-*`). Session ids follow journal/1's rule for any id henki makes, and any id is 1 to 64 of
+`A-Z a-z 0-9 . _ -`, not starting with `.` or `-`. A session is held by one binding process at a time, from `create`
+or `open` until another `create` or `open`, `bye`, or the process's end (a kill included).
+
+| Method | Params | Result | Errors |
+|---|---|---|---|
+| `create` | `scope`, `hint` (an id or null) | `{"session":ID}`, held; `hint` is used when free | `invalid`, `exists`, `io` |
+| `open` | `scope`, `session` (an id, looked up in every scope, or null: the newest session of `scope` nothing holds) | `{"session":ID}`, held; the id asked | `not_found`, `busy`, `corrupt`, `io` |
+| `read` | `session`, `from` (a record index) | `{"records":[...],"next"?:N,"notices"?:[...]}`; `next` (the count so far) asks for another page | `not_found`, `tampered`, `corrupt`, `io` |
+| `append` | `session` (held), `record` | `null`, once the record is durable (it survives a kill of the binding and of henki) | `not_found`, `invalid`, `tampered`, `io` |
+| `discard` | `session` (held) | `{"removed":B}`: a session this process created that has no `user` record is removed | `not_found` |
+| `list` | `scope` | `{"sessions":[{"session":ID,"updated":SECONDS},...]}`, newest first | `io` |
+| `bye` | `{}` | `null`, then exit | |
+
+henki checks every answer as it checks its own journal: the id rule, `read` records are objects with a string `t`,
+`next` grows and equals the count so far, at most 256 MiB over all pages; then the replay, the repairs (appended) and
+the pairing of calls and results at start. A history failure in a session ends the turn `error journal` (exit 2) with
+the fix `henki --port history=std for this session, or henki mods swap history std`; henki never falls back to std in
+a session. `list` is for tools (henki-mods, an import); henki itself does not call it. The cap `fork` is reserved.
+
+## conform/1
+
+A conformance suite is a file of steps, `PORT.tsv` (`manager/conform/` in the repository), run through `henki port`.
+One step per line, TAB-separated, `#` comments:
+
+```
+NAME INST REQUEST EXPECT [SAVE]
+```
+
+- INST is `a` or `b`, an instance (`henki port PORT -- PROGRAM`, started on first use), `a!` (kill instance a without
+  `bye`; the next `a` step starts a fresh one), or `+V` (a fresh instance offering version V).
+- REQUEST is `hello` (the instance's first line) or `{"method":M,"params":P}`. `@NAME@` is a saved value; `@SCOPE@` and
+  `@SCOPE2@` are two empty directories, `@BIG@` 1 MiB of text.
+- EXPECT is the canonical answer line, where `*` is any text and `@(A|B)` is A or B; every other character stands for
+  itself. SAVE is `NAME=KEY`: the first string value of `"KEY"` in the answer.
+- A step named with a trailing lowercase letter prepares a check and counts only when it fails. After the steps, each
+  `henki port` must end within 1 s of its stdin closing, and the program run alone must exit within 1 s of EOF on its
+  stdin. The std binding passes the same file in henki's own tests.
+

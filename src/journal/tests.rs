@@ -3,6 +3,7 @@ use super::*;
 use crate::types::{Call, Usage};
 use serde_json::json;
 use std::cell::Cell;
+use std::collections::HashMap;
 use std::os::unix::fs::{MetadataExt, PermissionsExt, symlink};
 use std::process::Command;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -109,7 +110,7 @@ impl Fx {
     fn session(&self, recs: &[Value]) -> (String, PathBuf) {
         let mut j = J::create(&self.state, &self.cwd).unwrap();
         let id = j.id().to_string();
-        j.write(rec::session(&self.cfg, &id, &self.cwd, false)).unwrap();
+        j.write(rec::session(&self.cfg, &id, &self.cwd, false, &[])).unwrap();
         for r in recs {
             j.write(r.clone()).unwrap();
         }
@@ -283,7 +284,7 @@ fn journal_lock_in_use() {
     let f = fx();
     let mut j = J::create(&f.state, &f.cwd).unwrap();
     let id = j.id().to_string();
-    j.write(rec::session(&f.cfg, &id, &f.cwd, false)).unwrap();
+    j.write(rec::session(&f.cfg, &id, &f.cwd, false, &[])).unwrap();
     let busy = format!("session {id} is in use");
     assert_eq!(f.busy(Some(&id)), busy);
     assert_eq!(f.busy(None), busy);
@@ -301,7 +302,7 @@ fn journal_record_shapes() {
     let cfg = Config::test(Path::new("/d"));
     let v = env!("CARGO_PKG_VERSION");
     assert_eq!(
-        s(rec::session(&cfg, "20261105T171203Z-3f9a", Path::new("/p"), false)),
+        s(rec::session(&cfg, "20261105T171203Z-3f9a", Path::new("/p"), false, &[])),
         format!(
             r#"{{"agents_hash":null,"allow_hash":null,"approve":"ask","approve_from":"default","base_url":"http://127.0.0.1:9/v1","base_url_from":"config","config":null,"config_hash":null,"ctx":32768,"cwd":"/p","dialect":"openai","exts":[],"henki":"{v}","id":"20261105T171203Z-3f9a","model":"m","pass_env":[],"project_agents_hash":null,"resumed":null,"shell":"/bin/bash","t":"session","tools":["shell","read","write","edit"],"v":1}}"#
         )
@@ -312,7 +313,7 @@ fn journal_record_shapes() {
     (cfg.file, cfg.hash, cfg.agents_hash) = (Some("/c/config.toml".into()), Some("9c1d0e2a77f0b431".into()), Some("1a2b3c4d5e6f7081".into()));
     (cfg.pass_env, cfg.tools, cfg.window) = (vec!["FOO".into()], vec!["shell", "read"], 8192);
     assert_eq!(
-        s(rec::session(&cfg, "x", Path::new("/p"), true)),
+        s(rec::session(&cfg, "x", Path::new("/p"), true, &[])),
         format!(
             r#"{{"agents_hash":"1a2b3c4d5e6f7081","allow_hash":null,"approve":"auto","approve_from":"--approve","base_url":"http://[::1]:8080","base_url_from":"HENKI_BASE_URL","config":"/c/config.toml","config_hash":"9c1d0e2a77f0b431","ctx":8192,"cwd":"/p","dialect":"openai","exts":[],"henki":"{v}","id":"x","model":"m","pass_env":["FOO"],"project_agents_hash":null,"resumed":{{}},"shell":"/bin/bash","t":"session","tools":["shell","read"],"v":1}}"#
         )
@@ -379,11 +380,11 @@ fn journal_session_record_fields() {
         targets: vec![],
     };
     (cfg.dialect, cfg.exts, cfg.allow.hash) = ("anthropic", vec![ext("halti"), ext("itse")], Some("5d0c9e1f2a3b4c6d".into()));
-    let r = rec::session(&cfg, "x", Path::new("/p"), false);
+    let r = rec::session(&cfg, "x", Path::new("/p"), false, &[]);
     assert_eq!((&r["dialect"], &r["exts"], &r["allow_hash"]), (&json!("anthropic"), &json!(["halti", "itse"]), &json!("5d0c9e1f2a3b4c6d")));
     assert_eq!(r["project_agents_hash"], Value::Null);
     // No rules read (an absent file, or auto mode): null, as in journal_record_shapes.
-    assert_eq!(rec::session(&Config::test(Path::new("/d")), "x", Path::new("/p"), false)["allow_hash"], Value::Null);
+    assert_eq!(rec::session(&Config::test(Path::new("/d")), "x", Path::new("/p"), false, &[])["allow_hash"], Value::Null);
 }
 
 #[test]
@@ -414,7 +415,7 @@ fn journal_sync_table() {
     let mut j = J::create(&f.state, &f.cwd).unwrap();
     let c = call("h1");
     let recs = [
-        (rec::session(&f.cfg, j.id(), &f.cwd, false), true),
+        (rec::session(&f.cfg, j.id(), &f.cwd, false, &[]), true),
         (rec::user("u"), true),
         (asst(&["h1"]), true),
         (rec::ask(&c, None), false),
@@ -509,7 +510,7 @@ fn journal_torn_every_offset() {
         assert_eq!(r.notices.iter().any(|n| n.starts_with("dropped an incomplete last line (")), keep < cut, "cut {cut}");
         let repaired = fs::read(&path).unwrap();
         assert!(repaired.starts_with(&full[..keep]), "cut {cut}");
-        r.journal.write(rec::session(&f.cfg, &id, &f.cwd, true)).unwrap();
+        r.journal.write(rec::session(&f.cfg, &id, &f.cwd, true, &[])).unwrap();
         r.journal.write(rec::user("again")).unwrap();
         drop(r);
         let r = f.resume(Some(&id)).unwrap();
@@ -531,7 +532,7 @@ fn journal_torn_every_offset() {
 #[test]
 fn journal_corrupt_line() {
     let f = fx();
-    let ok = [rec::session(&f.cfg, "c", &f.cwd, false), rec::user("a")];
+    let ok = [rec::session(&f.cfg, "c", &f.cwd, false, &[]), rec::user("a")];
     let path = f.plant("c", &ok);
     for bad in [b"not json\n".as_slice(), b"5\n", b"\n", b"{\"t\":\"user\"} {}\n", b"{\"t\":\"us\xffer\"}\n"] {
         let mut bytes = fs::read(&path).unwrap();
@@ -570,7 +571,7 @@ fn journal_tamper_after_close() {
     assert_eq!(journal_err("tampered", f.resume(Some(&id))), tampered);
     // An earlier segment's close is not checked again once a later session record starts a new segment.
     let mut next = full.clone();
-    next.extend(format!("{}\n", rec::session(&f.cfg, &id, &f.cwd, true)).bytes());
+    next.extend(format!("{}\n", rec::session(&f.cfg, &id, &f.cwd, true, &[])).bytes());
     fs::write(&path, &next).unwrap();
     assert_eq!(f.resume(Some(&id)).unwrap().notices, ["previous run did not close cleanly"]);
 }
@@ -590,7 +591,7 @@ fn journal_resume_dialect_mismatch_both_ways() {
     let f = fx();
     let mut anthropic = Config::test(&f.tmp.0);
     (anthropic.cwd, anthropic.dialect) = (f.cwd.clone(), "anthropic");
-    let (open, other) = (rec::session(&f.cfg, "d", &f.cwd, false), rec::session(&anthropic, "d", &f.cwd, false));
+    let (open, other) = (rec::session(&f.cfg, "d", &f.cwd, false, &[]), rec::session(&anthropic, "d", &f.cwd, false, &[]));
     assert_eq!((&open["dialect"], &other["dialect"]), (&json!("openai"), &json!("anthropic")));
     let path = f.plant("d", &[other.clone(), rec::user("a")]);
     assert_eq!(journal_err("journal", f.resume(None)), format!("{}: the session's dialect is anthropic, not openai", path.display()));
@@ -625,7 +626,7 @@ fn journal_resume_keeps_blocks() {
     let c = Call { id: "toolu_1".into(), args: blocks[3]["input"].clone(), ..call("x") };
     let mut j = J::create(&f.state, &f.cwd).unwrap();
     let id = j.id().to_string();
-    j.write(rec::session(&f.cfg, &id, &f.cwd, false)).unwrap();
+    j.write(rec::session(&f.cfg, &id, &f.cwd, false, &[])).unwrap();
     let text = blocks[2]["text"].as_str().unwrap();
     let recs = [rec::user("go"), rec::assistant(text, &[c], "tool_calls", Usage::default(), Some(&blocks)), rec::tool_result("toolu_1", "shell", "ok", false, 1, 2)];
     let live: Vec<Value> = recs.into_iter().map(|r| j.write(r).unwrap()).collect();
@@ -643,7 +644,7 @@ fn journal_discard_fresh_only() {
     let f = fx();
     let mut j = J::create(&f.state, &f.cwd).unwrap();
     let id = j.id().to_string();
-    j.write(rec::session(&f.cfg, &id, &f.cwd, false)).unwrap();
+    j.write(rec::session(&f.cfg, &id, &f.cwd, false, &[])).unwrap();
     let (path, bytes) = (j.path(), j.bytes());
     assert!(j.discard());
     assert!(!path.exists());
@@ -664,7 +665,7 @@ fn journal_discard_fresh_only() {
 fn journal_discard_twice() {
     let f = fx();
     let mut j = J::create(&f.state, &f.cwd).unwrap();
-    j.write(rec::session(&f.cfg, j.id(), &f.cwd, false)).unwrap();
+    j.write(rec::session(&f.cfg, j.id(), &f.cwd, false, &[])).unwrap();
     let path = j.path();
     assert!(j.discard());
     fs::write(&path, "not henki's\n").unwrap();
@@ -673,7 +674,7 @@ fn journal_discard_twice() {
     fs::remove_file(&path).unwrap();
     // Removed by someone else first: the unlink fails, so the journal is not gone and its writes still count.
     let mut j = J::create(&f.state, &f.cwd).unwrap();
-    j.write(rec::session(&f.cfg, j.id(), &f.cwd, false)).unwrap();
+    j.write(rec::session(&f.cfg, j.id(), &f.cwd, false, &[])).unwrap();
     let bytes = j.bytes();
     fs::remove_file(j.path()).unwrap();
     assert!(!j.discard());
@@ -783,7 +784,7 @@ fn journal_resume_scoped_cwd() {
     let (a, path_a) = f.session(&[rec::user("a")]);
     let mut j = J::create(&f.state, &other).unwrap();
     let b = j.id().to_string();
-    j.write(rec::session(&f.cfg, &b, &other, false)).unwrap();
+    j.write(rec::session(&f.cfg, &b, &other, false, &[])).unwrap();
     drop(j);
     set_mtime(&path_a, 3600);
     assert_eq!(f.resume(None).unwrap().journal.id(), a);
@@ -804,7 +805,7 @@ fn journal_resume_none() {
     let f = fx();
     let none = format!("no session to resume in {}", f.cwd.display());
     assert_eq!(journal_err("journal", f.resume(None)), none);
-    let path = f.plant("real", &[rec::session(&f.cfg, "real", &f.cwd, false)]);
+    let path = f.plant("real", &[rec::session(&f.cfg, "real", &f.cwd, false, &[])]);
     for id in ["nope", "../real", "", "/real"] {
         assert_eq!(journal_err("journal", f.resume(Some(id))), none, "{id:?}");
     }
@@ -819,8 +820,8 @@ fn journal_resume_none() {
 fn journal_resume_newest_unlocked() {
     let f = fx();
     let (old, new) = ("20260101T000000Z-aaaa", "20260102T000000Z-bbbb");
-    let path_old = f.plant(old, &[rec::session(&f.cfg, old, &f.cwd, false)]);
-    let path_new = f.plant(new, &[rec::session(&f.cfg, new, &f.cwd, false)]);
+    let path_old = f.plant(old, &[rec::session(&f.cfg, old, &f.cwd, false, &[])]);
+    let path_new = f.plant(new, &[rec::session(&f.cfg, new, &f.cwd, false, &[])]);
     set_mtime(&path_old, 7200);
     set_mtime(&path_new, 3600);
     assert_eq!(f.resume(None).unwrap().journal.id(), new);
@@ -1025,7 +1026,7 @@ fn spill_counter_after_sweep() {
     let f = fx();
     let mut j = J::create(&f.state, &f.cwd).unwrap();
     let id = j.id().to_string();
-    j.write(rec::session(&f.cfg, &id, &f.cwd, false)).unwrap();
+    j.write(rec::session(&f.cfg, &id, &f.cwd, false, &[])).unwrap();
     j.write(asst(&["h1", "h2"])).unwrap();
     let first = j.spill(&f.tmp.0);
     fs::write(&first.path, "full output").unwrap();
@@ -1099,7 +1100,7 @@ fn journal_line_never_panics() {
     for _ in 0..10_000 {
         let mut buf = Vec::new();
         if next(4) != 0 {
-            buf.extend(format!("{}\n", rec::session(&f.cfg, "x", &f.cwd, false)).bytes());
+            buf.extend(format!("{}\n", rec::session(&f.cfg, "x", &f.cwd, false, &[])).bytes());
         }
         for _ in 0..next(12) {
             match next(25) {
@@ -1172,7 +1173,7 @@ fn journal_every_close_checked() {
     let (id, path) = f.closed(&[rec::user("a")]);
     let full = fs::read(&path).unwrap();
     let lines: Vec<&[u8]> = full.split_inclusive(|&b| b == b'\n').collect();
-    let next = format!("{}\n", rec::session(&f.cfg, &id, &f.cwd, true));
+    let next = format!("{}\n", rec::session(&f.cfg, &id, &f.cwd, true, &[]));
     // A line removed before the first close, and a new segment after it: today's last segment is fine.
     fs::write(&path, [lines[0], lines[2], next.as_bytes()].concat()).unwrap();
     assert_eq!(journal_err("tampered", f.resume(Some(&id))), format!("journal modified outside henki: {}", path.display()));
@@ -1191,4 +1192,97 @@ fn journal_read_unheld() {
     assert_eq!((t.notices.len(), t.place), (0, path.display().to_string()));
     assert_eq!(fs::read(&path).unwrap(), before);
     assert!(matches!(Journal::new(&f.state).read("none"), Err(PortError { code: "not_found", .. })));
+}
+
+/// A conform/1 EXPECT over `s`: `*` is any text, `@(A|B)` is A or B, every other character stands for itself.
+pub fn conform_match(pat: &str, s: &str) -> bool {
+    if let Some(i) = pat.find("@(") {
+        let end = i + 2 + pat[i + 2..].find(')').expect("an @( group ends with )");
+        return pat[i + 2..end].split('|').any(|alt| conform_match(&format!("{}{alt}{}", &pat[..i], &pat[end + 1..]), s));
+    }
+    // Between the first and the last piece each literal piece is found by search, leftmost first, which is exact for `*`.
+    let parts: Vec<&str> = pat.split('*').collect();
+    let (first, last) = (parts[0], parts[parts.len() - 1]);
+    if parts.len() == 1 {
+        return pat == s;
+    }
+    if !s.starts_with(first) || s.len() < first.len() + last.len() || !s.ends_with(last) {
+        return false;
+    }
+    let (mut at, end) = (first.len(), s.len() - last.len());
+    for mid in &parts[1..parts.len() - 1] {
+        match s[at..end].find(mid) {
+            Some(k) => at += k + mid.len(),
+            None => return false,
+        }
+    }
+    true
+}
+
+#[test]
+fn conform_match_rules() {
+    assert!(conform_match("{\"a\":*}", "{\"a\":[1,2]}"));
+    assert!(conform_match("x@(ab|cd)y*", "xcdy z"));
+    assert!(!conform_match("x@(ab|cd)y", "xefy"));
+    assert!(conform_match("[*]", "[]") && !conform_match("[*]", "[]x"));
+    assert!(conform_match("*a*b*", "xxaxxbxx") && !conform_match("*b*a", "ab"));
+}
+
+/// conform/1's history suite (manager/conform/history.tsv), the file every outside binding is held to, run against the
+/// std binding: one `Journal` per instance, the answers rendered as `henki port` renders them. Std speaks no protocol,
+/// so the hello and version steps are skipped; `list` reads the store as `pick` does.
+#[test]
+fn conform_history_std() {
+    let t = Tmp::new();
+    let (state, scope, scope2) = (t.0.join("state"), t.0.join("scope"), t.0.join("scope2"));
+    for d in [&scope, &scope2] {
+        fs::create_dir_all(d).unwrap();
+    }
+    state_dir(&state).unwrap();
+    let mut inst: HashMap<String, Journal> = HashMap::new();
+    let mut saved: Vec<(String, String)> =
+        vec![("@SCOPE@".into(), scope.display().to_string()), ("@SCOPE2@".into(), scope2.display().to_string()), ("@BIG@".into(), "x".repeat(1 << 20))];
+    let (mut checks, mut steps) = (0, 0);
+    for line in include_str!("../../manager/conform/history.tsv").lines().filter(|l| !l.starts_with('#') && !l.is_empty()) {
+        let f: Vec<&str> = line.split('\t').collect();
+        let (name, who) = (f[0], f[1]);
+        let sub = |s: &str| saved.iter().fold(s.to_string(), |s, (k, v)| s.replace(k.as_str(), v));
+        if who.starts_with('+') || f[2] == "hello" {
+            continue;
+        }
+        if let Some(k) = who.strip_suffix('!') {
+            inst.remove(k);
+            continue;
+        }
+        let q: Value = serde_json::from_str(&sub(f[2])).unwrap_or_else(|e| panic!("{name}: {e}"));
+        let h = inst.entry(who.to_string()).or_insert_with(|| Journal::new(&state));
+        let p = &q["params"];
+        let path = |p: &Value| PathBuf::from(p["scope"].as_str().unwrap_or_default());
+        let a = match q["method"].as_str().unwrap() {
+            "create" => h.create(&path(p), p["hint"].as_str()).map(|s| json!({"session": s})),
+            "open" => h.open(&path(p), p["session"].as_str()).map(|s| json!({"session": s})),
+            "read" => h.read(p["session"].as_str().unwrap()).map(|t| json!({"records": t.records[p["from"].as_u64().unwrap() as usize..]})),
+            "append" => h.append(p["session"].as_str().unwrap(), p["record"].clone()).map(|_| Value::Null),
+            "discard" => h.discard(p["session"].as_str().unwrap()).map(|r| json!({"removed": r})),
+            "list" => {
+                let dir = state.join("sessions").join(super::scope(&path(p)).unwrap());
+                let mut found: Vec<(SystemTime, String)> =
+                    ls(dir).map(|f| (fs::metadata(&f).unwrap().modified().unwrap(), f.file_stem().unwrap().to_string_lossy().into_owned())).collect();
+                found.sort();
+                let secs = |t: SystemTime| t.duration_since(SystemTime::UNIX_EPOCH).unwrap().as_secs();
+                Ok(json!({"sessions": found.into_iter().rev().map(|(t, s)| json!({"session": s, "updated": secs(t)})).collect::<Vec<_>>()}))
+            }
+            m => Err(port::err("unsupported", format!("no method {m}"))),
+        };
+        let got = term::json_line(&a.map_or_else(|e| json!({"error": {"code": e.code, "message": e.message}}), |r| json!({"result": r})));
+        let want = sub(f[3]);
+        assert!(conform_match(&want, &got), "{name}: got {}", got.chars().take(400).collect::<String>());
+        if let Some((k, key)) = f.get(4).and_then(|s| s.split_once('=')) {
+            let v: Value = serde_json::from_str(&got).unwrap();
+            saved.push((format!("@{k}@"), v["result"][key].as_str().unwrap().to_string()));
+        }
+        steps += 1;
+        checks += usize::from(!name.ends_with(|c: char| c.is_ascii_lowercase()));
+    }
+    assert_eq!((steps, checks), (27, 22), "the suite changed: say so here (std skips H01, H02 and the kill)");
 }
