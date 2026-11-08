@@ -440,8 +440,8 @@ null, `target` the resolved path of a file tool's target, or null (a shell call,
 JSON cannot hold). No event comes before `session_start`.
 
 - **The run.** The program with no arguments, in the session's working directory, in a process group and session of
-  its own, with the tool environment (journal/1 "Files") plus `HENKI_EVENT` (the event), `HENKI_MODULE` (the module
-  dir) and `HENKI_STATE` (the state dir); never `HENKI_NEXT`. stdin is one line
+  its own, with the tool environment (ext/1: every module's `bin/` first on `PATH`) plus `HENKI_EVENT` (the event),
+  `HENKI_MODULE` (the module dir) and `HENKI_STATE` (the state dir); never `HENKI_NEXT`. stdin is one line
   `{"data":DATA,"event":"EVENT","seq":N,"session":"ID","v":1}` in journal/1's JSON, read from a file, so a run that
   never reads it holds up nothing. `seq` counts this henki's events, so runs that overlap can be put in order. stdout
   and stderr go to henki's log, `STATE/spill/.kernel-PID.log`; the exit status is ignored. An observer whose run does
@@ -482,9 +482,9 @@ ports = ["history"]              # optional; exactly the programs in port/ (port
 ```
 
 A module without a manifest is unmanaged (allowed for path and URL installs, and listed as such). `port/PORT` is a
-program its owner can run (a file, or a link inside the module), PORT one that henki binds (`history`). `cmd/` and
-`eval/` are ext/2's (`eval/` holds eval/1 tasks), `on/` observe/1's; `.henki/template` may hold a program that `cmd/` links run. The directory
-`ctx/` is reserved for a later layout: henki-mods refuses it.
+program its owner can run (a file, or a link inside the module), PORT one that henki binds (`history` or `policy`).
+`cmd/` and `eval/` are ext/2's (`eval/` holds eval/1 tasks), `on/` observe/1's; `.henki/template` may hold a program
+that `cmd/` links run. The directory `ctx/` is reserved for a later layout: henki-mods refuses it.
 
 A git source (`URL[@REF][#SUBDIR]`) is cloned only over `https`, `http`, `ssh`, `git` or `file` URLs, or scp's
 `USER@HOST:PATH`; a remote helper (`ext::`, `fd::`, any other `SCHEME::` or unknown `SCHEME://`) is refused before
@@ -652,14 +652,17 @@ NAME INST REQUEST EXPECT [SAVE]
 ```
 
 - INST is `a` or `b`, an instance (`henki port PORT -- PROGRAM`, started on first use), `a!` (kill instance a without
-  `bye`; the next `a` step starts a fresh one), or `+V` (a fresh instance offering version V).
+  `bye`; the next `a` step starts a fresh one; its REQUEST and EXPECT are `-`), or `+V` (a fresh instance offering
+  version V).
 - REQUEST is `hello` (the instance's first line) or `{"method":M,"params":P}`. `@NAME@` is a saved value; `@SCOPE@` and
   `@SCOPE2@` are two empty directories, `@BIG@` 1 MiB of text.
 - EXPECT is the canonical answer line, where `*` is any text and `@(A|B)` is A or B; every other character stands for
   itself. SAVE is `NAME=KEY`: the first string value of `"KEY"` in the answer.
 - A step named with a trailing lowercase letter prepares a check and counts only when it fails. After the steps, each
   `henki port` must end within 1 s of its stdin closing, and the program run alone must exit within 1 s of EOF on its
-  stdin. The std binding passes the same file in henki's own tests.
+  stdin. henki's own tests run the history file against the std binding through its trait: std speaks no protocol,
+  so the hello, version and kill steps are skipped, and the test itself answers `list`, `read`'s `from` (std reads
+  whole sessions) and an unknown method (`unsupported`).
 
 
 ## eval/1
