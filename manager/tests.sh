@@ -1189,7 +1189,7 @@ t_ext2() {
   rc_is 0
   out_has "prompt   +0 B on every request (total on after: 0 B)"
   run list
-  out_has "on: nothing (0 B of prompt)"
+  out_has "on: 1 module(s), 0 B of prompt"
   # With bin/ the doc is for the model again.
   mkmod "$W/both"
   mkdir -p "$W/both/cmd" && cp "$m/cmd/go" "$W/both/cmd/go"

@@ -1468,7 +1468,7 @@ cmd_lock() {
 }
 
 cmd_list() {
-  local n b on_b=0 cards=0 c src mods=0 off_names x d agents_now agents_none state
+  local n b on_b=0 on_n=0 cards=0 c src mods=0 off_names x d agents_now agents_none state
   [ $# = 0 ] || usage
   lock_check
   STAGE=$(mktemp -d "${TMPDIR:-/tmp}/henki-mods.XXXXXX") || die "cannot make a scratch dir; fix: check TMPDIR"
@@ -1495,7 +1495,7 @@ cmd_list() {
       d="$EXT/$n" state=on x=- src="not added by henki-mods ($(shown "$EXT/$n"))"
     fi
     if b=$(prompt_bytes "$n" "$d" 2>/dev/null); then
-      [ "$state" != on ] || on_b=$((on_b + b))
+      [ "$state" != on ] || on_b=$((on_b + b)) on_n=$((on_n + 1))
       b="$(num "$b") B"
     else
       b="unreadable"
@@ -1530,8 +1530,10 @@ cmd_list() {
     cards=$((agents_now - agents_none))
   fi
   [ "$on_b" = 0 ] || on_b=$((on_b + ${#HEADER} + 2))
-  if [ "$on_b" = 0 ] && [ "$cards" = 0 ]; then
+  if [ "$on_n" = 0 ] && [ "$cards" = 0 ]; then
     say "on: nothing (0 B of prompt)"
+  elif [ "$on_b" = 0 ] && [ "$cards" = 0 ]; then
+    say "on: $on_n module(s), 0 B of prompt"
   else
     say "on: $(num $((on_b + cards))) B of prompt (extensions $(num "$on_b") B with the $((${#HEADER} + 2)) B header, cards $(num "$cards") B)"
   fi
