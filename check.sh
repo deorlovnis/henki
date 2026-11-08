@@ -458,9 +458,10 @@ step tests
 cargo test --locked
 
 # The module manager: its own suite (hermetic, with a live prompt check against the henki the tests just built),
-# then the official modules.
-step "mods (manager/tests.sh, mods/*/)"
+# then the official modules: their own tests, and the layout henki loads.
+step "mods (manager/tests.sh, manager/mods-tests.sh, mods/*/)"
 MODS_TEST_HENKI="$target/debug/henki" manager/tests.sh
+manager/mods-tests.sh
 gate_mods mods
 
 step "lines of code (src/, non-test)"

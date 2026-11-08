@@ -280,7 +280,7 @@ EOF
     <<~TEXT
       henki reads ~/.config/henki/config.toml; start from a profile, then set model and base_url:
         mkdir -p ~/.config/henki && cp #{HOMEBREW_PREFIX}/share/henki/config.mac.toml ~/.config/henki/config.toml
-      The official modules (halti, itse) ship off. henki-mods manages modules:
+      The official modules (clip, halti, itse, prompts, sessions) ship off. henki-mods manages modules:
         henki-mods list        what is added, on, and what each adds to the prompt
         henki-mods add halti   shows what it installs, then asks
     TEXT
@@ -368,14 +368,16 @@ selftest() {
   [ "$got" = "henki-mods $version" ] || { say "selftest: bin/henki-mods --version said \"$got\""; bad=1; }
   # The official modules are found in the tarball's share/ (no HENKI_SHARE, no repo checkout next to it).
   got=$(env -i HOME="$t/home" PATH=/usr/bin:/bin "$x/bin/henki-mods" list 2>&1) || got="(exit $?) $got"
-  case "$got" in *"official, not added: halti itse "*) ;; *)
+  case "$got" in *"official, not added: clip halti itse prompts sessions "*) ;; *)
     say "selftest: bin/henki-mods list said: $got"
     bad=1
     ;;
   esac
+  # sessions needs this henki's version (requires), and its links into .henki/ and cmd/ survive the copy.
   got=$(env -i HOME="$t/home" PATH=/usr/bin:/bin "$x/bin/henki-mods" add itse --yes 2>&1 &&
-    env -i HOME="$t/home" PATH=/usr/bin:/bin "$x/bin/henki-mods" verify 2>&1) || { say "selftest: add itse, verify: $got"; bad=1; }
-  [ -L "$t/home/.config/henki/ext/itse" ] || { say "selftest: add itse --yes made no link"; bad=1; }
+    env -i HOME="$t/home" PATH=/usr/bin:/bin "$x/bin/henki-mods" add sessions --yes 2>&1 &&
+    env -i HOME="$t/home" PATH=/usr/bin:/bin "$x/bin/henki-mods" verify 2>&1) || { say "selftest: add itse and sessions, verify: $got"; bad=1; }
+  [ -L "$t/home/.config/henki/ext/itse" ] && [ -L "$t/home/.config/henki/ext/sessions" ] || { say "selftest: add --yes made no link"; bad=1; }
   # The conformance suites are found in the tarball's share/ too.
   got=$(env -i HOME="$t/home" PATH=/usr/bin:/bin "$x/bin/henki-mods" test --port history std 2>&1) || { say "selftest: test --port history std: $got"; bad=1; }
 

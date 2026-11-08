@@ -280,3 +280,54 @@ fn handoff_new_restart_resume() {
     assert_eq!(log[2].contents("user").len(), 2, "the resumed session holds first and third");
     assert_eq!(r.journals().len(), 2, "first (resumed) and second");
 }
+
+/// The official sessions, prompts and clip modules from this checkout, linked as the manager links them: only clip's
+/// doc is in the prompt, /help lists the commands, /sessions lists this folder's sessions, /resume N switches, and a
+/// prompt goes out with its argument once Enter says so.
+#[test]
+fn handoff_official_mods() {
+    let m = Mock::start(vec![say("one"), say("two"), say("reviewed")]);
+    let mut r = Run::new(&m.url());
+    let ext = r.dir.join("ext");
+    fs::create_dir_all(&ext).unwrap();
+    for n in ["clip", "prompts", "sessions"] {
+        std::os::unix::fs::symlink(Path::new(env!("CARGO_MANIFEST_DIR")).join("mods").join(n), ext.join(n)).unwrap();
+    }
+    r.set("ext", &format!("[\"{}\"]", ext.display()));
+    let mut p = Pty::spawn(&r, &[], 24, 80);
+    p.expect("ext clip: clip-get, clip-put\r\next prompts: no tools\r\next sessions: no tools\r\n", W);
+    p.prompt(W);
+    p.line("/help");
+    p.expect("this terminal; the model is told you ran it", W);
+    p.expect("\r\n/commit-msg  (prompts)\r\n/explain  (prompts)\r\n/fix-test  (prompts)\r\n/review  (prompts)\r\n/new  (sessions)\r\n", W);
+    p.prompt(W);
+    message(&p, "first task", "one");
+    p.line("/new");
+    p.expect("approval: AUTO", W);
+    p.prompt(W);
+    message(&p, "second task", "two");
+    p.line("/sessions");
+    p.expect(" 2   ", W);
+    p.expect("B  first task\r\n", W);
+    p.prompt(W);
+    let first = r.journals().into_iter().map(|j| j.file_stem().unwrap().to_string_lossy().into_owned()).min().unwrap();
+    p.line("/resume 2");
+    p.expect(&format!("switch to session {first}? [y/N] "), W);
+    p.line("y");
+    p.expect("approval: AUTO", W);
+    p.prompt(W);
+    p.renew(&r);
+    p.line("/review the parser");
+    p.expect("[from /review]\r\nReview the uncommitted changes", W);
+    p.expect("\r\nthe parser\r\n", W);
+    p.expect("send? [Y/n] ", W);
+    p.line("y");
+    p.expect("reviewed", W);
+    p.prompt(W);
+    exit(&r, p);
+    let log = m.log();
+    let (system, user) = (log[2].system(), log[2].contents("user"));
+    assert!(system.contains("\n- clip: clipboard: clip-get prints it") && !system.contains("- prompts:") && !system.contains("- sessions:"), "{system}");
+    assert_eq!(user.len(), 2, "the first session, resumed: {user:?}");
+    assert!(user[1].starts_with("Review the uncommitted changes") && user[1].ends_with("\n\nthe parser\n"), "{user:?}");
+}

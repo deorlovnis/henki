@@ -1,0 +1,10 @@
+# The clip mod: two tools the model calls to read and set the clipboard.
+henki_module = 1
+name = "clip"
+version = "0.1.0"
+license = "Apache-2.0"
+requires = ["henki >= 0.2"]
+contracts = ["ext/2", "module/1"]
+os = ["macos", "linux"]
+caps_net = "none"
+ports = []
