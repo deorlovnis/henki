@@ -104,13 +104,13 @@ field() { lockline "$1" | cut -f "$2"; }
 static_bash32() {
   case_ "static: no bash 4+ features"
   local f hits
-  for f in "$MODS" "$HERE/henki-mods-dev" "$HERE/tests.sh"; do
+  for f in "$MODS" "$HERE/henki-mods-dev" "$HERE/tests.sh" "$HERE/dev-tests.sh"; do
     hits=$(command grep -nE '(^|[^[:alnum:]_])(mapfile|readarray|coproc)([^[:alnum:]_]|$)|(declare|local|typeset) +-[a-zA-Z]*[An]|\$\{[[:alnum:]_]+(,,?|\^\^?)[}[:alnum:]]|\$\{[[:alnum:]_]+@[QEPAa]\}|\|&|&>>|;;&|\[\[ +-v |\$\{[[:alnum:]_]+\[-[0-9]|EPOCH(SECONDS|REALTIME)|BASHPID|wait +-n|shopt +-s +(globstar|lastpipe|inherit_errexit)|\{[0-9]+\.\.[0-9]+\.\.' "$f" |
       command grep -vE '^[0-9]+:[[:space:]]*#|command grep -nE' || true)
     [ -z "$hits" ] || fail "$f uses bash 4+ syntax:$(printf '\n%s' "$hits")"
   done
   # GNU-only flags and tools, which a Mac lacks.
-  for f in "$MODS" "$HERE/henki-mods-dev" "$HERE/tests.sh"; do
+  for f in "$MODS" "$HERE/henki-mods-dev" "$HERE/tests.sh" "$HERE/dev-tests.sh"; do
     hits=$(command grep -nE '(^|[^[:alnum:]_-])(sed -i|readlink -f|stat -c|grep -P|date -d|mv -T|cp -T|sort -V|realpath|tac|xargs -r)([^[:alnum:]_-]|$)|-printf' "$f" |
       command grep -vE '^[0-9]+:[[:space:]]*#|command grep -nE' || true)
     [ -z "$hits" ] || fail "$f uses a GNU-only tool or flag:$(printf '\n%s' "$hits")"
@@ -126,7 +126,7 @@ static_bash32() {
   # A bash 3.2 built for tests (HENKI_TEST_BASH32) parses what this bash cannot judge: a case pattern inside $(...)
   # without its opening parenthesis is a syntax error there.
   if [ -n "${HENKI_TEST_BASH32:-}" ]; then
-    for f in "$MODS" "$HERE/henki-mods-dev" "$HERE/tests.sh" "$HERE/mods-tests.sh"; do
+    for f in "$MODS" "$HERE/henki-mods-dev" "$HERE/tests.sh" "$HERE/mods-tests.sh" "$HERE/dev-tests.sh"; do
       "$HENKI_TEST_BASH32" -n "$f" || fail "bash 3.2 cannot parse $f"
     done
   fi
@@ -513,9 +513,13 @@ t_refusals() {
   run add "$m" --yes
   refused 'requires "itse >= 1" is not "henki >= VERSION"'
   rm -rf "$m" && mkmod "$m"
-  printf 'x\n' >"$m/.henki/notes"
+  # .henki holds data files too (dev-tests.sh), but neither a program nor a link.
+  printf 'x\n' >"$m/.henki/notes" && chmod 755 "$m/.henki/notes"
   run add "$m" --yes
-  refused ".henki holds module.toml, card.md and template"
+  refused ".henki holds module.toml, card.md, template (a program cmd/ links run) and data files of mode 644"
+  rm -f "$m/.henki/notes" && ln -s ../doc.md "$m/.henki/notes"
+  run add "$m" --yes
+  refused ".henki holds module.toml"
 
   # Nothing of a refused add stays behind.
   check "no link after refusals" [ ! -e "$CONF/ext" ] || [ -z "$(ls "$CONF/ext")" ]
@@ -2287,6 +2291,18 @@ t_index_yank() {
   ixc "$IX" "lean malicious"
   run sync
   run add "file://$W/lean" --yes
+  refused "was yanked as malicious (phones home (2026-11-08)) by index deorlovnis; not installed"
+  # And a module made from an Agent Skill, by the hd1 of the files it makes.
+  mkdir -p "$W/sk/yk" && printf -- '---\nname: yk\ndescription: A skill.\n---\nBody.\n' >"$W/sk/yk/SKILL.md"
+  run add --skill "$W/sk/yk" --yes
+  rc_is 0
+  local skh
+  skh=$(field yk 8)
+  run rm yk
+  setkey "$IX/mods/lean/0.1.0.toml" hd1 "\"$skh\""
+  ixc "$IX" "a skill's files, yanked"
+  run sync
+  run add --skill "$W/sk/yk" --yes
   refused "was yanked as malicious (phones home (2026-11-08)) by index deorlovnis; not installed"
   run on hello
   rc_is 0

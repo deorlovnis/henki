@@ -497,15 +497,31 @@ SHA-256 instead, whenever the store copy is (`verify`, `on`, a swap).
 A module without a manifest is unmanaged (allowed for path and URL installs, and listed as such). `port/PORT` is a
 program its owner can run (a file, or a link inside the module), PORT one that henki binds (`history` or `policy`).
 `cmd/` and `eval/` are ext/2's (`eval/` holds eval/1 tasks), `on/` observe/1's; `.henki/template` may hold a program
-that `cmd/` links run. The directory `ctx/` is reserved for a later layout: henki-mods refuses it.
+that `cmd/` links run. Any other file under `.henki/` is data the module's own programs read (a library, an Agent
+Skill's files): a regular file of mode 644, never a link or a program, which nothing puts on a PATH. The directory
+`ctx/` is reserved for a later layout: henki-mods refuses it.
 
 A git source (`URL[@REF][#SUBDIR]`) is cloned only over `https`, `http`, `ssh`, `git` or `file` URLs, or scp's
 `USER@HOST:PATH`; a remote helper (`ext::`, `fd::`, any other `SCHEME::` or unknown `SCHEME://`) is refused before
 git runs. The module is copied from the commit's raw blobs, and refused when a `.gitattributes` in it or in a
 directory above it sets `export-subst`, `export-ignore`, `ident`, `filter`, `text`, `eol`, `crlf` or
 `working-tree-encoding` (a checkout would hold other bytes), or when two of its paths differ only in ASCII case (one
-name on a Mac).
+name on a Mac). `add SRC --expect hd1:HASH` installs only a copy of that hd1 (the line `henki-mods share NAME`
+prints, with the full commit).
 
+**Agent Skills.** `henki-mods add --skill SRC [--as NAME]` makes a module from an Agent Skill (agentskills.io: a
+directory whose `SKILL.md` starts with YAML frontmatter, then markdown instructions), SRC being a path or a git source
+as above; the source is copied the same way, and nothing of it runs. The frontmatter is read for top-level scalars
+(plain, quoted on one line, `|` and `>` blocks) and `metadata`'s block map, which is skipped; anything else is refused.
+`name` follows the format (1 to 64 of `a-z`, `0-9` and inner single hyphens, the directory's name) and must also be a
+henki name (else `--as`), not one henki keeps, an official module's, or one an added module or its command has; the
+body is at most 16 KiB of UTF-8 without a code point henki escapes, the skill at most 200 files and 4 MiB, with no
+links. The module is made the same way each time (so its hd1 is too): `doc.md` (line 1 the `description` on one line,
+cut to 160 bytes, then where it came from), `cmd/NAME.md` (the body), `cmd/NAME -> ../.henki/template` (the `prompts`
+module's template, which hands the text back as `send`, with a line naming `.henki/skill` when the skill has other
+files), `.henki/skill/...` (the skill's other files, mode 644; `LICENSE*` at the top as well) and a manifest
+(`version = "skill-"` and 12 hex digits of the commit, or of the source's hd1; `license` the frontmatter's when it is
+one the index accepts, else `NOASSERTION`; `requires = ["henki >= 0.2"]`). `allowed-tools` is shown and ignored.
 ## lock/1
 
 Owned by henki-mods. `CONFIG_DIR/mods.lock` holds one line per module, fields separated by tabs, lines sorted by name,
@@ -516,13 +532,14 @@ lock/1 NAME STATE VERSION SOURCE_KIND SOURCE COMMIT HD1 ADDED HOW FLAGS
 ```
 
 - STATE `on` or `off`; SOURCE_KIND `official`, `path`, `url`, `skill` or `index:INDEX`; SOURCE the module's name
-  (official), the path, `URL` or `URL#SUBDIR`, or for `index:INDEX` the package's name in index INDEX (index/1);
+  (official), the path, `URL` or `URL#SUBDIR` (for `skill` too: the skill's directory or git source), or for
+  `index:INDEX` the package's name in index INDEX (index/1);
   COMMIT 40 hex digits or `-`; HD1 the module's `hd1:` hash; ADDED the UTC time, `YYYY-MM-DDTHH:MMZ`; HOW `tty`
   (answered on the terminal) or `yes` (`--yes`).
 - FLAGS is empty or a comma-separated list: `pin` (an update leaves the module as it is), `ref=REF` (the ref a URL
   install follows: the branch or tag it named, `HEAD` for the default branch; none when it named a commit),
   `yanked=malicious` or `yanked=buggy` (an index yanked this version; a malicious one stays off), `skill=hd1:HASH`
-  (the Agent Skill the module was made from), `mask=cmd/NAME`, one per masked command (`henki-mods off NAME/CMD`: the
+  (the hd1 of the Agent Skill's directory the module was made from; a skill from a URL has `ref=` too), `mask=cmd/NAME`, one per masked command (`henki-mods off NAME/CMD`: the
   link names a copy of the store copy without `cmd/CMD` and `cmd/CMD.md`, beside it as `ID.mHASH`, where HASH is 8 hex
   digits of the SHA-256 of the masked names, sorted, one per line; HD1 stays the module's own).
 - A line whose first field is not `lock/1` (or `bind/1`, after them), or that holds a kind or flag henki-mods does not

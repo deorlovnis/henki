@@ -82,6 +82,8 @@ usage() {
 usage: henki-mods [list]              modules: state, version, source, prompt bytes
        henki-mods add SRC [--yes]     SRC: NAME (official, else an index's), /DIR or ./DIR [#SUBDIR], URL[@REF][#SUBDIR]
        henki-mods add NAME[@INDEX] [--version V] [--yes]   a module of a signed index, at its reviewed commit
+       henki-mods add SRC --expect hd1:HASH [--yes]   only when SRC holds these files (the line share prints)
+       henki-mods add --skill SRC [--as NAME] [--yes]   an Agent Skill (a dir with SKILL.md) as a command /NAME
        henki-mods search [TERM] | info NAME[@INDEX] | sync   the signed indexes: what they list, one package, yanks
        henki-mods doctor              everything henki-mods depends on, each problem with its fix
        henki-mods on NAME | off NAME | rm NAME
@@ -102,7 +104,13 @@ usage: henki-mods [list]              modules: state, version, source, prompt by
                                       eval/1 tasks with the module on and off
        henki-mods eval --check DIR    the layout of a directory of eval/1 tasks
        henki-mods allow [--config FILE] [rm N]   henki's allow rules: list them, or remove rule N
-       henki-mods entry derive REPO PATH COMMIT | entry lint FILE   index entries (henki-mods-dev)
+       henki-mods new NAME [--tool|--cmd|--template|--observer EVENT|--port history] [--dir D]   a module to start from
+       henki-mods test [DIR]          an author's checks of a module (or of each in DIR), then DIR/test.sh
+       henki-mods try [DIR|NAME] [--keep] [-- HENKI_ARGS]   henki with only that module, in a scratch home
+       henki-mods publish [DIR]       the index entry files for the committed, pushed module in DIR
+       henki-mods share NAME          one line that installs these files of NAME elsewhere
+       henki-mods entry derive REPO PATH COMMIT | entry lint FILE   index entries
+       (new, test without --port, try, publish, share and entry are henki-mods-dev's)
        henki-mods help | --version
 EOF
   exit 2
@@ -778,10 +786,12 @@ EOF
         esac
         ;;
       .henki)
+        # Data (mode 644, no link) is what the module's own programs read: a library, an Agent Skill's files. Nothing
+        # puts it on a PATH or runs it as a command, and henki ignores the whole dot dir.
         case "$rest:$kind" in
           module.toml:644 | module.toml:755 | card.md:644 | card.md:755 | template:755) ;;
-          *)
-            ERR="$dir/$p: .henki holds module.toml, card.md and template (a program cmd/ links run; regular files) only; fix: remove it"
+          module.toml:* | card.md:* | template:* | *:link | *:755)
+            ERR="$dir/$p: .henki holds module.toml, card.md, template (a program cmd/ links run) and data files of mode 644, all regular files; fix: make it a file (chmod 644 for data), or remove it"
             return 1
             ;;
         esac
@@ -1346,6 +1356,32 @@ file_kind() {
 
 red() { if [ -t 1 ]; then printf '\033[1;31m%s\033[0m' "$1"; else printf '%s' "$1"; fi; }
 
+# A git source URL[@REF][#SUBDIR] into the caller's url, ref, sub, source (URL#SUBDIR, as the lock holds it) and
+# fallback (the module's default name: SUBDIR's last name, else the repository's).
+url_parse() { # SRC
+  local x
+  url=$1 ref="" sub=""
+  case "$url" in *'#'*) sub=${url##*#} && url=${url%#*} ;; esac
+  # @REF comes after the host: a user@ in front of the host, and scp's git@host:, are not refs.
+  case "$url" in
+    *://*/*@* | [!/]*@*:*@*)
+      ref=${url##*@}
+      url=${url%@*}
+      ;;
+  esac
+  while [ "${sub%/}" != "$sub" ]; do sub=${sub%/}; done
+  if [ -n "$sub" ]; then
+    case "/$sub/" in */../* | */./* | //*) die "#$sub is not a plain directory path; fix: name a directory of the repository like #mods/NAME" ;; esac
+  fi
+  case "$ref" in -*) die "@$ref is not a ref; fix: name a branch, tag or commit" ;; esac
+  source="$url${sub:+#$sub}"
+  x=${url%/}
+  x=${x##*/}
+  x=${x##*:}
+  fallback=${sub##*/}
+  fallback=${fallback:-${x%.git}}
+}
+
 # Copies source SRC into $STAGE/m as add takes it (WANT: --version's value, for an index package), inspects it, and puts
 # this machine's prebuilt program in place. Sets the caller's kind, source, fallback, dir, url, sub, ref and pkg, and
 # COMMIT (or -), E_ver and E_rec (an index version), F_index. Dies with the reason when the copy cannot go in here.
@@ -1369,26 +1405,7 @@ stage_src() { # SRC WANT
       ;;
     *::* | *://* | *@*:*)
       kind=url
-      url=$src
-      case "$url" in *'#'*) sub=${url##*#} && url=${url%#*} ;; esac
-      # @REF comes after the host: a user@ in front of the host, and scp's git@host:, are not refs.
-      case "$url" in
-        *://*/*@* | [!/]*@*:*@*)
-          ref=${url##*@}
-          url=${url%@*}
-          ;;
-      esac
-      while [ "${sub%/}" != "$sub" ]; do sub=${sub%/}; done
-      if [ -n "$sub" ]; then
-        case "/$sub/" in */../* | */./* | //*) die "#$sub is not a plain directory path; fix: name a directory of the repository like #mods/NAME" ;; esac
-      fi
-      case "$ref" in -*) die "@$ref is not a ref; fix: name a branch, tag or commit" ;; esac
-      source="$url${sub:+#$sub}"
-      x=${url%/}
-      x=${x##*/}
-      x=${x##*:}
-      fallback=${sub##*/}
-      fallback=${fallback:-${x%.git}}
+      url_parse "$src"
       copy_git "$url" "$ref" "$sub" "$STAGE/m"
       ;;
     *)
@@ -1576,13 +1593,14 @@ screen_review() {
 }
 
 cmd_add() {
-  local src="" yes=0 want="" kind source fallback dir store ref sub url bytes total extra n need line pkg=""
+  local src="" yes=0 want="" kind source fallback dir store ref sub url bytes total extra n need line pkg="" skill=0 as="" expect=""
   while [ $# -gt 0 ]; do
     case "$1" in
       --yes | -y) yes=1 ;;
-      --version)
+      --skill) skill=1 ;;
+      --version | --as | --expect)
         [ $# -ge 2 ] || usage
-        want=$2
+        case "$1" in --version) want=$2 ;; --as) as=$2 ;; *) expect=$2 ;; esac
         shift
         ;;
       -*) usage ;;
@@ -1591,14 +1609,22 @@ cmd_add() {
     shift
   done
   [ -n "$src" ] || usage
+  case "$skill:$as:$want" in 0:?*:* | 1:*:?*) usage ;; esac
   case "$src" in *[[:cntrl:]]*) die "the source holds a control character; fix: name it without one" ;; esac
+  case "$expect" in '' | hd1:????????????????????????????????????????????????????????????????) ;; *) die "--expect $expect is not hd1: and 64 hex digits; fix: copy the whole line henki-mods share printed" ;; esac
+  case "${expect#hd1:}" in *[!0-9a-f]*) die "--expect $expect is not hd1: and 64 hex digits; fix: copy the whole line henki-mods share printed" ;; esac
   trust_guard
   busy
   lock_check
   stage
   STAGE_LIST="$STAGE/list"
+  if [ "$skill" = 1 ]; then
+    skill_add "$src" "$as" "$yes" "$expect"
+    return
+  fi
   stage_src "$src" "$want"
   n=$I_name
+  expect_ok "$expect" "$src"
   if lock_get "$n"; then
     die "$n is already added (from $L_source); fix: henki-mods update $n for another version, or henki-mods on $n"
   fi
@@ -1624,6 +1650,616 @@ cmd_add() {
   say "added $n: on, $(shown "$store")"
   [ -z "$line" ] || say "add to $(shown "$CONF/config.toml"): $line"
   allow_follow "$I_cmds" 1 "$yes"
+  ext_path_warning
+  restart
+}
+
+# A copy whose hd1 is not EXPECT (add --expect, which a share line carries) is not installed.
+expect_ok() { # EXPECT SRC
+  [ -z "$1" ] || [ "$I_hd1" = "$1" ] ||
+    die "$2 holds other files than the line expects ($I_hd1, not $1); not installed; fix: ask whoever shared the line for a new one"
+}
+
+# FILE through ${PAGER:-more}, controls (but tab and newline) and C1 shown as ?, so no escape sequence in text not yet
+# accepted hides or rewrites a line on the screen being read.
+page_text() {
+  LC_ALL=C awk '{ gsub(/[\001-\010\013-\037\177]|\302[\200-\237]/, "?"); print }' "$1" | ${PAGER:-more}
+}
+
+# --- Agent Skills ------------------------------------------------------------------------------------------------------
+# An Agent Skill is a directory whose SKILL.md starts with YAML frontmatter between --- lines, then markdown
+# instructions (agentskills.io/specification, as read on 2026-11-08). skill_build turns one into a module: doc.md,
+# cmd/NAME -> ../.henki/template (a template: its text is shown, then sent), cmd/NAME.md (the body),
+# .henki/module.toml, .henki/template, and the skill's other files kept as data under .henki/skill/ with mode 644, so
+# no script of the skill lands on a PATH. The same input gives the same bytes, so the same hd1. awk sees only the ASCII
+# structure of text checked to be UTF-8 first (on bytes); counts and cuts are made on bytes (tr, od), so byte awks
+# (mawk, macOS awk) and UTF-8 awks agree.
+
+SKILL_BODY_MAX=16384   # bytes of the body (cmd/NAME.md); henki checks cmd/*.md against the same 16 KiB
+SKILL_SIZE_MAX=4194304 # bytes of the whole skill dir
+SKILL_FILES_MAX=200    # files in the skill dir, SKILL.md included
+SKILL_UNREAD='frontmatter this importer does not read; fix: import by hand with henki mods new NAME --template'
+# Licenses a generated module.toml may carry (as the index accepts; expressions of these with AND, OR and parentheses).
+SKILL_LICENSES='Apache-2.0 MIT BSD-2-Clause BSD-3-Clause 0BSD ISC MPL-2.0 Zlib BSL-1.0 Unlicense CC0-1.0 GPL-2.0-or-later GPL-3.0-only GPL-3.0-or-later LGPL-2.1-or-later LGPL-3.0-or-later AGPL-3.0-only AGPL-3.0-or-later'
+# Names a skill may not take besides the official mods': std, henki, the six ports, the manager's words.
+SKILL_RESERVED='std henki model history context exec policy frontend mods allow help exit index'
+
+# The prompts mod's template, written into every generated module as .henki/template. With FILES 1 it gains the line
+# that tells the model where the skill's other files are ($HENKI_MODULE is expanded when the command runs).
+skill_template() { # FILES
+  printf '%s\n' '#!/bin/sh' \
+    '# A prompt template (handoff/1): hands back `send` with the text of cmd/NAME.md, NAME the command this runs as (a link' \
+    '# to this file), and the command'"'"'s argument after a blank line when there is one.' \
+    'name=${0##*/}' \
+    '# Read before HENKI_NEXT is written: a missing NAME.md hands back nothing, never an empty `send`.' \
+    'text=$(cat "$HENKI_MODULE/cmd/$name.md") || exit 1' \
+    '{' \
+    '  echo send'
+  [ "$1" != 1 ] || printf '%s\n' "  echo \"(This skill's files are in \$HENKI_MODULE/.henki/skill; read them when the text names them.)\""
+  printf '%s\n' '  printf '"'"'%s\n'"'"' "$text"' \
+    '  if [ -n "${1:-}" ]; then printf '"'"'\n%s\n'"'"' "$1"; fi' \
+    '} >"$HENKI_NEXT"'
+}
+
+# The frontmatter of the normalized SKILL.md F into files under DIR: DIR/name, DIR/description, DIR/license,
+# DIR/compatibility, DIR/allowed-tools (each only when present; the value's exact bytes) and DIR/.ignored (other
+# top-level keys, one per line). Reads top-level `key: value` scalars, plain (also over indented lines), single- or
+# double-quoted on one line, and | or > block scalars with their indicators; the lines of `metadata` are skipped.
+# Anything else (tabs, nested maps and lists, flow collections, anchors, aliases, tags, multi-line quotes, escapes
+# other than \\ \" \/ \n \t and \ ) is refused. Prints the line where the body starts; else 1 with the reason on stdout.
+skill_frontmatter() { # F DIR
+  HM_OUT="$2" HM_UNREAD="$SKILL_UNREAD" awk '
+    BEGIN { out = ENVIRON["HM_OUT"]; mode = ""; nign = 0 }
+    function bad(m) { if (!failed) print "SKILL.md line " NR ": " m; failed = 1; exit 1 }
+    function unread(m) { bad(m "; " ENVIRON["HM_UNREAD"]) }
+    function nls(n,   s) { s = ""; while (n-- > 0) s = s "\n"; return s }
+    function trim(s) { sub(/^ +/, "", s); sub(/ +$/, "", s); return s }
+    function put(k, v,   f) {
+      if (k == "name" || k == "description" || k == "license" || k == "compatibility" || k == "allowed-tools") {
+        f = out "/" k; printf "%s", v > f; close(f)
+      } else ign[++nign] = k
+    }
+    # After a closing quote: nothing, or a comment.
+    function after(t) { t = trim(t); if (t != "" && substr(t, 1, 1) != "#") unread("text after a quoted value") }
+    function dq(s,   i, n, c, e, r) {
+      r = ""; n = length(s)
+      for (i = 2; i <= n; i++) {
+        c = substr(s, i, 1)
+        if (c == "\\") {
+          i++; e = substr(s, i, 1)
+          if (e == "\\" || e == "\"" || e == "/" || e == " ") r = r e
+          else if (e == "n") r = r "\n"
+          else if (e == "t") r = r "\t"
+          else unread("the escape \\" e " in a quoted value")
+          continue
+        }
+        if (c == "\"") { after(substr(s, i + 1)); return r }
+        r = r c
+      }
+      unread("a quoted value that does not end on its line")
+    }
+    function sq(s,   i, n, c, r) {
+      r = ""; n = length(s)
+      for (i = 2; i <= n; i++) {
+        c = substr(s, i, 1)
+        if (c == "\047") {
+          if (substr(s, i + 1, 1) == "\047") { r = r c; i++; continue }
+          after(substr(s, i + 1)); return r
+        }
+        r = r c
+      }
+      unread("a quoted value that does not end on its line")
+    }
+    # A piece of a plain (unquoted) value: YAML ends it at " #" (a comment) and refuses ": " inside it.
+    function plain(t,   p) {
+      p = index(t, " #"); if (p) t = substr(t, 1, p - 1)
+      t = trim(t)
+      if (index(t, ": ") || t ~ /:$/) unread("\": \" inside an unquoted value (quote the value)")
+      return t
+    }
+    # The collected lines B[1..nb] of a block scalar (style | or >, chomp "", "-" or "+") as YAML reads them.
+    function endblock(   i, last, r, started, blanks, prev, more) {
+      last = 0
+      for (i = nb; i >= 1; i--) if (B[i] != "") { last = i; break }
+      r = ""; started = 0; blanks = 0; prev = ""
+      for (i = 1; i <= last; i++) {
+        if (B[i] == "") { blanks++; continue }
+        more = substr(B[i], 1, 1) == " "
+        if (!started) { r = nls(blanks) B[i]; started = 1 }
+        else if (style == ">" && prev == "n" && !more) r = r (blanks ? nls(blanks) : " ") B[i]
+        else r = r nls(blanks + 1) B[i]
+        prev = more ? "m" : "n"; blanks = 0
+      }
+      if (last) { if (chomp == "+") r = r nls(1 + nb - last); else if (chomp != "-") r = r "\n" }
+      else if (chomp == "+") r = nls(nb)
+      put(bkey, r); mode = ""
+    }
+    {
+      line = $0
+      if (NR == 1) {
+        if (line !~ /^--- *$/) bad("SKILL.md does not start with a --- line (no frontmatter)")
+        next
+      }
+      if (index(line, "\t")) unread("a tab")
+      if (mode == "block") {
+        if (line ~ /^ *$/) { B[++nb] = ""; next }
+        match(line, /^ */); ind = RLENGTH
+        if (!bind) { if (ind == 0) endblock(); else bind = ind }
+        if (mode == "block") {
+          if (ind >= bind) { B[++nb] = substr(line, bind + 1); next }
+          if (ind > 0) unread("a block value whose lines are indented less than its first line")
+          endblock()
+        }
+      }
+      if (mode == "meta") {
+        if (line ~ /^ / || line ~ /^ *$/) next
+        mode = ""
+      }
+      if (mode == "plain") {
+        if (line ~ /^ *$/) { pend++; next }
+        if (line ~ /^ /) {
+          t = trim(line)
+          if (substr(t, 1, 1) == "#") unread("a comment inside a value")
+          pv = pv (pend ? nls(pend) : " ") plain(t); pend = 0
+          next
+        }
+        put(pkey, pv); mode = ""
+      }
+      if (line ~ /^--- *$/) { done = 1; print NR + 1; exit 0 }
+      if (line ~ /^ *$/ || line ~ /^ *#/) next
+      if (line ~ /^ /) unread("an indented line outside a value (a nested map or list)")
+      if (!match(line, /^[A-Za-z0-9_][A-Za-z0-9_-]*:/)) unread("a line that is not key: value")
+      key = substr(line, 1, RLENGTH - 1); rest = substr(line, RLENGTH + 1)
+      if (rest != "" && substr(rest, 1, 1) != " ") unread("a line that is not key: value")
+      if (key in seen) bad("the key " key " twice; fix: keep one")
+      seen[key] = 1
+      rest = trim(rest)
+      if (rest == "" || substr(rest, 1, 1) == "#") {
+        if (key == "metadata") mode = "meta"; else put(key, "")
+        next
+      }
+      if (key == "metadata") unread("metadata that is not a block map")
+      c = substr(rest, 1, 1)
+      if (c == "\"") { put(key, dq(rest)); next }
+      if (c == "\047") { put(key, sq(rest)); next }
+      if (c == "|" || c == ">") {
+        h = rest
+        if (match(h, / +#/)) h = substr(h, 1, RSTART - 1)
+        if (h !~ /^[|>]([1-9][-+]?|[-+][1-9]?)?$/) unread("a block value header " h)
+        style = c; chomp = ""; bind = 0; nb = 0; bkey = key; mode = "block"
+        for (i = 2; i <= length(h); i++) {
+          c = substr(h, i, 1)
+          if (c == "-" || c == "+") chomp = c; else bind = c + 0
+        }
+        next
+      }
+      if (index("[]{}&*!%@`,", c)) unread("a flow collection, anchor, alias or tag")
+      if ((c == "-" || c == "?" || c == ":") && (rest == c || substr(rest, 2, 1) == " ")) unread("a list or complex key")
+      pv = plain(rest)
+      if (pv == "~" || pv == "null" || pv == "Null" || pv == "NULL") pv = ""
+      pkey = key; pend = 0; mode = "plain"
+    }
+    END {
+      if (failed) exit 1
+      if (!done) { print "SKILL.md: no --- line ends the frontmatter; " ENVIRON["HM_UNREAD"]; exit 1 }
+      f = out "/.ignored"
+      printf "" > f
+      for (i = 1; i <= nign; i++) print ign[i] > f
+      close(f)
+    }' "$1"
+}
+
+# 0 when FILE is UTF-8: no overlong form, no surrogate, nothing above U+10FFFF, no sequence cut short. Else 1 and the
+# 1-based offset of the first byte of the bad sequence. On bytes (od), so every awk agrees; it needs no iconv.
+skill_utf8() { # FILE
+  od -An -v -tx1 <"$1" | awk '
+    BEGIN { for (i = 0; i < 16; i++) h[substr("0123456789abcdef", i + 1, 1)] = i; need = 0; pos = 0 }
+    function bad(at) { print at; failed = 1; exit 1 }
+    {
+      for (i = 1; i <= NF; i++) {
+        b = h[substr($i, 1, 1)] * 16 + h[substr($i, 2, 1)]; pos++
+        if (need) {
+          if (b < lo || b > hi) bad(start)
+          lo = 128; hi = 191; need--
+          continue
+        }
+        start = pos; lo = 128; hi = 191
+        if (b < 128) continue
+        if (b >= 194 && b <= 223) need = 1
+        else if (b == 224) { need = 2; lo = 160 }
+        else if (b == 237) { need = 2; hi = 159 }
+        else if (b >= 225 && b <= 239) need = 2
+        else if (b == 240) { need = 3; lo = 144 }
+        else if (b >= 241 && b <= 243) need = 3
+        else if (b == 244) { need = 3; hi = 143 }
+        else bad(pos)
+      }
+    }
+    END { if (failed) exit 1; if (need) bad(start) }'
+}
+
+# 0 when henki keeps NAME for itself: SKILL_RESERVED, an official mod's name, x-*.
+skill_reserved() { # NAME
+  case " $SKILL_RESERVED " in *" $1 "*) return 0 ;; esac
+  case "$1" in x-*) return 0 ;; esac
+  official_dir "$1" >/dev/null 2>&1
+}
+
+# Characters (UTF-8 code points) in FILE: its bytes less its continuation bytes.
+skill_chars() { LC_ALL=C tr -d '\200-\277' <"$1" | wc -c | tr -d ' '; }
+
+# FILE's text on one line: tabs and newlines to spaces, runs of spaces to one, trimmed.
+skill_line() { tr '\t\n' '  ' <"$1" | tr -s ' ' | sed 's/^ //; s/ $//'; }
+
+# FILE cut to at most MAX bytes at a character boundary: at the last space when one is in the second half, so a word
+# is not split; without a trailing space.
+skill_cut() { # FILE MAX
+  local n
+  n=$(od -An -v -tx1 <"$1" | HM_MAX="$2" awk '
+    BEGIN { max = ENVIRON["HM_MAX"] + 0 }
+    { for (i = 1; i <= NF; i++) b[++n] = $i }
+    END {
+      if (n <= max) { print n; exit }
+      for (l = max; l > 0; l--) if (b[l + 1] !~ /^[89ab]/) break
+      for (s = l + 1; s > max / 2; s--) if (b[s] == "20") { l = s - 1; break }
+      print l
+    }')
+  head -c "$n" <"$1" | sed 's/ *$//'
+}
+
+# 0 when the license text L is an expression of SKILL_LICENSES ids with AND, OR and balanced parentheses.
+skill_spdx() {
+  HM_L="$1" HM_OK="$SKILL_LICENSES" awk 'BEGIN {
+    n = split(ENVIRON["HM_OK"], a, " "); for (i = 1; i <= n; i++) ok[a[i]] = 1
+    s = ENVIRON["HM_L"]; gsub(/\(/, " ( ", s); gsub(/\)/, " ) ", s)
+    n = split(s, t, " "); depth = 0; want = "id"
+    if (n == 0) exit 1
+    for (i = 1; i <= n; i++) {
+      if (t[i] == "(") { if (want != "id") exit 1; depth++ }
+      else if (t[i] == ")") { if (want != "op" || --depth < 0) exit 1 }
+      else if (t[i] == "AND" || t[i] == "OR") { if (want != "op") exit 1; want = "id" }
+      else if (t[i] in ok) { if (want != "id") exit 1; want = "op" }
+      else exit 1
+    }
+    exit (want == "op" && depth == 0) ? 0 : 1 }'
+}
+
+# 0 when ROOT (a copy of the source, or of its #SUB) holds SKILL.md; else 1 with ERR, and SK_FOUND listing up to 20
+# skill dirs within 3 levels of ROOT, each as the #DIR that names it.
+skill_find() { # ROOT SUB
+  local found count
+  SK_FOUND=""
+  if [ -f "$1/SKILL.md" ] && [ ! -L "$1/SKILL.md" ]; then return 0; fi
+  found=$(cd "$1" && find . -path ./.git -prune -o -name SKILL.md -type f -print 2>/dev/null |
+    awk -F / 'NF >= 3 && NF <= 5' | sed "s|^\./|#${2:+$2/}|; s|/SKILL\.md\$||" | LC_ALL=C sort)
+  count=$(printf '%s' "$found" | awk 'END { print NR }')
+  if [ "$count" = 0 ]; then
+    ERR="${2:+#$2: }no SKILL.md here or within 3 levels; fix: name a skill's directory with #DIR"
+  else
+    SK_FOUND=$(printf '%s\n' "$found" | head -n 20 | sed 's/^/  /')
+    [ "$count" -le 20 ] || SK_FOUND="$SK_FOUND$nl  ($((count - 20)) more not shown)"
+    ERR="${2:+#$2: }not a skill (no SKILL.md), and $count skill(s) are below it (above); fix: name one with #DIR"
+  fi
+  return 1
+}
+
+# Check the skill in SKILLDIR and generate its module at OUT (which must not exist). DIRNAME: the skill dir's own name
+# ("" when unknown); AS: the --as name or ""; SOURCE and COMMIT (40 hex, or "" for a path source) as the lock records
+# them; TAKEN: names in use, one per line (added modules, commands of modules that are on). On success sets SK_NAME
+# (the skill's), SK_HNAME (henki's), SK_DESC, SK_LICENSE, SK_TOOLS, SK_FILES, SK_SCRIPTS, SK_IGNORED, SK_SRC_HD1,
+# SK_VERSION and SK_REF. Else 1 with ERR.
+skill_build() { # SKILLDIR DIRNAME AS SOURCE COMMIT TAKEN OUT
+  local p="$7.parse" STAGE_LIST="$7.parse/list" x
+  SK_NAME="" SK_HNAME="" SK_DESC="" SK_LICENSE="" SK_TOOLS="" SK_FILES=0 SK_SCRIPTS=0 SK_IGNORED="" SK_SRC_HD1=""
+  SK_VERSION="" SK_REF=""
+  ERR=""
+  if [ -e "$7" ] || [ -L "$7" ]; then
+    ERR="$7 exists"
+    return 1
+  fi
+  mkdir "$p" || {
+    ERR="cannot make $p"
+    return 1
+  }
+  skill_build_in "$@" "$p"
+  x=$?
+  rm -rf "$p"
+  [ "$x" = 0 ] || {
+    chmod -R u+w "$7" 2>/dev/null
+    rm -rf "$7"
+  }
+  return "$x"
+}
+
+skill_build_in() {
+  local src="$1" dirname="$2" as="$3" source="$4" commit="$5" taken="$6" out="$7" p="$8"
+  local line kind path n size start x cr w
+  # The skill dir: files and dirs only, at most 200 files and 4 MiB.
+  listing "$src" || return 1
+  n=0 size=0
+  while IFS= read -r line; do
+    kind=${line##*"$tab"}
+    path=${line%"$tab"*}
+    if [ "$kind" = link ]; then
+      ERR="$path: a link in the skill; fix: import by hand with henki mods new NAME --template"
+      return 1
+    fi
+    n=$((n + 1))
+    x=$(wc -c <"$src/$path" | tr -d ' ')
+    size=$((size + x))
+  done <"$STAGE_LIST"
+  if [ "$n" -gt "$SKILL_FILES_MAX" ]; then
+    ERR="the skill holds $n files, over $SKILL_FILES_MAX; fix: import by hand with henki mods new NAME --template"
+    return 1
+  fi
+  if [ "$size" -gt "$SKILL_SIZE_MAX" ]; then
+    ERR="the skill is $size bytes, over $SKILL_SIZE_MAX (4 MiB); fix: import by hand with henki mods new NAME --template"
+    return 1
+  fi
+  if ! command grep -q "^SKILL\.md$tab" "$STAGE_LIST"; then
+    ERR="no SKILL.md in the skill dir; fix: name a skill's directory with #DIR"
+    return 1
+  fi
+  SK_SRC_HD1=$(hd1 "$src")
+  cp "$STAGE_LIST" "$p/src.list"
+  # UTF-8 before anything reads it, so no awk sees a stray byte and the checks below see every character.
+  x=$(skill_utf8 "$src/SKILL.md") || {
+    ERR="SKILL.md: not UTF-8 (byte $x); fix: save it as UTF-8"
+    return 1
+  }
+
+  # SKILL.md without a UTF-8 BOM and with CRLF line ends made LF; a lone CR stays and is refused below.
+  cr=$(printf '\r')
+  if [ "$(head -c 3 <"$src/SKILL.md" | od -An -tx1 | tr -d ' ')" = efbbbf ]; then
+    tail -c +4 <"$src/SKILL.md"
+  else
+    cat <"$src/SKILL.md"
+  fi | sed "s/$cr\$//" >"$p/skill.md"
+  mkdir "$p/fm"
+  start=$(skill_frontmatter "$p/skill.md" "$p/fm") || {
+    ERR=$start
+    return 1
+  }
+  sed -n "$start,\$p" "$p/skill.md" | sed '/[^[:space:]]/,$!d' >"$p/body"
+
+  # The frontmatter, against the format's rules.
+  [ -f "$p/fm/name" ] && SK_NAME=$(cat "$p/fm/name")
+  case "$SK_NAME" in
+    '') ERR="SKILL.md: no name; fix: add name: to the frontmatter" ;;
+    *[!a-z0-9-]* | -* | *- | *--*) ERR="SKILL.md: name \"$SK_NAME\" is not 1 to 64 of a-z, 0-9 and single hyphens inside; fix: correct it in SKILL.md" ;;
+  esac
+  [ -z "$ERR" ] || return 1
+  if [ "${#SK_NAME}" -gt 64 ]; then
+    ERR="SKILL.md: name is ${#SK_NAME} characters, over 64; fix: shorten it in SKILL.md"
+    return 1
+  fi
+  if [ -n "$dirname" ] && [ "$SK_NAME" != "$dirname" ]; then
+    ERR="SKILL.md: name \"$SK_NAME\" is not the skill's directory name \"$dirname\"; fix: make them equal"
+    return 1
+  fi
+  [ -f "$p/fm/description" ] || : >"$p/fm/description"
+  x=$(skill_chars "$p/fm/description")
+  if [ -z "$(skill_line "$p/fm/description")" ]; then
+    ERR="SKILL.md: no description; fix: add description: to the frontmatter"
+    return 1
+  fi
+  if [ "$x" -gt 1024 ]; then
+    ERR="SKILL.md: description is $x characters, over 1024; fix: shorten it"
+    return 1
+  fi
+  if [ -f "$p/fm/compatibility" ]; then
+    x=$(skill_chars "$p/fm/compatibility")
+    if [ "$x" -gt 500 ]; then
+      ERR="SKILL.md: compatibility is $x characters, over 500; fix: shorten it"
+      return 1
+    fi
+  fi
+
+  # The values as read and the body, once more (a value is decoded from its quotes).
+  for w in "$p"/fm/* "$p/body"; do
+    [ -f "$w" ] || continue
+    x=$(skill_utf8 "$w") || {
+      ERR="SKILL.md: ${w##*/} is not UTF-8 (byte $x of it); fix: save SKILL.md as UTF-8"
+      return 1
+    }
+  done
+
+  # The body becomes cmd/NAME.md, which henki reads as checked data.
+  x=$(wc -c <"$p/body" | tr -d ' ')
+  if [ "$x" = 0 ]; then
+    ERR="SKILL.md: no instructions after the frontmatter; fix: add them"
+    return 1
+  fi
+  if [ "$x" -gt "$SKILL_BODY_MAX" ]; then
+    ERR="SKILL.md: the instructions are $x bytes, over $SKILL_BODY_MAX (16 KiB); fix: import by hand with henki mods new NAME --template and cut them"
+    return 1
+  fi
+  x=$(invisible_check "$p/body") || {
+    ERR="SKILL.md: the instructions hold $x, which henki would show escaped; fix: remove it"
+    return 1
+  }
+  x=$(invisible_check "$p/skill.md") || {
+    ERR="SKILL.md: the frontmatter holds $x, which henki would show escaped; fix: remove it"
+    return 1
+  }
+
+  # henki's name for it.
+  SK_HNAME=${as:-$SK_NAME}
+  if ! is_name "$SK_HNAME"; then
+    if [ -n "$as" ]; then
+      ERR="--as $as: $NAME_RULE; fix: choose another"
+    else
+      ERR="the skill's name $SK_NAME is not a henki name ($NAME_RULE); fix: give it one with --as NAME"
+    fi
+    return 1
+  fi
+  if skill_reserved "$SK_HNAME"; then
+    ERR="$SK_HNAME is a name henki keeps for itself; fix: give the skill another with --as NAME"
+    return 1
+  fi
+  if printf '%s\n' "$taken" | command grep -Fqx -- "$SK_HNAME"; then
+    ERR="$SK_HNAME is taken by a module or a command of one (henki-mods list); fix: give the skill another name with --as NAME, or henki-mods update $SK_HNAME for this skill"
+    return 1
+  fi
+
+  # The values shown and written.
+  SK_DESC=$(skill_line "$p/fm/description")
+  printf '%s' "$SK_DESC" >"$p/desc"
+  SK_DESC=$(skill_cut "$p/desc" 160)
+  SK_LICENSE=NOASSERTION
+  if [ -f "$p/fm/license" ]; then
+    x=$(skill_line "$p/fm/license")
+    ! skill_spdx "$x" || SK_LICENSE=$x
+  fi
+  [ ! -f "$p/fm/allowed-tools" ] || SK_TOOLS=$(skill_line "$p/fm/allowed-tools")
+  SK_IGNORED=$(tr '\n' ' ' <"$p/fm/.ignored" | sed 's/ $//; s/ /, /g')
+  if [ -n "$commit" ]; then
+    SK_REF=$commit
+    x=$commit
+  else
+    SK_REF="hd1:$(printf '%s' "${SK_SRC_HD1#hd1:}" | cut -c 1-12)"
+    x=${SK_SRC_HD1#hd1:}
+  fi
+  SK_VERSION="skill-$(printf '%s' "$x" | cut -c 1-12)"
+
+  # The module.
+  mkdir -p "$out/cmd" "$out/.henki/skill" || {
+    ERR="cannot make $out"
+    return 1
+  }
+  w=0
+  ! command grep -v "^SKILL\.md$tab" "$p/src.list" | command grep -q . || w=1
+  {
+    printf '%s\n\n' "$SK_DESC"
+    printf 'Imported from the Agent Skill %s (%s @ %s). /%s [TEXT] shows its instructions, with TEXT after them, and sends them when you say yes.\n' \
+      "$SK_NAME" "$source" "$SK_REF" "$SK_HNAME"
+  } >"$out/doc.md"
+  cat "$p/body" >"$out/cmd/$SK_HNAME.md"
+  skill_template "$w" >"$out/.henki/template"
+  ln -s ../.henki/template "$out/cmd/$SK_HNAME"
+  {
+    printf 'henki_module = 1\n'
+    printf 'name = "%s"\n' "$SK_HNAME"
+    printf 'version = "%s"\n' "$SK_VERSION"
+    printf 'summary = "%s"\n' "$(printf '%s' "$SK_DESC" | tr '"\\' "'/")"
+    printf 'license = "%s"\n' "$SK_LICENSE"
+    printf 'requires = ["henki >= 0.2"]\n'
+    printf 'contracts = ["ext/2", "handoff/1"]\n'
+  } >"$out/.henki/module.toml"
+  while IFS= read -r line; do
+    path=${line%"$tab"*}
+    kind=${line##*"$tab"}
+    [ "$path" != SKILL.md ] || continue
+    case "$path" in */*) mkdir -p "$out/.henki/skill/${path%/*}" ;; esac
+    cat <"$src/$path" >"$out/.henki/skill/$path"
+    SK_FILES=$((SK_FILES + 1))
+    # A script: runnable, a #! line, or a script language's suffix (a skill's scripts/ also holds data).
+    case "$kind:$path" in
+      755:* | *.sh | *.bash | *.py | *.js | *.mjs | *.cjs | *.ts | *.rb | *.pl) SK_SCRIPTS=$((SK_SCRIPTS + 1)) ;;
+      *) [ "$(head -c 2 <"$src/$path")" != '#!' ] || SK_SCRIPTS=$((SK_SCRIPTS + 1)) ;;
+    esac
+    case "$path" in */*) ;; LICENSE*) cat <"$src/$path" >"$out/$path" ;; esac
+  done <"$p/src.list"
+  # Modes are part of hd1: 644 for every file, 755 for the template only.
+  find "$out" -type f -exec chmod 644 {} +
+  chmod 755 "$out/.henki/template"
+}
+
+# The install screen's lines for a skill (after skill_build), before the usual ones.
+skill_screen() { # SOURCE
+  say "  skill    $SK_NAME from $1 @ $SK_REF (Agent Skill)"
+  [ -z "$SK_TOOLS" ] || say "  allowed-tools: $SK_TOOLS (ignored: henki asks for each call as usual)"
+  [ "$SK_FILES" = 0 ] || say "  data     $SK_FILES files of the skill in .henki/skill, $SK_SCRIPTS of them scripts (not on PATH; the model can run them only through a shell call you approve)"
+  [ -z "$SK_IGNORED" ] || say "  ignored  frontmatter keys henki does not use: $SK_IGNORED"
+  say "  text     /$SK_HNAME shows the skill's instructions ($(num "$(wc -c <"$STAGE/m/cmd/$SK_HNAME.md" | tr -d ' ')") B) and sends them when you say yes; nothing goes into other requests"
+}
+
+# The names a skill may not take here: added modules, modules in the ext dir, and the commands of those (one per line),
+# but SELF (an update's own module).
+skill_taken() { # SELF
+  local n c
+  {
+    lock_names
+    for n in $(ext_names); do
+      printf '%s\n' "$n"
+      [ -d "$EXT/$n/cmd" ] || continue
+      for c in "$EXT/$n/cmd"/*; do
+        c=${c##*/}
+        case "$c" in '*' | *.md | .*) ;; *) printf '%s\n' "$c" ;; esac
+      done
+    done
+  } | HM_S="$1" awk '$0 != ENVIRON["HM_S"]'
+}
+
+# The module made from the Agent Skill at SRC (a directory /DIR or ./DIR, or DIR#SUBDIR, or URL[@REF][#SUBDIR]), named
+# AS or the skill's name, into $STAGE/m, inspected as an install. The source is copied as add copies a module (a git
+# source from its raw blobs, nothing of it run). Sets kind (path or url), source, url, sub, ref, COMMIT and SK_*.
+skill_make() { # SRC AS SELF
+  local d dirname
+  COMMIT=- ref="" sub="" url=""
+  case "$1" in
+    /* | ./* | ../*)
+      kind=path
+      d=$1
+      if [ ! -d "$d" ]; then
+        case "$d" in *'#'*) d="${d%#*}/${d##*#}" ;; esac
+      fi
+      [ -d "$d" ] || die "$1 is not a directory; fix: name a skill's directory (the one holding SKILL.md)"
+      d=$(cd -P "$d" && pwd) || die "cannot enter $1; fix: make it readable"
+      case "$d" in *[[:cntrl:]]*) die "the path $d holds a control character; fix: rename it" ;; esac
+      source=$d dirname=${d##*/}
+      copy_dir "$d" "$STAGE/src"
+      ;;
+    *::* | *://* | *@*:*)
+      kind=url
+      url_parse "$1"
+      dirname=${sub##*/}
+      copy_git "$url" "$ref" "$sub" "$STAGE/src"
+      ;;
+    *) die "$1 is not a skill's source; fix: name its directory (/DIR or ./DIR) or a git URL[@REF][#SUBDIR]" ;;
+  esac
+  skill_find "$STAGE/src" "$sub" || {
+    [ -z "$SK_FOUND" ] || printf '%s\n' "$SK_FOUND" >&2
+    die "$ERR"
+  }
+  skill_build "$STAGE/src" "$dirname" "$2" "$source" "${COMMIT#-}" "$(skill_taken "${3:-}")" "$STAGE/m" || die "$ERR"
+  inspect "$STAGE/m" "$SK_HNAME" 1 || die "the module made from the skill: $(printf '%s' "$ERR" | sed "s|$STAGE/m|$SK_HNAME|g")"
+  index_local_all
+}
+
+# add --skill SRC [--as NAME] [--expect hd1:H] [--yes]: the Agent Skill at SRC as a module of one template command
+# (skill_make), on add's screen with the skill's lines; its text can be read before the question.
+skill_add() { # SRC AS YES EXPECT
+  local yes="$3" n store x kind source url sub ref fallback dir bytes total extra need line
+  skill_make "$1" "$2"
+  n=$I_name
+  expect_ok "$4" "$1"
+  if lock_get "$n"; then
+    die "$n is already added (from $L_source); fix: henki-mods update $n takes the skill as its source holds it now, or give it another name with --as NAME"
+  fi
+  if [ -e "$EXT/$n" ] || [ -L "$EXT/$n" ]; then
+    die "$(shown "$EXT/$n") exists and henki-mods did not make it; fix: move it out of $(shown "$EXT") first"
+  fi
+  screen_bytes
+  say "$n $SK_VERSION"
+  screen_review
+  skill_screen "$source"
+  screen_body
+  if [ "$yes" != 1 ] && tty_ask "show the text first? [y/N]"; then
+    case "$ANSWER" in y | Y | yes | YES) page_text "$STAGE/m/cmd/$n.md" ;; esac
+  fi
+  confirm "$yes" "install and turn on? [y/N]" "not installed (the answer was no); fix: run add again and answer y"
+  store="$STORE/$n/$(store_id)"
+  store_put "$store" "$I_hd1" "$n"
+  mkdir -p "$EXT" && ln -s -- "$store" "$EXT/$n" || die "cannot link $(shown "$EXT/$n"); fix: make $(shown "$EXT") writable"
+  L_name=$n L_version=$SK_VERSION L_kind=skill L_source=$source L_commit=$COMMIT L_hd1=$I_hd1 L_how=$HOW
+  L_flags="skill=$SK_SRC_HD1"
+  x=""
+  [ "$kind" != url ] || x=$(url_flags "$ref")
+  [ -z "$x" ] || L_flags="$x,$L_flags"
+  L_added=$(date -u +%Y-%m-%dT%H:%MZ)
+  lock_put "$n" "$(lock_line on)"
+  say "added $n: on, $(shown "$store"); /$n in henki shows its text"
   ext_path_warning
   restart
 }
@@ -2021,7 +2657,7 @@ cmd_outdated() {
   printf '%-16s %-10s %s\n' NAME VERSION STATUS
   for n in $(lock_names); do
     lock_get "$n"
-    case "$L_kind" in
+    case "$L_kind:$L_source" in
       index:*)
         i=${L_kind#index:}
         if [ ! -f "$STAGE/ix/$i/pkgs" ]; then
@@ -2037,7 +2673,20 @@ cmd_outdated() {
           fi
         fi
         ;;
-      url)
+      skill:/*)
+        # A skill from a directory: the hd1 of that directory now against the one it was made from (FLAGS skill=).
+        x=$(printf '%s\n' "$L_flags" | tr ',' '\n' | sed -n 's/^skill=//p')
+        if [ ! -d "$L_source" ]; then
+          st="gone: $L_source is not a directory"
+        elif ! listing "$L_source"; then
+          st="cannot be read: $ERR"
+        elif [ "$(hd1 "$L_source" "$STAGE/list")" = "$x" ]; then
+          st="up to date"
+        else
+          st="changed: the skill in $L_source changed (henki-mods update $n)"
+        fi
+        ;;
+      url:* | skill:*)
         x=$(ref_of)
         if [ -z "$x" ]; then
           st="unknown ref: the URL pins a commit (henki-mods update $n --to @BRANCH follows one)"
@@ -2046,7 +2695,7 @@ cmd_outdated() {
           if [ -z "$v" ]; then st="unknown: cannot read $x of ${L_source%%#*}"; elif [ "$v" = "$L_commit" ]; then st="up to date"; else st="$x is at $(short "$v") (henki-mods update $n)"; fi
         fi
         ;;
-      path)
+      path:*)
         if [ ! -d "$L_source" ]; then
           st="gone: $L_source is not a directory"
         elif ! inspect "$L_source" "$n" 0; then
@@ -2057,7 +2706,7 @@ cmd_outdated() {
           st="changed: $L_source holds $I_hd1 (henki-mods update $n)"
         fi
         ;;
-      official)
+      official:*)
         if ! x=$(official_dir "$n"); then
           st="this henki ships no $n"
         elif inspect "$x" "$n" 0 && [ "$I_hd1" = "$L_hd1" ]; then
@@ -2198,14 +2847,24 @@ cmd_update() {
     url:*) die "--to takes @REF for a module from a URL; fix: henki-mods update $n --to @BRANCH" ;;
     index:*:@*) die "--to takes a version for a module from an index; fix: henki-mods info $L_source lists them" ;;
     index:*) src="$L_source@${L_kind#index:}" want=$to ;;
-    *) die "$n was made from an Agent Skill; fix: import the skill again" ;;
+    skill:)
+      case "$L_source" in
+        /*) src=$L_source ;;
+        *) x=$(ref_of) && [ -n "$x" ] || die "$n's skill URL pins a commit, so there is nothing to follow; fix: henki-mods update $n --to @BRANCH" ;;
+      esac
+      ;;
+    skill:@?*) case "$L_source" in /*) die "a skill from a directory has one version, the one there now; fix: drop --to" ;; *) x=${to#@} ;; esac ;;
+    *) die "--to takes @REF for a module made from a skill's URL; fix: henki-mods update $n --to @BRANCH" ;;
   esac
-  if [ "$L_kind" = url ]; then
-    src=${L_source%%#*}
-    [ "$x" = HEAD ] || src="$src@$x"
-    case "$L_source" in *'#'*) src="$src#${L_source#*#}" ;; esac
-  fi
-  stage_src "$src" "$want"
+  case "$L_kind:$L_source" in
+    url:* | skill:[!/]*)
+      src=${L_source%%#*}
+      [ "$x" = HEAD ] || src="$src@$x"
+      case "$L_source" in *'#'*) src="$src#${L_source#*#}" ;; esac
+      ;;
+  esac
+  # A skill is made again from its source (the same name), and checked as add --skill checks it.
+  if [ "$L_kind" = skill ]; then skill_make "$src" "$n" "$n"; else stage_src "$src" "$want"; fi
   new_hd1=$I_hd1 new_cmds=$I_cmds new_commit=$COMMIT new_ver=${M_version:--}
   [ -z "$pkg" ] || new_ver=$E_ver
   # A sync applied the yanks meanwhile, which reads every lock line: read NAME's again.
@@ -2228,15 +2887,14 @@ cmd_update() {
   x=$(allow_hits "$new_cmds")
   [ -z "$x" ] || say "  allow rules that run its programs without asking: $(printf '%s\n' "$x" | tr '\n' ' ')(asked after the update)"
   if [ "$yes" != 1 ] && [ -s "$STAGE/diff" ] && tty_ask "show the whole diff? [y/N]"; then
-    # Its bytes are the new code's, not yet accepted: controls (but tab and newline) and C1 shown as ?, so no escape
-    # sequence of it hides or rewrites a line on the screen being reviewed.
-    case "$ANSWER" in y | Y | yes | YES) LC_ALL=C awk '{ gsub(/[\001-\010\013-\037\177]|\302[\200-\237]/, "?"); print }' "$STAGE/diff" | ${PAGER:-more} ;; esac
+    case "$ANSWER" in y | Y | yes | YES) page_text "$STAGE/diff" ;; esac
   fi
   confirm "$yes" "update? [y/N]" "not updated (the answer was no); fix: run update again and answer y"
   cards_ok
   store="$STORE/$n/$(store_id)"
   store_put "$store" "$new_hd1" "$n"
   L_flags=$(flags_across "$store")
+  [ "$L_kind" != skill ] || L_flags=$(flags_with "skill=$SK_SRC_HD1")
   if [ "$kind" = url ] && [ -n "$to" ]; then
     L_flags=$(flags_less ref)
     x=$(url_flags "${to#@}")
@@ -4956,9 +5614,13 @@ case "${1:-list}" in
   info) shift && cmd_info "$@" ;;
   sync) shift && cmd_sync "$@" ;;
   doctor) shift && cmd_doctor "$@" ;;
-  entry)
-    [ -x "$SELF/henki-mods-dev" ] || die "henki-mods-dev is not beside henki-mods; fix: reinstall henki"
-    exec "$SELF/henki-mods-dev" "$@"
+  # The author's verbs are henki-mods-dev's; test --port stays here (swap runs it).
+  entry | new | try | publish | share | test)
+    if [ "$1" != test ] || [ "${2:-}" != --port ]; then
+      [ -x "$SELF/henki-mods-dev" ] || die "henki-mods-dev is not beside henki-mods; fix: reinstall henki"
+      exec "$SELF/henki-mods-dev" "$@"
+    fi
+    shift && cmd_test "$@"
     ;;
   add) shift && cmd_add "$@" ;;
   on | off) cmd_onoff "$@" ;;
@@ -4977,7 +5639,6 @@ case "${1:-list}" in
   verify) shift && cmd_verify "$@" ;;
   allow) shift && cmd_allow "$@" ;;
   swap) shift && cmd_swap "$@" ;;
-  test) shift && cmd_test "$@" ;;
   eval) shift && cmd_eval "$@" ;;
   help | -h | --help)
     usage 2>&1 | sed 's/^usage: //;s/^       //'
