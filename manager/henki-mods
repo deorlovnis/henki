@@ -156,6 +156,7 @@ setup() {
   CONF="$HOME/.config/henki"
   # henki names the config dir its session runs on (a --config profile's) when it runs this as /mods.
   case "${HENKI_CONFIG:-}" in '') ;; /*) CONF=$HENKI_CONFIG ;; *) die "HENKI_CONFIG is not an absolute path; fix: unset it" ;; esac
+  case "$CONF" in *"$nl"*) die "the config dir's path holds a newline; fix: name one without" ;; esac
   EXT="$CONF/ext"
   LOCK="$CONF/mods.lock"
   HIST="$CONF/mods.history"
@@ -165,27 +166,41 @@ setup() {
   case "$data" in /*) ;; *) data="$HOME/.local/share" ;; esac
   STORE="$data/henki/mods"
   IDXD="$data/henki/index"
+  USERS="$data/henki/mods.users"
   case "$(uname -s)" in Darwin) OS=macos ;; Linux) OS=linux ;; *) OS=$(uname -s | tr 'A-Z' 'a-z') ;; esac
 }
 
 # --- cleanup and the one-at-a-time guard ------------------------------------------------------------------------------
 STAGE=""
 BUSY=""
+BUSY_ALSO=""
 cleanup() {
+  local d
   if [ -n "$STAGE" ]; then
     chmod -R u+w "$STAGE" 2>/dev/null
     rm -rf "$STAGE"
   fi
   [ -z "$BUSY" ] || rmdir "$BUSY" 2>/dev/null
+  printf '%s' "$BUSY_ALSO" | while IFS= read -r d; do rmdir "$d" 2>/dev/null; done
 }
 trap cleanup EXIT
 trap 'exit 1' INT TERM HUP
 
-# Two runs at once would each write the lock from what it read; mkdir is atomic on every filesystem.
+# Two runs at once would each write the lock from what it read; mkdir is atomic on every filesystem. The config dir
+# goes into DATA/henki/mods.users before anything is written: the store and the index clones are shared by every
+# config dir (henki --config profiles), and gc keeps what any of them names.
 busy() {
   mkdir -p "$CONF" || die "cannot make $CONF; fix: make it a directory you own"
   mkdir "$CONF/mods.busy" 2>/dev/null || die "another henki-mods is running ($CONF/mods.busy exists); fix: wait for it, or rmdir $CONF/mods.busy if none runs"
   BUSY="$CONF/mods.busy"
+  [ -f "$USERS" ] && HM_C="$CONF" awk '$0 == ENVIRON["HM_C"] { f = 1 } END { exit !f }' "$USERS" ||
+    { mkdir -p "${USERS%/*}" && printf '%s\n' "$CONF" >>"$USERS"; } || die "cannot write $USERS; fix: make it writable"
+}
+
+# The config dirs that use the store (DATA/henki/mods.users), this one first, one per line; those gone are left out.
+users() {
+  printf '%s\n' "$CONF"
+  [ ! -f "$USERS" ] || HM_C="$CONF" awk '/^\// && $0 != ENVIRON["HM_C"] && !s[$0]++' "$USERS" | while IFS= read -r d; do [ ! -d "$d" ] || printf '%s\n' "$d"; done
 }
 
 # A scratch dir next to the store, so the finished copy moves into place with one rename.
@@ -2213,7 +2228,9 @@ cmd_update() {
   x=$(allow_hits "$new_cmds")
   [ -z "$x" ] || say "  allow rules that run its programs without asking: $(printf '%s\n' "$x" | tr '\n' ' ')(asked after the update)"
   if [ "$yes" != 1 ] && [ -s "$STAGE/diff" ] && tty_ask "show the whole diff? [y/N]"; then
-    case "$ANSWER" in y | Y | yes | YES) ${PAGER:-more} <"$STAGE/diff" ;; esac
+    # Its bytes are the new code's, not yet accepted: controls (but tab and newline) and C1 shown as ?, so no escape
+    # sequence of it hides or rewrites a line on the screen being reviewed.
+    case "$ANSWER" in y | Y | yes | YES) LC_ALL=C awk '{ gsub(/[\001-\010\013-\037\177]|\302[\200-\237]/, "?"); print }' "$STAGE/diff" | ${PAGER:-more} ;; esac
   fi
   confirm "$yes" "update? [y/N]" "not updated (the answer was no); fix: run update again and answer y"
   cards_ok
@@ -2325,39 +2342,30 @@ EOF
   restart
 }
 
-# gc [--all] [--yes]: removes the store copies nothing names: not the lock (masked copies too), not a port link, not one
-# of the two newest history pins of a module (--all: no history pin), and the clones of indexes no longer in use. Lists
-# them with their sizes and asks.
+# gc [--all] [--yes]: removes the store copies nothing names and the clones of indexes no longer in use. The store and
+# the clones are shared by every config dir using them (users), so what any of them names stays: a copy its lock names
+# (masked copies too), a port links into, or one of the two newest history pins of a module (--all: no history pin);
+# an index its mods.index names. Each other config dir is held (its mods.busy) while gc reads it. Lists what goes with
+# its size and asks.
 cmd_gc() {
-  local all=0 yes=0 a n d keep="" gone="" k
+  local all=0 yes=0 a d keep="" ixs="" gone="" u me=$CONF
   for a in "$@"; do case "$a" in --all) all=1 ;; --yes | -y) yes=1 ;; *) usage ;; esac; done
   busy
   lock_check
   scratch
-  for n in $(lock_names); do
-    lock_get "$n"
-    keep="$keep$(store_of)$nl$(linked_of)$nl"
-  done
-  for a in $(port_names); do
-    d=$(target "$CONF/port/$a")
-    case "$d" in "$STORE"/*/*/*) d=${d#"$STORE"/} && keep="$keep$STORE/${d%%/*}/$(printf '%s' "${d#*/}" | cut -d / -f 1)$nl" ;; esac
-  done
-  if [ "$all" = 0 ] && [ -f "$HIST" ]; then
-    for n in $(awk -F '\t' '$1 == "hist/1" { print $5 }' "$HIST" | sort -u); do
-      k=0
-      while IFS="$tab" read -r _ _ _ L_name L_state L_version L_kind L_source L_commit L_hd1 L_added L_how L_flags; do
-        [ -n "$L_name" ] || continue
-        d=$(store_of)
-        case "$nl$keep" in *"$nl$d$nl"*) continue ;; esac
-        [ -d "$d" ] || continue
-        keep="$keep$d$nl"
-        k=$((k + 1))
-        [ "$k" -lt 2 ] || break
-      done <<EOF
-$(hist_of "$n")
+  while IFS= read -r u; do
+    if [ "$u" != "$me" ]; then
+      mkdir "$u/mods.busy" 2>/dev/null || die "another henki-mods is running in $u (its mods.busy exists); fix: wait for it, or rmdir $u/mods.busy if none runs"
+      BUSY_ALSO="$BUSY_ALSO$u/mods.busy$nl"
+    fi
+    CONF=$u LOCK="$u/mods.lock" HIST="$u/mods.history" MINDEX="$u/mods.index"
+    lock_check
+    gc_keep "$all"
+    ixs="$ixs$(index_names)$nl"
+  done <<EOF
+$(users)
 EOF
-    done
-  fi
+  CONF=$me LOCK="$me/mods.lock" HIST="$me/mods.history" MINDEX="$me/mods.index"
   [ ! -d "$STORE" ] || for d in "$STORE"/*/*; do
     [ -d "$d" ] && [ ! -L "$d" ] || continue
     case "$nl$keep" in *"$nl$d$nl"*) continue ;; esac
@@ -2366,13 +2374,13 @@ EOF
   [ ! -d "$IDXD" ] || for d in "$IDXD"/*.git; do
     [ -d "$d" ] || continue
     a=${d##*/}
-    index_names | command grep -qx "${a%.git}" || gone="$gone$d$nl"
+    case "$nl$ixs" in *"$nl${a%.git}$nl"*) ;; *) gone="$gone$d$nl" ;; esac
   done
   [ -n "$gone" ] || {
     say "nothing to remove"
     return 0
   }
-  say "not named by the lock, a port, or the history's two newest pins of a module:"
+  say "named by no lock, port or history's two newest pins of a module, in any config dir using them ($(shown "$USERS")):"
   printf '%s' "$gone" | while IFS= read -r d; do printf '  %6s KiB  %s\n' "$(du -sk "$d" | cut -f 1)" "$(shown "$d")"; done
   confirm "$yes" "remove them? [y/N]" "nothing removed (the answer was no); fix: run gc again and answer y"
   printf '%s' "$gone" | while IFS= read -r d; do
@@ -2380,6 +2388,34 @@ EOF
     case "$d" in *.git) rm -f "${d%.git}.synced" ;; *) rmdir "${d%/*}" 2>/dev/null ;; esac
   done
   say "removed $(printf '%s' "$gone" | awk 'END { print NR }')"
+}
+
+# Adds to KEEP the store copies the config dir in CONF names (cmd_gc; ALL 1: no history pin).
+gc_keep() { # ALL
+  local n a d k
+  for n in $(lock_names); do
+    lock_get "$n"
+    keep="$keep$(store_of)$nl$(linked_of)$nl"
+  done
+  for a in $(port_names); do
+    d=$(target "$CONF/port/$a")
+    case "$d" in "$STORE"/*/*/*) d=${d#"$STORE"/} && keep="$keep$STORE/${d%%/*}/$(printf '%s' "${d#*/}" | cut -d / -f 1)$nl" ;; esac
+  done
+  [ "$1" = 0 ] && [ -f "$HIST" ] || return 0
+  for n in $(awk -F '\t' '$1 == "hist/1" { print $5 }' "$HIST" | sort -u); do
+    k=0
+    while IFS="$tab" read -r _ _ _ L_name L_state L_version L_kind L_source L_commit L_hd1 L_added L_how L_flags; do
+      [ -n "$L_name" ] || continue
+      d=$(store_of)
+      case "$nl$keep" in *"$nl$d$nl"*) continue ;; esac
+      [ -d "$d" ] || continue
+      keep="$keep$d$nl"
+      k=$((k + 1))
+      [ "$k" -lt 2 ] || break
+    done <<EOF
+$(hist_of "$n")
+EOF
+  done
 }
 
 # --- packs, profiles, init (pack/1) --------------------------------------------------------------------------------------
@@ -2391,6 +2427,11 @@ install_copy() { # DIR WHY
   local store old link
   old=$(HM_N="$L_name" awk -F '\t' '$1 == "lock/1" && $2 == ENVIRON["HM_N"]' "$LOCK" 2>/dev/null)
   store=$(store_of)
+  # Only a link into the store a lock line here made is replaced; anything else at EXT/NAME is the person's own.
+  if [ -e "$EXT/$L_name" ] || [ -L "$EXT/$L_name" ]; then
+    case "$(target "$EXT/$L_name")" in "$STORE/$L_name/"*) [ -n "$old" ] ;; *) false ;; esac ||
+      die "$(shown "$EXT/$L_name") exists and henki-mods did not make it; fix: move it out of $(shown "$EXT") first"
+  fi
   store_put "$store" "$L_hd1" "$L_name" "$1"
   link=$(mask_make) || exit 1
   if [ -L "$EXT/$L_name" ]; then rm -f "$EXT/$L_name" || die "cannot remove $(shown "$EXT/$L_name"); fix: make $(shown "$EXT") writable"; fi
@@ -2778,6 +2819,10 @@ EOF
       if [ "$L_state" = off ]; then say "  $n: off in your lock, so it stays off (henki-mods on $n turns it on)"; else say "  $n: added already"; fi
       continue
     fi
+    if [ -e "$EXT/$n" ] || [ -L "$EXT/$n" ]; then
+      say "  $n: $(shown "$EXT/$n") exists and henki-mods did not make it; left out (move it out of $(shown "$EXT") to add it)"
+      continue
+    fi
     if [ "$kind" = official ]; then
       official_dir "$n" >/dev/null || {
         say "  $n: this henki ships no $n; left out"
@@ -2913,7 +2958,7 @@ index_list() {
 # index add NAME URL --signers FILE [--checkpoint COMMIT] [--yes]: an index of your own choosing: its allowed_signers
 # FILE becomes the pinned anchor CONFIG/index/NAME.signers (shown by key fingerprint first), then the first sync.
 index_add() {
-  local n="" u="" f="" c="" yes=0 k
+  local n="" u="" f="" c="" yes=0 k d o shared=""
   while [ $# -gt 0 ]; do
     case "$1" in
       --yes | -y) yes=1 ;;
@@ -2938,10 +2983,24 @@ index_add() {
   [ -f "$f" ] && [ "$(wc -c <"$f")" -le 65536 ] || die "$f is not a file of at most 64 KiB; fix: name the index's allowed_signers file"
   k=$(key_lines "$f" | awk '{ for (i = 2; i < NF; i++) if ($i ~ /^(ssh-|sk-|ecdsa-)/) { print $1 "\t" $i "\t" $(i + 1); break } }')
   [ -n "$k" ] || die "$f holds no key line; fix: name the index's allowed_signers file"
+  # A clone of that name left by index rm would carry on from what it verified, never from this anchor: it goes, unless
+  # another config dir uses the same index (URL, anchor and checkpoint), whose clone is shared.
+  [ ! -d "$IDXD/$n.git" ] || while IFS= read -r d; do
+    [ "$d" != "$CONF" ] && [ -f "$d/mods.index" ] || continue
+    o=$(HM_N="$n" awk -F '\t' '$1 == "index/1" && $2 == ENVIRON["HM_N"] { print $3; exit }' "$d/mods.index")
+    [ -n "$o" ] || continue
+    [ "$o" = "$u" ] && cmp -s "$f" "$d/index/$n.signers" && [ "$(sed -n 1p "$d/index/$n.checkpoint" 2>/dev/null)" = "$c" ] ||
+      die "index $n is another config dir's ($d), with another URL, anchor or checkpoint; fix: name this one another way"
+    shared=1
+  done <<EOF
+$(users)
+EOF
   say "index $n: $u"
   printf '%s\n' "$k" | while IFS="$tab" read -r f u c; do say "  signer   $f $u $(key_fp "$c")"; done
   [ -n "$c" ] || say "  $(yellow "no checkpoint: a key this index rotated out could still graft a branch on the first sync (--checkpoint COMMIT, from its owner, closes that)")"
   confirm "$yes" "trust these keys for index $n? [y/N]" "not added (the answer was no); fix: run index add again and answer y"
+  [ -n "$shared" ] || [ ! -d "$IDXD/$n.git" ] || { chmod -R u+w "$IDXD/$n.git" && rm -rf "$IDXD/$n.git" "$IDXD/$n.synced"; } ||
+    die "cannot remove the old clone $IDXD/$n.git; fix: check its permissions"
   mkdir -p "$CONF/index" && cp "$f" "$CONF/index/$n.signers" && { [ -z "$c" ] || printf '%s\n' "$c" >"$CONF/index/$n.checkpoint"; } &&
     printf 'index/1\t%s\t%s\n' "$n" "$u" >>"$MINDEX" || die "cannot write $(shown "$CONF/index"); fix: make $(shown "$CONF") writable"
   if ! index_sync "$n"; then
@@ -2959,7 +3018,7 @@ index_drop() { # NAME
 }
 
 # index rm NAME [--yes]: stops using an index you added (not while a module of it is in the lock: its yanks would stop
-# applying). Its clone stays until henki-mods gc.
+# applying). Its clone stays until henki-mods gc; an index add of the name starts a new one.
 index_rm() {
   local n="" yes=0 a x
   for a in "$@"; do case "$a" in --yes | -y) yes=1 ;; -*) usage ;; *) [ -z "$n" ] && n=$a || usage ;; esac; done

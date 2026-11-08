@@ -568,6 +568,9 @@ hist/1 TIME WHY LOCK_LINE
 - TIME is the UTC time (`YYYY-MM-DDTHH:MMZ`), WHY the verb (`rm`, `update`, `rollback`, `unpack`, `init`) and
   LOCK_LINE the whole lock/1 line as it was, its tabs included. A rollback takes the pin it goes back to from here,
   never from the module's source.
+- The store (`DATA/henki/mods/`) and the index clones are shared by every config dir henki-mods runs on, each listed
+  once in `DATA/henki/mods.users`. `henki-mods gc` keeps whatever the lock, the port links, the history and
+  `mods.index` of any of them name.
 
 ## index/1
 
@@ -608,7 +611,9 @@ apply yanks.
   before (`refs/henki/verified`), or at a first sync the checkpoint, must be on the fetched first-parent line: no
   rollback, and no branch grafted by a key since rotated out. Then the chain is checked for the commits after it, and
   `refs/henki/verified` moves to the fetched commit; on any refusal, or offline, the verified commit stays in use.
-  `DATA/henki/index/NAME.synced` holds the time of the last good sync.
+  `DATA/henki/index/NAME.synced` holds the time of the last good sync. `index add NAME` starts a new clone (one left
+  by `index rm` is removed first), unless another config dir uses the same index (URL, anchor and checkpoint); a
+  different one by that name is refused.
 - **Reading.** Entries are read with git from the verified commit only, never from a checkout. Once per run before
   the first read, that commit's own signature is checked again against the `.signers` of its first parent: a ref
   edited to point at an unsigned commit is refused, but a history crafted by someone who can write `DATA` is not

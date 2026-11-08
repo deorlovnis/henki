@@ -2325,6 +2325,28 @@ t_index_yank() {
   run swap history tree --yes
   refused "tree 0.1.0 was yanked as malicious (forges sessions (2026-11-08)) by index deorlovnis"
   check "history stays std" [ ! -L "$CONF/port/history" ] && [ -z "$(awk -F '\t' '$1 == "bind/1"' "$CONF/mods.lock")" ]
+  case_ "index: a rollback never goes back to a pin yanked as malicious; a buggy one is said"
+  ix_two
+  run add hello --version 0.1.0 --yes
+  rc_is 0
+  run update hello --yes
+  rc_is 0
+  setkey "$IX/mods/hello/0.1.0.toml" yanked '"malicious: steals keys (2026-11-08)"'
+  ixc "$IX" "0.1.0 malicious"
+  run sync
+  rc_is 0
+  run rollback hello --yes
+  refused "no earlier pin of hello can be gone back to"
+  out_has "skipped hello 0.1.0"
+  out_has "yanked as malicious by index deorlovnis"
+  check "the lock is unchanged" [ "$(field hello 3):$(field hello 4)" = on:0.2.0 ]
+  setkey "$IX/mods/hello/0.1.0.toml" yanked '"buggy: slow (2026-11-08)"'
+  ixc "$IX" "0.1.0 buggy"
+  run sync
+  run rollback hello --yes
+  rc_is 0
+  out_has "yanked   as buggy"
+  check "rolled back to the buggy pin" [ "$(field hello 3):$(field hello 4)" = on:0.1.0 ]
 }
 
 t_index_guard() {
@@ -2457,6 +2479,15 @@ t_update() {
   check "the lock line" [ "$(field up 4):$(field up 7)" = "0.2.0:$(git -C "$r" rev-parse HEAD)" ]
   check "a hist/1 update line with the old lock line" [ "$(cut -f 3 "$CONF/mods.history")" = update ] && [ "$(cut -f 7 "$CONF/mods.history")" = 0.1.0 ]
   check "the rule kept" command grep -q 'up --loud' "$CONF/allow"
+  # The whole diff, paged: the new code's escape sequences and carriage returns are shown as ?, never sent raw.
+  printf '#!/bin/sh\n# \033[2Kgone\rhidden\n' >"$r/cmd/newcmd"
+  commit "$r" escapes
+  printf 'y\nn\n' >"$W/answer"
+  PAGER=cat HENKI_MODS_TTY="$W/answer" run update up
+  refused "not updated (the answer was no)"
+  out_has "+# ?[2Kgone?hidden"
+  case "$OUT" in *"$(printf '\033')"* | *"$(printf '\r')"*) fail "a raw escape or CR reached the pager" ;; esac
+  git -C "$r" reset -q --hard HEAD~1
   run verify
   rc_is 0
   run update up
@@ -2537,6 +2568,58 @@ t_update() {
   rc_is 0
   run outdated
   check "official up to date" [ -n "$(printf '%s\n' "$OUT" | awk '$1 == "offi" && /up to date/')" ]
+}
+
+t_gc_shared() {
+  case_ "gc: the store is shared by every config dir (henki --config profiles); what any of them names stays"
+  local b1 b2
+  mkmod "$W/alpha"
+  mkmod "$W/beta"
+  export HENKI_CONFIG="$W/profB"
+  run add "$W/beta" --yes
+  rc_is 0
+  b1=$(readlink "$W/profB/ext/beta")
+  printf 'v2\n' >>"$W/beta/doc.md"
+  run update beta --yes
+  rc_is 0
+  b2=$(readlink "$W/profB/ext/beta")
+  unset HENKI_CONFIG
+  run add "$W/alpha" --yes
+  rc_is 0
+  check "the store records both config dirs" [ "$(cat "$XDG_DATA_HOME/henki/mods.users")" = "$W/profB$nl$CONF" ]
+  run gc --yes
+  rc_is 0
+  out_has "nothing to remove"
+  check "beta's copies stay (the other config dir's lock and history)" [ -d "$b1" ] && [ -d "$b2" ]
+  check "the other config dir is free again" [ ! -d "$W/profB/mods.busy" ]
+  # A port the other config dir links into an old copy keeps it, even with --all.
+  mkdir -p "$W/profB/port"
+  ln -s "$b1/bin/beta" "$W/profB/port/history"
+  run gc --all --yes
+  out_has "nothing to remove"
+  check "the copy a port links into stays" [ -d "$b1" ]
+  rm "$W/profB/port/history"
+  # Another henki-mods running there, or a lock there this one cannot read, stops gc.
+  mkdir "$W/profB/mods.busy"
+  run gc --all --yes
+  refused "another henki-mods is running in $W/profB"
+  rmdir "$W/profB/mods.busy"
+  cp "$W/profB/mods.lock" "$W/lock.b"
+  printf 'lock/9\tx\n' >>"$W/profB/mods.lock"
+  run gc --all --yes
+  rc_is 1
+  check "nothing removed on a lock it cannot read" [ -d "$b1" ]
+  cp "$W/lock.b" "$W/profB/mods.lock"
+  run gc --all --yes
+  rc_is 0
+  check "gc --all: beta's old copy goes, its lock's copy stays" [ ! -d "$b1" ] && [ -d "$b2" ]
+  # A config dir gone takes what it named with it.
+  rm -rf "$W/profB"
+  run gc --yes
+  rc_is 0
+  check "beta's copies go with its config dir" [ ! -d "$b2" ] && [ -L "$CONF/ext/alpha" ]
+  run verify
+  rc_is 0
 }
 
 t_masks() {
@@ -3036,6 +3119,24 @@ t_init() {
   printf 'lock/1\tx\ton\t-\tpath\t/x\t-\t-\t-\t-\t\n' >"$W/bad.lock"
   run init "$W/bad.lock" --yes
   refused "a profile holds official modules and index packages only"
+  # An ext entry henki-mods did not make (a link or a dir of the person's own) is left out, never replaced or filled.
+  local form
+  for form in link dir; do
+    export HOME="$W/home-$form"
+    CONF="$HOME/.config/henki"
+    mkdir -p "$CONF/ext" "$W/mine-$form"
+    printf '# sessions: my own\n' >"$W/mine-$form/doc.md"
+    if [ "$form" = link ]; then ln -s "$W/mine-$form" "$CONF/ext/sessions"; else cp -R "$W/mine-$form" "$CONF/ext/sessions"; fi
+    run init minimal --yes
+    rc_is 0
+    out_has "sessions: ~/.config/henki/ext/sessions exists and henki-mods did not make it; left out"
+    check "$form: no lock line" [ -z "$(lockline sessions)" ]
+    if [ "$form" = link ]; then
+      check "link: the person's own link stays" [ "$(readlink "$CONF/ext/sessions")" = "$W/mine-$form" ]
+    else
+      check "dir: nothing put inside it" [ "$(ls "$CONF/ext/sessions")" = doc.md ]
+    fi
+  done
   # The profiles shipped in the repository read as profiles, and name official modules.
   unset HENKI_SHARE
   run init
@@ -3082,6 +3183,27 @@ t_index_verbs() {
   run index rm extra --yes
   rc_is 0
   check "gone from mods.index" [ ! -f "$CONF/mods.index" ] && [ ! -f "$CONF/index/extra.signers" ]
+  # The clone index rm leaves is not carried on from: an add of the name verifies from its own anchor again.
+  run index add extra "file://$W/extra" --signers "$W/k2.signers" --yes
+  refused "(index extra was not added)"
+  run index add extra "file://$W/extra" --signers "$W/extra.signers" --yes
+  rc_is 0
+  # Another config dir using the same index shares its clone; one with another anchor is refused.
+  export HENKI_CONFIG="$W/profB"
+  run index add extra "file://$W/extra" --signers "$W/k2.signers" --yes
+  refused "index extra is another config dir's ($CONF), with another URL, anchor or checkpoint"
+  run index add extra "file://$W/extra" --signers "$W/extra.signers" --yes
+  rc_is 0
+  unset HENKI_CONFIG
+  v=$(ixv extra)
+  run index rm extra --yes
+  rc_is 0
+  run gc --yes
+  check "gc keeps a clone another config dir uses" [ -n "$v" ] && [ "$(ixv extra)" = "$v" ]
+  export HENKI_CONFIG="$W/profB"
+  run index rm extra --yes
+  rc_is 0
+  unset HENKI_CONFIG
   run gc --yes
   rc_is 0
   check "gc removes its clone" [ ! -d "$XDG_DATA_HOME/henki/index/extra.git" ]
@@ -3129,6 +3251,7 @@ all() {
   t_index_yank
   t_index_guard
   t_update
+  t_gc_shared
   t_masks
   t_assets
   t_pack
