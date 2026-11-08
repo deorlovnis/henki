@@ -1,0 +1,9 @@
+FAIL: rerun with --repeats 13: the halti suite's CI (-2 to +8) holds 0 with a positive effect
+eval_suite = "halti"
+eval_model = "Qwen3.5-2B-Q8_0"
+eval_hd1 = "hd1:5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e"
+eval_repeats = 3
+eval_on = "15/36"
+eval_off = "12/36"
+eval_effect = "+3 per 36 (95% CI -2 to +8; tasks 5 better, 2 worse, 5 equal; sign p 0.453)"
+eval_general = "on 25/36, off 24/36: +1 per 36 (95% CI -2 to +4)"

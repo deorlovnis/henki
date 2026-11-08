@@ -1,0 +1,1 @@
+emanative doesn't need Python any more: remove pypi.org and files.pythonhosted.org from the hosts its boxes may read, and get the change approved.

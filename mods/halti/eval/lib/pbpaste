@@ -1,0 +1,3 @@
+#!/bin/sh
+# pbpaste for the halti tasks: the clipboard that the stand-in halti's `copy RES FIELD` fills.
+exec cat "${HALTI_FAKE_STATE:-$HOME/.halti-fake}/clipboard" 2>/dev/null

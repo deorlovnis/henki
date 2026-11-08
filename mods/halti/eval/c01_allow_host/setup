@@ -1,0 +1,4 @@
+#!/bin/sh
+# c01_allow_host: the halti world
+. "$EVAL_LIB/world"
+seed

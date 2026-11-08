@@ -1,0 +1,4 @@
+#!/bin/sh
+# r08_start_box: the halti world
+. "$EVAL_LIB/world"
+seed

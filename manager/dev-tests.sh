@@ -864,6 +864,194 @@ t_publish() {
   refused_out "is not a module"
 }
 
+# --- eval: the statistics, report, badge and publish --eval -------------------------------------------------------------
+
+EV="$HERE/testdata/eval"
+# Pinned: the effect of 200 made-up tasks (the binomial and the bootstrap stay exact; the same under every awk).
+PIN_BIG='"+60 per 600 (95% CI +35 to +85; tasks 80 better, 40 worse, 80 equal; sign p <0.001)"'
+
+t_stats() {
+  case_ "stats: badges pinned on the fixture rows"
+  local f b got code st
+  for f in "$EV"/*.tsv; do
+    b=$(basename "$f" .tsv)
+    code=0
+    got=$(evalstats badge "$f") || code=$?
+    eq "$b" "$got" "$(cat "$EV/expected/$b.badge")"
+    case "$b" in pass | thirteen) eq "$b exit" "$code" 0 ;; *) eq "$b exit" "$code" 1 ;; esac
+    eq "$b keys" "$(evalstats keys "$f")" "$(sed 1d "$EV/expected/$b.badge")"
+  done
+  for b in pass void; do
+    eq "$b report" "$(evalstats report "$EV/$b.tsv")" "$(cat "$EV/expected/$b.report")"
+  done
+  eq stdin "$(evalstats badge - <"$EV/pass.tsv")" "$(cat "$EV/expected/pass.badge")"
+  # more: the runner's cue for 10 more repeats, per suite.
+  eq 'more: rerun' "$(evalstats more "$EV/rerun.tsv" | sort)" "$(printf 'general\tyes\nhalti\tyes')"
+  eq 'more: pass' "$(evalstats more "$EV/pass.tsv" | sort)" "$(printf 'general\tyes\nown\tno')"
+
+  case_ "stats: rows it cannot read"
+  for f in "$EV"/bad/*.tsv; do
+    b=$(basename "$f" .tsv)
+    code=0
+    got=$(evalstats badge "$f" 2>&1) || code=$?
+    eq "$b exit" "$code" 2
+    has "$b" "$got" "evalrun/1"
+  done
+  code=0
+  got=$(evalstats badge /dev/null 2>&1) || code=$?
+  eq 'no rows' "$code:$got" "2:evalrun/1: no rows"
+
+  case_ "stats: STATUS is one of a closed set"
+  # Each VOID cause voids the badge; each other status of henki's result counts as a run; anything else stops.
+  for st in none setup error:config error:nested error:journal error:internal error:tampered; do
+    ST="$st" awk -F '\t' 'BEGIN { OFS = FS } NR == 1 { $12 = ENVIRON["ST"] } { print }' "$EV/pass.tsv" >"$W/st.tsv"
+    code=0
+    got=$(evalstats badge "$W/st.tsv") || code=$?
+    eq "$st exit" "$code" 1
+    has "$st" "$got" "FAIL: a VOID run (1)"
+    has "$st report" "$(evalstats report "$W/st.tsv")" "VOID: 1 run(s)"
+  done
+  for st in ok gave_up:max_steps gave_up:stuck gave_up:empty_answer needs_approval budget interrupted output_closed \
+    error:auth error:changed error:context_exceeded error:gateway error:provider error:stream_incomplete; do
+    ST="$st" awk -F '\t' 'BEGIN { OFS = FS } NR == 1 { $12 = ENVIRON["ST"] } { print }' "$EV/pass.tsv" >"$W/st.tsv"
+    eq "$st" "$(evalstats badge "$W/st.tsv" | head -n 1)" PASS
+  done
+  for st in VOID max_steps gave_up error error:other error:config: OK "ok "; do
+    ST="$st" awk -F '\t' 'BEGIN { OFS = FS } NR == 1 { $12 = ENVIRON["ST"] } { print }' "$EV/pass.tsv" >"$W/st.tsv"
+    code=0
+    got=$(evalstats badge "$W/st.tsv" 2>&1) || code=$?
+    eq "[$st] exit" "$code" 2
+    eq "[$st]" "$got" "evalrun/1 line 1: status $st is not an evalrun/1 status"
+  done
+
+  case_ "stats: bootstrap edge cases"
+  # One task: every resample is that task, so the CI is the effect.
+  printf 'evalrun/1\tR\tp\t1\thd1:x\tm\t%s\t%s\t1\tt1\t%s\tok\t1\t1\t0\n' own on 1 own off 0 general on 1 general off 1 >"$W/one.tsv"
+  eq 'one task' "$(evalstats keys "$W/one.tsv" | sed -n 's/^eval_effect = //p')" '"+1 per 1 (95% CI +1 to +1; tasks 1 better, 0 worse, 0 equal; sign p 1.000)"'
+  eq 'one task general' "$(evalstats keys "$W/one.tsv" | sed -n 's/^eval_general = //p')" '"on 1/1, off 1/1: 0 per 1 (95% CI 0 to 0)"'
+  # Numeric-looking task names sort as bytes: "10" before "9".
+  printf 'evalrun/1\tR\tp\t1\thd1:x\tm\town\t%s\t1\t%s\t%s\tok\t1\t1\t0\n' on 9 1 off 9 0 on 10 0 off 10 0 >"$W/num.tsv"
+  eq 'byte order' "$(evalstats report "$W/num.tsv" | sed -n 's/^  \([0-9]*\) .*/\1/p' | tr '\n' ' ')" "10 9 "
+  awk 'BEGIN { for (t = 1; t <= 200; t++) for (r = 1; r <= 3; r++) {
+      on = (t * 7 + r) % 5 < 3; off = (t * 3 + r) % 4 < 2
+      printf "evalrun/1\tR\tp\t1\thd1:x\tm\town\ton\t%d\tt%03d\t%d\tok\t1\t1\t0\n", r, t, on
+      printf "evalrun/1\tR\tp\t1\thd1:x\tm\town\toff\t%d\tt%03d\t%d\tok\t1\t1\t0\n", r, t, off } }' >"$W/big.tsv"
+  eq '200 tasks' "$(evalstats keys "$W/big.tsv" | sed -n 's/^eval_effect = //p')" "$PIN_BIG"
+}
+
+# A run dir RUN under the case's state dir: pass.tsv's rows with HD1 and RUN put in, and a run.toml (EXTRA: more lines).
+mkrun() { # RUN HD1 [EXTRA]
+  local d="$XDG_STATE_HOME/henki/eval/$1"
+  mkdir -p "$d"
+  HM_R="$1" HM_H="$2" awk -F '\t' 'BEGIN { OFS = FS } { $2 = ENVIRON["HM_R"]; $5 = ENVIRON["HM_H"]; print }' "$EV/pass.tsv" >"$d/runs.tsv"
+  printf 'run = "%s"\nserver_build = "b9999-abc"\n%b' "$1" "${3:-}" >"$d/run.toml"
+}
+SHA64=0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
+
+t_eval_dev() {
+  case_ "eval report and badge: a run by its name, dir or rows file, through henki-mods"
+  local h
+  mkrun 20270101T000000Z-abcd hd1:5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e
+  run eval report 20270101T000000Z-abcd
+  rc_is 0
+  eq report "$OUT" "$(sed 's/20270111T220000Z-a1b2/20270101T000000Z-abcd/' "$EV/expected/pass.report")"
+  run eval badge "$XDG_STATE_HOME/henki/eval/20270101T000000Z-abcd"
+  rc_is 0
+  eq badge "$OUT" "$(cat "$EV/expected/pass.badge")"
+  run eval badge "$EV/weak.tsv"
+  rc_is 1
+  out_has "FAIL: "
+  run eval badge 20270101T000000Z-none
+  refused "no eval run 20270101T000000Z-none"
+  printf 'x\n' >"$W/junk.tsv"
+  run eval report "$W/junk.tsv"
+  refused "the rows do not read"
+
+  case_ "eval badge --check: an index entry's badge against its rows"
+  mkdir -p "$W/v"
+  { printf 'index = 1\nversion = "0.3.0"\nhd1 = "hd1:5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e"\n'
+    sed 1d "$EV/expected/pass.badge"; } >"$W/v/ok.toml"
+  run eval badge --check "$EV/pass.tsv" "$W/v/ok.toml"
+  rc_is 0
+  out_has "ok: the rows recompute to the badge (PASS)"
+  sed 's/^eval_on = .*/eval_on = "27\/36"/' "$W/v/ok.toml" >"$W/v/edited.toml"
+  run eval badge --check "$EV/pass.tsv" "$W/v/edited.toml"
+  rc_is 1
+  out_has 'FAIL: eval_on is "27/36"; the rows give "26/36"'
+  sed 's/^hd1 = .*/hd1 = "hd1:6e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e"/' "$W/v/ok.toml" >"$W/v/hd1.toml"
+  run eval badge --check "$EV/pass.tsv" "$W/v/hd1.toml"
+  rc_is 1
+  out_has "FAIL: eval_hd1 is not the version's hd1"
+  run eval badge --check "$EV/weak.tsv" "$W/v/ok.toml"
+  rc_is 1
+  out_has "FAIL: "
+  # The index's own check.sh runs exactly this command.
+  RC=0
+  OUT=$($RUN "$DEV" eval badge --check "$EV/void.tsv" "$W/v/ok.toml" 2>&1) || RC=$?
+  rc_is 1
+  has 'void' "$OUT" "FAIL: a VOID run (1)"
+
+  case_ "publish --eval: the badge block and the rows of a pushed module"
+  mkdir -p "$W/src"
+  mkmod "$W/src/pm" 'summary = "says hello, for the index"\nmaintainer = "fixture-dev"\n'
+  mkrepo "$W/src"
+  git init -q --bare "$W/remote.git"
+  git -C "$W/src" remote add origin "file://$W/remote.git"
+  git -C "$W/src" push -q origin HEAD:main 2>/dev/null
+  git -C "$W/src" fetch -q origin 2>/dev/null
+  h=$(modhd1 "$W/src/pm")
+  mkrun R1 "$h"
+  HENKI_INDEX_ALLOW_FILE=1 dev_run "$W/src" publish ./pm --eval R1
+  refused_out "the run names no model file"
+  mkrun R1 "$h" "model_sha256 = \"$SHA64\"\n"
+  HENKI_INDEX_ALLOW_FILE=1 dev_run "$W/src" publish ./pm --eval R1 --by some-one
+  rc_is 0
+  has 'suite' "$OUT" 'eval_suite = "halti"'
+  has 'sha' "$OUT" "eval_model_sha256 = \"$SHA64\""
+  has 'server' "$OUT" 'eval_server = "llama.cpp b9999-abc"'
+  has 'hd1' "$OUT" "eval_hd1 = \"$h\""
+  has 'by' "$OUT" "eval_by = \"some-one $(date -u +%Y-%m-%d)\""
+  has 'rows' "$OUT" "# evals/pm/0.1.0.tsv"
+  has 'a row' "$OUT" "$(head -n 1 "$XDG_STATE_HOME/henki/eval/R1/runs.tsv")"
+  entry_lints pm
+  # The rows split out of the output recompute to the version file's badge.
+  printf '%s\n' "$OUT" | awk 'index($0, "# evals/pm/0.1.0.tsv ") == 1 { f = 1; next } /^$/ { f = 0 } f' >"$W/rows.tsv"
+  check "the printed rows are the run's" cmp -s "$W/rows.tsv" "$XDG_STATE_HOME/henki/eval/R1/runs.tsv"
+  run eval badge --check "$W/rows.tsv" "$W/ix/mods/pm/0.1.0.toml"
+  rc_is 0
+  mkrun R2 hd1:1111111111111111111111111111111111111111111111111111111111111111 "model_sha256 = \"$SHA64\"\n"
+  HENKI_INDEX_ALLOW_FILE=1 dev_run "$W/src" publish ./pm --eval R2
+  refused_out "the run measured other files"
+  cp "$EV/weak.tsv" "$XDG_STATE_HOME/henki/eval/R2/runs.tsv"
+  HENKI_INDEX_ALLOW_FILE=1 dev_run "$W/src" publish ./pm --eval R2
+  refused_out "no badge from this run: FAIL:"
+  HENKI_INDEX_ALLOW_FILE=1 dev_run "$W/src" publish ./pm --by 'a b'
+  refused_out "--by a b: not a GitHub login"
+
+  case_ "publish --eval of an official module: a badge record under henki's version"
+  mkdir -p "$W/share/official" "$W/bin"
+  mkmod "$W/share/official/offi"
+  printf '#!/bin/sh\necho "henki 0.3.0 (test)"\n' >"$W/bin/henki" && chmod 755 "$W/bin/henki"
+  h=$(modhd1 "$W/share/official/offi")
+  mkrun R3 "$h" "model_sha256 = \"$SHA64\"\n"
+  HENKI_SHARE="$W/share" HENKI_BIN="$W/bin/henki" dev_run "$W" publish "$W/share/official/offi"
+  refused_out "an index lists one for its badge only"
+  HENKI_SHARE="$W/share" HENKI_BIN="$W/bin/henki" dev_run "$W" publish "$W/share/official/offi" --eval R3 --by owner
+  rc_is 0
+  has 'kind' "$OUT" 'kind = "official"'
+  has 'version' "$OUT" "# mods/offi/0.3.0.toml"
+  has 'hd1' "$OUT" "hd1 = \"$h\""
+  out_lacks 'commit = '
+  has 'rows' "$OUT" "# evals/offi/0.3.0.tsv"
+  mkdir -p "$W/ix/mods/offi"
+  printf '%s\n' "$OUT" | awk '$0 == "# mods/offi.toml (a package the index does not list yet; for one it does, set only latest = \"0.3.0\")" { f = 1; next } /^$/ { f = 0 } f' >"$W/ix/mods/offi.toml"
+  printf '%s\n' "$OUT" | awk '$0 == "# mods/offi/0.3.0.toml" { f = 1; next } /^$/ { f = 0 } f' >"$W/ix/mods/offi/0.3.0.toml"
+  dev_run "$W" entry lint "$W/ix/mods/offi.toml"
+  rc_is 0
+  dev_run "$W" entry lint "$W/ix/mods/offi/0.3.0.toml"
+  rc_is 0
+}
+
 # --- routing -----------------------------------------------------------------------------------------------------------
 
 t_routing() {
@@ -912,6 +1100,7 @@ t_static() {
 }
 
 units() {
+  t_stats
   t_frontmatter
   t_skill_build
   t_skill_names
@@ -929,6 +1118,7 @@ verbs() {
   t_test
   t_try
   t_publish
+  t_eval_dev
   t_routing
 }
 

@@ -1,0 +1,9 @@
+PASS
+eval_suite = "halti"
+eval_model = "Qwen3.5-2B-Q8_0"
+eval_hd1 = "hd1:5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e"
+eval_repeats = 13
+eval_on = "92/156"
+eval_off = "61/156"
+eval_effect = "+31 per 156 (95% CI +17 to +45; tasks 10 better, 1 worse, 1 equal; sign p 0.012)"
+eval_general = "on 105/156, off 105/156: 0 per 156 (95% CI -5 to +5)"

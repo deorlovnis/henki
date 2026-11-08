@@ -120,6 +120,7 @@ fn contracts_index() {
         ("bind/1", "henki-mods"),
         ("hd1", "henki-mods"),
         ("eval/1", "henki-mods"),
+        ("evalrun/1", "henki-mods"),
         ("hist/1", "henki-mods"),
         ("index/1", "henki-mods"),
         ("pack/1", "henki-mods"),

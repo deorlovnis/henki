@@ -1,0 +1,9 @@
+FAIL: the general suite loses: CI upper bound -12, below 0
+eval_suite = "halti"
+eval_model = "Qwen3.5-2B-Q8_0"
+eval_hd1 = "hd1:5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e"
+eval_repeats = 3
+eval_on = "26/36"
+eval_off = "1/36"
+eval_effect = "+25 per 36 (95% CI +19 to +30; tasks 11 better, 0 worse, 1 equal; sign p 0.001)"
+eval_general = "on 9/36, off 25/36: -16 per 36 (95% CI -20 to -12)"

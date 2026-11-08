@@ -1722,24 +1722,55 @@ t_eval() {
   refused "plain has no eval/ tasks; fix: henki-mods eval $W/plain --suite general"
   HENKI_BIN="$W/henki" run eval probe --suite nope --yes
   refused "nope is not added"
-  HENKI_BIN="$W/henki" HENKI_MODS_TTY="$W/no-tty" run eval probe
+  HENKI_BIN="$W/henki" run eval probe --suite own,nope --yes
+  refused "nope is not added"
+  HENKI_BIN="$W/henki" run eval probe --server http://example.org:80/v1 --yes
+  refused "not a loopback http://HOST:PORT/PATH"
+  HENKI_BIN="$W/henki" run eval probe --model 'a"b' --yes
+  refused 'a tab, a newline, " or \ in --model'
+  HENKI_BIN="$W/henki" run eval probe --model-file "$W/nope.gguf" --yes
+  refused "--model-file $W/nope.gguf: no such file"
+  # No sandbox program here (this henki ships no sandbox module): only --unsandboxed runs.
+  HENKI_BIN="$W/henki" run eval probe --yes
+  refused "this henki ships no sandbox module (official sandbox, port/exec); eval runs every arm inside it"
+  err_has "or run eval --unsandboxed"
+  HENKI_BIN="$W/henki" HENKI_MODS_TTY="$W/no-tty" run eval probe --unsandboxed
   refused "no terminal to ask on"
   out_has "eval: probe 0.1.0 (hd1:"
-  out_has "each task's setup and check run as you, and henki with approve = auto"
+  out_has "the model's commands run without asking (approve = auto), with your rights; HOME and the XDG dirs are scratch dirs"
+  out_has "--unsandboxed: nothing else is isolated"
   printf 'n\n' >"$W/answer"
-  HENKI_BIN="$W/henki" HENKI_MODS_TTY="$W/answer" run eval probe
+  HENKI_BIN="$W/henki" HENKI_MODS_TTY="$W/answer" run eval probe --unsandboxed
   refused "not run (the answer was no)"
   [ ! -e "$XDG_STATE_HOME/henki/eval.tsv" ] || fail "a refused eval wrote eval.tsv"
+  [ ! -e "$XDG_STATE_HOME/henki/eval" ] || fail "a refused eval made a run dir"
+  # A sandbox program that does not run here: refused before the question.
+  mkdir -p "$W/share/official/sandbox/port"
+  printf '# sandbox: a stand-in\n' >"$W/share/official/sandbox/doc.md"
+  printf '#!/bin/sh\necho "sandbox: no backend here" >&2\nexit 126\n' >"$W/share/official/sandbox/port/exec"
+  chmod 755 "$W/share/official/sandbox/port/exec"
+  HENKI_SHARE="$W/share" HENKI_BIN="$W/henki" run eval probe --yes
+  refused "the sandbox does not run here: sandbox: no backend here"
+
+  case_ "eval/1: lib/ holds the tasks' shared data, never a task"
+  rm -rf "$W/lib-suite" && mkdir -p "$W/lib-suite/lib" && cp -R "$e/one" "$W/lib-suite/one"
+  printf 'data\n' >"$W/lib-suite/lib/notes"
+  run eval --check "$W/lib-suite"
+  rc_is 0
+  out_has "ok: eval/1, 1 tasks"
+  rm -rf "$W/lib-suite/lib" && printf 'x\n' >"$W/lib-suite/lib"
+  run eval --check "$W/lib-suite"
+  refused "lib: a task is a directory"
 }
 
 # Live: eval against a real henki and the eval stub, the arms told apart by what the model sees.
 t_eval_live() {
-  case_ "eval: two arms through henki run, the result lines, the repeats rule"
+  case_ "eval: two arms through henki run, the run dir and its rows, the result lines, the repeats rule"
   live_ok || return
-  local d="$W/stub" m="$W/probe" s="$W/suite" lines
+  local d="$W/stub" m="$W/probe" s="$W/suite" lines run rd x
   eval_stub_up "$d" || return
   mkdir -p "$CONF"
-  printf 'model = "m"\nbase_url = "http://127.0.0.1:%s/v1"\next = ["~/elsewhere"]\n' "$STUB_PORT" >"$CONF/config.toml"
+  printf 'model = "m"\nbase_url = "http://127.0.0.1:%s/v1"\next = ["~/elsewhere"]\nshadow = ["x/y"]\n' "$STUB_PORT" >"$CONF/config.toml"
   chmod 600 "$CONF/config.toml"
   printf 'Be brief.\n' >"$CONF/AGENTS.md"
   mkmod "$m"
@@ -1753,40 +1784,171 @@ t_eval_live() {
   # bytes: the check gets the answer's exact bytes (escapes, a surrogate pair, a tab, no added newline).
   mktask "$m/eval" bytes "BYTES" 'cmp - "$EVAL_DIR/.want"'
   printf 'caf\303\251 "q" back\\slash\ttab\nline two \342\200\213 \363\240\200\201 end' >"$m/eval/bytes/.want"
+  # lib: a fake-bin program that is a link into the suite's lib/, which setup and check also read (EVAL_LIB).
+  mkdir -p "$m/eval/lib" "$m/eval/libcall/fake-bin"
+  printf '#!/bin/sh\necho LIB-OK\n' >"$m/eval/lib/libtool" && chmod 755 "$m/eval/lib/libtool"
+  printf 'LIB-DATA\n' >"$m/eval/lib/data"
+  mktask "$m/eval" libcall "CALL: libtool" 'command grep -q LIB-OK && command grep -q LIB-DATA "$EVAL_LIB/data" && [ -f lib-seen ]'
+  printf '#!/bin/sh\ncp "$EVAL_LIB/data" lib-seen\n' >"$m/eval/libcall/setup"
+  ln -s ../../lib/libtool "$m/eval/libcall/fake-bin/libtool"
+  # home: setup, henki and check see the run's scratch HOME and XDG dirs, never the person's.
+  mktask "$m/eval" home "Say yes." '[ -f "$HOME/setup-was-here" ] && [ "$HOME" = "$EVAL_HOME" ] && [ "$XDG_STATE_HOME" = "$EVAL_ROOT/xdg/state" ] && [ "$PWD" = "$EVAL_ROOT/work" ] && [ -f "$EVAL_ROOT/henki.jsonl" ]'
+  printf '#!/bin/sh\n: >"$HOME/setup-was-here"\n: >"$XDG_DATA_HOME/arm-data" && : >"$XDG_CACHE_HOME/arm-cache"\n' >"$m/eval/home/setup"
+  # peek: while henki runs, no check and no task file is in the run's root, nor in the module the on arm added.
+  mktask "$m/eval" peek "CALL: find .. -name check -o -name prompt.txt -o -name task.toml" '! command grep -q -e /check -e /prompt.txt -e task.toml'
   run add "$m" --yes
   rc_is 0
-  run eval probe --yes
+  export XDG_CACHE_HOME="$W/cache"
+  mkdir -p "$XDG_DATA_HOME" "$XDG_CACHE_HOME"
+  x=$( (find "$XDG_DATA_HOME" "$XDG_CACHE_HOME" "$CONF"; cat "$CONF/config.toml" "$CONF/AGENTS.md") | LC_ALL=C sort | cksum)
+  run eval probe --repeats 3 --yes --unsandboxed
   rc_is 0
   out_has "ask              on  pass  (ok, 1 steps,"
   out_has "ask              off fail  (ok, 1 steps,"
   out_has "fake             off pass  (ok, 2 steps,"
   out_has "bytes            off pass"
+  out_has "libcall          on  pass  (ok, 2 steps,"
+  out_has "home             off pass"
+  out_has "peek             on  pass  (ok, 2 steps,"
+  out_has "peek             off pass  (ok, 2 steps,"
   out_lacks "10 more"
+  check "the person's HOME, data, cache and config dirs are as they were" [ "$x" = "$( (find "$XDG_DATA_HOME" "$XDG_CACHE_HOME" "$CONF"; cat "$CONF/config.toml" "$CONF/AGENTS.md") | LC_ALL=C sort | cksum)" ]
+  check "setup wrote into the run's HOME, not the person's" [ ! -e "$HOME/setup-was-here" ]
   check "eval/1 lines have CONTRACTS.md's fields" [ "$(awk -F '\t' '{ print NF }' "$XDG_STATE_HOME/henki/eval.tsv" | sort -u)" = "$(doc_fields eval/1)" ]
   lines=$(cat "$XDG_STATE_HOME/henki/eval.tsv")
-  case "$lines" in "eval/1${tab}probe${tab}0.1.0${tab}$(field probe 8)${tab}m${tab}probe${tab}on${tab}9${tab}9${tab}"*"${nl}eval/1${tab}probe${tab}0.1.0${tab}"*"${tab}off${tab}6${tab}9${tab}"*) ;; *)
+  case "$lines" in "eval/1${tab}probe${tab}0.1.0${tab}$(field probe 8)${tab}m${tab}probe${tab}on${tab}18${tab}18${tab}"*"${nl}eval/1${tab}probe${tab}0.1.0${tab}"*"${tab}off${tab}15${tab}18${tab}"*) ;; *)
     fail "eval.tsv holds: $lines"
     ;;
   esac
-  out_has "probe: on 9 of 9 passed, off 6 of 9; added to $XDG_STATE_HOME/henki/eval.tsv"
-  # The arms within one pass of each other after 3 runs: 10 more, 13 each; --model names the model.
-  mkdir -p "$s" && cp -R "$m/eval/fake" "$s/fake"
+  out_has "probe on probe: on 18 of 18 passed, off 15 of 18"
+  # The run dir: run.toml, one evalrun/1 row per run, each run's records and journal.
+  run=$(printf '%s\n' "$OUT" | sed -n 's/^run \([0-9TZ]*-[0-9a-f]*\): .*/\1/p')
+  rd="$XDG_STATE_HOME/henki/eval/$run"
+  check "a run dir" [ -n "$run" ] && [ -f "$rd/run.toml" ]
+  check "evalrun/1 rows have CONTRACTS.md's fields" [ "$(awk -F '\t' '{ print NF }' "$rd/runs.tsv" | sort -u)" = "$(doc_fields evalrun/1)" ]
+  check "36 rows" [ "$(wc -l <"$rd/runs.tsv" | tr -d ' ')" = 36 ]
+  x=$(awk -F '\t' '$8 == "on" && $10 == "ask" && $9 == 2 { print $11, $12, $15 }' "$rd/runs.tsv")
+  case "$x" in "1 ok "[1-9]*) ;; *) fail "the on arm's ask row: $x" ;; esac
+  check "off arm prompt bytes 0" [ "$(awk -F '\t' '$8 == "off" { print $15 }' "$rd/runs.tsv" | sort -u)" = 0 ]
+  check "the rows read as one run" evalstats_ok "$rd/runs.tsv"
+  check "run.toml names the package, hd1 and sandbox" command grep -q "^sandbox = \"none\"" "$rd/run.toml"
+  check "run.toml: hd1" command grep -qF "hd1 = \"$(field probe 8)\"" "$rd/run.toml"
+  check "each run keeps henki's records and the journal" [ -s "$rd/0001-on-1-ask/henki.jsonl" ] && [ -s "$rd/0001-on-1-ask/journal.jsonl" ]
+  check "the on arm's session lists probe, the off arm's none" command grep -q '"exts":\["probe"\]' "$rd/0001-on-1-ask/journal.jsonl"
+  check "the off arm lists no module" command grep -q '"exts":\[\]' "$rd/0002-off-1-ask/journal.jsonl"
+  check "no VOID" [ ! -e "$rd/VOID" ]
+  # A suite whose effect is positive with 0 in its CI after 3 repeats: 10 more, 13 each; --model names the model.
+  mkdir -p "$s" && cp -R "$m/eval/fake" "$s/fake" && cp -R "$m/eval/ask" "$s/ask"
   : >"$d/models"
-  run eval probe --suite "$s" --model other --yes
+  run eval probe --suite "$s" --model other --yes --unsandboxed
   rc_is 0
-  out_has "the arms are within one pass of each other after 3 repeats: 10 more"
+  out_has "suite $s: the effect is positive with 0 in its 95% CI after 3 repeats: 10 more"
   [ "$(sort -u "$d/models")" = other ] || fail "the stub saw the models $(sort -u "$d/models" | tr '\n' ' ')"
-  case "$(tail -n 2 "$XDG_STATE_HOME/henki/eval.tsv")" in *"${tab}other${tab}$s${tab}on${tab}13${tab}13${tab}"*"${tab}off${tab}13${tab}13${tab}"*) ;; *)
+  case "$(tail -n 2 "$XDG_STATE_HOME/henki/eval.tsv")" in *"${tab}other${tab}$s${tab}on${tab}26${tab}26${tab}"*"${tab}off${tab}13${tab}26${tab}"*) ;; *)
     fail "eval.tsv ends with: $(tail -n 2 "$XDG_STATE_HOME/henki/eval.tsv")"
     ;;
   esac
-  # The general suite: every setup runs (none fails), one run per task and arm.
-  run eval probe --suite general --repeats 1 --yes
+  # Two suites in one run: own and general, one run per task and arm; general's setups all run.
+  run eval probe --suite own,general --repeats 1 --yes --unsandboxed
   rc_is 0
   case "$(tail -n 1 "$XDG_STATE_HOME/henki/eval.tsv")" in *"${tab}general${tab}off${tab}"*"${tab}12${tab}"*) ;; *)
     fail "eval.tsv ends with: $(tail -n 1 "$XDG_STATE_HOME/henki/eval.tsv")"
     ;;
   esac
+  run=$(printf '%s\n' "$OUT" | sed -n 's/^run \([0-9TZ]*-[0-9a-f]*\): .*/\1/p')
+  check "one run holds both suites" [ "$(cut -f 7 "$XDG_STATE_HOME/henki/eval/$run/runs.tsv" | sort -u | tr '\n' ' ')" = "general probe " ]
+  run eval report "$run"
+  rc_is 0
+  out_has "suite probe: 6 tasks x 1 repeats"
+  out_has "suite general: 12 tasks x 1 repeats"
+
+  case_ "eval: a failing setup makes the run VOID; a server that cannot answer stops it before any task"
+  mkdir -p "$CONF"
+  printf 'model = "m"\nbase_url = "http://127.0.0.1:%s/v1"\n' "$STUB_PORT" >"$CONF/config.toml"
+  chmod 600 "$CONF/config.toml"
+  mkdir -p "$W/vs"
+  mktask "$W/vs" broken "Say yes." 'true'
+  printf '#!/bin/sh\necho "no such fixture" >&2\nexit 3\n' >"$W/vs/broken/setup"
+  mkmod "$m"
+  run add "$m" --yes
+  run eval probe --suite "$W/vs" --yes --unsandboxed
+  refused "broken: setup exited 3 (its last lines above), so this run is VOID"
+  err_has "no such fixture"
+  rd=$(ls -d "$XDG_STATE_HOME"/henki/eval/2*)
+  check "the VOID mark" [ -f "$rd/VOID" ]
+  check "the setup row" [ "$(cut -f 11-12 "$rd/runs.tsv")" = "0${tab}setup" ]
+  rm -rf "$XDG_STATE_HOME/henki/eval"
+  printf 'model = "m"\nbase_url = "http://127.0.0.1:9/v1"\n' >"$CONF/config.toml"
+  run eval probe --suite "$W/vs" --yes --unsandboxed
+  refused "the on arm's first run (\"Reply with the word ready.\") ended error:"
+  check "no rows" [ ! -s "$(ls -d "$XDG_STATE_HOME"/henki/eval/2*)/runs.tsv" ]
+
+  case_ "eval: every run inside the sandbox program, which starts in the run's root"
+  mkdir -p "$CONF"
+  printf 'model = "m"\nbase_url = "http://127.0.0.1:%s/v1"\n' "$STUB_PORT" >"$CONF/config.toml"
+  chmod 600 "$CONF/config.toml"
+  mkdir -p "$W/share/official/sandbox/port"
+  printf '# sandbox: a stand-in that logs what it runs\n' >"$W/share/official/sandbox/doc.md"
+  printf '#!/bin/sh\nprintf "%%s|%%s|%%s\\n" "$PWD" "$HOME" "$*" >>%s/sbx.log\nexec "$@"\n' "$W" >"$W/share/official/sandbox/port/exec"
+  chmod 755 "$W/share/official/sandbox/port/exec"
+  rm -rf "$W/vs/broken" && mktask "$W/vs" plain "Say yes." 'true'
+  mkmod "$m"
+  run add "$m" --yes
+  HENKI_SHARE="$W/share" run eval probe --suite "$W/vs" --repeats 1 --yes
+  rc_is 0
+  out_has "each run (setup, henki, check) is inside the sandbox program $W/share/official/sandbox/port/exec"
+  # the probe, 2 first runs, then per run setup, henki, check.
+  check "9 programs through the sandbox" [ "$(wc -l <"$W/sbx.log" | tr -d ' ')" = 9 ]
+  check "it starts in each run's root with the person's HOME" [ "$(cut -d '|' -f 2 "$W/sbx.log" | sort -u)" = "$HOME" ]
+  check "the root holds work/" [ "$(sed -n 4p "$W/sbx.log" | cut -d '|' -f 1)" = "$(sed -n 4p "$W/sbx.log" | sed 's/.*EVAL_ROOT=\([^ ]*\) .*/\1/')" ]
+  x=$(sed -n 5p "$W/sbx.log")
+  case "$x" in *"|/bin/sh -c cd work && exec \"\$@\" sh env HOME="*"/home XDG_CONFIG_HOME="*" run --json --approve auto"*) ;; *) fail "the henki run: $x" ;; esac
+  check "henki runs from a copy in the run's root" [ "$(printf '%s' "$x" | sed 's/.* PATH=[^ ]* \([^ ]*\) run --json.*/\1/')" = "$(printf '%s' "$x" | cut -d '|' -f 1)/henki" ]
+  kill "$STUB_PID" 2>/dev/null
+  wait "$STUB_PID" 2>/dev/null
+  unset XDG_CACHE_HOME
+}
+
+# The rows of a run read as one run (henki-mods' own statistics).
+evalstats_ok() {
+  (
+    . "$HERE/henki-mods" >/dev/null 2>&1
+    trap - EXIT
+    evalstats report "$1" >/dev/null
+  )
+}
+
+# Live: the halti module's tasks through henki with a scripted model: the known-good solutions pass in both arms; the
+# known-bad ones fail, except where the module's own wrappers stop the bad act (s11: `halti with` is refused).
+t_halti_eval_live() {
+  case_ "the halti module's eval: scripted solutions through henki, on and off"
+  live_ok || return
+  local d="$W/hstub" k got
+  mkdir -p "$d"
+  python3 -I "$HERE/testdata/halti/stub.py" "$d" "$HERE/testdata/halti/scripts.json" "$HERE/../mods/halti/eval" &
+  STUB_PID=$!
+  k=0
+  while [ ! -s "$d/port" ] && [ $k -lt 100 ]; do
+    sleep 0.1
+    k=$((k + 1))
+  done
+  STUB_PORT=$(cat "$d/port" 2>/dev/null)
+  mkdir -p "$CONF"
+  printf 'model = "m"\nbase_url = "http://127.0.0.1:%s/v1"\n' "$STUB_PORT" >"$CONF/config.toml"
+  chmod 600 "$CONF/config.toml"
+  for k in oracle bad1; do
+    printf '%s\n' "$k" >"$d/round"
+    run eval "$HERE/../mods/halti" --repeats 1 --yes --unsandboxed
+    rc_is 0
+    got=$(printf '%s\n' "$OUT" | awk '$2 == "on" || $2 == "off" { print $1 " " $2 " " $3 }' | command grep -E ' (pass|fail)$' | sort | tr '\n' ';')
+    case "$k" in
+      oracle) [ "$(printf '%s' "$got" | tr ';' '\n' | command grep -c ' pass$')" = 24 ] || fail "oracle: $got" ;;
+      bad1)
+        [ "$(printf '%s' "$got" | tr ';' '\n' | command grep ' pass$')" = "s11_secret_value on pass" ] || fail "bad1: $got"
+        ;;
+    esac
+  done
+  check "the stub played the scripts" command grep -q "^s11_secret_value${tab}bad1$" "$d/log"
   kill "$STUB_PID" 2>/dev/null
   wait "$STUB_PID" 2>/dev/null
 }
@@ -2065,6 +2227,66 @@ ix_two() {
   ixentry lean 0.1.0
   ixc "$IX" entries
   mkshare
+}
+
+# A badge on IX's version file mods/NAME/VERSION.toml for files HD1: the eval fixture's rows (testdata/eval/pass.tsv,
+# a pass) as evals/NAME/VERSION.tsv, and the keys henki-mods' statistics give them.
+ixbadge() { # NAME VERSION HD1
+  mkdir -p "$IX/evals/$1"
+  HM_N="$1" HM_H="$3" awk -F '\t' 'BEGIN { OFS = FS } { $3 = ENVIRON["HM_N"]; $5 = ENVIRON["HM_H"]; print }' "$HERE/testdata/eval/pass.tsv" >"$IX/evals/$1/$2.tsv"
+  (
+    . "$HERE/henki-mods" >/dev/null 2>&1
+    trap - EXIT
+    evalstats keys "$IX/evals/$1/$2.tsv"
+  ) >>"$IX/mods/$1/$2.toml"
+  printf 'eval_model_sha256 = "%s"\neval_server = "llama.cpp b1"\neval_by = "someone 2026-11-08"\n' \
+    0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef >>"$IX/mods/$1/$2.toml"
+}
+
+t_index_badge() {
+  case_ "index: a badge recomputed from the index's rows makes the tier measured; edited rows do not"
+  local h
+  ix_two
+  h=$(sed -n 's/^hd1 = "\(.*\)"$/\1/p' "$IX/mods/lean/0.1.0.toml")
+  ixbadge lean 0.1.0 "$h"
+  # An official module's record: the badge shows on its install screen when its hd1 is the files henki ships.
+  run verify --dir "$HERE/../mods/halti"
+  h=$(printf '%s\n' "$OUT" | sed -n 's/.*\(hd1:[0-9a-f]*\)$/\1/p')
+  mkdir -p "$IX/mods/halti"
+  printf 'index = 1\nname = "halti"\nkind = "official"\nsummary = "halti for tests"\nmaintainer = "someone"\nlicense = "Apache-2.0"\nlatest = "0.3.0"\nadded = "2026-11-08"\n' >"$IX/mods/halti.toml"
+  printf 'index = 1\nversion = "0.3.0"\nhd1 = "%s"\n' "$h" >"$IX/mods/halti/0.3.0.toml"
+  ixbadge halti 0.3.0 "$h"
+  ixc "$IX" badges
+  run search
+  rc_is 0
+  out_has "lean             measured                 0.1.0"
+  run info lean
+  rc_is 0
+  out_has "lean 0.1.0 · reviewed by someone (signed index henki-index, 2026-11-08) · measured on Qwen3.5-2B-Q8_0: +25 of 36 on its tasks, general suite not worse"
+  out_has "recomputed here from its rows: PASS"
+  run add lean --yes
+  rc_is 0
+  out_has "review   reviewed by someone (signed index henki-index, 2026-11-08) · measured on Qwen3.5-2B-Q8_0: +25 of 36"
+  run add halti --yes
+  rc_is 0
+  out_has "badge    measured on Qwen3.5-2B-Q8_0: +25 of 36 on its tasks, general suite not worse (signed index henki-index)"
+  # Rows that no longer give the entry's numbers: no tier from them, and info says why.
+  awk -F '\t' 'BEGIN { OFS = FS } NR == 2 { $11 = 1 } { print }' "$IX/evals/lean/0.1.0.tsv" >"$W/rows" && mv "$W/rows" "$IX/evals/lean/0.1.0.tsv"
+  rm -f "$IX/evals/halti/0.3.0.tsv"
+  ixc "$IX" "edited rows"
+  run sync
+  run info lean
+  out_has "lean 0.1.0 · reviewed by someone (signed index henki-index, 2026-11-08)$nl"
+  out_has "not a badge: its rows give another eval_off than the entry"
+  run search
+  out_has "lean             reviewed                 0.1.0"
+  out_has "26/36 vs 1/36 (no)"
+  run rm halti
+  run add halti --yes
+  rc_is 0
+  out_lacks "badge    measured"
+  run info halti
+  out_has "not a badge: its rows (evals/halti/0.3.0.tsv) are not in the index"
 }
 
 t_index_add() {
@@ -3264,6 +3486,7 @@ all() {
   t_index_sync
   t_index_long
   t_index_add
+  t_index_badge
   t_index_yank
   t_index_guard
   t_update
@@ -3284,6 +3507,7 @@ all
 t_live
 t_halti_live
 t_eval_live
+t_halti_eval_live
 t_general
 # POSIX mode turns off some bash behaviour a script may lean on without knowing; the manager must not.
 RUN="bash --posix"

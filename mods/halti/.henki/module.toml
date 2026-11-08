@@ -1,10 +1,10 @@
-# The halti mod: a doc, the card for AGENTS.md, and seatbelt wrappers for halti, pbpaste and security.
+# The halti mod: a doc, the card for AGENTS.md, seatbelt wrappers for halti, pbpaste and security, and eval tasks.
 henki_module = 1
 name = "halti"
-version = "0.1.0"
+version = "0.2.0"
 license = "Apache-2.0"
-requires = ["henki >= 0.1"]
-contracts = ["ext/1", "module/1"]
+requires = ["henki >= 0.2"]
+contracts = ["eval/1", "ext/2", "module/1"]
 os = ["macos", "linux"]          # halti is a Mac program; linux for boxes and tests, where the wrappers still refuse
 needs = ["halti"]
 # henki refuses to start while a bin/ command shadows one on the user PATH that `shadow` does not list.

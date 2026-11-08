@@ -19,7 +19,7 @@
 # HENKI_MODS_TTY (the terminal the question is asked on; default /dev/tty), HENKI_CONFIG (the config dir; henki sets
 # it for /mods), HENKI_BIN (the henki whose `henki port` runs the conformance suites and that eval runs; henki sets it),
 # HENKI_NEXT (the hand-off file of a henki that runs this as /mods: a change writes `restart` there, and henki asks to
-# restart on it), XDG_STATE_HOME (eval adds its lines to henki/eval.tsv there).
+# restart on it), XDG_STATE_HOME (eval adds its lines to henki/eval.tsv there, and keeps each run in henki/eval/RUN/).
 set -u
 export LC_ALL=C
 umask 022
@@ -41,7 +41,7 @@ nl='
 # ext::prompt's header line; henki joins it to the rest of the system prompt with a blank line ("\n\n").
 HEADER='Extensions are commands on PATH; read the doc in brackets before first use.'
 # The named formats this henki ships (CONTRACTS.md); a module's `contracts` must all be here.
-CONTRACTS_KNOWN='journal/1 json/1 wire/1 ext/1 ext/2 handoff/1 observe/1 module/1 lock/1 hd1 port/1 history/1 policy/1 conform/1 bind/1 eval/1 hist/1 index/1 pack/1'
+CONTRACTS_KNOWN='journal/1 json/1 wire/1 ext/1 ext/2 handoff/1 observe/1 module/1 lock/1 hd1 port/1 history/1 policy/1 conform/1 bind/1 eval/1 evalrun/1 hist/1 index/1 pack/1'
 # The ports a package may bind (henki's port::LINKED), and what each one gets to see, for the swap screen.
 PORTS_KNOWN='history policy'
 PORT_SEES_history='stores every session record'
@@ -100,17 +100,19 @@ usage: henki-mods [list]              modules: state, version, source, prompt by
        henki-mods verify --dir DIR    one module directory: layout and manifest
        henki-mods swap PORT NAME|std [--yes]   bind henki's PORT to module NAME's port/PORT, or back to std
        henki-mods test --port PORT NAME|std|DIR|PROGRAM   the conformance suite of PORT against a binding
-       henki-mods eval NAME|/DIR [--suite NAME|general|/DIR] [--repeats N] [--model M] [--yes]
-                                      eval/1 tasks with the module on and off
+       henki-mods eval NAME|/DIR [--suite own|general|NAME|/DIR[,...]] [--repeats N] [--model M] [--server URL]
+                       [--model-file F] [--yes] [--unsandboxed]
+                                      eval/1 tasks with the module on and off, each run sandboxed in a scratch home
        henki-mods eval --check DIR    the layout of a directory of eval/1 tasks
        henki-mods allow [--config FILE] [rm N]   henki's allow rules: list them, or remove rule N
        henki-mods new NAME [--tool|--cmd|--template|--observer EVENT|--port history] [--dir D]   a module to start from
        henki-mods test [DIR]          an author's checks of a module (or of each in DIR), then DIR/test.sh
        henki-mods try [DIR|NAME] [--keep] [-- HENKI_ARGS]   henki with only that module, in a scratch home
-       henki-mods publish [DIR]       the index entry files for the committed, pushed module in DIR
+       henki-mods publish [DIR] [--eval RUN] [--by LOGIN]   the index entry files for the committed, pushed module
+       henki-mods eval report RUN | eval badge RUN   an eval run's statistics, and its badge
        henki-mods share NAME          one line that installs these files of NAME elsewhere
        henki-mods entry derive REPO PATH COMMIT | entry lint FILE   index entries
-       (new, test without --port, try, publish, share and entry are henki-mods-dev's)
+       (new, test without --port, try, publish, share, entry and eval report|badge are henki-mods-dev's)
        henki-mods help | --version
 EOF
   exit 2
@@ -184,6 +186,7 @@ BUSY=""
 BUSY_ALSO=""
 cleanup() {
   local d
+  [ -z "${E_child:-}" ] || kill "$E_child" 2>/dev/null
   if [ -n "$STAGE" ]; then
     chmod -R u+w "$STAGE" 2>/dev/null
     rm -rf "$STAGE"
@@ -1439,7 +1442,7 @@ stage_src() { # SRC WANT
       [ "$I_hd1" = "$(rget "$E_rec" hd1)" ] ||
         die "the files of $url at $COMMIT are not the reviewed ones ($I_hd1, the entry has $(rget "$E_rec" hd1)); fix: report it to index $F_index"
       ;;
-    url | path) index_local_all ;;
+    url | path | official) index_local_all ;;
   esac
   [ -z "$I_asset" ] || {
     asset_place "$STAGE/m"
@@ -1569,7 +1572,16 @@ screen_bytes() {
 screen_review() {
   local x
   case "$kind" in
-    official) say "  source   official ($dir)" ;;
+    official)
+      say "  source   official ($dir)"
+      # The default index's record of these files, when it holds a badge that recomputes here.
+      x=$(hd1_hits "$I_hd1" | HM_D="$INDEX_DEFAULT" awk -F '\t' '$1 == ENVIRON["HM_D"]' | head -n 1)
+      if [ -n "$x" ]; then
+        index_again "$INDEX_DEFAULT"
+        ! badge_of "$INDEX_DEFAULT" "$STAGE/ix/$INDEX_DEFAULT/r/$(printf '%s' "$x" | cut -f 2)@${x##*"$tab"}" ||
+          say "  badge    $B_text (signed index $(cut -f 1 "$STAGE/ix/$INDEX_DEFAULT/who"))"
+      fi
+      ;;
     index:*)
       say "  source   index $F_index: $pkg $E_ver ($url${sub:+#$sub} @ $COMMIT)"
       index_again "$F_index"
@@ -4630,8 +4642,43 @@ index_find() {
   F_index=${hits# }
 }
 
-# The review line of index I's version record REC into T_kind (reviewed, source or listed) and T_text: who
-# reviewed it and when, inside the signed index; "source only" when the asset for this machine was not rebuilt.
+# The badge of index I's version record REC (STAGE/ix/I/r/NAME@VERSION; index_again I first), recomputed here from the
+# rows the index holds for it (evals/NAME/VERSION.tsv at the verified commit) with evalrun/1's statistics: 0 when they
+# give a PASS whose keys are REC's, for REC's own hd1, with B_text the badge in a few words; else 1 with B_text why
+# not ("" when REC has no badge).
+badge_of() { # I REC
+  local n=${2##*/} v out k want got
+  v=${n#*@} n=${n%@*} B_text=""
+  rget "$2" eval_suite >/dev/null || return 1
+  _ix cat-file blob "$X_V:evals/$n/$v.tsv" 2>/dev/null | head -c 4194305 >"$STAGE/badge.tsv"
+  [ -s "$STAGE/badge.tsv" ] || {
+    B_text="its rows (evals/$n/$v.tsv) are not in the index"
+    return 1
+  }
+  out=$(evalstats badge "$STAGE/badge.tsv" 2>/dev/null) || {
+    B_text="its rows do not give a passing badge"
+    return 1
+  }
+  for k in eval_suite eval_model eval_hd1 eval_repeats eval_on eval_off eval_effect eval_general; do
+    want=$(printf '%s\n' "$out" | sed -n "s/^$k = //p" | sed 's/^"//; s/"$//')
+    got=$(rget "$2" "$k") || got=""
+    [ "$want" = "$got" ] || {
+      B_text="its rows give another $k than the entry"
+      return 1
+    }
+  done
+  [ "$(rget "$2" eval_hd1)" = "$(rget "$2" hd1)" ] || {
+    B_text="it was measured on other files"
+    return 1
+  }
+  B_text="measured on $(rget "$2" eval_model): $(HM_A="$(rget "$2" eval_on)" HM_B="$(rget "$2" eval_off)" awk 'BEGIN {
+    split(ENVIRON["HM_A"], a, "/"); split(ENVIRON["HM_B"], b, "/"); d = a[1] - b[1]
+    printf "%s%d of %d on its tasks, general suite not worse", (d >= 0 ? "+" : ""), d, a[2] }')"
+}
+
+# The review line of index I's version record REC into T_kind (reviewed, source, measured or listed) and T_text: who
+# reviewed it and when, inside the signed index; "source only" when the asset for this machine was not rebuilt;
+# "measured" when its badge recomputes here.
 tier_of() { # INDEX REC
   local who day t a p
   p=$(cut -f 1 "$STAGE/ix/$1/who")
@@ -4647,6 +4694,8 @@ tier_of() { # INDEX REC
     [ "$a" != none ] || T_kind=source T_text="$T_text · source only: the binary $(rget "$2" "asset_$t" | cut -f 1) was NOT reproduced"
     break
   done
+  [ "$T_kind" = reviewed ] && badge_of "$1" "$2" && T_kind=measured T_text="$T_text · $B_text"
+  return 0
 }
 
 # The asset targets of this machine, the static (musl) one first on Linux.
@@ -4869,10 +4918,13 @@ cmd_search() {
         tier="(latest unreadable)"
       else
         tier_of "$i" "$rec"
-        case "$T_kind" in listed) tier=UNREVIEWED ;; source) tier="reviewed (source only)" ;; *) tier=reviewed ;; esac
+        case "$T_kind" in listed) tier=UNREVIEWED ;; source) tier="reviewed (source only)" ;; measured) tier=measured ;; *) tier=reviewed ;; esac
         b="$(num "$(rget "$rec" prompt_bytes)") B"
       fi
-      [ ! -f "$rec" ] || ! rget "$rec" eval_on >/dev/null || badge="$(rget "$rec" eval_on) vs $(rget "$rec" eval_off)"
+      if [ -f "$rec" ] && rget "$rec" eval_on >/dev/null; then
+        badge="$(rget "$rec" eval_on) vs $(rget "$rec" eval_off)"
+        badge_of "$i" "$rec" || badge="$badge (no)"
+      fi
       printf '  %-16s %-24s %-9s %-9s %-12s %s\n' "$n" "$tier" "$latest" "$b" "$badge" "$sum"
     done
     hits=1
@@ -4925,7 +4977,12 @@ cmd_info() {
     y=$(rget "$rec" yanked) && say "  $(red "yanked   $y")"
     if rget "$rec" eval_effect >/dev/null; then
       say "  badge    $(rget "$rec" eval_suite) on $(rget "$rec" eval_model): $(rget "$rec" eval_effect)"
-      say "           general suite: $(rget "$rec" eval_general); by $(rget "$rec" eval_by); not recomputed by this henki-mods"
+      say "           general suite: $(rget "$rec" eval_general); by $(rget "$rec" eval_by)"
+      if badge_of "$i" "$rec"; then
+        say "           recomputed here from its rows: PASS"
+      else
+        say "           $(red "not a badge: $B_text")"
+      fi
     fi
   done
   say ""
@@ -5105,6 +5162,8 @@ eval_check() { # DIR
     [ -e "$t" ] || [ -L "$t" ] || continue
     x=${t##*/}
     case "$x" in README* | LICENSE*) continue ;; esac
+    # lib/: data the tasks share (EVAL_LIB), never a task.
+    [ "$x" != lib ] || [ ! -d "$t" ] || [ -L "$t" ] || continue
     if ! is_name "$x" || [ ! -d "$t" ]; then
       ERR="$t: a task is a directory, and its name as a module's: $NAME_RULE; fix: rename it, or move it out of $d"
       return 1
@@ -5234,80 +5293,410 @@ json_str() { # KEY LINE
 # The number after `"KEY":` in LINE (as json_str finds the key), or nothing.
 json_num() { printf '%s\n' "$2" | sed -n "s/.*[{,]\"$1\":\([0-9.]*\).*/\1/p"; }
 
-# The config dir of arm ARM (on or off) in STAGE/ARM: config.toml without its ext key (the ext dir is the arm's own),
-# AGENTS.md with the mods cards block replaced by NAME's card in the on arm and by none in the off arm, and in the on
-# arm the one link ext/NAME -> DIR. No allow file and no port link: std history, std policy in auto mode.
-eval_arm() { # ARM NAME DIR
-  local a="$STAGE/$1"
-  mkdir -p "$a/ext" "$a/state" && chmod 700 "$a" || die "cannot make $a; fix: check TMPDIR"
-  : >"$a/block"
-  if [ -f "$CONF/config.toml" ]; then
-    awk '{ l = $0; sub(/^[ \t]+/, "", l) } l !~ /^ext[ \t]*=/' "$CONF/config.toml" >"$a/config.toml"
-  else
-    : >"$a/config.toml"
-  fi
-  chmod 600 "$a/config.toml"
-  if [ "$1" = on ]; then
-    ln -s -- "$3" "$a/ext/$2" || die "cannot link $a/ext/$2; fix: check TMPDIR"
-    if [ -f "$3/.henki/card.md" ]; then
-      {
-        say "$CARDS_BEGIN"
-        cat "$3/.henki/card.md"
-        [ -z "$(tail -c 1 "$3/.henki/card.md")" ] || echo
-        say "$CARDS_END"
-      } >"$a/block"
-    fi
-  fi
-  splice "$a/block" "$a/AGENTS.md" || die "$ERR"
-  [ -s "$a/AGENTS.md" ] || rm -f "$a/AGENTS.md"
+# --- eval: runs, rows and the statistics -----------------------------------------------------------------------------
+
+EVAL_WATCH=60 # seconds a task's setup or check may take
+EVAL_READY='Reply with the word ready.'
+
+# The statistics of `eval` (the repeats rule) and of henki-mods-dev's `eval report`, `eval badge` and `publish --eval`;
+# an index's check.sh recomputes a badge with them (henki-mods-dev eval badge --check).
+#
+# Input: evalrun/1 rows, one per run, tab-separated:
+#   evalrun/1 RUN PKG VERSION HD1 MODEL SUITE ARM REPEAT TASK PASS STATUS STEPS SECONDS PROMPT_BYTES
+# SUITE is `general` or one other suite (the module's own); ARM `on` or `off`; REPEAT 1..R; PASS 0 or 1. STATUS is
+# one of a closed set, so a runner that spells one otherwise stops the statistics instead of counting a fail:
+#   henki's result: ok, gave_up:max_steps|stuck|empty_answer, needs_approval, budget, interrupted, output_closed,
+#     error:KIND with KIND auth|changed|config|context_exceeded|gateway|internal|journal|nested|provider|
+#     stream_incomplete|tampered;
+#   the runner's: none (henki gave no result), setup (the task's setup failed).
+# A run whose STATUS is none, setup or error:config|nested|journal|internal|tampered is VOID: no badge comes from it.
+#
+# Tasks are the unit. Per suite, d(t) = passes on - passes off over the R repeats of task t; the effect is the sum of
+# d(t), shown "per R x T runs". The 95% CI is a bootstrap of the tasks: 2,000 resamples with replacement drawn by the
+# Park-Miller generator (s = s * 16807 % 2147483647, seed 1 for each suite, task index s % T over the tasks in byte
+# order), the 50th and the 1,951st of the 2,000 sums. Every step is exact in double arithmetic (s * 16807 < 2^46),
+# so every awk gives the same numbers. The sign test is the exact two-sided binomial over the tasks better and worse
+# (equal tasks dropped): p = min(1, 2 * P(X <= min(n+, n-))), X ~ Bin(n+ + n-, 1/2).
+#
+# Badge rule: the own suite's CI lower bound is above 0 and its sign p <= 0.05; the general suite's CI upper bound
+# is at least 0; at least 3 repeats per arm; no VOID run. With fewer than 13 repeats, an own suite whose CI lower
+# bound is not above 0 while its effect is positive fails with "rerun with --repeats 13".
+#
+# MODE report|badge|keys|more over the rows in FILE ("-" = stdin). Exit 0; badge: 0 PASS, 1 FAIL; any mode: 2 with
+# "evalrun/1 line N: PROBLEM" on stderr for rows it cannot read. `more` prints, per suite, SUITE<TAB>yes when its CI
+# holds 0 with a positive effect (the runner's cue for 10 more repeats), else SUITE<TAB>no.
+evalstats() { # MODE FILE
+  HM_MODE="$1" LC_ALL=C awk '
+    BEGIN {
+      FS = "\t"; mode = ENVIRON["HM_MODE"]; B = 2000; M = 2147483647
+      nsuite = 0; own = ""
+    }
+    function die(m) { printf "evalrun/1 line %d: %s\n", NR, m > "/dev/stderr"; bad = 1; exit 2 }
+    function fail(m) { print "evalrun/1: " m > "/dev/stderr"; bad = 1; exit 2 }
+    function same(name, v) {
+      if (!(name in first)) { first[name] = v; return }
+      if (first[name] != v) die(name " is " v ", not " first[name] " as on line 1; fix: give one run")
+    }
+    function sg(x) { return x > 0 ? sprintf("+%d", x) : sprintf("%d", x) }
+    {
+      if (NF != 15 || $1 != "evalrun/1") die("not an evalrun/1 row of 15 fields")
+      for (i = 2; i <= 15; i++) if ($i == "" || $i ~ /["\\]/ || $i ~ /[\001-\037\177]/) die("field " i " is empty or holds \", \\ or a control character")
+      same("RUN", $2); same("PKG", $3); same("VERSION", $4); same("HD1", $5); same("MODEL", $6)
+      su = $7; arm = $8; rep = $9; task = $10; pass = $11; st = $12
+      if (su != "general") {
+        if (own == "") own = su
+        else if (su != own) die("a second own suite " su " (first " own ")")
+      }
+      if (arm != "on" && arm != "off") die("arm " arm " is not on or off")
+      if (rep !~ /^[1-9][0-9]*$/ || length(rep) > 4) die("repeat " rep " is not 1 to 9999")
+      if (task !~ /^[A-Za-z0-9._-]+$/) die("task " task " is not [A-Za-z0-9._-]+")
+      if (pass != "0" && pass != "1") die("pass " pass " is not 0 or 1")
+      if ($13 !~ /^[0-9]+$/ || $15 !~ /^[0-9]+$/ || $14 !~ /^[0-9]+(\.[0-9]+)?$/) die("steps, seconds or prompt bytes is not a number")
+      k = su SUBSEP arm SUBSEP rep SUBSEP task
+      if (k in row) die("a second row for " su " " arm " repeat " rep " task " task)
+      row[k] = 1
+      if (st ~ /^(none|setup|error:(config|nested|journal|internal|tampered))$/) void++
+      else if (st !~ /^(ok|needs_approval|budget|interrupted|output_closed|gave_up:(max_steps|stuck|empty_answer)|error:(auth|changed|context_exceeded|gateway|provider|stream_incomplete))$/) die("status " st " is not an evalrun/1 status")
+      if (!((su) in hasS)) { hasS[su] = 1; suite[++nsuite] = su }
+      if (!((su, task) in hasT)) { hasT[su, task] = 1; nt[su]++; tname[su, nt[su]] = task }
+      n[su, task, arm]++
+      if (rep + 0 > R[su]) R[su] = rep + 0
+      p[su, task, arm] += pass
+      bytes[su, arm] = $15
+    }
+    # Per suite S: T, R, ON, OFF, EFF, NP, NM, NZ, PV, LO, HI, task order O[S, 1..T] and D[S, i].
+    function stats(S,   i, j, t, x, c, b, s, sum, lo, hi, cum, k, term, cut) {
+      T = nt[S]
+      for (i = 1; i <= T; i++) O[S, i] = tname[S, i]
+      for (i = 2; i <= T; i++) {
+        x = O[S, i]
+        for (j = i - 1; j >= 1 && (O[S, j] "") > (x ""); j--) O[S, j + 1] = O[S, j]
+        O[S, j + 1] = x
+      }
+      ON = 0; OFF = 0; EFF = 0; NP = 0; NM = 0; NZ = 0
+      for (i = 1; i <= T; i++) {
+        t = O[S, i]
+        if (n[S, t, "on"] != R[S] || n[S, t, "off"] != R[S]) {
+          fail("suite " S " task " t ": " (n[S, t, "on"] + 0) " on and " (n[S, t, "off"] + 0) " off runs, not " R[S] " each; fix: complete the run")
+        }
+        D[S, i] = p[S, t, "on"] - p[S, t, "off"]
+        ON += p[S, t, "on"]; OFF += p[S, t, "off"]; EFF += D[S, i]
+        if (D[S, i] > 0) NP++; else if (D[S, i] < 0) NM++; else NZ++
+      }
+      # Sign test.
+      c = NP + NM; k = NP < NM ? NP : NM
+      if (c == 0) PV = 1
+      else {
+        term = 1; for (i = 0; i < c; i++) term = term / 2
+        cum = 0
+        for (i = 0; i <= k; i++) { cum += term; term = term * (c - i) / (i + 1) }
+        PV = 2 * cum; if (PV > 1) PV = 1
+      }
+      # Bootstrap.
+      s = 1
+      for (b = 1; b <= B; b++) {
+        sum = 0
+        for (j = 1; j <= T; j++) { s = (s * 16807) % M; sum += D[S, s % T + 1] }
+        hist[S, sum]++
+      }
+      cut = B / 40; cum = 0; LO = ""; HI = ""
+      for (x = -R[S] * T; x <= R[S] * T; x++) {
+        if (!((S, x) in hist)) continue
+        cum += hist[S, x]
+        if (LO == "" && cum >= cut) LO = x
+        if (HI == "" && cum >= B - cut + 1) HI = x
+      }
+    }
+    function pfmt(v,   s) { s = sprintf("%.3f", v); return s == "0.000" ? "<0.001" : s }
+    END {
+      if (bad) exit 2
+      if (NR == 0) fail("no rows")
+      for (i = 1; i <= nsuite; i++) {
+        S = suite[i]; stats(S)
+        if (bad) exit 2
+        rT[S] = T; rON[S] = ON; rOFF[S] = OFF; rEFF[S] = EFF; rNP[S] = NP; rNM[S] = NM; rNZ[S] = NZ
+        rPV[S] = PV; rLO[S] = LO; rHI[S] = HI
+        per[S] = R[S] * T
+        ci[S] = "95% CI " sg(LO) " to " sg(HI)
+      }
+      if (mode == "more") {
+        for (i = 1; i <= nsuite; i++) { S = suite[i]; printf "%s\t%s\n", S, (rLO[S] <= 0 && rEFF[S] > 0 ? "yes" : "no") }
+        exit 0
+      }
+      # Own suite first, then general.
+      ns = 0
+      name[own] = own == "own" ? first["PKG"] : own; name["general"] = "general"
+      if (own != "") ord[++ns] = own
+      if ("general" in hasS) ord[++ns] = "general"
+      if (mode == "report") {
+        printf "run %s: %s %s (%s), model %s\n", first["RUN"], first["PKG"], first["VERSION"], first["HD1"], first["MODEL"]
+        if (void) printf "VOID: %d run(s) did not finish as a run; no badge comes from this run\n", void
+        for (i = 1; i <= ns; i++) {
+          S = ord[i]
+          printf "suite %s: %d tasks x %d repeats; on %d/%d, off %d/%d; effect %s per %d (%s); tasks %d better, %d worse, %d equal; sign p %s; prompt bytes on %d, off %d\n", \
+            name[S], rT[S], R[S], rON[S], per[S], rOFF[S], per[S], sg(rEFF[S]), per[S], ci[S], rNP[S], rNM[S], rNZ[S], pfmt(rPV[S]), bytes[S, "on"], bytes[S, "off"]
+          for (j = 1; j <= rT[S]; j++) {
+            t = O[S, j]
+            printf "  %-16s on %d/%d  off %d/%d  %s\n", t, p[S, t, "on"], R[S], p[S, t, "off"], R[S], sg(D[S, j])
+          }
+        }
+        exit 0
+      }
+      # badge and keys
+      why = ""
+      if (void) why = "a VOID run (" void "); no badge comes from this run"
+      else if (own == "") why = "no rows of the module'"'"'s own suite"
+      else if (!("general" in hasS)) why = "no rows of the general suite"
+      else if (R[own] < 3 || R["general"] < 3) why = "fewer than 3 repeats per arm"
+      else if (rLO[own] <= 0 && rEFF[own] > 0 && R[own] < 13) why = "rerun with --repeats 13: the " name[own] " suite'"'"'s CI (" sg(rLO[own]) " to " sg(rHI[own]) ") holds 0 with a positive effect"
+      else if (rLO[own] <= 0) why = "the " name[own] " suite gains too little: CI lower bound " sg(rLO[own]) ", not above 0"
+      else if (rPV[own] > 0.05) why = "the " name[own] " suite'"'"'s sign test p " pfmt(rPV[own]) " is above 0.05"
+      else if (rHI["general"] < 0) why = "the general suite loses: CI upper bound " sg(rHI["general"]) ", below 0"
+      if (mode == "badge") print (why == "" ? "PASS" : "FAIL: " why)
+      if (own != "") {
+        printf "eval_suite = \"%s\"\n", name[own]
+        printf "eval_model = \"%s\"\n", first["MODEL"]
+        printf "eval_hd1 = \"%s\"\n", first["HD1"]
+        printf "eval_repeats = %d\n", R[own]
+        printf "eval_on = \"%d/%d\"\n", rON[own], per[own]
+        printf "eval_off = \"%d/%d\"\n", rOFF[own], per[own]
+        printf "eval_effect = \"%s per %d (%s; tasks %d better, %d worse, %d equal; sign p %s)\"\n", \
+          sg(rEFF[own]), per[own], ci[own], rNP[own], rNM[own], rNZ[own], pfmt(rPV[own])
+      }
+      if ("general" in hasS) {
+        S = "general"
+        printf "eval_general = \"on %d/%d, off %d/%d: %s per %d (%s)\"\n", rON[S], per[S], rOFF[S], per[S], sg(rEFF[S]), per[S], ci[S]
+      }
+      if (mode == "badge" && why != "") exit 1
+      exit 0
+    }' "$2"
 }
 
-# Run N of task T in arm ARM: setup in a fresh work dir, `henki run --json -` on prompt.txt with the arm's config dir
-# and state dir (fake-bin/ first on PATH), then check in that dir with the answer's text on stdin. Counts into the
-# arm's P_ARM (passes), N_ARM (runs) and S_ARM (henki's seconds), and prints a line.
-eval_run() { # T ARM
-  local t=$1 arm=$2 w line text status steps secs s pass=fail fb="" max_steps="" max_secs=$EVAL_SECONDS rc=0
-  RUN_N=$((RUN_N + 1))
-  w="$STAGE/run/$RUN_N"
-  mkdir -p "$w/work" || die "cannot make $w; fix: check TMPDIR"
-  (cd "$w/work" && EVAL_DIR=$t exec "$t/setup") </dev/null >"$w/setup" 2>&1 || rc=$?
-  if [ "$rc" != 0 ]; then
-    tail -n 20 "$w/setup" | sed 's/^/  | /' >&2
-    die "${t##*/}: setup exited $rc (its last lines above); fix: run $t/setup in an empty dir to see why"
+# The evalrun/1 STATUS of henki's result record LINE (json/1), or none when LINE is none.
+eval_status() { # LINE
+  local s k
+  s=$(json_str status "$1") || {
+    echo none
+    return 0
+  }
+  case "$s" in
+    gave_up) k=$(json_str reason "$1") || k=unknown ;;
+    error) k=$(json_str kind "$1") || k=unknown ;;
+    *) k="" ;;
+  esac
+  printf '%s%s\n' "$s" "${k:+:$k}"
+}
+
+# CMD... in the background with stdin IN and stdout and stderr into OUT, stopped after SECS seconds (macOS has no
+# timeout(1)); its exit status. CMD is in_arm, which execs, so the process stopped is the run's own.
+watch_run() { # SECS IN OUT CMD...
+  local secs=$1 in=$2 out=$3 n=0 rc=0
+  shift 3
+  "$@" <"$in" >"$out" 2>&1 &
+  E_child=$!
+  while kill -0 "$E_child" 2>/dev/null; do
+    if [ "$n" -ge $((secs * 10)) ]; then
+      printf '\n(stopped after %s s)\n' "$secs" >>"$out"
+      kill "$E_child" 2>/dev/null
+      sleep 1
+      kill -9 "$E_child" 2>/dev/null
+      break
+    fi
+    sleep 0.1
+    n=$((n + 1))
+  done
+  wait "$E_child" || rc=$?
+  E_child=""
+  return "$rc"
+}
+
+# CMD... as one run of an arm has it, from watch_run: in R/work, with HOME and the four XDG dirs under R (nothing of
+# the person's own config, state or data), EVAL_DIR (E_tdir), EVAL_LIB, EVAL_HOME and EVAL_ROOT, none of henki's own
+# variables, and FB (a task's fake-bin/ and a colon, or nothing) first on PATH. With a sandbox program (E_sbx), CMD
+# runs inside it, started from R: it hides the person's HOME (this process's) and keeps R writable.
+in_arm() { # R FB CMD...
+  local r=$1 fb=$2
+  shift 2
+  unset HENKI_CONFIG HENKI_NEXT HENKI_SESSION HENKI_MODS_TTY HENKI_BIN HENKI_DEPTH
+  [ -z "$E_server" ] || export HENKI_BASE_URL="$E_server"
+  set -- env HOME="$r/home" XDG_CONFIG_HOME="$r/xdg/config" XDG_DATA_HOME="$r/xdg/data" XDG_STATE_HOME="$r/xdg/state" \
+    XDG_CACHE_HOME="$r/xdg/cache" EVAL_HOME="$r/home" EVAL_ROOT="$r" EVAL_LIB="$r/suite/lib" EVAL_DIR="$E_tdir" \
+    PATH="$fb$PATH" "$@"
+  if [ -n "$E_sbx" ]; then
+    cd "$r" && exec "$E_sbx" /bin/sh -c 'cd work && exec "$@"' sh "$@"
   fi
-  [ ! -d "$t/fake-bin" ] || fb="$t/fake-bin:"
+  cd "$r/work" && exec "$@"
+}
+
+# A fresh root R for one run of ARM: home/ (HOME, its .config/henki holding the person's config.toml without its ext
+# and shadow keys, and their AGENTS.md without the mods cards block), xdg/{config,data,state,cache}, work/ (the cwd),
+# suite/, and henki itself when a sandbox may hide where it lives. In the on arm the module is then added there as a
+# person adds one (`henki-mods add DIR --yes` in that home): its store copy, link, card and the shadow line add names.
+# DIR is the module without its eval/ (E_armdir), so no task's check or expected answer is in the model's reach.
+eval_root() { # R ARM
+  local r=$1 c="$1/home/.config/henki" out rc=0 line
+  mkdir -p "$c" "$r/xdg/config" "$r/xdg/data" "$r/xdg/state" "$r/xdg/cache" "$r/work" "$r/suite" &&
+    chmod 700 "$r" "$r/home" "$c" || die "cannot make $r; fix: check TMPDIR"
+  if [ -f "$CONF/config.toml" ]; then
+    awk '{ l = $0; sub(/^[ \t]+/, "", l) } l !~ /^(ext|shadow)[ \t]*=/' "$CONF/config.toml" >"$c/config.toml"
+  else
+    : >"$c/config.toml"
+  fi
+  chmod 600 "$c/config.toml"
+  : >"$r/block"
+  splice "$r/block" "$c/AGENTS.md" || die "$ERR"
+  [ -s "$c/AGENTS.md" ] || rm -f "$c/AGENTS.md"
+  rm -f "$r/block"
+  E_h=$E_henki
+  if [ -n "$E_sbx" ]; then
+    { ln "$E_henki" "$r/henki" 2>/dev/null || cp "$E_henki" "$r/henki"; } || die "cannot copy $E_henki into $r; fix: check TMPDIR"
+    E_h="$r/henki"
+  fi
+  [ "$2" = on ] || return 0
+  out=$(
+    unset HENKI_CONFIG HENKI_NEXT HENKI_SESSION HENKI_MODS_TTY
+    HOME="$r/home" XDG_CONFIG_HOME="$r/xdg/config" XDG_DATA_HOME="$r/xdg/data" XDG_STATE_HOME="$r/xdg/state" \
+      XDG_CACHE_HOME="$r/xdg/cache" "$SELF/henki-mods" add "$E_armdir" --yes 2>&1
+  ) || rc=$?
+  if [ "$rc" != 0 ]; then
+    printf '%s\n' "$out" | tail -n 5 | sed 's/^/  | /' >&2
+    die "the on arm: $E_name could not be added in a scratch home (above); fix: henki-mods verify --dir $E_dir"
+  fi
+  # A command that shadows one on PATH loads only with the shadow line add printed (as try does).
+  line=$(printf '%s\n' "$out" | sed -n 's/^add to .*: \(shadow = \[.*\]\)$/\1/p')
+  [ -z "$line" ] || printf '%s\n' "$line" >>"$c/config.toml"
+}
+
+# The journal and henki's records of the run in R, and what setup and check printed, into the run dir as D.
+eval_keep() { # R D
+  local j
+  mkdir -p "$2" || return 0
+  for j in henki.jsonl err setup.log check.log; do [ ! -f "$1/$j" ] || cp "$1/$j" "$2/$j"; done
+  for j in "$1"/xdg/state/henki/sessions/*/*.jsonl; do [ ! -f "$j" ] || cat "$j" >>"$2/journal.jsonl"; done
+}
+
+# henki run in R with prompt file P and the run's limits (max seconds S, max steps N or ""), its records into
+# R/henki.jsonl; sets E_line (the result record, or none).
+eval_henki() { # R FB P S N
+  watch_run $(($4 + 30)) "$3" "$1/henki.jsonl" in_arm "$1" "$2" "$E_h" run --json --approve auto ${E_model:+--model "$E_model"} \
+    --max-seconds "$4" ${5:+--max-steps "$5"} - || :
+  E_line=$(awk 'END { print }' "$1/henki.jsonl")
+  case "$E_line" in *',"t":"result",'*) ;; *) E_line=none ;; esac
+}
+
+# Before any task, each arm answers one plain prompt: a model or a server that cannot stops the eval here.
+eval_ready() { # ARM
+  local r="$STAGE/run/ready-$1" st
+  eval_root "$r" "$1"
+  printf '%s\n' "$EVAL_READY" >"$STAGE/ready.txt"
+  E_tdir=$r/work
+  eval_henki "$r" "" "$STAGE/ready.txt" 60 ""
+  st=$(eval_status "$E_line")
+  if [ "$st" != ok ]; then
+    sed 's/^/  | /' "$r/henki.jsonl" | tail -n 3 >&2
+    die "the $1 arm's first run (\"$EVAL_READY\") ended $st, so no task ran; fix: check the model server and config.toml (henki run \"hi\")"
+  fi
+  chmod -R u+w "$r" 2>/dev/null
+  rm -rf "$r"
+}
+
+# Run REP of task T of suite I in ARM: a fresh root (eval_root), the task (and the suite's lib/) copied into it, setup
+# in work/, henki run with prompt.txt, then check with the answer on stdin. One evalrun/1 row into the run's
+# runs.tsv; the records, journal and logs into the run dir; the counts of suite I and ARM.
+eval_run() { # I T ARM REP
+  local i=$1 t=$2 arm=$3 rep=$4 x r st text steps secs pass=0 fb="" max_steps="" max_secs=$EVAL_SECONDS rc=0 d
+  RUN_N=$((RUN_N + 1))
+  r="$STAGE/run/$RUN_N"
+  x=${t##*/}
+  eval_root "$r" "$arm"
+  cp -RP "$t" "$r/suite/$x" || die "cannot copy $t into $r; fix: check TMPDIR"
+  [ ! -d "${t%/*}/lib" ] || cp -RP "${t%/*}/lib" "$r/suite/lib" || die "cannot copy ${t%/*}/lib into $r; fix: check TMPDIR"
+  E_tdir="$r/suite/$x"
+  [ ! -d "$E_tdir/fake-bin" ] || fb="$E_tdir/fake-bin:"
   if [ -f "$t/task.toml" ]; then
     max_steps=$(toml max_steps <"$t/task.toml" | cut -f 3)
     max_secs=$(toml max_seconds <"$t/task.toml" | cut -f 3)
     max_secs=${max_secs:-$EVAL_SECONDS}
   fi
-  (cd "$w/work" && PATH="$fb$PATH" XDG_STATE_HOME="$STAGE/$arm/state" exec "$E_henki" run --json --approve auto \
-    --config "$STAGE/$arm/config.toml" ${E_model:+--model "$E_model"} --max-seconds "$max_secs" ${max_steps:+--max-steps "$max_steps"} - \
-    <"$t/prompt.txt" >"$w/out" 2>"$w/err")
-  line=$(tail -n 1 "$w/out")
-  case "$line" in *',"t":"result",'*) ;; *) line="" ;; esac
-  status=$(json_str status "$line") || status="no result: $(head -c 200 "$w/err" | tr '\n' ' ')"
-  steps=$(json_num steps "$line")
-  secs=$(json_num duration_s "$line")
-  text=$(json_str text "$line") || text=""
-  printf '%b' "$text" >"$w/text"
-  (cd "$w/work" && EVAL_DIR=$t exec "$t/check") <"$w/text" >"$w/check" 2>&1 && pass=pass
-  [ "$pass" = fail ] || eval "P_$arm=\$((P_$arm + 1))"
-  eval "s=\$S_$arm"
-  s=$(HM_A="$s" HM_B="${secs:-0}" awk 'BEGIN { printf "%.1f", ENVIRON["HM_A"] + ENVIRON["HM_B"] }')
-  eval "S_$arm=\$s N_$arm=\$((N_$arm + 1))"
-  printf '%-16s %-3s %s  (%s, %s steps, %s s)\n' "${t##*/}" "$arm" "$pass" "$status" "${steps:-0}" "${secs:-0}"
-  chmod -R u+w "$w" 2>/dev/null
-  rm -rf "$w"
+  d="$E_rundir/$(printf '%04d' "$RUN_N")-$arm-$rep-$x"
+  watch_run "$EVAL_WATCH" /dev/null "$r/setup.log" in_arm "$r" "" "$E_tdir/setup" || rc=$?
+  if [ "$rc" != 0 ]; then
+    printf 'evalrun/1\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t0\tsetup\t0\t0\t%s\n' "$E_run" "$E_name" "$E_ver" "$E_hd1" \
+      "$E_mlabel" "$(eval "printf '%s' \"\$E_label_$i\"")" "$arm" "$rep" "$x" "$(eval "printf '%s' \"\$E_bytes_$arm\"")" >>"$E_rundir/runs.tsv"
+    eval_keep "$r" "$d"
+    : >"$E_rundir/VOID"
+    tail -n 20 "$r/setup.log" | sed 's/^/  | /' >&2
+    die "$x: setup exited $rc (its last lines above), so this run is VOID; fix: run $t/setup in an empty dir to see why"
+  fi
+  # While henki runs, the suite's files (the checks, what they expect, the other tasks) are not in the run's root: only
+  # the task's fake-bin programs, as plain copies (henki reads the prompt from the task itself, on stdin).
+  mkdir -p "$r/fake-bin" || die "cannot write $r; fix: check TMPDIR"
+  for x in "$E_tdir"/fake-bin/*; do [ ! -f "$x" ] || cp -L "$x" "$r/fake-bin/${x##*/}" || die "cannot copy $x; fix: check TMPDIR"; done
+  [ -z "$fb" ] || fb="$r/fake-bin:"
+  chmod -R u+w "$r/suite" && rm -rf "$r/suite" && mkdir "$r/suite" || die "cannot clear $r/suite; fix: check TMPDIR"
+  eval_henki "$r" "$fb" "$t/prompt.txt" "$max_secs" "$max_steps"
+  x=${t##*/}
+  cp -RP "$t" "$r/suite/$x" || die "cannot copy $t into $r; fix: check TMPDIR"
+  [ ! -d "${t%/*}/lib" ] || cp -RP "${t%/*}/lib" "$r/suite/lib" || die "cannot copy ${t%/*}/lib into $r; fix: check TMPDIR"
+  st=$(eval_status "$E_line")
+  steps=$(json_num steps "$E_line")
+  secs=$(json_num duration_s "$E_line")
+  text=$(json_str text "$E_line") || text=""
+  printf '%b' "$text" >"$r/text"
+  watch_run "$EVAL_WATCH" "$r/text" "$r/check.log" in_arm "$r" "$fb" "$E_tdir/check" && pass=1
+  printf 'evalrun/1\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$E_run" "$E_name" "$E_ver" "$E_hd1" "$E_mlabel" \
+    "$(eval "printf '%s' \"\$E_label_$i\"")" "$arm" "$rep" "$x" "$pass" "$st" "${steps:-0}" "${secs:-0}" \
+    "$(eval "printf '%s' \"\$E_bytes_$arm\"")" >>"$E_rundir/runs.tsv"
+  eval_keep "$r" "$d"
+  case "$st" in none | setup | error:config | error:nested | error:journal | error:internal | error:tampered) : >"$E_rundir/VOID" ;; esac
+  eval "P_${i}_$arm=\$((P_${i}_$arm + pass)) N_${i}_$arm=\$((N_${i}_$arm + 1)) x=\$S_${i}_$arm"
+  x=$(HM_A="$x" HM_B="${secs:-0}" awk 'BEGIN { printf "%.1f", ENVIRON["HM_A"] + ENVIRON["HM_B"] }')
+  eval "S_${i}_$arm=\$x"
+  printf '%-16s %-3s %s  (%s, %s steps, %s s)\n' "${t##*/}" "$arm" "$([ "$pass" = 1 ] && echo pass || echo fail)" "$st" \
+    "${steps:-0}" "${secs:-0}"
+  chmod -R u+w "$r" 2>/dev/null
+  rm -rf "$r"
 }
 
-# eval NAME|/DIR [--suite NAME|general|/DIR] [--repeats N] [--model M] [--yes]: the tasks of the suite (the module's
-# own eval/ by default) with the module on and off, the arms taking turns; 3 repeats, 13 when the arms end within one
-# pass of each other, or N. One eval/1 line per arm, printed and added to STATE/henki/eval.tsv. `eval --check DIR`:
-# the layout only.
+# The sandbox program for the arms: the official sandbox module's exec binding, used directly (each arm keeps all four
+# tools). Sets E_sbx to its path when it runs a command here; else 1 with ERR.
+eval_sandbox() {
+  local d p
+  d=$(official_dir sandbox) && p="$d/port/exec" && [ -x "$p" ] || {
+    ERR="this henki ships no sandbox module (official sandbox, port/exec)"
+    return 1
+  }
+  mkdir -p "$STAGE/probe" || return 1
+  (cd "$STAGE/probe" && "$p" /bin/sh -c 'exit 0') >"$STAGE/probe.out" 2>&1 || {
+    ERR="the sandbox does not run here: $(tail -n 1 "$STAGE/probe.out")"
+    return 1
+  }
+  E_sbx=$p
+}
+
+# SHA-256 of the model file F, cached by its path, size and time in STATE/henki/eval/models.tsv.
+eval_model_sha() { # F STATEDIR
+  local f=$1 c="$2/henki/eval/models.tsv" k s
+  mkdir -p "$2/henki/eval" || return 1
+  k=$(ls -lnd -- "$f" | awk '{ print $5 " " $6 " " $7 " " $8 }')
+  s=$(HM_F="$f" HM_K="$k" awk -F '\t' '$1 == ENVIRON["HM_F"] && $2 == ENVIRON["HM_K"] { s = $3 } END { print s }' "$c" 2>/dev/null)
+  if [ -z "$s" ]; then
+    say "  hashing $(shown "$f") (once per file; cached)" >&2
+    s=$(sha <"$f") || return 1
+    printf '%s\t%s\t%s\n' "$f" "$k" "$s" >>"$c"
+  fi
+  printf '%s\n' "$s"
+}
+
+# eval NAME|/DIR [--suite SUITE[,SUITE]] [--repeats N] [--model M] [--server URL] [--model-file F] [--yes]
+# [--unsandboxed]: the tasks of each SUITE (own, the default: the module's eval/; general; an added module's name; a
+# directory of tasks) with the module on and off, each run in a fresh scratch home inside the sandbox program. One run
+# dir, STATE/henki/eval/RUN/ (run.toml, runs.tsv with an evalrun/1 row per run, each run's records), and per suite and
+# arm one eval/1 line, printed and added to STATE/henki/eval.tsv. `eval --check DIR`: the layout only.
 cmd_eval() {
-  local pkg="" suite="" reps="" yes=0 dir name ver hd1 sdir label n model total r t a tty answer st line p c s
-  E_model=""
+  local pkg="" suites="" reps="" yes=0 unsb=0 mfile="" s sdir label n model total r t a tty answer st line p c x i ns base
+  local more sum
+  E_model="" E_server="" E_sbx="" E_child=""
   if [ "${1:-}" = --check ]; then
     [ $# = 2 ] || usage
     eval_check "$2" || die "$ERR"
@@ -5316,19 +5705,22 @@ cmd_eval() {
   fi
   while [ $# -gt 0 ]; do
     case "$1" in
-      --suite | --repeats | --model)
+      --suite | --repeats | --model | --server | --model-file)
         [ $# -ge 2 ] || usage
-        case "$1" in --suite) suite=$2 ;; --repeats) reps=$2 ;; *) E_model=$2 ;; esac
+        case "$1" in --suite) suites=$2 ;; --repeats) reps=$2 ;; --model) E_model=$2 ;; --server) E_server=$2 ;; *) mfile=$2 ;; esac
         shift 2
         ;;
       --yes | -y) yes=1 && shift ;;
+      --unsandboxed) unsb=1 && shift ;;
       -*) usage ;;
       *) [ -z "$pkg" ] && pkg=$1 && shift || usage ;;
     esac
   done
   [ -n "$pkg" ] || usage
   case "$reps" in '' | [1-9] | [1-9][0-9]) ;; *) die "--repeats $reps: not a number from 1 to 99; fix: name one" ;; esac
-  case "$E_model$suite" in *"$tab"* | *"$nl"*) die "a tab or a newline in --model or --suite; fix: name them without one" ;; esac
+  case "$E_model$suites$E_server$mfile" in *"$tab"* | *"$nl"* | *'"'* | *'\'*) die "a tab, a newline, \" or \\ in --model, --suite, --server or --model-file; fix: name them without one" ;; esac
+  case "$E_server" in '' | http://127.0.0.1:* | http://localhost:* | 'http://[::1]:'*) ;; *) die "--server $E_server: not a loopback http://HOST:PORT/PATH (henki sends HENKI_BASE_URL only there); fix: set base_url in config.toml for another server" ;; esac
+  [ -z "$mfile" ] || [ -f "$mfile" ] || die "--model-file $mfile: no such file; fix: name the model's file (its SHA-256 goes into the run)"
   case "${HENKI_DEPTH:-0}" in 0) ;; *) die "eval starts henki, and this runs inside henki (HENKI_DEPTH=$HENKI_DEPTH); fix: run henki mods eval in a terminal outside henki" ;; esac
   STAGE=$(mktemp -d "${TMPDIR:-/tmp}/henki-mods.XXXXXX") || die "cannot make a scratch dir; fix: check TMPDIR"
   STAGE_LIST="$STAGE/list"
@@ -5336,79 +5728,152 @@ cmd_eval() {
   case "$pkg" in
     /* | ./* | ../*)
       [ -d "$pkg" ] || die "$pkg is not a directory; fix: name a module directory"
-      dir=$(cd -P "$pkg" && pwd)
-      inspect "$dir" "${dir##*/}" 0 || die "$ERR"
-      name=$I_name ver=${M_version:--} hd1=$I_hd1
+      E_dir=$(cd -P "$pkg" && pwd)
+      inspect "$E_dir" "${E_dir##*/}" 0 || die "$ERR"
+      E_name=$I_name E_ver=${M_version:--} E_hd1=$I_hd1
       ;;
     *)
       lock_check
       lock_get "$pkg" || die "$pkg is not added; fix: henki-mods add SRC first, or name a module directory by its path"
-      dir=$(store_of)
-      inspect "$dir" "$pkg" 2 || die "$pkg: $ERR"
-      [ "$I_hd1" = "$L_hd1" ] || die "the store copy $dir does not match the lock (it changed); fix: henki-mods rm $pkg and add it again"
-      name=$pkg ver=$L_version hd1=$L_hd1
+      E_dir=$(store_of)
+      inspect "$E_dir" "$pkg" 2 || die "$pkg: $ERR"
+      [ "$I_hd1" = "$L_hd1" ] || die "the store copy $E_dir does not match the lock (it changed); fix: henki-mods rm $pkg and add it again"
+      E_name=$pkg E_ver=$L_version E_hd1=$L_hd1
       ;;
   esac
-  case "$suite" in
-    '') sdir="$dir/eval" label=$name ;;
-    general)
-      sdir=$(eval_general) || die "no general suite found; fix: reinstall henki"
-      label=general
-      ;;
-    /*) sdir=$suite label=$suite ;;
-    *)
-      lock_check
-      lock_get "$suite" || die "$suite is not added; fix: name general, an added module or a directory of tasks"
-      sdir="$(store_of)/eval" label=$suite
-      ;;
-  esac
-  [ -d "$sdir" ] || die "$label has no eval/ tasks; fix: henki-mods eval $pkg --suite general"
-  eval_check "$sdir" || die "$ERR"
-  n=$(printf '%s' "$E_tasks" | awk 'NF' | wc -l | tr -d ' ')
-  model=${E_model:-${HENKI_MODEL:-$(toml model <"$CONF/config.toml" 2>/dev/null | cut -f 3)}}
-  model=${model:--}
-  say "eval: $name $ver ($hd1) on $label, $n tasks, model $model"
-  say "  arms: $name on, $name off; each a copy of $(shown "$CONF/config.toml") and AGENTS.md with no other module"
+  E_armdir="$STAGE/arm/$E_name"
+  copy_dir "$E_dir" "$E_armdir"
+  chmod -R u+w "$E_armdir" && rm -rf "$E_armdir/eval" || die "cannot make $E_armdir; fix: check TMPDIR"
+  x=$(prompt_bytes "$E_name" "$E_dir") || x=0
+  [ "$x" = 0 ] || x=$((x + ${#HEADER} + 2))
+  E_bytes_on=$((x + I_card)) E_bytes_off=0
+  # The suites, numbered: E_label_I (the SUITE of the rows and lines) and E_dir_I.
+  ns=0 n=0
+  for s in $(printf '%s' "${suites:-own}" | tr ',' ' '); do
+    case "$s" in
+      own) sdir="$E_dir/eval" label=$E_name ;;
+      general)
+        sdir=$(eval_general) || die "no general suite found; fix: reinstall henki"
+        label=general
+        ;;
+      /*) sdir=$s label=$s ;;
+      *)
+        lock_check
+        lock_get "$s" || die "$s is not added; fix: name own, general, an added module or a directory of tasks"
+        sdir="$(store_of)/eval" label=$s
+        ;;
+    esac
+    [ -d "$sdir" ] || die "$label has no eval/ tasks; fix: henki-mods eval $pkg --suite general"
+    eval_check "$sdir" || die "$ERR"
+    ns=$((ns + 1))
+    eval "E_label_$ns=\$label E_tasks_$ns=\$E_tasks"
+    n=$((n + $(printf '%s' "$E_tasks" | awk 'NF' | wc -l)))
+  done
+  [ "$ns" -gt 0 ] || usage
+  : >"$STAGE/config.toml"
+  [ ! -f "$CONF/config.toml" ] || cp "$CONF/config.toml" "$STAGE/config.toml"
+  model=${E_model:-${HENKI_MODEL:-$(toml model <"$STAGE/config.toml" 2>/dev/null | cut -f 3)}}
+  E_mlabel=${model:--}
+  base=${E_server:-${HENKI_BASE_URL:-$(toml base_url <"$STAGE/config.toml" 2>/dev/null | cut -f 3)}}
+  st=${XDG_STATE_HOME:-}
+  case "$st" in /*) ;; *) st="$HOME/.local/state" ;; esac
+  E_msha=""
+  [ -z "$mfile" ] || E_msha=$(eval_model_sha "$mfile" "$st") || die "cannot read $mfile; fix: make it readable"
+  # What the server says of itself (llama-server's /props); anything else gives nothing.
+  E_props=$(curl -s --max-time 5 "${base%/v1}/props" 2>/dev/null) || E_props=""
+  E_smodel=$(json_str model_path "$E_props" 2>/dev/null) || E_smodel=-
+  E_sbuild=$(json_str build_info "$E_props" 2>/dev/null) || E_sbuild=-
+  if [ "$unsb" = 1 ]; then
+    E_sbx=""
+  else
+    eval_sandbox || die "$ERR; eval runs every arm inside it; fix: install bubblewrap (Linux) or add the sandbox module, or run eval --unsandboxed (then nothing but HOME and the XDG dirs is a scratch copy)"
+  fi
+  say "eval: $E_name $E_ver ($E_hd1), model $E_mlabel${base:+ at $base}"
+  for i in $(seq 1 "$ns"); do
+    eval "say \"  suite \$E_label_$i: \$(printf '%s' \"\$E_tasks_$i\" | awk 'NF' | wc -l | tr -d ' ') tasks\""
+  done
+  [ "$E_smodel" = - ] || say "  server: $E_smodel, build $E_sbuild"
+  [ -z "$E_msha" ] || say "  model file: $(shown "$mfile"), sha256 $E_msha"
+  say "  arms: $E_name on, $E_name off; each run in a fresh scratch home with a copy of $(shown "$CONF/config.toml") (no ext, no shadow) and AGENTS.md (no cards); on: $E_name added there"
   case "$reps" in
-    '') say "  3 runs of each task per arm, 13 when the arms end within one pass of each other" ;;
+    '') say "  3 runs of each task per arm; 10 more of a suite (not general) whose effect is positive with 0 in its 95% CI" ;;
     1) say "  1 run of each task per arm" ;;
     *) say "  $reps runs of each task per arm" ;;
   esac
-  say "  each task's setup and check run as you, and henki with approve = auto: the model's calls run without asking"
+  say "  the model's commands run without asking (approve = auto), with your rights; HOME and the XDG dirs are scratch dirs"
+  if [ -n "$E_sbx" ]; then
+    say "  each run (setup, henki, check) is inside the sandbox program $(shown "$E_sbx"): your home hidden, the run's dir writable"
+  else
+    say "  $(red "--unsandboxed: nothing else is isolated; the model can read and change all you can")"
+  fi
   if [ "$yes" != 1 ]; then
     tty=${HENKI_MODS_TTY:-/dev/tty}
     (: <"$tty") 2>/dev/null || die "no terminal to ask on; fix: run it in a terminal, or add --yes once you have read the screen above"
-    if [ -c "$tty" ]; then printf 'eval? [y/N] ' >"$tty"; else printf 'eval? [y/N] \n' >&2; fi
+    if [ -c "$tty" ]; then printf 'run? [y/N] ' >"$tty"; else printf 'run? [y/N] \n' >&2; fi
     read -r answer <"$tty" || answer=""
     case "$answer" in y | Y | yes | YES) ;; *) die "not run (the answer was no); fix: run eval again and answer y" ;; esac
   fi
-  eval_arm on "$name" "$dir"
-  eval_arm off "$name" "$dir"
-  P_on=0 P_off=0 N_on=0 N_off=0 S_on=0 S_off=0 RUN_N=0 total=${reps:-3} r=0
-  while [ "$r" -lt "$total" ]; do
+  E_run="$(date -u +%Y%m%dT%H%M%SZ)-$(od -An -N2 -tx1 /dev/urandom | tr -d ' \n')"
+  E_rundir="$st/henki/eval/$E_run"
+  mkdir -p "$E_rundir" || die "cannot make $E_rundir; fix: make $st/henki a directory you own"
+  {
+    printf 'run = "%s"\npackage = "%s"\nversion = "%s"\nhd1 = "%s"\nmodel = "%s"\n' "$E_run" "$E_name" "$E_ver" "$E_hd1" "$E_mlabel"
+    printf 'server = "%s"\nserver_model = "%s"\nserver_build = "%s"\n' "${base:--}" "$E_smodel" "$E_sbuild"
+    printf 'henki = "%s"\n' "$("$E_henki" --version 2>/dev/null | head -n 1)"
+    [ -z "$E_msha" ] || printf 'model_file = "%s"\nmodel_sha256 = "%s"\n' "$mfile" "$E_msha"
+    printf 'sandbox = "%s"\nrepeats = "%s"\nstarted = "%s"\n' "${E_sbx:-none}" "${reps:-3 or 13}" "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  } >"$E_rundir/run.toml"
+  : >"$E_rundir/runs.tsv"
+  say "run $E_run: $(shown "$E_rundir")"
+  eval_ready on
+  eval_ready off
+  RUN_N=0 more=0 r=0
+  for i in $(seq 1 "$ns"); do eval "P_${i}_on=0 P_${i}_off=0 N_${i}_on=0 N_${i}_off=0 S_${i}_on=0 S_${i}_off=0 R_$i=${reps:-3}"; done
+  while :; do
     r=$((r + 1))
-    while IFS= read -r t; do
-      [ -n "$t" ] || continue
-      # The arms take turns going first, so neither always meets a cold server.
-      for a in $([ $((r % 2)) = 1 ] && echo on off || echo off on); do eval_run "$t" "$a"; done
-    done <<TASKS
-$E_tasks
+    sum=0
+    for i in $(seq 1 "$ns"); do
+      eval "total=\$R_$i"
+      [ "$r" -le "$total" ] || continue
+      sum=1
+      eval "x=\$E_tasks_$i"
+      while IFS= read -r t; do
+        [ -n "$t" ] || continue
+        # The arms take turns going first, so neither always meets a cold server.
+        for a in $([ $((r % 2)) = 1 ] && echo on off || echo off on); do eval_run "$i" "$t" "$a" "$r"; done
+      done <<TASKS
+$x
 TASKS
-    if [ -z "$reps" ] && [ "$total" = 3 ] && [ "$r" = 3 ] && [ $((P_on - P_off)) -le 1 ] && [ $((P_off - P_on)) -le 1 ]; then
-      total=13
-      say "the arms are within one pass of each other after 3 repeats: 10 more"
+    done
+    [ "$sum" = 1 ] || break
+    if [ -z "$reps" ] && [ "$r" = 3 ]; then
+      for i in $(seq 1 "$ns"); do
+        eval "label=\$E_label_$i"
+        [ "$label" != general ] || continue
+        HM_S="$label" awk -F '\t' '$7 == ENVIRON["HM_S"]' "$E_rundir/runs.tsv" >"$STAGE/suite.tsv"
+        x=$(evalstats more "$STAGE/suite.tsv" 2>/dev/null | cut -f 2)
+        [ "$x" = yes ] || continue
+        eval "R_$i=13"
+        say "suite $label: the effect is positive with 0 in its 95% CI after 3 repeats: 10 more"
+      done
     fi
   done
-  st=${XDG_STATE_HOME:-}
-  case "$st" in /*) ;; *) st="$HOME/.local/state" ;; esac
-  mkdir -p "$st/henki" || die "cannot make $st/henki; fix: make it a directory you own"
-  for a in on off; do
-    eval "p=\$P_$a c=\$N_$a s=\$S_$a"
-    line=$(printf 'eval/1\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s' "$name" "$ver" "$hd1" "$model" "$label" "$a" "$p" "$c" "$s")
-    say "$line"
-    printf '%s\n' "$line" >>"$st/henki/eval.tsv" || die "cannot write $st/henki/eval.tsv; fix: make it writable"
+  printf 'ended = "%s"\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" >>"$E_rundir/run.toml"
+  for i in $(seq 1 "$ns"); do
+    eval "label=\$E_label_$i"
+    for a in on off; do
+      eval "p=\$P_${i}_$a c=\$N_${i}_$a s=\$S_${i}_$a"
+      line=$(printf 'eval/1\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s' "$E_name" "$E_ver" "$E_hd1" "$E_mlabel" "$label" "$a" "$p" "$c" "$s")
+      say "$line"
+      printf '%s\n' "$line" >>"$st/henki/eval.tsv" || die "cannot write $st/henki/eval.tsv; fix: make it writable"
+    done
+    eval "say \"\$E_name on \$label: on \$P_${i}_on of \$N_${i}_on passed, off \$P_${i}_off of \$N_${i}_off\""
   done
-  say "$name: on $P_on of $N_on passed, off $P_off of $N_off; added to $(shown "$st/henki/eval.tsv")"
+  say "added to $(shown "$st/henki/eval.tsv"); the rows: $(shown "$E_rundir/runs.tsv")"
+  if [ -f "$E_rundir/VOID" ]; then
+    say "$(red "VOID: a run did not finish as a run (status none or an error of henki's setup); no badge comes from $E_run")"
+  fi
+  say "next: henki mods eval report $E_run, henki mods eval badge $E_run"
 }
 
 # --- allow rules -------------------------------------------------------------------------------------------------------
@@ -5640,7 +6105,15 @@ case "${1:-list}" in
   verify) shift && cmd_verify "$@" ;;
   allow) shift && cmd_allow "$@" ;;
   swap) shift && cmd_swap "$@" ;;
-  eval) shift && cmd_eval "$@" ;;
+  eval)
+    case "${2:-}" in
+      report | badge)
+        [ -x "$SELF/henki-mods-dev" ] || die "henki-mods-dev is not beside henki-mods; fix: reinstall henki"
+        exec "$SELF/henki-mods-dev" "$@"
+        ;;
+    esac
+    shift && cmd_eval "$@"
+    ;;
   help | -h | --help)
     usage 2>&1 | sed 's/^usage: //;s/^       //'
     exit 0

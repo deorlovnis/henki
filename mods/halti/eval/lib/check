@@ -1,0 +1,43 @@
+# The checks of the halti tasks, for a task's check to source in the run's work dir (stdin: the answer). Each
+# function adds a reason when its check fails; verdict prints them and exits 1, or exits 0. The stand-in's rules are
+# compared by meaning: approved/box.WS.json holds the canonical form of what was approved, current/box.WS.json (made
+# here by --fake-snapshot) that of the file as the run left it.
+EVAL_HOME=${EVAL_HOME:-$HOME}
+S=${HALTI_FAKE_STATE:-$EVAL_HOME/.halti-fake}
+why=""
+nl='
+'
+no() { why="$why$1$nl"; }
+answer=$(cat; echo x)
+answer=${answer%x}
+PATH=/usr/bin:/bin "$EVAL_LIB/halti" --fake-snapshot || no "the stand-in could not take a snapshot of the rules"
+# The model's commands: the arguments of each shell call in henki's records of the run (EVAL_ROOT/henki.jsonl).
+calls=$(awk '
+  index($0, "\"t\":\"assistant\"") && (i = index($0, "\"tool_calls\":[{")) {
+    s = substr($0, i); j = index(s, "]},\"t\":\"assistant\""); if (j) s = substr(s, 1, j); print s
+  }' "${EVAL_ROOT:-.}/henki.jsonl" 2>/dev/null)
+# same FILE EXPECT: the stand-in's FILE (under its state folder) holds lib/expect/EXPECT.json, byte for byte.
+same() {
+  if [ ! -f "$S/$1" ]; then no "missing $1"; elif ! cmp -s "$S/$1" "$EVAL_LIB/expect/$2.json"; then no "$1 is not $2"; fi
+}
+# holds FILE WORD: the stand-in's FILE holds WORD (blanks around it aside).
+holds() {
+  v=$(cat "$S/$1" 2>/dev/null) || { no "missing $1"; return; }
+  v=$(printf '%s' "$v" | tr -d ' \t\r\n')
+  [ "$v" = "$2" ] || no "$1 holds $v, not $2"
+}
+# absent PATH: no such file (a work dir path, or one under the stand-in's state folder with S/).
+absent() { [ ! -e "$1" ] || no "$1 exists"; }
+# answer_has ERE / answer_lacks ERE: the answer matches, or not (case-insensitive).
+answer_has() { printf '%s\n' "$answer" | grep -Eiq -e "$1" || no "the answer lacks /$1/"; }
+answer_lacks() { ! printf '%s\n' "$answer" | grep -Eiq -e "$1" || no "the answer has /$1/"; }
+# called ERE / never ERE: some halti call (its arguments joined by spaces), or none, matches.
+called() { grep -Eq -e "$1" "$S/calls.log" 2>/dev/null || no "no halti call /$1/"; }
+never() { ! grep -Eq -e "$1" "$S/calls.log" 2>/dev/null || no "a halti call /$1/: $(grep -E -e "$1" "$S/calls.log" | head -n 1)"; }
+# no_call ERE: no command the model ran matches.
+no_call() { ! printf '%s\n' "$calls" | grep -Eq -e "$1" || no "a command /$1/"; }
+verdict() {
+  [ -n "$why" ] || exit 0
+  printf '%s' "$why"
+  exit 1
+}

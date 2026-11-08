@@ -1,0 +1,9 @@
+FAIL: the halti suite's sign test p 0.125 is above 0.05
+eval_suite = "halti"
+eval_model = "Qwen3.5-2B-Q8_0"
+eval_hd1 = "hd1:5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e"
+eval_repeats = 3
+eval_on = "12/12"
+eval_off = "0/12"
+eval_effect = "+12 per 12 (95% CI +12 to +12; tasks 4 better, 0 worse, 0 equal; sign p 0.125)"
+eval_general = "on 25/36, off 24/36: +1 per 36 (95% CI -2 to +4)"

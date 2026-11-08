@@ -1,0 +1,2 @@
+# The stand-in halti needs python3 (3.11 or later).
+max_seconds = 300

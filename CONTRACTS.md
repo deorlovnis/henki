@@ -44,6 +44,7 @@ A program reads the contracts this henki ships from the rows of this table: each
 | `bind/1` | henki-mods | the lock lines of bound ports, in `mods.lock` |
 | `hd1` | henki-mods | the tree hash that pins a module's files |
 | `eval/1` | henki-mods | a module's eval tasks, the two arms they run in, and the line that records them |
+| `evalrun/1` | henki-mods | an eval run's dir and rows, its statistics, and the badge an index entry carries |
 | `hist/1` | henki-mods | the lock lines a change replaced or removed, `mods.history` |
 | `index/1` | henki-mods | a signed module index: its entries, its signature chain, and what henki-mods reads from it |
 | `pack/1` | henki-mods | a pack of modules for a machine with no network: its members and its `PACK` |
@@ -828,22 +829,36 @@ TASK/setup               required: a program that makes the task's files in an e
 TASK/check               required: a program; exit 0 is a pass
 TASK/fake-bin/CMD        optional: programs first on PATH in the run (a tool the task's machine lacks, or must not run)
 TASK/task.toml           optional, module/1's grammar: max_steps (1 to 10000), max_seconds (1 to 9999; default 120)
+lib/                     optional: data and programs the tasks share (never a task); a fake-bin entry may be a
+                         relative link into it
 ```
 
 Dot files are ignored anywhere, and so are `README*` and `LICENSE*` next to the tasks; anything else is refused.
-`henki-mods eval --check DIR` checks this layout and runs nothing; `add` and `verify --dir` check a module's `eval/`.
+`henki-mods eval --check DIR` checks this layout and runs nothing; `add` and `verify --dir` check a module's `eval/`
+(its links, as every link in a module, stay inside the module).
 
-- **A run.** `setup` runs in a new empty work dir with `EVAL_DIR` (the task's directory) and stdin empty; a setup that
-  fails stops the eval. Then, in that dir, `henki run --json --approve auto --config ARM/config.toml [--model M]
-  --max-seconds S [--max-steps N] -` with prompt.txt on stdin, `fake-bin/` first on PATH and `XDG_STATE_HOME` the
-  arm's. Then `check` runs in the same dir with `EVAL_DIR`, and on stdin the `text` of henki's `result` record
-  (json/1), byte for byte, with no newline added. Its exit status is the result; what it prints is not kept.
-- **The arms.** The module on and the module off, each a config dir of its own: the user's `config.toml` without its
-  `ext` key, the user's `AGENTS.md` with the mods cards block holding only the module's card (on) or none (off), the
-  link `ext/NAME` to the module (on) or no module (off), no allow file and no port link. In each repeat every task
-  runs once per arm, the arms taking turns going first. 3 repeats; when the arms' passes then differ by at most one,
-  10 more; `--repeats N` runs exactly N.
-- **The record.** Per arm one line, printed and appended to `$XDG_STATE_HOME/henki/eval.tsv` (else
+- **A run.** Each run of a task has a fresh root dir of its own holding `home/` (the run's `HOME`),
+  `xdg/{config,data,state,cache}` (the four `XDG_*_HOME`), `work/` (the cwd) and a copy of the task and of the suite's
+  `lib/`; nothing of the person's own home, config, state or data is read or written in it. `setup` runs in `work/`
+  with stdin empty; then `henki run --json --approve auto [--model M] --max-seconds S [--max-steps N] -` with
+  prompt.txt on stdin and `fake-bin/` first on PATH; then `check` in `work/` with, on stdin, the `text` of henki's
+  `result` record (json/1), byte for byte, with no newline added. Its exit status is the result. All three get
+  `EVAL_DIR` (the task's copy), `EVAL_LIB` (the copy of `lib/`), `EVAL_HOME` (= `HOME`) and `EVAL_ROOT` (the root);
+  henki's records of the run (its `--json` stdout) are `EVAL_ROOT/henki.jsonl` when `check` runs. A setup or a check
+  is stopped after 60 seconds. A setup that fails stops the eval, and its run is VOID (evalrun/1).
+- **The sandbox.** Each of the three runs inside the official `sandbox` module's program (`port/exec`, run directly,
+  not as an exec binding, so henki keeps all four tools), started in the root with the person's own `HOME`, which it
+  hides. Where it does not run, `eval` refuses unless `--unsandboxed` is given; then only `HOME` and the XDG dirs are
+  scratch dirs.
+- **The arms.** The module on and the module off: in each run's home the person's `config.toml` without its `ext` and
+  `shadow` keys and their `AGENTS.md` without the mods cards block; in the on arm the module is then added there as a
+  person adds one (`henki-mods add DIR --yes`: its store copy, its link, its card, and the `shadow` line it names). No
+  allow file and no port link. Before any task each arm answers `Reply with the word ready.`; a status other than
+  `ok` stops the eval. In each repeat every task runs once per arm, the arms taking turns going first. 3 repeats; a
+  suite other than `general` whose effect after them is positive with 0 inside its 95% CI (evalrun/1) gets 10 more;
+  `--repeats N` runs exactly N. `--suite` names one suite or several, comma-separated (`own` is the module's own tasks,
+  the default), all in one run.
+- **The record.** Per suite and arm one line, printed and appended to `$XDG_STATE_HOME/henki/eval.tsv` (else
   `~/.local/state/henki/eval.tsv`), fields separated by tabs:
 
 ```
@@ -853,7 +868,47 @@ eval/1 PKG VERSION HD1 MODEL SUITE ARM PASSES RUNS SECONDS
   PKG is the module's name, VERSION its manifest's (`-` without one), HD1 its tree hash, MODEL `--model`, else
   `HENKI_MODEL`, else the config's `model` (`-` with none), SUITE the module's name (its own tasks), `general`, another
   module's name or a suite's path, ARM `on` or `off`, PASSES and RUNS counts, SECONDS the sum of the runs'
-  `duration_s`.
+  `duration_s`. Each run is also an evalrun/1 row.
 - **The general suite** uses POSIX tools and git only, no network, and every check is deterministic.
-- eval runs a module's `setup` and `check` as the user, and henki with `approve = "auto"`, so it shows what it will run
-  and asks first (`--yes` once the screen was read); it refuses to run inside henki (`HENKI_DEPTH` set).
+- eval runs a module's `setup` and `check`, and henki with `approve = "auto"`, so it shows what it will run and asks
+  first (`--yes` once the screen was read); it refuses to run inside henki (`HENKI_DEPTH` set). `--server URL` (a
+  loopback `http://HOST:PORT/PATH`, passed as `HENKI_BASE_URL`) names the model server; `--model-file F` the model's
+  file, whose SHA-256 the run records.
+
+## evalrun/1
+
+Owned by henki-mods; henki never reads it. One eval run's record, and the badge a module's index entry carries.
+
+- **The run dir** `$XDG_STATE_HOME/henki/eval/RUN/` (RUN is `YYYYMMDDTHHMMSSZ-XXXX`, UTC and 4 hex digits) holds
+  `run.toml` (module/1's grammar: `run`, `package`, `version`, `hd1`, `model`, `server`, `server_model` and
+  `server_build` from the server's `GET /props` when it answers one (llama.cpp's), else `-`, `henki` (its `--version`),
+  `model_file` and `model_sha256` with `--model-file`, `sandbox` (the program, or `none`), `repeats`, `started`,
+  `ended`), `runs.tsv` (one row per run, in run order), `VOID` when a run was VOID, and per run a dir
+  `NNNN-ARM-REPEAT-TASK/` with henki's records (`henki.jsonl`), its journal, and what setup and check printed.
+- **A row**, fields separated by tabs, none empty, none holding `"`, `\` or a control character:
+
+```
+evalrun/1 RUN PKG VERSION HD1 MODEL SUITE ARM REPEAT TASK PASS STATUS STEPS SECONDS PROMPT_BYTES
+```
+
+  RUN, PKG, VERSION, HD1 and MODEL as eval/1's (the same in every row of a run); SUITE as eval/1's (one suite besides
+  `general` per run); ARM `on` or `off`; REPEAT from 1; TASK the task's name; PASS `1` or `0`; STATUS henki's result
+  (`ok`, `gave_up:REASON`, `needs_approval`, `budget`, `interrupted`, `output_closed`, `error:KIND`; json/1), or
+  `none` (no result) or `setup` (the setup failed); STEPS and SECONDS the result's `steps` and `duration_s`;
+  PROMPT_BYTES what the arm adds to the system prompt (the module's doc line with the extensions header, and its
+  card), 0 in the off arm. A run whose STATUS is `none`, `setup` or `error:` `config`, `nested`, `journal`,
+  `internal` or `tampered` is VOID: it measured henki or its setup, not the model.
+- **The statistics** (`henki-mods eval report RUN`), per suite, with tasks as the unit: d(t) = passes on minus
+  passes off over the R repeats of task t; the effect is the sum of d(t) per R×T runs. Its 95% CI is a bootstrap
+  over the tasks: 2,000 resamples with replacement, each task drawn as `s % T` (tasks in byte order) with the
+  Park-Miller generator `s = s * 16807 % 2147483647` from seed 1 for each suite, the 50th and the 1,951st of the
+  sorted sums. The sign test is the exact two-sided binomial over the tasks better and worse.
+- **The badge rule** (`henki-mods eval badge RUN`: PASS or FAIL with the reason): no VOID run; rows of the module's
+  own suite and of `general`, at least 3 repeats of each; the own suite's CI lower bound above 0 and its sign p at
+  most 0.05; the general suite's CI upper bound at least 0. Below 13 repeats, an own suite with a positive effect and
+  0 in its CI fails with "rerun with --repeats 13".
+- **In an index** (index/1) a version's badge is the `eval_*` keys `henki-mods-dev publish --eval RUN` prints:
+  `eval_suite`, `eval_model`, `eval_hd1` (= the version's `hd1`), `eval_repeats`, `eval_on`, `eval_off`,
+  `eval_effect` and `eval_general` as the statistics give them, `eval_model_sha256` and `eval_server` from the run,
+  and `eval_by` (who ran it, and when); the rows behind it are `evals/NAME/VERSION.tsv`, byte for byte the run's
+  `runs.tsv`. `henki-mods-dev eval badge --check ROWS FILE` passes when the rows give a PASS whose keys equal FILE's.
