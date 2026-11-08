@@ -38,6 +38,7 @@ A program reads the contracts this henki ships from the rows of this table: each
 | `port/1` | henki | how henki talks to a port binding: a program it starts, JSON lines both ways |
 | `history/1` | henki | the history port's methods over port/1: where sessions are kept |
 | `policy/1` | henki | the policy port's methods over port/1: who may run a call |
+| `exec/1` | henki | the exec port: a program henki puts in front of every shell call |
 | `conform/1` | henki | the conformance suite files a binding is held to |
 | `module/1` | henki-mods | the module manifest, `.henki/module.toml` |
 | `lock/1` | henki-mods | the module lock, `mods.lock` |
@@ -539,7 +540,8 @@ symbolic link, `MODE SHA256 PATH\n`, sorted bytewise (`LC_ALL=C`) by PATH:
 
 A port is a part without which there is no agent: `model`, `history`, `context`, `exec`, `policy`, `frontend`. Each
 has one binding: the std one built into henki, or a program that `CONFIG_DIR/port/PORT` links to. This henki binds
-`history` and `policy` that way; `--port PORT=std` (repeatable, all six names) runs a session on std whatever the links say.
+`history`, `policy` and `exec` that way; `--port PORT=std` (repeatable, all six names) runs a session on std whatever the
+links say. `exec` speaks no protocol (exec/1): of this section only the link rules apply to it.
 
 - **The link.** henki reads `CONFIG_DIR/port/` at start: names starting with `.` are skipped; any other name must be a
   port this henki binds, and a link to a regular file its owner can run (or that file itself, which the manager never
@@ -641,6 +643,46 @@ call's arguments, its target, the tripwire) and before the call runs.
   or the session deadline ends a `decide` within 50 ms and the turn with it.
 - **Std.** `approve = "auto"` is a mode of the std policy: henki refuses to start with it while a policy binding is
   linked (`error config`). While one is linked henki reads no allow rules; `--port policy=std` runs a session on std.
+
+## exec/1
+
+Where shell calls run. The std binding runs `BASH --noprofile --norc -c COMMAND`, where BASH is the absolute path of
+the first `bash` on the user's PATH, found at start (a trust file). A program bound by `CONFIG_DIR/port/exec`
+(`henki mods swap exec NAME`) is put in front of it: every shell call runs as
+
+    PROGRAM BASH --noprofile --norc -c COMMAND
+
+in the session's working directory, with the tool environment, stdin `/dev/null`, and stdout and stderr as one stream.
+henki starts PROGRAM in a process group and session of its own and treats it as the call: the call's timeout (SIGTERM,
+then SIGKILL to the group and, on Linux, every process of its session), the stop's kill, and the sweep of every
+descendant at the session end (Linux; macOS: the groups). henki does not start it at the session start, and it gets
+no `hello`, `bye` or state dir.
+
+PROGRAM must:
+- run its arguments after its own setup (`exec "$@"` in the environment it sets up). A program whose commands run on
+  another machine (a box, ssh) replaces argument 1 with its own bash; one that shares this machine's files keeps it;
+- pass stdin, stdout and stderr through, and exit with the command's status (126 or 127, with one line on stderr, for
+  its own failures);
+- keep the command in its own process tree. A program that hands the command to a daemon (a container runtime, ssh)
+  moves it out of henki's reach: the kill and the sweep stop at the local side. Such a binding says so in its doc.md.
+
+It should pass the environment henki gives through, except `SSH_AUTH_SOCK`, which a sandbox should drop unless the
+person opts in (an agent socket lets anything inside sign with the person's keys). It gets no arguments of its own:
+a program that needs settings (a workspace name) reads its own config file.
+
+Not run through it: the person's `!cmd`, module commands, observers and port bindings: they run on the host with the
+person's rights. Files the model writes inside the program's view of the project (AGENTS.md, git hooks, scripts) are
+read or run later by code on the host (git, the person). A sandbox confines the model's calls, not what later reads
+their results.
+
+A `CONFIG_DIR/port/exec` link that names nothing runnable stops the start with its fix, as port/1's link rules say. The
+binding is a notice at start (`exec: NAME ID (exec/1) runs every shell call; henki --port exec=std runs a session
+without it`), the `session` record names it in `ports` (`{"exec":"NAME ID"}`), and `henki --port exec=std` runs a
+session without it. `henki port` does not take `exec`. `henki-mods test --port exec NAME` runs the checks R01 to R07
+against a program, each as `PROGRAM BASH --noprofile --norc -c COMMAND`: R01 `echo ok` prints `ok` and exits 0; R02
+`exit 7` exits 7; R03 the arguments after COMMAND arrive intact; R04 stdin is at EOF at once; R05 stdout and stderr
+both arrive; R06 a SIGTERM to the group ends `sleep 30` within 1 s, and after a SIGKILL to the group (Linux: also its
+session) no process of the run is left within 1 s; R07 the environment arrives (a warning only).
 
 ## conform/1
 

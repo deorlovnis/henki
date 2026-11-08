@@ -114,6 +114,7 @@ fn contracts_index() {
         ("port/1", "henki"),
         ("history/1", "henki"),
         ("policy/1", "henki"),
+        ("exec/1", "henki"),
         ("conform/1", "henki"),
         ("module/1", "henki-mods"),
         ("lock/1", "henki-mods"),

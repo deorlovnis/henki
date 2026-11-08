@@ -7,6 +7,8 @@ mod mock;
 mod allow;
 #[path = "e2e/anthropic.rs"]
 mod anthropic;
+#[path = "e2e/exec.rs"]
+mod exec;
 #[path = "e2e/ext.rs"]
 mod ext;
 #[path = "e2e/handoff.rs"]

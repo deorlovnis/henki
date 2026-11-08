@@ -156,7 +156,7 @@ static_formats() {
     printf '%s\n' "$obs" | sed -n 's/.*NAME\/on\/EVENT\.wait  *\([a-z_]*\) and \([a-z_]*\) only.*/\1.wait \2.wait/p' | tr ' ' '\n') | sort | tr '\n' ' ')
   [ "$doc" = "$(mine EVENTS)" ] || fail "EVENTS is [$(mine EVENTS)], observe/1 has [$doc]"
   port=$(doc_sec port/1)
-  doc=$(printf '%s\n' "$port" | sed -n 's/.*This henki binds `\([a-z]*\)` and `\([a-z]*\)` that way.*/\1 \2/p' | tr ' ' '\n' | sort | tr '\n' ' ')
+  doc=$(printf '%s\n' "$port" | sed -n 's/.*This henki binds \(.*\) that way.*/\1/p' | awk -F '`' '{ for (i = 2; i <= NF; i += 2) print $i }' | sort | tr '\n' ' ')
   [ "$doc" = "$(mine PORTS_KNOWN)" ] || fail "PORTS_KNOWN is [$(mine PORTS_KNOWN)], port/1 binds [$doc]"
   for f in "$HERE"/conform/*.tsv; do
     names=""
@@ -479,7 +479,7 @@ t_refusals() {
   refused "ports must name exactly the programs in port/"
   rm -rf "$m" && mkmod "$m" 'ports = ["context"]\n'
   run add "$m" --yes
-  refused "port context is not one this henki binds (history policy)"
+  refused "port context is not one this henki binds (history policy exec)"
   rm -rf "$m" && mkmod "$m" && mkdir "$m/port" && printf '#!/bin/sh\n' >"$m/port/history"
   run add "$m" --yes
   refused "port/history: port/ holds a program you can run per port"
@@ -1428,7 +1428,7 @@ t_ports() {
   rc_is 0
   out_has "std passes this suite in henki's own tests"
   run test --port context std
-  refused "context is not a port this henki binds (history policy)"
+  refused "context is not a port this henki binds (history policy exec)"
   mkport tree
   run add "$W/tree" --yes
   rc_is 0
@@ -1582,6 +1582,74 @@ t_policy() {
     rc_is 1
     out_has "FAIL $want: got"
   done
+}
+
+# A module NAME in W that binds exec with BODY as its port/exec (sh).
+mkexec() {
+  mkmod "$W/$1" 'ports = ["exec"]\ncontracts = ["exec/1"]\n'
+  mkdir -p "$W/$1/port"
+  printf '#!/bin/sh\n%s\n' "$2" >"$W/$1/port/exec"
+  chmod 755 "$W/$1/port/exec"
+}
+
+# exec/1's fixed checks (no henki needed): the toy passes all 7, a program that loses the status or escapes the
+# session fails the check named for it; swap shows the exec screen (a module's bin/bash in red) and links it.
+t_exec() {
+  case_ "exec: test --port, the checks' faults, swap"
+  run test --port exec std
+  rc_is 0
+  run test --port exec "$HERE/../tests/fixtures/exec/toy-exec"
+  rc_is 0
+  out_has "ok R06"
+  out_has "exec/1: 7 checks, 7 passed"
+  printf '#!/bin/sh\n"$@"\nexit 0\n' >"$W/status"
+  printf '#!/bin/sh\nsetsid "$@" &\nwait\n' >"$W/escape"
+  printf '#!/bin/sh\nunset HENKI_CONFORM\nexec "$@"\n' >"$W/noenv"
+  chmod 755 "$W/status" "$W/escape" "$W/noenv"
+  run test --port exec "$W/status"
+  rc_is 1
+  out_has "FAIL R02: exit 0 (want 7)"
+  if [ "$(uname -s)" = Linux ] && command -v setsid >/dev/null; then
+    run test --port exec "$W/escape"
+    rc_is 1
+    out_has "FAIL R06: "
+  fi
+  run test --port exec "$W/noenv"
+  rc_is 0
+  out_has "warn R07: HENKI_CONFORM=1 did not arrive"
+  mkexec box 'exec "$@"'
+  mkexec broken 'exit 0'
+  mkmod "$W/bash"
+  mv "$W/bash/bin/bash" "$W/bash/bin/sh"
+  mkdir -p "$CONF" && printf 'shadow = ["bash/sh"]\n' >"$CONF/config.toml"
+  for m in box broken bash; do
+    run add "$W/$m" --yes
+    rc_is 0
+  done
+  run test --port exec box
+  rc_is 0
+  out_has "exec/1: 7 checks, 7 passed"
+  run swap exec broken --yes
+  refused "broken does not pass the exec/1 checks (above)"
+  out_has "FAIL R01"
+  check "no link after failed checks" [ ! -L "$CONF/port/exec" ]
+  run swap exec box --yes
+  rc_is 0
+  out_has "exec: std -> box 0.1.0 ("
+  out_has "checks: passed (exec/1, 7 checks) · it runs with your rights and runs every shell call"
+  out_has "a program that hands commands to a daemon (a box, ssh) takes them out of henki's kill and sweep"
+  out_has "bash has bin/sh: henki runs its own bash for shell calls, but the model can call bash's by name"
+  check "the link to the store copy's port/exec" [ "$(readlink "$CONF/port/exec")" = "$(readlink "$CONF/ext/box")/port/exec" ]
+  check "a bind/1 line for exec" [ "$(tail -n 1 "$CONF/mods.lock" | cut -f 1-3)" = "$(printf 'bind/1\texec\tbox')" ]
+  run list
+  out_has "exec: box 0.1.0 (bound)"
+  run verify
+  rc_is 0
+  run rm box
+  refused "box holds the exec binding; fix: henki-mods swap exec std"
+  run swap exec std
+  rc_is 0
+  check "std: no link" [ ! -L "$CONF/port/exec" ]
 }
 
 # A stub model server for the eval checks in D, a small agent: a message holding `CALL: CMD` gets a shell call of CMD
@@ -1846,6 +1914,7 @@ all() {
   t_ports
   t_port_toy
   t_policy
+  t_exec
   t_eval
 }
 

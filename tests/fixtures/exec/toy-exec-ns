@@ -1,0 +1,4 @@
+#!/bin/sh
+# toy-exec-ns: an exec/1 binding that runs its arguments in new user and pid namespaces (Linux, unprivileged): the
+# command runs as pid 1's child there, and every process of the namespace ends with it.
+exec unshare -Ur --pid --fork --kill-child -- "$@"

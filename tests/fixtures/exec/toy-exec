@@ -1,0 +1,7 @@
+#!/bin/sh
+# toy-exec: an exec/1 binding that runs its arguments as they are, as std does. It first appends them to
+# $HENKI_TOY_LOG (when set): each followed by a unit separator (0x1F), the call ended by a newline.
+if [ -n "${HENKI_TOY_LOG:-}" ]; then
+  { printf '%s\037' "$@"; printf '\n'; } >>"$HENKI_TOY_LOG"
+fi
+exec "$@"

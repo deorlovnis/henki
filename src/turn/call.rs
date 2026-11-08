@@ -3,7 +3,7 @@
 use super::{CALL_MAX_S, LATE, SLICE, Session, approve::DENIED};
 use crate::{allow, files, journal, journal::rec, port::Decision, supervise, supervise::GRACE, sys, term, tools, tools::Killed, tools::Target, types::*};
 use serde_json::json;
-use std::{path::PathBuf, time::Duration, time::Instant};
+use std::{ffi::OsStr, path::PathBuf, time::Duration, time::Instant};
 
 /// Why a policy binding's allow was asked instead.
 const FLOOR: &str = "asked: the call touches henki's own files";
@@ -120,7 +120,8 @@ impl Session {
             files::start(c.clone(), t, cap, tag, &self.tx);
         } else {
             let spill = journal::spill(&self.cfg.state, &self.sid, &mut self.spill_n, &self.cfg.home);
-            let argv = [self.cfg.bash.as_os_str(), "--noprofile".as_ref(), "--norc".as_ref(), "-c".as_ref(), cmd.as_ref()];
+            // An exec binding's program goes first. BASH is the stamped one: a module's bin/bash never takes the call.
+            let argv: Vec<&OsStr> = self.cfg.exec.iter().chain([&self.cfg.bash]).map(|p| p.as_os_str()).chain(["--noprofile", "--norc", "-c", cmd].map(OsStr::new)).collect();
             match supervise::spawn(&argv, &self.cfg.cwd, &self.env, cap, spill, tag, &self.tx) {
                 Ok(p) => pgid = Some(p),
                 Err(e) => return self.answer(c, &tools::not_started(&e), true, None, None),

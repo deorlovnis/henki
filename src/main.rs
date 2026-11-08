@@ -92,7 +92,7 @@ fn parse(a: &mut Args) -> Result<Option<String>, lexopt::Error> {
         }
         Some(Value(v)) if v == "port" => {
             let name = p.value()?.string()?;
-            let port = port::LINKED.into_iter().find(|k| *k == name).ok_or(format!("henki port takes {}, not {name}", port::LINKED.join(" or ")))?;
+            let port = port::LINKED[..2].iter().find(|k| **k == name).copied().ok_or(format!("henki port takes {}, not {name}", port::LINKED[..2].join(" or ")))?;
             let (mut offer, mut exe) = (Vec::new(), None);
             while let Some(arg) = p.next()? {
                 match arg {

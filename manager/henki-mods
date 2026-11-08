@@ -41,11 +41,12 @@ nl='
 # ext::prompt's header line; henki joins it to the rest of the system prompt with a blank line ("\n\n").
 HEADER='Extensions are commands on PATH; read the doc in brackets before first use.'
 # The named formats this henki ships (CONTRACTS.md); a module's `contracts` must all be here.
-CONTRACTS_KNOWN='journal/1 json/1 wire/1 ext/1 ext/2 handoff/1 observe/1 module/1 lock/1 hd1 port/1 history/1 policy/1 conform/1 bind/1 eval/1'
+CONTRACTS_KNOWN='journal/1 json/1 wire/1 ext/1 ext/2 handoff/1 observe/1 module/1 lock/1 hd1 port/1 history/1 policy/1 exec/1 conform/1 bind/1 eval/1'
 # The ports a package may bind (henki's port::LINKED), and what each one gets to see, for the swap screen.
-PORTS_KNOWN='history policy'
+PORTS_KNOWN='history policy exec'
 PORT_SEES_history='stores every session record'
 PORT_SEES_policy='decides every call before it runs; protected paths stay refused'
+PORT_SEES_exec='runs every shell call'
 AGENTS_MAX=4096 # henki refuses to start with a bigger AGENTS.md
 CARDS_BEGIN='# >>> mods cards'
 CARDS_END='# <<< mods cards'
@@ -1773,13 +1774,98 @@ EOF
   [ -z "$C_fail" ]
 }
 
+# exec/1's checks R01 to R07 against PROGRAM (CONTRACTS.md exec/1): each runs `PROGRAM BASH --noprofile --norc -c CMD`,
+# BASH the first bash on PATH as henki finds it, in a scratch project dir, stdin /dev/null, stdout and stderr to one file,
+# in a process group of its own: job control (`set -m`) gives each job one, as bash 3.2 has no other way and macOS no
+# setsid command. Leftovers are found by a marker in their command line (`ps -axo`). "ok X0N" or "FAIL X0N: WHY" per
+# check, "warn R07" for an environment that does not arrive (a warning only), then "exec/1: 7 checks, N passed"; exit
+# 1 on a failure. Runs in a subshell, so job control and the trap stay there.
+exec_run() { # PROGRAM
+  local bash_abs
+  bash_abs=$(path_lookup bash) || die "bash is not on PATH; fix: install bash, or add its directory to PATH"
+  (
+    prog=$1 fails=0 linux=0 mark=henki-exec-check-$$-$RANDOM
+    [ "$(uname -s)" != Linux ] || linux=1
+    work=$(mktemp -d "${TMPDIR:-/tmp}/henki-exec.XXXXXX") && work=$(cd -P "$work" && pwd) && mkdir "$work/proj" ||
+      die "cannot make a scratch dir; fix: check TMPDIR"
+    left() { ps -axo pid=,pgid=,command= 2>/dev/null | MARK=$mark awk 'index($0, ENVIRON["MARK"]) && !/awk/'; }
+    trap 'for p in $(left | awk "{ print \$1 }"); do kill -9 "$p" 2>/dev/null; done; rm -rf "$work"' EXIT
+    exec 9>&2 2>/dev/null # the shell's job notices ("Terminated") stay out of the report
+    set -m
+    verdict() { # ID OK DETAIL
+      if [ "$2" = 1 ]; then say "ok $1"; elif [ "$1" = R07 ]; then say "warn $1: $3"; else fails=$((fails + 1)) && say "FAIL $1: $3"; fi
+    }
+    start() { # CMD [ARGS]: in the background, its own group; pid = its pgid
+      local c=$1
+      shift
+      (cd "$work/proj" && exec "$prog" "$bash_abs" --noprofile --norc -c "$c" "$@") </dev/null >"$work/out" 2>&1 &
+      pid=$!
+    }
+    finish() { # TICKS of 50 ms: st = its status, or 1 when it still runs
+      local n=0
+      while kill -0 "$pid" 2>/dev/null; do
+        case $(ps -o stat= -p "$pid" 2>/dev/null) in Z*) break ;; esac
+        [ "$n" -lt "$1" ] || return 1
+        sleep 0.05
+        n=$((n + 1))
+      done
+      wait "$pid" 2>/dev/null
+      st=$?
+    }
+    run() { # TICKS CMD [ARGS]: out, st (timeout: the group killed)
+      local t=$1
+      shift
+      start "$@"
+      finish "$t" || { kill -9 "-$pid" 2>/dev/null; wait "$pid" 2>/dev/null; st=timeout; }
+      out=$(cat "$work/out")
+    }
+    run 200 'echo ok'
+    verdict R01 "$([ "$st" = 0 ] && [ "$out" = ok ] && echo 1)" "exit $st, output: $out (want ok, exit 0)"
+    run 200 'exit 7'
+    verdict R02 "$([ "$st" = 7 ] && echo 1)" "exit $st (want 7), output: $out"
+    run 200 'printf "%s|" "$@"' _ 'a b' '' 'c"d'
+    verdict R03 "$([ "$st" = 0 ] && [ "$out" = 'a b||c"d|' ] && echo 1)" "the arguments arrived as [$out], exit $st (want [a b||c\"d|])"
+    run 40 'cat; echo end'
+    verdict R04 "$([ "$st" = 0 ] && [ "$out" = end ] && echo 1)" "stdin is not at EOF: exit $st within 2 s, output: $out"
+    run 200 'echo to-out; echo to-err >&2'
+    case $out in *to-out*to-err* | *to-err*to-out*) x=1 ;; *) x= ;; esac
+    verdict R05 "$x" "stdout and stderr do not both arrive: $out"
+    # R06: a SIGTERM to the group ends `sleep 30` within 1 s; after a SIGKILL to the group (Linux: also every process
+    # of its session) no process of the run is left within 1 s. The run leaves a background job and waits in a
+    # foreground one, both named by the marker.
+    start 'sleep 30'
+    sleep 0.5
+    kill -TERM "-$pid" 2>/dev/null
+    if finish 20; then why= x=1; else why="SIGTERM: still running after 1 s; " x=; kill -9 "-$pid" 2>/dev/null; wait "$pid" 2>/dev/null; fi
+    start "(exec -a $mark-bg sleep 300) & exec -a $mark-fg sleep 301"
+    sleep 0.5
+    n=$(ps -axo command= 2>/dev/null | MARK=$mark awk '$1 == ENVIRON["MARK"] "-bg" || $1 == ENVIRON["MARK"] "-fg"' | wc -l | tr -d ' ')
+    members=
+    [ "$linux" = 0 ] || members=$(ps -eo pid=,sid= | SID=$pid awk '$2 == ENVIRON["SID"] { print $1 }')
+    kill -9 "-$pid" 2>/dev/null
+    for p in $members; do kill -9 "$p" 2>/dev/null; done
+    i=0
+    while [ -n "$(left)" ] && [ "$i" -lt 20 ]; do sleep 0.05 && i=$((i + 1)); done
+    wait "$pid" 2>/dev/null
+    rest=$(left | tr '\n' ';')
+    if [ "$n" -lt 2 ]; then why="${why}SIGKILL: $n of the run's 2 processes started" x=; elif [ -n "$rest" ]; then why="${why}SIGKILL: left after 1 s: $rest" x=; fi
+    verdict R06 "$x" "$why"
+    export HENKI_CONFORM=1
+    run 200 'printf %s "${HENKI_CONFORM-unset}"'
+    unset HENKI_CONFORM
+    verdict R07 "$([ "$out" = 1 ] && echo 1)" "HENKI_CONFORM=1 did not arrive (got [$out])"
+    say "exec/1: 7 checks, $((7 - fails)) passed"
+    exit "$fails"
+  )
+}
+
 # test --port PORT NAME|std|/PROGRAM: the suite of PORT against module NAME's port/PORT (its store copy), a program
-# by path (while writing one), or std.
+# by path (while writing one), or std. exec has fixed checks, not a suite.
 cmd_test() {
   local port="${2:-}" what="${3:-}" exe h
   [ "${1:-}" = --port ] && [ $# = 3 ] || usage
   case " $PORTS_KNOWN " in *" $port "*) ;; *) die "$port is not a port this henki binds ($PORTS_KNOWN); fix: name one of them" ;; esac
-  C_suite="$(conform_dir)/$port.tsv" || die "no conformance suites found; fix: reinstall henki"
+  [ "$port" = exec ] || C_suite="$(conform_dir)/$port.tsv" || die "no conformance suites found; fix: reinstall henki"
   case "$what" in
     std) say "std passes this suite in henki's own tests" && return 0 ;;
     /*) exe=$what ;;
@@ -1790,6 +1876,10 @@ cmd_test() {
       ;;
   esac
   [ -f "$exe" ] && [ -x "$exe" ] || die "$exe is not a program; fix: name a module with port/$port"
+  if [ "$port" = exec ]; then
+    exec_run "$exe" || exit 1
+    return 0
+  fi
   h=$(henki_bin) || exit 1 # its die ends only the command substitution
   conform_run "$port" "$exe" "$h" || exit 1
 }
@@ -1797,7 +1887,7 @@ cmd_test() {
 # swap PORT NAME|std [--yes]: binds henki's PORT to module NAME's port/PORT (its store copy, after the suite passes and
 # the person says yes), or back to std, which always works: the link CONFIG/port/PORT and the bind/1 line.
 cmd_swap() {
-  local port="${1:-}" n="${2:-}" yes=0 a store exe was tty answer how id h
+  local port="${1:-}" n="${2:-}" yes=0 a store exe was tty answer how id h what
   [ $# -ge 2 ] || usage
   for a in "${3:-}" "${4:-}"; do case "$a" in '') ;; --yes | -y) yes=1 ;; *) usage ;; esac; done
   case " $PORTS_KNOWN " in *" $port "*) ;; *) die "$port is not a port this henki binds ($PORTS_KNOWN); fix: name one of them" ;; esac
@@ -1819,16 +1909,26 @@ cmd_swap() {
   inspect "$store" "$n" 0 || die "$n: $ERR"
   [ "$I_hd1" = "$L_hd1" ] || die "the store copy $store does not match the lock (it changed); fix: henki-mods rm $n and add it again"
   printf '%s\n' "$M_ports" | command grep -qx "$port" || die "$n's manifest does not list $port in ports; fix: swap to a module that declares it"
-  C_suite="$(conform_dir)/$port.tsv" || die "no conformance suites found; fix: reinstall henki"
-  h=$(henki_bin) || exit 1
-  conform_run "$port" "$exe" "$h" >"$STAGE/conform" || {
-    cat "$STAGE/conform"
-    die "$n does not pass the $port/1 suite (above); fix: ask its author, or keep std"
-  }
+  if [ "$port" = exec ]; then
+    exec_run "$exe" >"$STAGE/conform" || {
+      cat "$STAGE/conform"
+      die "$n does not pass the exec/1 checks (above); fix: ask its author, or keep std"
+    }
+    C_checks=7 what=checks
+  else
+    C_suite="$(conform_dir)/$port.tsv" || die "no conformance suites found; fix: reinstall henki"
+    h=$(henki_bin) || exit 1
+    conform_run "$port" "$exe" "$h" >"$STAGE/conform" || {
+      cat "$STAGE/conform"
+      die "$n does not pass the $port/1 suite (above); fix: ask its author, or keep std"
+    }
+    what=conformance
+  fi
   was=std
   ! bind_get "$port" || was="$B_name $B_id"
   id=${store##*/}
-  say "$port: $was -> $n ${L_version} ($id) · conformance: passed ($port/1, $C_checks checks) · it runs with your rights and $(eval "printf '%s' \"\$PORT_SEES_$port\"")"
+  say "$port: $was -> $n ${L_version} ($id) · $what: passed ($port/1, $C_checks checks) · it runs with your rights and $(eval "printf '%s' \"\$PORT_SEES_$port\"")"
+  [ "$port" != exec ] || exec_screen
   [ "$port" != history ] || say "  your sessions in the std store stay there; henki --port history=std --resume reaches them; import comes with a later henki"
   [ "$port" != policy ] || [ "$(toml approve <"$CONF/config.toml" 2>/dev/null)" != "approve${tab}S${tab}auto" ] ||
     say "  henki refuses approve = auto with a policy binding; set approve = \"ask\" in $(shown "$CONF/config.toml")"
@@ -1848,6 +1948,18 @@ cmd_swap() {
   lock_write bind/1 "$port" "$(printf 'bind/1\t%s\t%s\t%s\t%s\t%s' "$port" "$n" "$id" "$(date -u +%Y-%m-%dT%H:%MZ)" "$how")"
   say "$port: $n $id"
   restart
+}
+
+# The swap screen's lines for an exec binding: what it takes out of henki's reach, and a module's bin/bash or bin/sh,
+# which the model can still call by name (henki gives the program its own bash, never one of those).
+exec_screen() {
+  local m b
+  say "  a program that hands commands to a daemon (a box, ssh) takes them out of henki's kill and sweep"
+  for m in $(lock_names_on); do
+    for b in bash sh; do
+      [ ! -e "$EXT/$m/bin/$b" ] || say "  $(red "$m has bin/$b"): henki runs its own bash for shell calls, but the model can call $m's by name"
+    done
+  done
 }
 
 # The ports linked into NAME's store copies, one per line (rm refuses while there is one).

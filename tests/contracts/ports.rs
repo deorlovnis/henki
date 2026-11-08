@@ -34,13 +34,15 @@ fn refused(d: &Done, says: &str, what: &str) {
 }
 
 /// The six ports: `--port NAME=std` takes each (and no other name); only the ones port/1 says this henki binds may be
-/// linked in `CONFIG/port/` or run through `henki port`.
+/// linked in `CONFIG/port/`, and of those only the ones that speak port/1 run through `henki port`.
 #[test]
 fn contracts_port_names() {
     let d = flat("port/1");
     let six = ticked(d.split(". Each").next().unwrap());
     let bound = ticked(d.split("This henki binds ").nth(1).unwrap().split(" that way").next().unwrap());
-    assert_eq!((six.len(), bound.len()), (6, 2), "{six:?} {bound:?}");
+    let own = ticked(d.split("links say. ").nth(1).unwrap().split(" speaks no protocol").next().unwrap());
+    assert_eq!((six.len(), bound.len(), own.as_slice()), (6, 3, &["exec".to_string()][..]), "{six:?} {bound:?} {own:?}");
+    assert!(flat("exec/1").contains("`henki port` does not take `exec`"));
     for p in &six {
         let m = Mock::start(vec![say("ok")]);
         let d = Run::new(&m.url()).cmd(&["--json", "--port", &format!("{p}=std"), "x"]).go();
@@ -49,20 +51,27 @@ fn contracts_port_names() {
     }
     refused(&Run::new("http://127.0.0.1:9/v1").cmd(&["--json", "--port", "tools=std", "x"]).go(), "--port takes PORT=std", "--port tools=std");
     for p in &six {
-        // A binding that exits at once: a port henki binds fails at its hello, any other at the link rule.
-        let r = Run::new("http://127.0.0.1:9/v1");
+        // A binding that exits at once: a port/1 port henki binds fails at its hello, exec runs (no call starts it), any
+        // other fails at the link rule.
+        let m = Mock::start(vec![say("ok")]);
+        let r = Run::new(&m.url());
         let prog = r.config_dir().join("bindings/exits");
         file(&prog, "#!/bin/sh\nexit 0\n", 0o700);
         fs::set_permissions(prog.parent().unwrap(), fs::Permissions::from_mode(0o700)).unwrap();
         fs::create_dir_all(r.config_dir().join("port")).unwrap();
         std::os::unix::fs::symlink(&prog, r.config_dir().join("port").join(p)).unwrap();
         let d = r.json("x");
-        let says = if bound.contains(p) { format!("{p} binding") } else { "this henki cannot bind that port".into() };
-        refused(&d, &says, &format!("a link for {p}"));
+        if own.contains(p) {
+            d.finish();
+            assert_eq!(d.code, Some(0), "a link for {p}\n{}", d.diag());
+        } else {
+            let says = if bound.contains(p) { format!("{p} binding") } else { "this henki cannot bind that port".into() };
+            refused(&d, &says, &format!("a link for {p}"));
+        }
         let out =
             Command::new(env!("CARGO_BIN_EXE_henki")).args(["port", p, "--", "/bin/true"]).env_clear().env("HOME", "/nonexistent").env("PATH", "/usr/bin:/bin").output().unwrap();
         let line = format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
-        assert_eq!(line.contains("henki port takes"), !bound.contains(p), "henki port {p}: {line}");
+        assert_eq!(line.contains("henki port takes"), !bound.contains(p) || own.contains(p), "henki port {p}: {line}");
     }
 }
 
@@ -106,4 +115,36 @@ fn contracts_ext2_names_and_observers() {
             refused(&d, &format!("more than {max} observers"), &format!("{n} observers"));
         }
     }
+}
+
+/// exec/1: the argv henki runs a shell call with (BASH by its absolute path, the first `bash` on the user PATH), and
+/// the start notice, as the section gives them.
+#[test]
+fn contracts_exec_argv() {
+    let sec = section(&text(), "exec/1");
+    let shape: Vec<&str> = sec.lines().find(|l| l.trim_start().starts_with("PROGRAM BASH")).unwrap().split_whitespace().collect();
+    let notice = flat("exec/1").split("a notice at start (`").nth(1).unwrap().split("`)").next().unwrap().to_string();
+    let m = Mock::start(vec![shell("echo pinned"), say("ok")]);
+    let r = Run::new(&m.url());
+    let (prog, log) = (r.dir.join("bindings/exec"), r.dir.join("argv"));
+    file(&prog, &format!("#!/bin/sh\nprintf '%s\\n' \"$0\" \"$@\" >{}\nexec \"$@\"\n", log.display()), 0o700);
+    fs::set_permissions(prog.parent().unwrap(), fs::Permissions::from_mode(0o700)).unwrap();
+    fs::create_dir_all(r.config_dir().join("port")).unwrap();
+    std::os::unix::fs::symlink(&prog, r.config_dir().join("port/exec")).unwrap();
+    let d = r.json("x");
+    d.finish();
+    assert_eq!(d.code, Some(0), "{}", d.diag());
+    let bash = ["/usr/local/bin/bash", "/usr/bin/bash", "/bin/bash"].into_iter().find(|b| Path::new(b).is_file()).unwrap();
+    let p = prog.display().to_string();
+    let want: Vec<&str> = shape
+        .iter()
+        .map(|w| match *w {
+            "PROGRAM" => p.as_str(),
+            "BASH" => bash,
+            "COMMAND" => "echo pinned",
+            w => w,
+        })
+        .collect();
+    assert_eq!(fs::read_to_string(&log).unwrap().lines().collect::<Vec<_>>(), want);
+    assert!(d.notices().contains(&notice.replace("NAME ID", &p)), "{notice}\n{}", d.diag());
 }

@@ -72,6 +72,7 @@ pub struct Config {
     pub notices: Vec<String>,
     /// The port bindings `CONFIG/port/` links (`port::links`): (port, the program's realpath, its display name).
     pub links: Vec<(&'static str, PathBuf, String)>,
+    pub exec: Option<PathBuf>, // the exec/1 binding's program (`port::bind`), put in front of every shell call
 }
 
 /// The HENKI_* variables henki reads or sets for its children; any other gives a notice.
