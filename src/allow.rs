@@ -1,6 +1,6 @@
 //! Allow rules: the user's standing approvals for exact shell commands in one project root, kept in a plain text file
 //! the user can read, edit and empty.
-use crate::{sys, term};
+use crate::{config::Config, port::Decision, port::Policy, sys, term, tools, tools::Target, types::Call};
 use std::{fs, fs::File, fs::TryLockError, io, io::Read, io::Write, os::unix::fs::MetadataExt, os::unix::fs::OpenOptionsExt, path::Path, path::PathBuf};
 
 #[derive(Clone, Debug, PartialEq)]
@@ -72,6 +72,30 @@ impl Allow {
         let n = numbered(&b).count() + 1;
         self.rules.push(Rule { n, root: root.into(), cmd: cmd.into() });
         Ok(n)
+    }
+}
+
+/// The std policy binding: `auto` allows every call; `ask` asks for shell, write and edit and for reads outside the
+/// project (`tools::needs_approval`), unless an allow rule for the root holds the exact command; `always` saves one.
+pub struct Std;
+
+impl Policy for Std {
+    fn decide(&mut self, c: &Call, t: Option<&Target>, cfg: &Config, session: &str) -> Decision {
+        let cmd = c.args["command"].as_str().filter(|_| c.name == "shell");
+        if !tools::needs_approval(&c.name, t, cfg, session) {
+            return Decision::Allow { verdict: "auto", rule: None, line: None };
+        }
+        let Some(r) = cmd.and_then(|cmd| cfg.allow.find(cmd, &cfg.root)) else { return Decision::Ask { always: cmd.is_some_and(|cmd| fits(cmd, &cfg.root)) } };
+        let line = format!("$ {}  (allowed by rule {} for {}, {})", r.cmd, r.n, shown(Path::new(&r.root), &cfg.home), shown(&cfg.allow.file, &cfg.home));
+        Decision::Allow { verdict: "rule", rule: Some(r.n), line: Some(line) }
+    }
+
+    fn record(&mut self, c: &Call, cfg: &mut Config) -> Result<(String, Option<usize>), String> {
+        let (root, file) = (shown(&cfg.root, &cfg.home), shown(&cfg.allow.file, &cfg.home));
+        match cfg.allow.append(&cfg.root, c.args["command"].as_str().unwrap_or_default()) {
+            Ok(n) => Ok((format!("added to {file} as rule {n} for {root}; /allow lists and removes rules"), Some(n))),
+            Err(e) => Err(format!("could not write {file}: {e}")),
+        }
     }
 }
 

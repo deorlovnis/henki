@@ -7,22 +7,22 @@ pub const DENIED: &str = "denied by the user";
 
 impl Session {
     /// Shows `c`, asks until there is an answer, journals `ask` before and `approval` after; true to run the call.
-    /// INT and QUIT are a no; EOF, TERM, HUP and a closed stdout end the turn; a tripwire found before an append ends it
-    /// `Error changed`.
-    pub(super) fn ask(&mut self, c: &Call, t: Option<&Target>) -> Result<bool, Outcome> {
+    /// `always`: the policy can save a rule for it. INT and QUIT are a no; EOF, TERM, HUP and a closed stdout end the
+    /// turn; a tripwire found before the policy records a rule ends it `Error changed`.
+    pub(super) fn ask(&mut self, c: &Call, t: Option<&Target>, always: bool) -> Result<bool, Outcome> {
         self.record(rec::ask(c, t.map(|t| t.shown.as_str())))?;
         let (shell, cmd) = (c.name == "shell", c.args["command"].as_str().unwrap_or_default());
         // A rule saves an exact command; none while a process started earlier still runs, since it may be what the
         // command talks to.
         let bg = supervise::reap();
-        let offer = shell && bg == 0 && allow::fits(cmd, &self.cfg.root);
+        let offer = always && bg == 0;
         let ((rows, cols), lines) = (sys::winsize(0).unwrap_or((24, 80)), tools::display(c, t));
         self.out.control(term::RESET);
         lines.iter().for_each(|l| self.out.line(l));
         let n = term::rows(&lines, usize::from(cols)) + 1;
         (n > usize::from(rows)).then(|| self.out.line(&format!("{} rows: taller than the screen; scroll up or answer n", term::num(n as u64))));
         (shell && bg > 0).then(|| self.notice(&format!("{} background processes still run; always is off until they end", term::num(bg as u64)))).transpose()?;
-        let (root, file) = (allow::shown(&self.cfg.root, &self.cfg.home), allow::shown(&self.cfg.allow.file, &self.cfg.home));
+        let root = allow::shown(&self.cfg.root, &self.cfg.home);
         loop {
             match self.typed(if offer { "run? [y/N/always] " } else { "run? [y/N] " })?.as_str() {
                 "y" | "yes" => return self.verdict(c, "yes", None),
@@ -34,14 +34,14 @@ impl Session {
                         continue;
                     }
                     self.tripwire()?;
-                    match self.cfg.allow.append(&self.cfg.root, cmd) {
-                        Ok(n) => {
+                    match self.ports.policy.record(c, &mut self.cfg) {
+                        Ok((line, n)) => {
                             self.rearm();
-                            self.out.line(&format!("added to {file} as rule {n} for {root}; /allow lists and removes rules"));
-                            return self.verdict(c, "always", Some(n));
+                            self.out.line(&line);
+                            return self.verdict(c, "always", n);
                         }
                         Err(e) => {
-                            self.out.note(&format!("could not write {file}: {e}; ran once"));
+                            self.out.note(&format!("{e}; ran once"));
                             return self.verdict(c, "yes", None);
                         }
                     }

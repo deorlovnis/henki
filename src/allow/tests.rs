@@ -377,3 +377,43 @@ fn allow_hash() {
     assert_eq!(load(&f, false).unwrap().hash, None);
     assert_eq!(load(&t.p("none"), true).unwrap().hash, None);
 }
+
+/// The std policy: auto allows everything; ask allows a call that needs no approval and a shell command an allow rule
+/// holds (with the rule's line), and asks for the rest, offering `always` only for a command a rule can hold.
+#[test]
+fn std_decide_table() {
+    let t = T::new();
+    let mut cfg = Config::test(&t.0);
+    cfg.allow.rules = vec![r(1, "*", "ls"), r(2, "/elsewhere", "make")];
+    let call = |name: &str, args: serde_json::Value| Call { id: "h1".into(), name: name.into(), args, ..Default::default() };
+    let shown = |d: Decision| match d {
+        Decision::Allow { verdict, rule, line } => format!("{verdict} {rule:?} {line:?}"),
+        Decision::Ask { always } => format!("ask {always}"),
+    };
+    let decide = |cfg: &Config, c: &Call| shown(Std.decide(c, None, cfg, "s"));
+    let ls = r#"rule Some(1) Some("$ ls  (allowed by rule 1 for *, ~/allow)")"#;
+    assert_eq!(decide(&cfg, &call("shell", serde_json::json!({"command": "ls"}))), ls);
+    assert_eq!(decide(&cfg, &call("shell", serde_json::json!({"command": "make"}))), "ask true");
+    assert_eq!(decide(&cfg, &call("shell", serde_json::json!({"command": "a\tb"}))), "ask false");
+    assert_eq!(decide(&cfg, &call("shell", serde_json::json!({"command": "x".repeat(201)}))), "ask false");
+    assert_eq!(decide(&cfg, &call("write", serde_json::json!({"path": "ls", "content": ""}))), "ask false");
+    assert_eq!(decide(&cfg, &call("read", serde_json::json!({"path": "/etc/passwd"}))), "ask false");
+    cfg.auto = true;
+    for (name, args) in [("shell", serde_json::json!({"command": "make"})), ("write", serde_json::json!({"path": "x", "content": ""}))] {
+        assert_eq!(decide(&cfg, &call(name, args)), "auto None None");
+    }
+}
+
+/// `always` through the std policy: the rule appended to the allow file, its number, and today's line; a file that
+/// cannot be written is the reason, and nothing is kept.
+#[test]
+fn std_record() {
+    let t = T::new();
+    let mut cfg = Config::test(&t.0);
+    let c = Call { id: "h1".into(), name: "shell".into(), args: serde_json::json!({"command": "make test"}), ..Default::default() };
+    let line = "added to ~/allow as rule 1 for ~; /allow lists and removes rules";
+    assert_eq!(Std.record(&c, &mut cfg), Ok((line.to_string(), Some(1))));
+    assert_eq!(load(&t.p("allow"), true).unwrap().rules, [Rule { n: 1, root: t.0.to_string_lossy().into(), cmd: "make test".into() }]);
+    cfg.allow.file = t.p("missing/allow");
+    assert_eq!(Std.record(&c, &mut cfg), Err("could not write ~/missing/allow: No such file or directory (os error 2)".to_string()));
+}

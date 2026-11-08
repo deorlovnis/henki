@@ -1,9 +1,9 @@
 //! The ports: the parts without which there is no agent. Each always has a binding, the std one built in to start
-//! with. The kernel calls `history` through its trait and checks every answer the same way, whoever gave it; the other
-//! ports keep their typed seams (model: `types::Wire`; context: `Session::elide`; exec: `supervise::spawn` and
-//! `files::start`; policy: `tools::needs_approval` and the allow rules; frontend: `repl::run` and the headless branch of
-//! `main::run`). A trait mirrors its protocol's method set, one method each, and only henki implements it.
-use crate::types::Outcome;
+//! with. The kernel calls `history` and `policy` through these traits and checks every answer the same way, whoever
+//! gave it; the other four ports keep their typed seams (model: `types::Wire`; context: `Session::elide`; exec:
+//! `supervise::spawn` and `files::start`; frontend: `repl::run` and the headless branch of `main::run`). Each trait
+//! mirrors its protocol's method set, one method each, and only henki implements them.
+use crate::{config::Config, tools::Target, types::Call, types::Outcome};
 use serde_json::Value;
 use std::path::Path;
 
@@ -61,7 +61,25 @@ pub trait History {
     fn discard(&mut self, session: &str) -> Result<bool, PortError>;
 }
 
+/// The policy port's answer for one call.
+pub enum Decision {
+    /// Runs without a question: the journal verdict (`auto`, `rule`), the rule's number, and the line shown in place of
+    /// the call's head (None: the head, as for auto).
+    Allow { verdict: &'static str, rule: Option<usize>, line: Option<String> },
+    /// The person decides (`run`: the turn ends needs_approval); `always`: a saved rule may be offered.
+    Ask { always: bool },
+}
+
+/// `policy/1`: who may run a call. Asked after the kernel's floor: validation, the target and its protected-write
+/// refusal, the tripwire.
+pub trait Policy {
+    fn decide(&mut self, c: &Call, t: Option<&Target>, cfg: &Config, session: &str) -> Decision;
+    /// The person confirmed `always` for `c`: Ok((the line shown, the rule's number)); Err: why nothing was kept.
+    fn record(&mut self, c: &Call, cfg: &mut Config) -> Result<(String, Option<usize>), String>;
+}
+
 /// The bindings of one session.
 pub struct Ports {
     pub history: Box<dyn History>,
+    pub policy: Box<dyn Policy>,
 }

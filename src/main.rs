@@ -194,7 +194,7 @@ fn start(a: Args, tx: &Sender<Ev>, rx: &Receiver<Ev>, t0: Instant, early: io::Re
     if deadline.is_some_and(|d| Instant::now() >= d) {
         return Err(Outcome::Budget);
     }
-    let mut ports = Ports { history: Box::new(Journal::new(&cfg.state)) };
+    let mut ports = Ports { history: Box::new(Journal::new(&cfg.state)), policy: Box::new(allow::Std) };
     let (sid, hist, mut head, notices) = journal::start(ports.history.as_mut(), &a.resume, &cfg)?;
     cfg.notices.extend(notices);
     head.push(journal::put(ports.history.as_mut(), &sid, rec::session(&cfg, &sid, &cfg.cwd, a.resume.is_some()))?);

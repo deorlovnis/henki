@@ -1,8 +1,8 @@
 //! The calls of a step: ids and validation, who approves each (auto, an allow rule, the user), one call with its timeout
 //! and escalation, its result, the stuck rule and the kill path.
 use super::{CALL_MAX_S, LATE, SLICE, Session, approve::DENIED};
-use crate::{allow, files, journal, journal::rec, supervise, supervise::GRACE, sys, term, tools, tools::Killed, tools::Target, types::*};
-use std::{path::Path, time::Duration, time::Instant};
+use crate::{files, journal, journal::rec, port::Decision, supervise, supervise::GRACE, sys, term, tools, tools::Killed, tools::Target, types::*};
+use std::{time::Duration, time::Instant};
 
 /// A call extends the run when it repeats the previous call (name and arguments) and both failed; another failure
 /// starts a run of 1, a success ends it. Identical successes never count.
@@ -35,9 +35,9 @@ impl Session {
         calls
     }
 
-    /// One call of the step and its result: its error; else the tripwire, then who approves it (nobody needs to, an allow
-    /// rule for the project root, or the user: `run` ends the turn, the REPL asks), the tripwire right before the run,
-    /// the run, and the tripwire again.
+    /// One call of the step and its result: its error; else the tripwire, then who approves it (the policy binding
+    /// allows it, or the user decides: `run` ends the turn, the REPL asks), the tripwire right before the run, the run,
+    /// and the tripwire again.
     pub(super) fn dispatch(&mut self, c: &Call) -> Result<(), Outcome> {
         if let Some(e) = &c.error {
             return self.answer(c, e, true, None, None);
@@ -48,22 +48,22 @@ impl Session {
             t => t.and_then(Result::ok),
         };
         self.tripwire()?;
-        let rule = c.args["command"].as_str().filter(|_| c.name == "shell").and_then(|cmd| self.cfg.allow.find(cmd, &self.cfg.root)).cloned();
-        if !tools::needs_approval(&c.name, t.as_ref(), &self.cfg, &self.sid) {
-            self.record(rec::approval(&c.id, "auto", None))?;
-        } else if let Some(r) = &rule {
-            let (home, file) = (&self.cfg.home, &self.cfg.allow.file);
-            self.out.line(&format!("$ {}  (allowed by rule {} for {}, {})", r.cmd, r.n, allow::shown(Path::new(&r.root), home), allow::shown(file, home)));
-            self.record(rec::approval(&c.id, "rule", Some(r.n)))?;
-        } else if self.reader.is_none() {
-            self.record(rec::ask(c, t.as_ref().map(|t| t.shown.as_str())))?;
-            return Err(Outcome::NeedsApproval(c.clone()));
-        } else if !self.ask(c, t.as_ref())? {
-            return self.answer(c, DENIED, true, None, None);
-        }
+        let head = match self.ports.policy.decide(c, t.as_ref(), &self.cfg, &self.sid) {
+            Decision::Allow { verdict, rule, line } => {
+                line.iter().for_each(|l| self.out.line(l));
+                self.record(rec::approval(&c.id, verdict, rule))?;
+                line.is_none()
+            }
+            Decision::Ask { .. } if self.reader.is_none() => {
+                self.record(rec::ask(c, t.as_ref().map(|t| t.shown.as_str())))?;
+                return Err(Outcome::NeedsApproval(c.clone()));
+            }
+            Decision::Ask { always } if self.ask(c, t.as_ref(), always)? => true,
+            Decision::Ask { .. } => return self.answer(c, DENIED, true, None, None),
+        };
         // Again right before the call starts: the question can wait for as long as the user takes.
         self.tripwire()?;
-        self.call(c, t, rule.is_none())?;
+        self.call(c, t, head)?;
         self.tripwire()
     }
 
