@@ -272,20 +272,16 @@ pub fn tree(ps: &[Proc], root: impl Fn(&Proc) -> bool) -> Vec<i32> {
 pub fn exited(pid: i32) -> bool {
     // SAFETY: an all-zero siginfo_t is a valid out value; waitid writes only into it.
     let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
-    if pid <= 0 {
-        return false;
-    }
-    loop {
-        // SAFETY: P_PID with a positive pid names one child; the pointer is to the live local above.
-        if unsafe { libc::waitid(libc::P_PID, pid as libc::id_t, &mut info, libc::WEXITED | libc::WNOWAIT) } == 0 {
-            return true;
+    pid > 0
+        && loop {
+            // SAFETY: P_PID with a positive pid names one child; the pointer is to the live local above.
+            let done = unsafe { libc::waitid(libc::P_PID, pid as libc::id_t, &mut info, libc::WEXITED | libc::WNOWAIT) } == 0;
+            // ECHILD: reaped already, so a reap returns at once. EINTR: again.
+            let e = io::Error::last_os_error().raw_os_error();
+            if done || e != Some(libc::EINTR) {
+                break done || e == Some(libc::ECHILD);
+            }
         }
-        // ECHILD: reaped already, so a reap returns at once.
-        match io::Error::last_os_error().raw_os_error() {
-            Some(libc::EINTR) => {}
-            e => return e == Some(libc::ECHILD),
-        }
-    }
 }
 
 /// O_RDONLY|O_NONBLOCK|O_NOCTTY|O_CLOEXEC, then fstat. Never blocks on a FIFO or a device.

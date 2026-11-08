@@ -93,9 +93,7 @@ impl Observers {
                     let _ = thread::Builder::new().spawn(move || {
                         // Should waitid fail, the run is left as if the thread had not started: never reaped, so
                         // its pid stays its own for the session end's kill.
-                        if !sys::exited(pid) {
-                            return;
-                        }
+                        let true = sys::exited(pid) else { return };
                         supervise::kernel_end(Some(child), false);
                         lock(&live).retain(|l| l.1 != pid);
                         let _ = tx.send(Ev::Observed { tag: if wait { tag } else { 0 } });
