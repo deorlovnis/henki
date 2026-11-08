@@ -469,6 +469,23 @@ fn ext_on_rules() {
     assert_eq!(err(&[t.p("e")]), format!("ext {}: more than 16 observers (on/ files) over all modules; fix: turn a module off", t.p("e/b5").display()));
 }
 
+/// Nothing in a module, nor the ext path above it, that another user can write: it would run with the user's rights.
+#[test]
+fn ext_other_writable_refused() {
+    let t = T::new();
+    t.ext("e/a", "# a: watches");
+    let (o, b, c) = (t.exe("e/a/on/turn_end"), t.exe("e/a/bin/x"), t.exe("e/a/cmd/y"));
+    for p in [t.p("e"), t.p("e/a"), t.p("e/a/on"), o, t.p("e/a/bin"), b, t.p("e/a/cmd"), c] {
+        let m = fs::metadata(&p).unwrap().mode() & 0o7777;
+        for bits in [0o020, 0o002] {
+            fs::set_permissions(&p, fs::Permissions::from_mode(m | bits)).unwrap();
+            assert_eq!(err(&[t.p("e")]), format!("ext {0} is group- or world-writable; fix: chmod go-w {0}", p.display()));
+        }
+        fs::set_permissions(&p, fs::Permissions::from_mode(m)).unwrap();
+    }
+    assert_eq!(ok(&[t.p("e")]).exts[0].on, ["turn_end"]);
+}
+
 #[test]
 fn ext_optional_absent() {
     let t = T::new();

@@ -2,7 +2,7 @@
 //! first line goes into the prompt; an optional `NAME/bin/` goes first on the tool PATH; `NAME/cmd/X` is the user's
 //! `/X` (`handoff`); `NAME/on/EVENT` watches the session (`observe`); `NAME/port/PORT` is a binding that only a link
 //! in `CONFIG/port/` runs.
-use crate::{allow, config, observe, port};
+use crate::{allow, config, observe, port, sys};
 use std::io;
 use std::path::{Path, PathBuf};
 use std::{collections::BTreeMap, collections::BTreeSet, ffi::OsStr, ffi::OsString, fmt::Display, fs, os::unix::ffi::OsStrExt, os::unix::fs::MetadataExt};
@@ -116,6 +116,10 @@ fn one(dir: &Path, name: &str) -> Result<Ext, String> {
     if let Some(p) = paths.iter().skip(1).filter(|p| p.is_symlink()).find(out) {
         return Err(bad(p, "a link that leaves the module", "copy the file in"));
     }
+    // Its files run with the user's rights, on/'s unasked on each event: as with doc.md and a port binding, no other
+    // user may write one, or a directory above it up to the ext path.
+    let mode = |p: &Path| fs::metadata(p).map_or(Ok(()), |m| config::owner_mode(p, m.mode(), m.uid(), sys::euid(), false)).map_err(|e| format!("ext {e}"));
+    dir.parent().into_iter().chain(paths.iter().map(PathBuf::as_path)).try_for_each(mode)?;
     let targets = paths.iter().filter(|p| p.is_symlink()).filter_map(|p| fs::canonicalize(p).ok()).collect();
     let prompt = bin.is_some() || ["cmd", "on", "port"].iter().all(|d| has(d).is_none());
     Ok(Ext { name: name.into(), line: line.into(), dir: dir.to_path_buf(), doc, bin, cmds, user, on, prompt, shadows: Vec::new(), paths, targets })
