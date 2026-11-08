@@ -555,20 +555,16 @@ docline() {
 # A top-level NAME henki takes (anything but doc.md and bin, which inspect checks itself); else 1 with ERR.
 top_ok() {
   case "$2" in
-    ctx)
-      ERR="$1/$2/: a later module layout (context) that this henki does not load; fix: remove it, or set henki_module and requires for the henki that loads it"
-      return 1
-      ;;
     README* | LICENSE* | CHANGELOG* | .*) ;;
     *)
-      ERR="$1/$2: unknown entry; a module holds doc.md, bin/, cmd/, on/, port/, eval/, README*, LICENSE*, CHANGELOG* and dot files only; fix: move it out of the module"
+      ERR="$1/$2: unknown entry; a module holds doc.md, bin/, cmd/, on/, port/, ctx/, eval/, README*, LICENSE*, CHANGELOG* and dot files only; fix: move it out of the module"
       return 1
       ;;
   esac
 }
 
 # Everything about module DIR into I_* and M_*: hd1, doc line, commands, links, card, manifest, and I_runs: what runs
-# (PATH<TAB>WHEN, one per line: bin/, cmd/, on/ and port/ entries); NAME the default name (the source dir's), HOST 1
+# (PATH<TAB>WHEN, one per line: bin/, cmd/, on/, port/ and ctx/ entries); NAME the default name (the source dir's), HOST 1
 # to check this machine too. Exit 1 with ERR at the first problem.
 inspect() {
   local dir="$1" fallback="$2" host="$3" p kind top rest x why
@@ -588,14 +584,14 @@ inspect() {
   while IFS= read -r p; do
     [ -n "$p" ] || continue
     p=${p#"$dir"/}
-    case "$p" in bin/.* | cmd/.* | on/.* | doc.md | bin | cmd | on | port | eval | eval/*) ;; bin/* | cmd/* | on/* | port/*) p="$p/x" ;; *) top_ok "$dir" "$p" || return 1 ;; esac
-    case "$p" in bin/*/x | cmd/*/x | on/*/x | port/*/x)
+    case "$p" in bin/.* | cmd/.* | on/.* | ctx/.* | doc.md | bin | cmd | on | port | ctx | eval | eval/*) ;; bin/* | cmd/* | on/* | port/* | ctx/*) p="$p/x" ;; *) top_ok "$dir" "$p" || return 1 ;; esac
+    case "$p" in bin/*/x | cmd/*/x | on/*/x | port/*/x | ctx/*/x)
       ERR="$dir/${p%/x}: a directory; fix: a command or a port binding is a file you can run, so move it out of ${p%%/*}/"
       return 1
       ;;
     esac
   done <<EOF
-$(find "$dir" -mindepth 1 -maxdepth 1 -print; for x in bin cmd on port; do [ ! -d "$dir/$x" ] || [ -L "$dir/$x" ] || find "$dir/$x" -mindepth 1 -maxdepth 1 -type d -print; done)
+$(find "$dir" -mindepth 1 -maxdepth 1 -print; for x in bin cmd on port ctx; do [ ! -d "$dir/$x" ] || [ -L "$dir/$x" ] || find "$dir/$x" -mindepth 1 -maxdepth 1 -type d -print; done)
 EOF
   while IFS= read -r p; do
     kind=${p##*"$tab"}
@@ -704,6 +700,30 @@ EOF
               I_runs="${I_runs}on/$rest${tab}unasked, at every ${rest%.wait} event$x$nl"
             elif [ "${rest#.}" = "$rest" ]; then
               ERR="$dir/$p: an observer is a file you can run; fix: chmod u+x it, or move it out of on/"
+              return 1
+            fi
+            ;;
+        esac
+        ;;
+      ctx)
+        # ctx/SOURCE: a context source henki runs unasked at every start (ext/2); henki's test as for bin/.
+        case "$rest" in
+          '')
+            ERR="$dir/ctx: not a directory; fix: make ctx a directory of context sources"
+            return 1
+            ;;
+          .*/*) ;;
+          */*)
+            ERR="$dir/ctx/${rest%%/*}: a directory; fix: a context source is a file you can run, so move it out of ctx/"
+            return 1
+            ;;
+          *)
+            x=0
+            [ -n "$(find -L "$dir/$p" -prune -type f -perm -100 -print 2>/dev/null)" ] && x=1
+            if [ "$x" = 1 ] && is_cmd "$rest"; then
+              I_runs="${I_runs}ctx/$rest${tab}unasked, at every start; what it prints goes into the model's prompt$nl"
+            elif [ "$x" = 1 ] || [ "${rest#.}" = "$rest" ]; then
+              ERR="$dir/$p: a context source is a file you can run, named with A-Z, a-z, 0-9, ., _ and -; fix: rename it or chmod u+x it, or move it out of ctx/"
               return 1
             fi
             ;;
@@ -1029,10 +1049,11 @@ bind_get() {
 # --- prompt bytes and cards --------------------------------------------------------------------------------------------
 
 # What NAME's module adds to the system prompt (ext::prompt): "\n- NAME: LINE [DOC]", DOC as henki shows it; nothing
-# for a module of commands, observers or bindings without bin/, whose doc is not for the model.
+# for a module of commands, observers, bindings or context sources without bin/, whose doc is not for the model (a
+# source's own text is counted by henki at each start, not here).
 prompt_bytes() { # NAME DIR
   local l
-  if [ ! -d "$2/bin" ] && { [ -e "$2/cmd" ] || [ -L "$2/cmd" ] || [ -e "$2/on" ] || [ -L "$2/on" ] || [ -e "$2/port" ] || [ -L "$2/port" ]; }; then
+  if [ ! -d "$2/bin" ] && { [ -e "$2/cmd" ] || [ -L "$2/cmd" ] || [ -e "$2/on" ] || [ -L "$2/on" ] || [ -e "$2/port" ] || [ -L "$2/port" ] || [ -e "$2/ctx" ] || [ -L "$2/ctx" ]; }; then
     echo 0
     return 0
   fi

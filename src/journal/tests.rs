@@ -376,6 +376,7 @@ fn journal_session_record_fields() {
         doc: PathBuf::from(format!("/e/{name}/doc.md")),
         user: vec![],
         on: vec![],
+        ctx: vec![],
         prompt: true,
         bin: None,
         cmds: vec![],

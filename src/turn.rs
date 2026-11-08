@@ -82,7 +82,7 @@ impl Session {
     /// the REPL (approvals are asked on the terminal), None in `run`.
     pub fn new(cfg: Config, ports: Ports, sid: String, hist: Vec<Value>, out: Out, ch: (Sender<Ev>, Receiver<Ev>), deadline: Option<Instant>, reader: Option<Reader>) -> Session {
         let env = supervise::child_env(&cfg.env, &cfg.pass_env, &ext::child_path(&cfg.exts, &cfg.user_path), &cfg.user_path, &sid);
-        let system = tools::system(&cfg.tools, cfg.agents.as_deref(), &ext::prompt(&cfg.exts, &cfg.home));
+        let system = tools::system(&cfg.tools, cfg.agents.as_deref(), &cfg.context, &ext::prompt(&cfg.exts, &cfg.home));
         // The Anthropic API can be silent for minutes while it buffers a large tool input.
         let lim = http::Limits { stall: if cfg.dialect == "anthropic" { anthropic::STALL } else { http::LIMITS.stall }, ..http::LIMITS };
         let (tools, next_h, spill_n) = (tools::schema(&cfg.tools), journal::next_h(&hist), journal::spill_n(&cfg.state, &sid, &hist));

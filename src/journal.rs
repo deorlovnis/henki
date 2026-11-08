@@ -353,6 +353,7 @@ pub mod rec {
             "tools": cfg.tools, "shell": cfg.bash.to_string_lossy(), "exts": cfg.exts.iter().map(|e| &e.name).collect::<Vec<_>>(), "pass_env": cfg.pass_env, "ctx": cfg.window,
             "config_hash": cfg.hash, "allow_hash": cfg.allow.hash, "agents_hash": cfg.agents_hash, "project_agents_hash": null,
             "resumed": resumed.then(|| json!({}))});
+        let v = with(v, "sources", (!cfg.sources.is_empty()).then(|| cfg.sources.clone()));
         with(v, "ports", (!ports.is_empty()).then(|| ports.iter().map(|(p, n)| (p.to_string(), Value::from(n.as_str()))).collect::<serde_json::Map<_, _>>()))
     }
     pub fn user(content: &str) -> Value {

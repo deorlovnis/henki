@@ -104,7 +104,7 @@ fn e2e_ext_unknown_entry_refused() {
         let d = r.json("hi");
         d.finish();
         let e = config_error(&d);
-        assert!(e.contains(&format!("unknown entry {}; ext/2 modules hold doc.md, bin/, cmd/, on/, port/ and eval/", p.display())), "{e}");
+        assert!(e.contains(&format!("unknown entry {}; a module holds doc.md, bin/, cmd/, on/, port/, ctx/ and eval/", p.display())), "{e}");
         if entry == "tool" { fs::remove_dir(&p) } else { fs::remove_file(&p) }.unwrap();
     }
     assert!(m.log().is_empty());

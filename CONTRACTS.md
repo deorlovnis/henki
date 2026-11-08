@@ -81,7 +81,7 @@ values of `args` and `blocks` are opaque JSON.
 
 | Kind | Fields |
 |---|---|
-| `session` | `t` `ts` `v` `henki` `id` `cwd` `model` `dialect` `base_url` `base_url_from` `approve` `approve_from` `config` `tools` `shell` `exts` `pass_env` `ctx` `config_hash` `allow_hash` `agents_hash` `project_agents_hash` `resumed` `resumed.from_bytes?` `ports?` `ports.history?` `ports.policy?` |
+| `session` | `t` `ts` `v` `henki` `id` `cwd` `model` `dialect` `base_url` `base_url_from` `approve` `approve_from` `config` `tools` `shell` `exts` `pass_env` `ctx` `config_hash` `allow_hash` `agents_hash` `project_agents_hash` `resumed` `resumed.from_bytes?` `ports?` `ports.history?` `ports.policy?` `sources?` `sources[].name?` `sources[].bytes?` `sources[].hash?` |
 | `user` | `t` `ts` `msg` `msg.content` `msg.role` |
 | `assistant` | `t` `ts` `msg` `msg.content` `msg.role` `msg.tool_calls` `msg.tool_calls[].args` `msg.tool_calls[].id` `msg.tool_calls[].name` `msg.tool_calls[].raw?` `finish` `usage` `usage.cached` `usage.in` `usage.out` `blocks?` |
 | `ask` | `t` `ts` `id` `name` `args` `target?` |
@@ -103,6 +103,9 @@ values of `args` and `blocks` are opaque JSON.
   as read, or `null` when absent or not read; `project_agents_hash` is always `null` in this version. `resumed` is
   `null` for a new session, else `{"from_bytes": N}`: the file's length when this segment began (`{}` in a session a
   history binding keeps: history/1).
+  `sources` (only when a context source counted, ext/2) lists each one that did, in the order they ran: `name`
+  (`MODULE/SOURCE`), `bytes` (its text's length) and `hash` (FNV-1a 64 of the text). The texts themselves are not
+  journaled: a resume runs the sources again.
 - `user` is a message from the user; `msg.role` is `user`. A session's first task starts with
   `cwd: DIR\nos: OS ARCH\ndate: YYYY-MM-DD\n\n`; later ones do not.
 - `assistant` is one model reply; `msg.role` is `assistant`, `msg.content` its text. Each `msg.tool_calls` entry is a
@@ -343,10 +346,10 @@ default config). henki runs nothing while it loads them; a violation of any rule
 
 ## ext/2
 
-ext/2 is ext/1 with user commands, observers and bindings, and stricter text and link rules. A module with none of
-`cmd/`, `on/`, `port/` and `eval/` is an ext/1 module, and henki holds it to ext/1's rules for at least one release
-more, as the Stability section asks: only line 1 of its doc.md is read, and its links may leave it. Every other module
-is held to the rules below.
+ext/2 is ext/1 with user commands, observers, bindings and context sources, and stricter text and link rules. A module
+with none of `cmd/`, `on/`, `port/`, `eval/` and `ctx/` is an ext/1 module, and henki holds it to ext/1's rules for at
+least one release more, as the Stability section asks: only line 1 of its doc.md is read, and its links may leave it.
+Every other module is held to the rules below.
 
 ```
 NAME/doc.md              required: line 1 the summary; the whole file a text (below)
@@ -355,6 +358,7 @@ NAME/cmd/CMD             a user command /CMD (handoff/1); CMD as for bin/, not e
 NAME/cmd/CMD.md          data for a command: a text (below)
 NAME/on/EVENT            an observer of EVENT (observe/1); EVENT.wait for turn_start and call_start
 NAME/port/PORT           a binding program (port/1); run only through a link in CONFIG_DIR/port/
+NAME/ctx/SOURCE          a context source: run at each start, its text in the system prompt (below; henki 0.3)
 NAME/eval/...            tasks for the manager (eval/1); henki ignores them
 NAME/README* LICENSE* CHANGELOG* .*   ignored
 ```
@@ -362,22 +366,48 @@ NAME/README* LICENSE* CHANGELOG* .*   ignored
 - **Texts.** doc.md and each `cmd/*.md` are at most 16 KiB of UTF-8 without a code point henki escapes (on any line),
   regular files (or links to them) owned by the user or root and not group- or world-writable, as AGENTS.md is. A
   failure names the file and the line (`PATH:LINE: holds U+202E, which a terminal does not show; fix: remove it`).
-- **Entries.** `bin/`, `cmd/`, `on/` and `port/` hold files their owner can run, named `[A-Za-z0-9._-]+`; in `on/`
-  the name is an event (observe/1), in `port/` a port (`model`, `history`, `context`, `exec`, `policy`, `frontend`). A
-  dot file that cannot run is ignored but watched; in `cmd/` a `NAME.md` that cannot run is data. Anything else there
-  is refused. `ctx/` and any other name are refused (`unknown entry PATH; ext/2 modules hold doc.md, bin/, cmd/, on/,
-  port/ and eval/`). At most 16 `on/` files over all modules. `on/` and its files run unasked, so, as a port binding,
-  `on/`, the real file of each `on/` entry and every directory from it up to the module's real directory must be owned
-  by the user or root and not group- or world-writable (`PATH is group- or world-writable; fix: chmod go-w PATH`);
-  henki does not check the owner or mode of the module's other files and directories, nor of the ext path.
+- **Entries.** `bin/`, `cmd/`, `on/`, `port/` and `ctx/` hold files their owner can run, named `[A-Za-z0-9._-]+`; in
+  `on/` the name is an event (observe/1), in `port/` a port (`model`, `history`, `context`, `exec`, `policy`,
+  `frontend`). A dot file that cannot run is ignored but watched; in `cmd/` a `NAME.md` that cannot run is data.
+  Anything else there is refused. Any other name is refused (`unknown entry PATH; a module holds doc.md, bin/, cmd/,
+  on/, port/, ctx/ and eval/`). At most 16 `on/` files over all modules. `on/` and `ctx/` files run unasked, so, as a
+  port binding, `on/` and `ctx/`, the real file of each of their entries and every directory from it up to the
+  module's real directory must be owned by the user or root and not group- or world-writable (`PATH is group- or
+  world-writable; fix: chmod go-w PATH`); henki does not check the owner or mode of the module's other files and
+  directories, nor of the ext path.
 - **Links.** Inside an ext/2 module every link must be relative and lead to a path inside it (`a link that leaves the
   module; fix: copy the file in`); the module directory itself may be a link (the manager's store copy).
 - **Names across modules.** A `bin/` or a `cmd/` name in two modules stops the start.
-- **Trust.** The module directory, doc.md, `bin/`, `cmd/`, `on/`, `port/` and every entry of them are trust files;
-  the realpaths of the links among them are protected.
-- **The prompt.** A module enters the system prompt (ext/1's line) only with `bin/`, or with none of `cmd/`, `on/` and
-  `port/`: a module of commands, observers or bindings costs no prompt bytes. The banner says `ext NAME: CMDS` (its
-  `bin/` names), `doc only` or `no tools`; `/help` lists every user command as `/CMD  (NAME)`.
+- **Trust.** The module directory, doc.md, `bin/`, `cmd/`, `on/`, `port/`, `ctx/` and every entry of them are trust
+  files; the realpaths of the links among them are protected.
+- **The prompt.** A module enters the system prompt (ext/1's line) only with `bin/`, or with none of `cmd/`, `on/`,
+  `port/` and `ctx/`: a module of commands, observers, bindings or context sources costs no doc line. The banner says
+  `ext NAME: CMDS` (its `bin/` names), `doc only` or `no tools`; `/help` lists every user command as `/CMD  (NAME)`.
+
+### Context sources
+
+`NAME/ctx/SOURCE` is a context source (henki 0.3; henki 0.2 refuses a module with `ctx/`).
+
+- henki runs every source of every module that is on, once each time it starts (a new session, `--resume`, a
+  restart), before the `session` record: in ext path order, then module name, then source name (bytewise), one after
+  another. It runs as a tool call does: no arguments, stdin `/dev/null`, the session's working directory, the tool
+  environment (`HENKI_SESSION` empty) plus `HENKI_CONFIG` (the config dir), stdout and stderr as one stream, in a
+  process group and session of its own that henki kills and sweeps like a call's. It is not run through a bound
+  `exec` program.
+- A source must leave no process behind: a leftover is a background process of the session, so `always` is not
+  offered until it ends, and it is killed at the session end.
+- A source that reads project files must not follow links out of the project (a cloned repository, or a model that
+  wrote in the project, can plant a link to a secret), and should not run commands a repository's own config can
+  change (for git: `git -c core.fsmonitor=false`, and no command that reads the index).
+- All sources of a start share 2 seconds. A source still running then is killed and skipped. Ctrl-C (or TERM, HUP)
+  while one runs kills it and ends the start (exit 130, no session).
+- A source counts when it exits 0 having written at most 16,384 bytes, none of them a code point henki escapes on a
+  terminal. Invalid UTF-8 is replaced with U+FFFD. Trailing newlines are trimmed. A source that writes more is
+  skipped, not cut: a source that may print more cuts its own text.
+- The texts that count (and are not empty) go into the system prompt after the global `AGENTS.md` and before the
+  extensions item, each separated by a blank line, with nothing added by henki.
+- Every source is a notice: `context MODULE/SOURCE: N bytes`, or `context MODULE/SOURCE: skipped: WHY`. The `session`
+  record lists the ones that counted (journal/1, `sources`).
 
 ## handoff/1
 
@@ -390,7 +420,8 @@ or else on the user's PATH (never a module's), with ARGS split at spaces. A past
 - **The environment.** The tool environment (ext/1: every module's `bin/` first on `PATH`), plus `HENKI_CONFIG` (the
   config dir), `HENKI_STATE` (the state dir), `HENKI_BIN` (henki's path), `HENKI_MODULE` (the module dir; not for the
   manager) and `HENKI_NEXT`. A std session's journal is `$HENKI_STATE/sessions/*/$HENKI_SESSION.jsonl` (journal/1);
-  none is found when history is bound to another store. Tools, bindings and observers never get `HENKI_NEXT`.
+  none is found when history is bound to another store. Tools, bindings, observers and context sources never get
+  `HENKI_NEXT`.
 - **`HENKI_NEXT`** names an empty file henki made (0600, `STATE/spill/.next-PID-RAND`). Afterwards henki reads it only
   if it is still that regular file, at most 64 KiB of UTF-8; anything else is a notice and ignored. It is removed
   then. Line 1 is `VERB [ARG]`; the rest of the file is the text of `send`.
@@ -484,8 +515,8 @@ ports = ["history"]              # optional; exactly the programs in port/ (port
 
 A module without a manifest is unmanaged (allowed for path and URL installs, and listed as such). `port/PORT` is a
 program its owner can run (a file, or a link inside the module), PORT one that henki binds (`history` or `policy`).
-`cmd/` and `eval/` are ext/2's (`eval/` holds eval/1 tasks), `on/` observe/1's; `.henki/template` may hold a program
-that `cmd/` links run. The directory `ctx/` is reserved for a later layout: henki-mods refuses it.
+`cmd/`, `ctx/` and `eval/` are ext/2's (`ctx/` holds context sources, `eval/` eval/1 tasks), `on/` observe/1's;
+`.henki/template` may hold a program that `cmd/` links run. A module with `ctx/` says `requires = ["henki >= 0.3"]`.
 
 A git source (`URL[@REF][#SUBDIR]`) is cloned only over `https`, `http`, `ssh`, `git` or `file` URLs, or scp's
 `USER@HOST:PATH`; a remote helper (`ext::`, `fd::`, any other `SCHEME::` or unknown `SCHEME://`) is refused before
@@ -673,8 +704,8 @@ a program that needs settings (a workspace name) reads its own config file.
 While a program is bound, henki offers the model the `shell` tool only: `read`, `write` and `edit` are off (the
 `session` record's `tools` shows it, and the system prompt drops its line on reading a file before editing it), so no
 tool runs on the host outside the program. A config whose `tools` lacks `shell` cannot start with exec bound (`error
-config`, with the fix). Not run through it: the person's `!cmd`, module commands, observers and port bindings: they run
-on the host with the person's rights. Files the model writes inside the program's view of the project (AGENTS.md, git hooks, scripts) are
+config`, with the fix). Not run through it: the person's `!cmd`, module commands, observers, context sources and port
+bindings: they run on the host with the person's rights. Files the model writes inside the program's view of the project (AGENTS.md, git hooks, scripts) are
 read or run later by code on the host (git, the person). A sandbox confines the model's calls, not what later reads
 their results.
 

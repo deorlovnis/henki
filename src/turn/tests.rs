@@ -815,6 +815,7 @@ fn free_read_ext_doc_auto_approval() {
         cmds: Vec::new(),
         user: Vec::new(),
         on: Vec::new(),
+        ctx: Vec::new(),
         prompt: true,
         shadows: Vec::new(),
         paths: Vec::new(),

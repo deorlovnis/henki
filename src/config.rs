@@ -73,6 +73,8 @@ pub struct Config {
     /// The port bindings `CONFIG/port/` links (`port::links`): (port, the program's realpath, its display name).
     pub links: Vec<(&'static str, PathBuf, String)>,
     pub exec: Option<PathBuf>, // the exec/1 binding's program (`port::bind`), put in front of every shell call
+    pub context: String,       // the context sources' texts (`ext::sources`), for the system prompt after AGENTS.md
+    pub sources: Vec<Value>,   // the `session` record's `sources`: {name, bytes, hash} of each source that counted
 }
 
 /// The HENKI_* variables henki reads or sets for its children; any other gives a notice.

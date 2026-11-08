@@ -228,6 +228,7 @@ fn start(a: Args, tx: &Sender<Ev>, rx: &Receiver<Ev>, t0: Instant, early: io::Re
     if task.as_deref().is_some_and(|t| t.trim().is_empty()) {
         return Err(bad("task is empty".into()));
     }
+    cfg.context = ext::sources(&mut cfg, tx, rx)?;
     // A signal or the deadline that came during startup ends it here, before the session file exists.
     if let Ok(Ev::Signal(_)) = rx.try_recv() {
         return Err(Outcome::Interrupted);

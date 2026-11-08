@@ -84,12 +84,28 @@ fn contracts_ext_refuses() {
     type Setup = fn(&Path);
     let cases: Vec<(&str, Setup, &str)> = vec![
         (
-            "a ctx/ directory",
+            "a context source that cannot run",
             |x| {
                 file(&x.join("demo"), "doc.md", "a summary\n", 0o644);
-                fs::create_dir_all(x.join("demo/ctx")).unwrap();
+                file(&x.join("demo"), "ctx/notes", "notes\n", 0o644);
             },
-            "ext/2 modules hold doc.md, bin/, cmd/, on/, port/ and eval/",
+            "a command is a file you can run",
+        ),
+        (
+            "a group-writable context source",
+            |x| {
+                file(&x.join("demo"), "doc.md", "a summary\n", 0o644);
+                file(&x.join("demo"), "ctx/notes", "#!/bin/sh\n", 0o775);
+            },
+            "ctx/notes is group- or world-writable",
+        ),
+        (
+            "an unknown directory",
+            |x| {
+                file(&x.join("demo"), "doc.md", "a summary\n", 0o644);
+                fs::create_dir_all(x.join("demo/context")).unwrap();
+            },
+            "a module holds doc.md, bin/, cmd/, on/, port/, ctx/ and eval/",
         ),
         (
             "an observer of no event",
@@ -206,6 +222,34 @@ fn contracts_ext_refuses() {
         // After the config file's name: `ext PATH: PROBLEM; fix: ...` (or `ext NAME: ...` for a rule across extensions).
         assert!(message.contains(": ext ") && message.contains(says) && message.contains("; fix: "), "{what}: {message}");
     }
+}
+
+/// ext/2's context sources as the section gives them: the notices' forms, the text's place in the system prompt (after
+/// the global AGENTS.md, before the extensions item, nothing added), and the `session` record's `sources`.
+#[test]
+fn contracts_ctx_sources() {
+    let sec = crate::doc::section(&crate::doc::text(), "ext/2").split_whitespace().collect::<Vec<_>>().join(" ");
+    let form = |after: &str| sec.split(after).nth(1).and_then(|r| r.split('`').nth(1)).unwrap_or_else(|| panic!("no {after:?} in ext/2")).to_string();
+    let (counted, skipped) = (form("Every source is a notice:"), form("N bytes`, or"));
+    assert_eq!((counted.as_str(), skipped.as_str()), ("context MODULE/SOURCE: N bytes", "context MODULE/SOURCE: skipped: WHY"));
+    for rule in ["All sources of a start share 2 seconds.", "having written at most 16,384 bytes", "after the global `AGENTS.md` and before the extensions item"] {
+        assert!(sec.contains(rule), "{rule}");
+    }
+    let m = Mock::start(vec![say("ok")]);
+    let r = Run::new(&m.url());
+    let x = ext_dir(&r);
+    file(&r.config_dir(), "AGENTS.md", "Global.\n", 0o644);
+    file(&x.join("demo"), "doc.md", "a summary\n", 0o644);
+    file(&x.join("demo"), "ctx/a", "#!/bin/sh\necho counted\n", 0o755);
+    file(&x.join("demo"), "ctx/b", "#!/bin/sh\nexit 3\n", 0o755);
+    let d = r.json("x");
+    d.finish();
+    assert_eq!(d.code, Some(0), "{}", d.diag());
+    let n = d.notices();
+    assert!(n.contains(&counted.replace("MODULE/SOURCE", "demo/a").replace('N', "7")), "{n:?}");
+    assert!(n.iter().any(|l| l.starts_with(&skipped.replace("MODULE/SOURCE", "demo/b").replace("WHY", "exit 3"))), "{n:?}");
+    assert!(m.log()[0].system().ends_with("\n\nGlobal.\n\ncounted"), "{}", m.log()[0].system());
+    assert_eq!(d.of("session")[0]["sources"], json!([{"bytes": 7, "hash": "7797627416516b65", "name": "demo/a"}]));
 }
 
 /// `shadow` lets a command with the name of one on PATH load.

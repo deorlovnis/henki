@@ -129,6 +129,15 @@ fn contracts_record_fields() {
     std::fs::create_dir_all(r.state().join("port/policy")).unwrap();
     std::fs::write(r.state().join("port/policy/rules"), "allow\t\"command\":\"echo allowed\"\ndeny\t\"command\":\"rm \n").unwrap();
     runs.push(("policy", r.json("decide")));
+    // A module with a context source: `session.sources`.
+    let m = Mock::start(vec![say("sourced")]);
+    let r = Run::new(&m.url());
+    let src = r.config_dir().join("ext/notes/ctx/notes");
+    std::fs::create_dir_all(src.parent().unwrap()).unwrap();
+    std::fs::write(r.config_dir().join("ext/notes/doc.md"), "notes: a context source\n").unwrap();
+    std::fs::write(&src, "#!/bin/sh\necho notes\n").unwrap();
+    std::fs::set_permissions(&src, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+    runs.push(("sources", r.json("hello")));
     // An end before a session: the result alone, `session` null, no `ts`.
     let r = Run::new("http://127.0.0.1:9/v1");
     let d = r.cmd(&["--json", "--max-steps", "0", "x"]).go();

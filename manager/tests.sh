@@ -407,7 +407,7 @@ t_refusals() {
   rm -rf "$m" && mkmod "$m"
   mkdir -p "$m/ctx" && printf 'x\n' >"$m/ctx/x"
   run add "$m" --yes
-  refused "ctx/: a later module layout (context)"
+  refused "ctx/x: a context source is a file you can run"
   rm -rf "$m/ctx" && mkdir "$m/lib" && printf 'x\n' >"$m/lib/x"
   run add "$m" --yes
   refused "lib: unknown entry"
@@ -1274,6 +1274,37 @@ t_observe() {
   refused "leaves the module"
 }
 
+# ext/2's ctx/: context sources henki runs unasked at every start; the add screen names each, a module of sources
+# costs no doc line (its text is henki's to count at each start), and ctx/ holds runnable files only.
+t_ctx() {
+  case_ "ext/2: ctx/ sources, the add screen, prompt bytes"
+  local m="$W/notes"
+  mkmod "$m" 'contracts = ["ext/2"]\n'
+  rm -rf "$m/bin"
+  mkdir -p "$m/ctx"
+  printf '#!/bin/sh\necho notes\n' >"$m/ctx/notes"
+  chmod 755 "$m/ctx/notes"
+  printf 'x\n' >"$m/ctx/.DS_Store"
+  run verify --dir "$m"
+  rc_is 0
+  out_has "0 B of prompt"
+  run add "$m" --yes
+  rc_is 0
+  out_has "prompt   +0 B on every request"
+  out_has "  runs as you, unsandboxed:$nl    ctx/notes (sh, 2 lines): unasked, at every start; what it prints goes into the model's prompt$nl"
+  out_lacks ".DS_Store"
+  rm -rf "$W/r" && mkmod "$W/r" && mkdir -p "$W/r/ctx/sub"
+  run verify --dir "$W/r"
+  refused "ctx/sub: a directory"
+  rm -rf "$W/r" && mkmod "$W/r" && mkdir -p "$W/r/ctx" && printf '#!/bin/sh\n' >"$W/r/ctx/a b" && chmod 755 "$W/r/ctx/a b"
+  run verify --dir "$W/r"
+  refused "a context source is a file you can run, named with"
+  rm -rf "$W/r" && mkmod "$W/r" && mkdir -p "$W/r/ctx"
+  ln -s ../../elsewhere "$W/r/ctx/x"
+  run verify --dir "$W/r"
+  refused "leaves the module"
+}
+
 # After a change the manager writes `restart` to the hand-off file a henki gives it (/mods), and prints the restart
 # line without one; listing writes nothing.
 t_restart() {
@@ -1910,6 +1941,7 @@ all() {
   t_allow
   t_ext2
   t_observe
+  t_ctx
   t_restart
   t_ports
   t_port_toy
