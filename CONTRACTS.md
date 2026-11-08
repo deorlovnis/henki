@@ -851,8 +851,9 @@ Dot files are ignored anywhere, and so are `README*` and `LICENSE*` next to the 
   the eval, and its run is VOID (evalrun/1).
 - **The sandbox.** Each of the three runs inside the official `sandbox` module's program (`port/exec`, run directly,
   not as an exec binding, so henki keeps all four tools), started in the root with the person's own `HOME`, which it
-  hides, as it hides henki's own dirs (the run dir among them). It hides nothing else: a suite kept elsewhere on the
-  machine, such as an official module's `eval/` or the general suite in henki's share dir, is in the model's reach.
+  hides (on macOS only its listed secret paths), as it hides henki's own dirs (the run dir among them). It hides
+  nothing else: a suite kept elsewhere on the machine, such as an official module's `eval/` or the general suite in
+  henki's share dir, is in the model's reach.
   Where it does not run, `eval` refuses unless `--unsandboxed` is given; then only `HOME` and the XDG dirs are
   scratch dirs.
 - **The arms.** The module on and the module off: in each run's home the person's `config.toml` without its `ext` and

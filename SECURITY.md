@@ -57,10 +57,17 @@ a floor under every binding:
 
 ## Sandboxing the model's calls
 
-The official `sandbox` module is an exec binding (`henki mods swap exec sandbox`): every shell call runs with your
-home and henki's own dirs hidden, the project writable, the rest read-only, and `SSH_AUTH_SOCK` dropped (bubblewrap
-or user namespaces on Linux, `sandbox-exec` on macOS). While an exec binding is bound the model gets the `shell` tool
-only, so no tool of the model runs on the host outside it. What it does not cover:
+The official `sandbox` module is an exec binding (`henki mods swap exec sandbox`): every shell call runs inside it
+with `SSH_AUTH_SOCK` dropped. What it hides depends on the platform:
+
+- Linux (bubblewrap, or user namespaces): your whole home and henki's own dirs are hidden; the project and a private
+  `/tmp` are writable (and a `TMPDIR` outside `/tmp`, shared with your machine); everything else is read-only.
+- macOS (`sandbox-exec`): a list of secret paths (`~/.ssh`, `~/.config`, `~/.aws`, the Keychains and others) and
+  henki's own dirs are hidden; the rest of your home stays readable (other repos, documents, shell history). The
+  project, the temp dirs and `/private/tmp` are writable; everything else is read-only.
+
+The module's `doc.md` names each hidden path. While an exec binding is bound the model gets the `shell` tool only, so
+no tool of the model runs on the host outside it. What it does not cover:
 
 - Your `!cmd`, module commands, observers, context sources and the other port bindings run on the host, unsandboxed.
 - The network stays on, and so do sockets it cannot hide: loopback servers, abstract unix sockets (Linux). Its
@@ -128,7 +135,7 @@ only, so no tool of the model runs on the host outside it. What it does not cove
 | a policy binding fails closed; history never falls back | `e2e_policy_failures_ask`, `e2e_policy_auto_refused`, `e2e_port_dead_mid_turn`, `e2e_port_refused_starts` |
 | a bound exec runs every shell call and leaves only `shell`; a dangling one stops the start | `e2e_exec_runs_every_call`, `e2e_exec_shell_only`, `e2e_exec_needs_shell`, `e2e_exec_dangling_refused` |
 | an exec program is killed and swept as the call; a module's `bash` never runs the call | `e2e_exec_timeout_kills_program`, `e2e_exec_background_swept`, `e2e_exec_module_bash_not_used` |
-| `sandbox` hides the home and the agent socket and keeps writes to the project | `e2e_exec_official_sandbox`, `t_sandbox` |
+| `sandbox` hides the home (Linux) or a list of secret paths (macOS) and the agent socket, and keeps writes to the project and the temp dirs | `e2e_exec_official_sandbox`, `t_sandbox` |
 | context sources do not run through exec, are skipped not cut, killed when slow, swept, trusted | `ctx_not_through_exec`, `ctx_skip_never_cut`, `ctx_slow_source_killed`, `ctx_leftover_swept`, `ctx_entry_is_trusted` |
 | `project` never follows a link | `t_project` |
 | a context binding's answer is checked; a failing one leaves henki's elision | `e2e_context_refused_answers`, `e2e_context_dead_or_failing`, `e2e_context_start_failure` |

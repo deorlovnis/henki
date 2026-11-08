@@ -158,13 +158,14 @@ hd1_of() {
 }
 
 # anchor_check DIR NOT_LIVE: the index anchors in DIR (NAME.url, NAME.signers, NAME.checkpoint, refused.keys), as a
-# release ships them. Each signers line's key must not be a refused one (a development key: refused.keys, matched
-# as a fixed string, as henki-mods matches it), and an anchor with a key needs its checkpoint, the full commit a first
-# sync must find on the index's first-parent line. An anchor with no key line is the placeholder of an index not
-# live yet: refused unless NOT_LIVE is 1.
+# release ships them. Each signers line must name a key, and no line may hold a refused one (a development key in
+# refused.keys) anywhere in it: a fixed-string match on the whole line, as henki-mods drops such lines. An anchor with
+# a key needs its checkpoint, the full commit a first sync must find on the index's first-parent line. An anchor with
+# no key line is the placeholder of an index not live yet: refused unless NOT_LIVE is 1.
 anchor_check() {
-  local d=$1 f n keys blob ck
+  local d=$1 f n keys blob ck refused
   [ -f "$d/refused.keys" ] || die "$d/refused.keys is missing; fix: restore it from git (it lists the development keys)"
+  refused=$(LC_ALL=C command grep -v -e '^#' -e '^[[:space:]]*$' "$d/refused.keys" | LC_ALL=C tr -d ' \t\r' || true)
   for f in "$d"/*.url; do
     [ -f "$f" ] || die "$d holds no index URL (NAME.url); fix: restore manager/index/ from git"
     n=$(basename "$f" .url)
@@ -176,9 +177,9 @@ anchor_check() {
     fi
     for blob in $(printf '%s\n' "$keys" | awk '{ b = "-"; for (i = 2; i < NF; i++) if ($i ~ /^(ssh-|sk-|ecdsa-)/) { b = $(i + 1); break } print b }'); do
       [ "$blob" != - ] || die "index $n: a line of $d/$n.signers names no key; fix: write it as allowed_signers does (PRINCIPAL namespaces=\"git\" TYPE KEY)"
-      ! command grep -v '^#' "$d/refused.keys" | tr -d ' \t\r' | command grep -qxF -e "$blob" ||
-        die "index $n: $d/$n.signers holds a refused key (in refused.keys: a development key); fix: put the index's own signing key there"
     done
+    [ -z "$refused" ] || ! printf '%s\n' "$keys" | LC_ALL=C command grep -qF -e "$refused" ||
+      die "index $n: $d/$n.signers holds a refused key (in refused.keys: a development key); fix: put the index's own signing key there"
     ck=$(sed -n 1p "$d/$n.checkpoint" 2>/dev/null) || ck=""
     case "$ck" in *[!0-9a-f]* | "") ck="" ;; esac
     [ ${#ck} = 40 ] || die "index $n: $d/$n.checkpoint does not hold a full commit; fix: write the commit the index's main is at (40 hex digits) there"
@@ -393,6 +394,9 @@ selftest() {
   expect "an anchor with no key" "so the index is not live" anchor_check "$t/a-none" 0 || bad=1
   expect "an anchor with no key, --index-not-live" pass anchor_check "$t/a-none" 1 || bad=1
   expect "an anchor with a refused key" "holds a refused key" anchor_check "$t/a-dev" 1 || bad=1
+  # A quoted option with a space in it must not hide the refused key from the check.
+  anchor_fixture "$t/a-dev2" "henki-index namespaces=\"git ssh-ed25519 X\" ssh-ed25519 $x dev" "$(printf '%040d' 0)"
+  expect "an anchor with a refused key after a spaced option" "holds a refused key" anchor_check "$t/a-dev2" 1 || bad=1
   expect "an anchor without a checkpoint" "does not hold a full commit" anchor_check "$t/a-nock" 1 || bad=1
   expect "a live anchor" pass anchor_check "$t/a-live" 0 || bad=1
   rm "$t/a-live/refused.keys"
