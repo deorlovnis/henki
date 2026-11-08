@@ -184,6 +184,25 @@ fn observe_trust_change_stops_the_call() {
     assert!(!r.cwd.join("ran.txt").exists(), "the call ran");
 }
 
+/// A call that rewrites observers: the new programs never run, not on the call's own events, not after the tripwire
+/// (the notice, turn_end, session_end); the old ones ran until then.
+#[test]
+fn observe_changed_observer_never_runs() {
+    let mut r = Run::new("");
+    let log = r.dir.join("obs.log");
+    let events = ["call_end", "turn_end", "session_end", "record"];
+    let x = module(&r, "w", &events.map(|e| (e, format!("echo old-$HENKI_EVENT >>{}", log.display()))).each_ref().map(|(e, b)| (*e, b.as_str())));
+    let swap = |e: &str| format!("printf '#!/bin/sh\\necho new-$HENKI_EVENT >>{}\\n' >{}; ", log.display(), x.join("on").join(e).display());
+    let m = Mock::start(vec![shell(&events.map(swap).concat()), say("never")]);
+    r.at(&m.url());
+    let d = r.json("hi");
+    d.finish();
+    assert_eq!((d.status().as_str(), &d.result()["error"]["kind"]), ("error", &json!("changed")), "{}", d.diag());
+    let got = fs::read_to_string(&log).unwrap();
+    assert!(got.contains("old-record") && !got.contains("new-"), "{got}");
+    assert!(fs::read_to_string(x.join("on/turn_end")).unwrap().contains("new-"), "the call did not rewrite it");
+}
+
 /// A run started at session_end gets the grace, then is killed with its session; nothing with the marker is left.
 #[test]
 fn observe_session_end_run_killed() {

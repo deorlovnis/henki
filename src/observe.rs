@@ -66,12 +66,14 @@ impl Observers {
 
     /// Runs `event`'s observers, the event numbered `seq`; their output goes to the kernel log, or /dev/null without
     /// one. Each wait run sends `Ev::Observed { tag }` once it is reaped (another run tag 0, which the session end's
-    /// grace waits on): returns how many will send `tag`, and the notices.
-    pub fn emit(&mut self, event: &str, session: &str, data: &Value, tag: u32) -> (usize, Vec<String>) {
-        let (mut waits, mut notes, mut line) = (0, Vec::new(), None);
+    /// grace waits on): returns how many will send `tag`, and the notices. None runs unless `intact` (no trust file
+    /// changed): a changed `on/` file, or one it runs, is used only once a restart reads it again; the tripwire tells.
+    pub fn emit(&mut self, event: &str, session: &str, data: &Value, tag: u32, intact: impl Fn() -> bool) -> (usize, Vec<String>) {
+        let (mut waits, mut notes, mut line, mut fresh) = (0, Vec::new(), None, None);
         self.seq += 1;
         let out = || self.log.as_ref().map_or(Ok(Stdio::null()), |l| l.try_clone().map(Stdio::from));
-        for (i, o) in self.all.iter_mut().enumerate().filter(|(_, o)| o.event == event) {
+        // `intact` is asked once an observer would run, as the line is built: no stat for an event nobody watches.
+        for (i, o) in self.all.iter_mut().enumerate().filter(|(_, o)| o.event == event).take_while(|_| *fresh.get_or_insert_with(&intact)) {
             if lock(&self.live).iter().filter(|l| l.0 == i).count() >= LIVE {
                 let first = !std::mem::replace(&mut o.missed, true);
                 first.then(|| notes.push(format!("observer {}/on/{event} is slow: {LIVE} runs still going; it misses events until one ends", o.module)));

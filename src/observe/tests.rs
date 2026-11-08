@@ -82,20 +82,33 @@ fn observe_emit_runs_once_per_event() {
     let (d, x) = setup("kit", &[("call_start.wait", body), ("turn_end", body)]);
     let (mut o, rx) = observers(&d, &x);
     let data = json!({"call": {"name": "shell"}});
-    assert_eq!(o.emit("call_start", "s1", &data, 7), (1, Vec::new()));
+    assert_eq!(o.emit("call_start", "s1", &data, 7, || true), (1, Vec::new()));
     assert!(matches!(rx.recv_timeout(Duration::from_secs(5)), Ok(Ev::Observed { tag: 7 })));
     until("the run to be forgotten", || o.running().is_empty());
     let got = fs::read_to_string(d.join("state/call_start.out")).unwrap();
     let line = r#"{"data":{"call":{"name":"shell"}},"event":"call_start","seq":1,"session":"s1","v":1}"#;
     assert_eq!(got, format!("{line}\ncall_start|{}|{}\n", x.dir.display(), d.join("state").display()));
-    assert_eq!(o.emit("question", "s1", &data, 8), (0, Vec::new()), "no observer: nothing runs");
-    assert_eq!(o.emit("turn_end", "s1", &json!({}), 9), (0, Vec::new()));
+    assert_eq!(o.emit("question", "s1", &data, 8, || true), (0, Vec::new()), "no observer: nothing runs");
+    assert_eq!(o.emit("turn_end", "s1", &json!({}), 9, || true), (0, Vec::new()));
     until("the turn_end run", || d.join("state/turn_end.out").exists() && o.running().is_empty());
     assert!(fs::read_to_string(d.join("state/turn_end.out")).unwrap().contains(r#""seq":3"#), "seq counts every event");
     assert!(matches!(rx.recv_timeout(Duration::from_secs(5)), Ok(Ev::Observed { tag: 0 })), "a plain run reports tag 0");
     assert_eq!(fs::read_to_string(d.join("state/spill/.kernel-test.log")).unwrap(), "logged\nlogged\n");
     let left: Vec<_> = fs::read_dir(d.join("state/spill")).unwrap().flatten().map(|e| e.file_name()).collect();
     assert_eq!(left, [std::ffi::OsString::from(".kernel-test.log")], "an event file was left");
+    let _ = fs::remove_dir_all(&d);
+}
+
+/// A changed trust file: no observer runs, the event still counts; `intact` is asked only once an observer would run.
+#[test]
+fn observe_not_intact_runs_nothing() {
+    let (d, x) = setup("gate", &[("turn_end", "touch \"$HENKI_STATE/ran\"")]);
+    let (mut o, _rx) = observers(&d, &x);
+    assert_eq!(o.emit("question", "s", &json!({}), 1, || panic!("asked with no observer")), (0, Vec::new()));
+    assert_eq!(o.emit("turn_end", "s", &json!({}), 2, || false), (0, Vec::new()));
+    assert!(o.running().is_empty() && !d.join("state/ran").exists(), "a run started");
+    o.emit("turn_end", "s", &json!({}), 3, || true);
+    until("the intact run", || d.join("state/ran").exists() && o.running().is_empty());
     let _ = fs::remove_dir_all(&d);
 }
 
@@ -109,15 +122,15 @@ fn observe_slow_runs() {
     let x = Ext { on: vec!["call_start.wait".into(), "record".into(), "turn_end".into()], ..x };
     let (mut o, _rx) = observers(&d, &x);
     for _ in 0..4 {
-        assert_eq!(o.emit("record", "s", &json!({}), 1), (0, Vec::new()));
+        assert_eq!(o.emit("record", "s", &json!({}), 1, || true), (0, Vec::new()));
     }
     let slow = "observer slow/on/record is slow: 4 runs still going; it misses events until one ends".to_string();
-    assert_eq!(o.emit("record", "s", &json!({}), 1), (0, vec![slow]));
-    assert_eq!(o.emit("record", "s", &json!({}), 1), (0, Vec::new()), "one notice");
-    assert_eq!(o.emit("call_start", "s", &json!({}), 2).0, 1);
+    assert_eq!(o.emit("record", "s", &json!({}), 1, || true), (0, vec![slow]));
+    assert_eq!(o.emit("record", "s", &json!({}), 1, || true), (0, Vec::new()), "one notice");
+    assert_eq!(o.emit("call_start", "s", &json!({}), 2, || true).0, 1);
     assert_eq!(o.unwait("call_start"), ["observer slow/on/call_start.wait took over 2 s; it is no longer waited for"]);
-    assert_eq!(o.emit("call_start", "s", &json!({}), 3).0, 0, "not waited for again");
-    let (n, notes) = o.emit("turn_end", "s", &json!({}), 4);
+    assert_eq!(o.emit("call_start", "s", &json!({}), 3, || true).0, 0, "not waited for again");
+    let (n, notes) = o.emit("turn_end", "s", &json!({}), 4, || true);
     assert!(n == 0 && notes.len() == 1 && notes[0].starts_with("observer slow/on/turn_end did not start: "), "{notes:?}");
     assert_eq!(o.running().len(), 6);
     supervise::kernel_kill(&o.running());
@@ -137,7 +150,7 @@ fn observe_spawn_cost() {
         .map(|_| {
             until("a free slot", || o.running().len() < LIVE);
             let t = Instant::now();
-            o.emit("record", "s", &rec, 1);
+            o.emit("record", "s", &rec, 1, || true);
             t.elapsed().as_secs_f64() * 1e3
         })
         .collect();

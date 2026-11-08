@@ -157,7 +157,7 @@ impl Session {
         let (r, end) = match written {
             Ok((r, c)) => {
                 // Nothing is journaled after `close`: its observers' notices go to the terminal only.
-                self.opened.is_none().then(|| self.obs.emit("session_end", &self.sid, &c, 0).1).into_iter().flatten().for_each(|n| self.out.note(&n));
+                self.opened.is_none().then(|| self.obs.emit("session_end", &self.sid, &c, 0, intact(&self.cfg.snap)).1).into_iter().flatten().for_each(|n| self.out.note(&n));
                 (r, Ok(()))
             }
             Err(e) => {
@@ -413,7 +413,7 @@ impl Session {
     /// whose runs miss it are not waited for again.
     fn observe(&mut self, event: &str, data: &Value) -> Result<(), Outcome> {
         let tag = self.next_tag();
-        let (n, notes) = if self.opened.is_some() { (0, Vec::new()) } else { self.obs.emit(event, &self.sid, data, tag) };
+        let (n, notes) = if self.opened.is_some() { (0, Vec::new()) } else { self.obs.emit(event, &self.sid, data, tag, intact(&self.cfg.snap)) };
         self.observed(notes)?;
         // After a miss the others' waits end at once: `until` has passed.
         let until = Instant::now() + observe::WAIT;
@@ -456,6 +456,11 @@ pub fn outcome_line(o: &Outcome) -> String {
         Outcome::NeedsApproval(c) => format!("(needs approval: {}; henki --resume continues this session in the REPL)", tools::head(c)),
         o => format!("({})", o.status().replace('_', " ")),
     }
+}
+
+/// Whether every trust file still has its snapshot's stamps, asked once an observer would run.
+fn intact(snap: &[(PathBuf, (sys::Stamp, sys::Stamp))]) -> impl Fn() -> bool + '_ {
+    || snap.iter().all(|(p, s)| sys::stamp(p) == *s)
 }
 
 /// What a session's first task starts with: where and when the model works.
