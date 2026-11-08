@@ -58,9 +58,9 @@ impl Session {
             d => d,
         };
         // A signal or the deadline that came while a binding decided ends the turn here (std decides at once); the signal's
-        // event may still be on its way from the signal thread.
-        let slice = if seen == sys::seen() { Duration::ZERO } else { SLICE };
-        bound.is_some().then(|| self.wait(0, Some(Instant::now() + slice))).transpose()?;
+        // event may still be on its way from the signal thread. A new tag, which no event carries: only a stop ends it.
+        let (slice, tag) = (if seen == sys::seen() { Duration::ZERO } else { SLICE }, self.next_tag());
+        bound.is_some().then(|| self.wait(tag, Some(Instant::now() + slice))).transpose()?;
         let (verdict, rule, head) = match d {
             Decision::Allow { verdict, rule, line } => {
                 line.iter().for_each(|l| self.out.line(l));

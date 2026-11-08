@@ -8,6 +8,7 @@ use crate::mock::*;
 use crate::pty::Pty;
 use serde_json::{Value, json};
 use std::fs;
+use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{PermissionsExt, symlink};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -194,6 +195,26 @@ fn e2e_port_refused_starts() {
         d.check(msg.starts_with(&format!("history binding {}: {why}; log {}", w.display(), log.display())) && msg.ends_with(fix), faults);
         assert!(m.log().is_empty() && std_journals(&r).is_empty(), "{faults}: a request or a std journal");
     }
+}
+
+/// JSON holds UTF-8 only: a history binding in a cwd whose name is not refuses the start, naming the binding and
+/// the cwd, before any record; std runs there.
+#[test]
+fn e2e_port_non_utf8_cwd() {
+    let m = Mock::start(vec![say("on std")]);
+    let r = Run::new(&m.url());
+    let w = toy(&r, "");
+    let dir = r.cwd.join(std::ffi::OsStr::from_bytes(b"w\xff"));
+    fs::create_dir(&dir).unwrap();
+    let d = r.cmd(&["--json", "hi"]).cwd(&dir).go();
+    d.finish();
+    let says = format!("history binding {}: {} is not UTF-8, which port/1 cannot send; log ", w.display(), dir.display());
+    assert_eq!((d.code, &d.result()["error"]["kind"]), (Some(2), &json!("config")), "{}", d.diag());
+    d.check(d.result()["error"]["message"].as_str().unwrap().starts_with(&says), "the refusal");
+    assert!(m.log().is_empty() && fs::read_dir(store(&r)).unwrap().next().is_none(), "a request, or a session kept");
+    let d = r.cmd(&["--json", "--port", "history=std", "hi"]).cwd(&dir).go();
+    d.finish();
+    assert_eq!(d.code, Some(0), "{}", d.diag());
 }
 
 /// What the start checks before it runs anything: an entry for a port this henki cannot bind, a binding another user

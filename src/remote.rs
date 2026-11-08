@@ -6,17 +6,18 @@
 //! `budget`).
 //! A timeout, an exit or a broken line kills the binding for the rest of the session: every later call fails at once
 //! with that error, and the kernel's floor takes over (history: the turn ends `error journal`; policy: every call is
-//! asked).
+//! asked). Paths go as UTF-8 strings only: JSON cannot hold others, so such a scope refuses the start.
 use crate::port::{self, Decision, History, Policy, PortError, Record, Taken, err};
 use crate::{config::Config, supervise, sys, term, term::Out, tools, tools::Target, types::Call, types::Ev, types::Outcome};
 use serde_json::{Value, json};
 use std::io::{BufRead, BufReader, Read, Write};
+use std::sync::atomic::{AtomicU64, Ordering::SeqCst};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
-use std::{ffi::OsString, path::Path, process::Child, process::Stdio, thread, time::Duration, time::Instant};
+use std::{ffi::OsString, path::Path, process::Child, process::Stdio, sync::Arc, thread, time::Duration, time::Instant};
 
 /// Both directions. A record holds up to a 1 MiB typed line or a model reply, JSON-escaped.
 pub const LINE_MAX: usize = 16 << 20;
-/// What one `read` of a whole session may bring, over all its pages.
+/// What one `read` of a whole session may bring, over all its pages; and the lines nobody asked for between two answers.
 const READ_MAX: usize = 256 << 20;
 /// The contract timeout of each method in ms, and whether a signal or the deadline ends the wait (side-effect free only).
 #[rustfmt::skip]
@@ -42,10 +43,12 @@ pub struct Remote {
     child: Option<Child>,
     tx: Sender<String>,
     rx: Receiver<Line>,
+    /// The id of the request whose answer the reader passes on, once (u64::MAX: none); every other line it drops.
+    want: Arc<AtomicU64>,
     next: u64,
     got: usize,
     dead: Option<PortError>,
-    /// The policy's failure was said (once: every later call is asked without it).
+    /// The policy binding's death was said (once: every later call is asked without it).
     noted: bool,
 }
 
@@ -53,22 +56,25 @@ impl Remote {
     /// Starts `exe` in `cwd` with exactly `env` and `stderr` (the kernel log; the terminal for `henki port`); `fix`
     /// ends every failure's message.
     pub fn start(port: &'static str, exe: &Path, (name, fix): (String, String), cwd: &Path, env: &[(OsString, OsString)], stderr: Stdio) -> Result<Remote, PortError> {
-        let ((tx, wrx), (rtx, rx)) = (mpsc::channel::<String>(), mpsc::channel());
-        let mut r = Remote { port, name, said: String::new(), caps: Vec::new(), deadline: None, fix, child: None, tx, rx, next: 0, got: 0, dead: None, noted: false };
+        let ((tx, wrx), (rtx, rx), want) = (mpsc::channel::<String>(), mpsc::channel(), Arc::new(AtomicU64::new(u64::MAX)));
+        let mut r =
+            Remote { port, name, said: String::new(), caps: Vec::new(), deadline: None, fix, child: None, tx, rx, want: want.clone(), next: 0, got: 0, dead: None, noted: false };
         let mut c = supervise::kernel_child(exe, cwd, env, [Stdio::piped(), Stdio::piped(), stderr]).map_err(|e| r.named("crashed", &format!("not started: {e}")))?;
         let (stdin, stdout) = (c.stdin.take(), c.stdout.take());
         r.child = Some(c);
         let (Some(mut w), Some(out)) = (stdin, stdout) else { return Err(r.fail(err("crashed", "no pipes"))) };
         // The writer is a thread: a binding that stops reading fills its pipe, and MAIN must never block in write(2).
-        let threads =
-            thread::Builder::new().spawn(move || wrx.iter().try_for_each(|l| w.write_all(l.as_bytes()))).and_then(|_| thread::Builder::new().spawn(move || lines(out, &rtx)));
+        let threads = thread::Builder::new()
+            .spawn(move || wrx.iter().try_for_each(|l| w.write_all(l.as_bytes())))
+            .and_then(|_| thread::Builder::new().spawn(move || lines(out, &rtx, &want)));
         threads.map_err(|e| r.fail(err("crashed", format!("cannot start a thread: {e}"))))?;
         Ok(r)
     }
 
     /// `hello` for the session cwd `scope`, naming `state` (the binding's private dir under henki's protected state dir),
-    /// offering `versions` of the port's method set over port/1 protocol 1.
+    /// offering `versions` of the port's method set over port/1 protocol 1. A path that is not UTF-8 refuses it.
     pub fn hello(&mut self, scope: &Path, state: &Path, versions: &[u64]) -> Result<(), PortError> {
+        let (scope, state) = utf8(scope).and_then(|s| Ok((s, utf8(state)?))).map_err(|e| self.named(e.code, &e.message)).map_err(|e| self.end(e))?;
         let hello = json!({"protocol": [1], "port": self.port, "versions": versions, "henki": env!("CARGO_PKG_VERSION"), "scope": scope, "state": state});
         // A binding that did not say hello is never used: no bye, so a signal at a slow hello ends the start at once.
         let h = self.call("hello", hello).map_err(|e| self.end(e))?;
@@ -96,6 +102,7 @@ impl Remote {
         }
         let (id, end, seen) = (self.next, Instant::now() + Duration::from_millis(ms), sys::seen());
         self.next += 1;
+        self.want.store(id, SeqCst);
         let _ = self.tx.send(line);
         loop {
             let left = end.saturating_duration_since(Instant::now());
@@ -113,7 +120,7 @@ impl Remote {
                         _ => Err(self.fail(err("protocol", "an answer holds one of result and error"))),
                     };
                 }
-                Ok(Ok(_)) => {} // the late answer to an interrupted call
+                Ok(Ok(_)) => {} // the late answer to an interrupted call, passed on before this request was
                 Ok(Err(why)) => return Err(self.fail(err("protocol", why))),
                 Err(RecvTimeoutError::Disconnected) => return Err(self.fail(err("crashed", "it closed its stdout or exited"))),
                 Err(_) if left.is_zero() => return Err(self.fail(err("timeout", format!("no answer to {method} in {} s", term::secs(ms))))),
@@ -151,27 +158,34 @@ impl Drop for Remote {
     }
 }
 
-/// The binding's stdout: each answer to MAIN with its length; lines without an id are notifications, which port/1 v1
-/// reserves and skips; the first broken line (over `LINE_MAX`, no newline at EOF, not a JSON object) ends the binding.
-fn lines(out: impl Read, tx: &Sender<Line>) {
-    let (mut r, mut line) = (BufReader::new(out), Vec::new());
+/// The binding's stdout: the answer to the request MAIN waits for (`want`, taken once) to MAIN with its length. Every
+/// other line is dropped here, so nothing piles up between calls: a notification (no id; port/1 v1 reserves and skips
+/// them), a stale or repeated answer. Over READ_MAX bytes of those between two answers, or the first broken line (over
+/// `LINE_MAX`, no newline at EOF, not a JSON object), ends the binding.
+fn lines(out: impl Read, tx: &Sender<Line>, want: &AtomicU64) {
+    let (mut r, mut line, mut idle) = (BufReader::new(out), Vec::new(), 0);
     loop {
         line.clear();
         match (&mut r).take(LINE_MAX as u64 + 1).read_until(b'\n', &mut line) {
             Ok(0) | Err(_) => return,
             Ok(_) if !line.ends_with(b"\n") => return drop(tx.send(Err(format!("a line over {} bytes, or cut", term::num(LINE_MAX as u64))))),
-            Ok(_) => {}
+            Ok(_) => idle += line.len(),
         }
-        match serde_json::from_slice::<Value>(&line) {
-            Ok(v) if v.get("id").is_some_and(|i| !i.is_null()) => {
-                if tx.send(Ok((v, line.len()))).is_err() {
-                    return;
-                }
+        let Some(v) = serde_json::from_slice::<Value>(&line).ok().filter(Value::is_object) else { return drop(tx.send(Err("a line that is not a JSON object".into()))) };
+        if v["id"].as_u64().is_some_and(|i| want.compare_exchange(i, u64::MAX, SeqCst, SeqCst).is_ok()) {
+            idle = 0;
+            if tx.send(Ok((v, line.len()))).is_err() {
+                return;
             }
-            Ok(v) if v.is_object() => {}
-            _ => return drop(tx.send(Err("a line that is not a JSON object".into()))),
+        } else if idle > READ_MAX {
+            return drop(tx.send(Err(format!("over {} bytes of lines nobody asked for", term::num(READ_MAX as u64)))));
         }
     }
+}
+
+/// A path as port/1 sends it: a JSON string, so UTF-8 only.
+fn utf8(p: &Path) -> Result<&str, PortError> {
+    p.to_str().ok_or_else(|| err("invalid", format!("{} is not UTF-8, which port/1 cannot send", p.display())))
 }
 
 /// The session id in an answer, checked as history/1 allows it.
@@ -181,12 +195,12 @@ fn id(v: &Value) -> Result<String, PortError> {
 
 impl History for Remote {
     fn create(&mut self, scope: &Path, hint: Option<&str>) -> Result<String, PortError> {
-        let a = self.call("create", json!({"scope": scope, "hint": hint}))?;
+        let a = self.call("create", json!({"scope": utf8(scope)?, "hint": hint}))?;
         id(&a).map_err(|e| self.fail(e))
     }
 
     fn open(&mut self, scope: &Path, session: Option<&str>) -> Result<String, PortError> {
-        let got = id(&self.call("open", json!({"scope": scope, "session": session}))?).map_err(|e| self.fail(e))?;
+        let got = id(&self.call("open", json!({"scope": utf8(scope)?, "session": session}))?).map_err(|e| self.fail(e))?;
         if session.is_some_and(|s| s != got) {
             return Err(self.fail(err("protocol", format!("open {session:?} answered {got}"))));
         }
@@ -220,18 +234,24 @@ impl History for Remote {
 }
 
 impl Policy for Remote {
-    /// The binding's verdict on the call's view. A failure, an interruption or an answer that is not allow, ask or deny
-    /// asks (fail closed); a failure is said once, and a broken answer kills the binding. The caller's `poll` ends the
-    /// turn on the signal or the deadline that interrupted it.
+    /// The binding's verdict on the call's view. A failure, an error answer, an interruption, an answer that is not allow,
+    /// ask or deny, or a target the view cannot hold (not UTF-8) asks (fail closed). The binding's death is said once and
+    /// a broken answer kills it; an error answer is said for its call, and the binding lives on. The caller's wait ends
+    /// the turn on the signal or the deadline that interrupted it.
     fn decide(&mut self, c: &Call, t: Option<&Target>, cfg: &Config, session: &str) -> Decision {
-        let target = t.map(|t| json!({"outside": t.outside, "path": t.path, "protected": t.prot, "shown": t.shown}));
-        let view = json!({"call": {"args": c.args, "id": c.id, "name": c.name}, "cwd": cfg.cwd, "root": cfg.root, "session": session, "target": target});
+        if let Some(e) = t.and_then(|t| utf8(&t.path).err()) {
+            return Decision::Ask { always: false, note: Some(format!("{} binding {}: the target {}; this call is asked", self.port, self.name, e.message)) };
+        }
+        let target = t.map(|t| json!({"outside": t.outside, "path": t.path.to_str(), "protected": t.prot, "shown": t.shown}));
+        let view = json!({"call": {"args": c.args, "id": c.id, "name": c.name}, "cwd": cfg.cwd.to_str(), "root": cfg.root.to_str(), "session": session, "target": target});
         let known = |a: &Value| matches!(a["decision"].as_str(), Some("allow" | "ask" | "deny"));
         let a = match self.call("decide", view).and_then(|a| if known(&a) { Ok(a) } else { Err(self.fail(err("protocol", "decide: the decision is not allow, ask or deny"))) }) {
             Ok(a) => a,
             Err(e) => {
-                let said = matches!(e.code, "interrupted" | "budget") || std::mem::replace(&mut self.noted, true);
-                return Decision::Ask { always: false, note: (!said).then(|| format!("{}; every call is asked", e.message)) };
+                let dead = self.dead.is_some();
+                let said = matches!(e.code, "interrupted" | "budget") || dead && std::mem::replace(&mut self.noted, true);
+                let then = if dead { "every call is asked" } else { "this call is asked" };
+                return Decision::Ask { always: false, note: (!said).then(|| format!("{}; {then}", e.message)) };
             }
         };
         let why = a["reason"].as_str().filter(|r| !r.is_empty()).map_or(String::new(), |r| format!(": {}", term::escape(&r.chars().take(200).collect::<String>())));

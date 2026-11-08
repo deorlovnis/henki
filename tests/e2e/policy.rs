@@ -8,6 +8,7 @@ use crate::mock::*;
 use crate::pty::Pty;
 use serde_json::{Value, json};
 use std::fs;
+use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{PermissionsExt, symlink};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -284,4 +285,86 @@ fn pty_policy_asks() {
     p.prompt(W);
     p.line("/exit");
     p.wait(W).finish();
+}
+
+/// An error answer to `decide` is one failed call: that call is asked with a notice saying so, the binding lives on and
+/// decides the next one; its death later is still said, once, and every call after it is asked.
+#[test]
+fn pty_policy_error_answer_asks_that_call() {
+    let m = Mock::start(vec![shell("echo one"), shell("echo two"), shell("echo three"), shell("echo four"), say("done")]);
+    let mut r = Run::new(&m.url());
+    let w = toy(&mut r, "allow", "--error-at decide#1 --exit-at decide#3").display().to_string();
+    let p = Pty::spawn(&r, &[], 24, 200);
+    p.prompt(W);
+    p.line("go");
+    p.expect(&format!("henki: policy binding {w}: io: a fault; log "), W);
+    p.expect("or henki mods swap policy std; this call is asked\r\n", W);
+    p.expect("run? [y/N] ", W);
+    p.line("y");
+    p.expect(&format!("$ echo two  (allowed by policy {w}: port_toy allows every call)\r\n"), W);
+    p.expect(&format!("henki: policy binding {w}: crashed: it closed its stdout or exited; log "), W);
+    p.expect(&format!("{FIX}\r\n"), W);
+    p.expect("run? [y/N] ", W);
+    p.line("y");
+    p.expect("run? [y/N] ", W);
+    p.line("y");
+    p.expect("done", W);
+    p.prompt(W);
+    p.line("/exit");
+    let d = p.wait(W);
+    d.finish();
+    let said = |end: &str| d.notices().iter().filter(|n| n.ends_with(end)).count();
+    assert_eq!((said("; this call is asked"), said("; every call is asked")), (1, 1), "{}", d.diag());
+    assert_eq!(d.of("approval").iter().map(|a| a["verdict"].clone()).collect::<Vec<_>>(), ["yes", "policy", "yes", "yes"]);
+}
+
+/// A signal during `decide` ends the turn even when other events are queued (a `record` observer's ended runs).
+#[test]
+fn e2e_policy_signal_with_observer() {
+    let m = Mock::start(vec![shell("echo hi"), say("never")]);
+    let mut r = Run::new(&m.url());
+    toy(&mut r, "allow", "--hang-at decide");
+    let on = r.config_dir().join("ext/obs/on");
+    fs::create_dir_all(&on).unwrap();
+    fs::write(on.parent().unwrap().join("doc.md"), "obs: watches\n").unwrap();
+    fs::write(on.join("record"), "#!/bin/sh\nsleep 0.2\n").unwrap();
+    fs::set_permissions(on.join("record"), fs::Permissions::from_mode(0o755)).unwrap();
+    let mut l = r.cmd(&["--json", "go"]).spawn();
+    l.wait_record(W, |x| x["t"] == "assistant");
+    std::thread::sleep(Duration::from_millis(600));
+    l.signal(libc::SIGINT);
+    let d = l.wait();
+    d.finish();
+    assert_eq!((d.code, d.status()), (Some(130), "interrupted".to_string()), "{}", d.diag());
+    assert!(d.of("ask").is_empty(), "{}", d.diag());
+}
+
+/// JSON holds UTF-8 only: a cwd whose name is not refuses the start with the binding named (std runs there), and a
+/// target whose real path is not is asked without asking the binding.
+#[test]
+fn e2e_policy_non_utf8_paths() {
+    let m = Mock::start(vec![call("read", json!({"path": "a.txt"})), say("std read it")]);
+    let mut r = Run::new(&m.url());
+    let w = toy(&mut r, "allow", "");
+    let dir = r.cwd.join(std::ffi::OsStr::from_bytes(b"w\xff"));
+    fs::create_dir(&dir).unwrap();
+    fs::write(dir.join("a.txt"), "a\n").unwrap();
+    let d = r.cmd(&["--json", "read a.txt"]).cwd(&dir).go();
+    d.finish();
+    let says = format!("policy binding {}: {} is not UTF-8, which port/1 cannot send; log ", w.display(), dir.display());
+    let e = &d.result()["error"];
+    assert_eq!((d.code, &e["kind"]), (Some(2), &json!("config")), "{}", d.diag());
+    d.check(e["message"].as_str().unwrap().starts_with(&says), "the refusal");
+    let d = r.cmd(&["--json", "--port", "policy=std", "--approve", "auto", "read a.txt"]).cwd(&dir).go();
+    d.finish();
+    assert_eq!(d.code, Some(0), "{}", d.diag());
+    let m = Mock::start(vec![call("read", json!({"path": "link.txt"})), say("never")]);
+    r.at(&m.url());
+    symlink(dir.join("a.txt"), r.path("link.txt")).unwrap();
+    let d = r.json("read the link");
+    d.finish();
+    assert_eq!(d.code, Some(3), "{}", d.diag());
+    let says = format!("policy binding {}: the target ", w.display());
+    d.check(d.notices().iter().any(|n| n.starts_with(&says) && n.ends_with(" is not UTF-8, which port/1 cannot send; this call is asked")), "the note");
+    assert!(decided(&r).is_empty(), "the binding was asked: {:?}", decided(&r));
 }

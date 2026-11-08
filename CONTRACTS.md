@@ -537,22 +537,26 @@ has one binding: the std one built into henki, or a program that `CONFIG_DIR/por
 `history` and `policy` that way; `--port PORT=std` (repeatable, all six names) runs a session on std whatever the links say.
 
 - **The link.** henki reads `CONFIG_DIR/port/` at start: names starting with `.` are skipped; any other name must be a
-  port this henki binds, and a link to a regular file its owner can run, that file and its directory owned by the user
-  (or the file by root) and not group- or world-writable. Anything else stops the start (`error config`) with the fix
-  `henki mods swap PORT std, or start with --port PORT=std`. The directory, the link and the program are trust files,
-  and the program is protected from the model's write and edit tools. The binding's name in notices and records is
-  `NAME ID` for a program at `.../mods/NAME/ID/port/PORT`, else its path.
+  port this henki binds, and a link to a regular file its owner can run (or that file itself, which the manager never
+  writes), that file and its directory owned by the user (or the file by root) and not group- or world-writable.
+  Anything else stops the start (`error config`) with the fix `henki mods swap PORT std, or start with --port
+  PORT=std`. The directory, the link and the program are trust files, and the program is protected from the model's
+  write and edit tools. The binding's name in notices and records is `NAME ID` for a program at
+  `.../mods/NAME/ID/port/PORT`, else its path.
 - **The process.** Once per session, before the first record, henki runs the program with no arguments in the session's
   working directory, in a session and process group of its own, without a terminal. Its environment is the tool
   environment without the extensions' `bin/` (the allowlist and `pass_env`, `HENKI_DEPTH` one deeper, `HENKI_SESSION`
   empty, no API key). Its stderr goes to henki's kernel log, `STATE/spill/.kernel-PID.log` (0600, removed with the
   spill files after 24 hours). It must exit when its stdin closes, and leave no process behind: at the session's end
   henki sends `bye`, waits 300 ms for the answer, then kills the process group and, on Linux, every process of the
-  binding's session.
+  binding's session. The working directory and the state dir go to it as JSON strings: when either path is not
+  UTF-8, which JSON cannot hold, the start stops (`error config`, naming the binding and the path).
 - **Lines.** UTF-8 JSON, one object per line, `\n` after it, at most 16 MiB each way. henki writes canonical lines
   (compact, keys sorted, invisible code points escaped). A request is `{"id":N,"method":M,"params":P}`, ids from 0, one
   at a time. An answer is `{"id":N,"result":R}` or `{"error":{"code":C,"message":S},"id":N}`. A line with another id
-  is dropped; a line without `id` (or with `"id":null`) is a notification, which this version reads and skips.
+  (or a second answer to one) is dropped as henki reads it, while it waits and between calls; a line without `id` (or
+  with `"id":null`) is a notification, which this version reads and skips. More than 256 MiB of such lines between two
+  answers is a broken line (the dead rule).
 - **hello**, the first request: params `henki` (its version), `port`, `protocol` (`[1]`), `versions` (the port's
   method set majors henki offers, `[1]`), `scope` (the session's working directory) and `state`
   (`STATE/port/PORT/`, 0700, the binding's own dir). The answer: `{"caps":[...],"impl":V,"name":N,"protocol":1,
@@ -564,9 +568,9 @@ has one binding: the std one built into henki, or a program that `CONFIG_DIR/por
 - **Timeouts.** `hello` 5 s, `create` 2 s, `open` 5 s, `read` 10 s per page, `list` 5 s, `append` 2 s, `discard` 2 s,
   `decide` 5 s, `record` 2 s, `bye` 300 ms. A signal or the session deadline ends a wait for `hello`, `create`, `open`,
   `read`, `list` or `decide` within 50 ms, never one for a method that changes state.
-- **The dead rule.** A timeout, a closed stdout, a line over the cap or cut at EOF, a non-object line, or an answer with
-  both or neither of `result` and `error` kills the binding for the rest of the session: every later call fails at once.
-  An error answer is one failed call; the binding lives on.
+- **The dead rule.** A timeout, a closed stdout, a line over the cap or cut at EOF, a non-object line, or an answer
+  with both or neither of `result` and `error`, or 256 MiB of lines no request asked for, kills the binding for the
+  rest of the session: every later call fails at once. An error answer is one failed call; the binding lives on.
 - **Visibility.** A bound port is a notice at start (`history: NAME ID (port/1, N V); henki --port history=std runs a
   session without it`), and the journal's `session` record names it in `ports` (`{"history":"NAME ID"}`).
 - **`henki port PORT [--offer V]... -- PROGRAM`** (not in the usage text): no config read, the same environment, the
@@ -605,7 +609,7 @@ call's arguments, its target, the tripwire) and before the call runs.
 
 | Method | Params | Result |
 |---|---|---|
-| `decide` | `call` (`args`, `id`, `name`), `cwd`, `root` (the project root), `session`, `target` (a file tool's: `outside`, `path` as resolved, `protected`, `shown`; null for a shell call) | `{"decision":"allow","reason"?:S}`, `{"decision":"ask","always"?:B}` or `{"decision":"deny","reason":S}` |
+| `decide` | `call` (`args`, `id`, `name`), `cwd`, `root` (the project root), `session`, `target` (a file tool's: `outside`, `path` as resolved, `protected`, `shown`; null for a shell call; a call whose resolved path is not UTF-8 is asked without `decide`) | `{"decision":"allow","reason"?:S}`, `{"decision":"ask","always"?:B}` or `{"decision":"deny","reason":S}` |
 | `record` (cap `record`) | `call`, `verdict` (`always`) | `null` or `{"shown":S}`, once it is kept |
 | `bye` | `{}` | `null`, then exit |
 
@@ -622,10 +626,11 @@ call's arguments, its target, the tripwire) and before the call runs.
   or when a shell command's text names a protected path, absolute or with `~/`. That text match is a seatbelt only: a
   command can name a path in ways no match sees, as with `approve = "auto"`; the tripwire stays the floor for the
   trust files.
-- **Failure asks.** A binding that does not start or answer `hello` stops the start. In a session a timeout, an exit, a
-  broken line or a decision that is none of the three asks, with one notice naming the binding; the binding is then
-  dead for the session and every later call is asked at once. A signal or the session deadline ends a `decide` within
-  50 ms and the turn with it.
+- **Failure asks.** A binding that does not start or answer `hello` stops the start. In a session a timeout, an exit,
+  a broken line or a decision that is none of the three asks, with one notice naming the binding and ending `every
+  call is asked`; the binding is then dead for the session and every later call is asked at once. An error answer asks
+  that call only, with a notice ending `this call is asked`; the binding lives on and decides the next call. A signal
+  or the session deadline ends a `decide` within 50 ms and the turn with it.
 - **Std.** `approve = "auto"` is a mode of the std policy: henki refuses to start with it while a policy binding is
   linked (`error config`). While one is linked henki reads no allow rules; `--port policy=std` runs a session on std.
 

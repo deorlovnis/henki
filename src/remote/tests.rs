@@ -1,6 +1,7 @@
 #![allow(clippy::disallowed_methods, clippy::print_stdout, clippy::print_stderr, clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::string_slice)]
 use super::*;
 use std::fs;
+use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -62,6 +63,36 @@ fn remote_hello_version() {
 fn remote_skips_stale_ids_and_notifications() {
     let (_t, mut r) = binding(r#"printf '{"note":1}\n{"id":null,"x":1}\n{"id":999,"result":1}\n'; ok '{"session":"s-2"}'"#);
     assert_eq!(r.open(Path::new("/"), None).unwrap(), "s-2");
+}
+
+/// The reader passes on only the answer MAIN waits for, once: stale and repeated answers and notifications are dropped
+/// as they come, so nothing piles up between calls, and past 256 MiB of them between two answers the binding is broken.
+#[test]
+fn remote_unasked_lines_are_dropped_and_capped() {
+    let (tx, rx) = mpsc::channel();
+    let mut line = br#"{"id":7}"#.to_vec();
+    line.resize(LINE_MAX - 1, b' ');
+    line.push(b'\n');
+    let all = (0..18).fold(Box::new(std::io::empty()) as Box<dyn Read>, |r, _| Box::new(r.chain(&line[..])));
+    lines(all, &tx, &AtomicU64::new(7));
+    let got: Vec<Line> = rx.try_iter().collect();
+    assert_eq!(got.len(), 2, "the answer and the end, nothing between");
+    assert!(matches!(&got[0], Ok((v, n)) if v["id"] == 7 && *n == LINE_MAX));
+    assert_eq!(got[1], Err("over 268,435,456 bytes of lines nobody asked for".into()));
+    let (_t, mut r) = binding(r#"ok '{"session":"s-1"}'; ok '{"session":"s-1"}'; printf '{"id":%s}\n{"x":1}\n' "$id""#);
+    for _ in 0..3 {
+        assert_eq!(r.create(Path::new("/"), None).unwrap(), "s-1", "a repeated answer is never the next call's");
+    }
+}
+
+/// JSON holds UTF-8 only: a scope or state dir that is not refuses hello, and the binding is ended without it.
+#[test]
+fn remote_hello_refuses_non_utf8_paths() {
+    let (t, mut r) = binding("");
+    let bad = t.0.join(std::ffi::OsStr::from_bytes(b"w\xff"));
+    let e = r.hello(&bad, &t.0, &[1]).unwrap_err();
+    assert_eq!(e, err("invalid", format!("history binding t 1: {} is not UTF-8, which port/1 cannot send; fix: X", bad.display())));
+    assert!(r.child.is_none() && r.call("create", json!({})).unwrap_err() == e);
 }
 
 #[test]
