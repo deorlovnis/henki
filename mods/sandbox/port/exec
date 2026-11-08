@@ -3,7 +3,7 @@
 # directory (the project). This program hides your home, henki's own dirs and the known control sockets (terminal
 # multiplexers, the X server, the session bus, docker), keeps writes inside the project and the temp dir, drops SSH_AUTH_SOCK,
 # then runs its arguments. It shares this machine's files, so it keeps argument 1 (the host bash). Backends, picked per
-# call: bwrap (Linux), user namespaces through unshare (Linux), sandbox-exec (macOS).
+# call: bwrap (Linux, if a trial run works), user namespaces through unshare (Linux), sandbox-exec (macOS).
 # Its own failures exit 126 with one line on stderr; otherwise it exits with the command's status.
 # HENKI_SANDBOX=bwrap|ns|seatbelt forces a backend (tests); unset or `auto` picks the first that works here.
 set -uf # -f: no globbing of paths
@@ -39,9 +39,12 @@ userns_ok() { # the kernel allows unprivileged user namespaces (a cheap check; n
   [ "$_n" != 0 ]
 }
 if [ "$pick" = auto ]; then
+  bw= # a bwrap that cannot set up its namespaces here (a container's /proc, say) is passed over
   if [ -x /usr/bin/sandbox-exec ]; then pick=seatbelt
-  elif tool bwrap >/dev/null; then pick=bwrap
+  elif bw=$(tool bwrap) && "$bw" --ro-bind / / --dev /dev --proc /proc --unshare-pid true </dev/null >/dev/null 2>&1; then pick=bwrap
   elif tool unshare >/dev/null && userns_ok; then pick=ns
+  elif [ -n "$bw" ]; then
+    die "bwrap fails here (see: $bw --ro-bind / / --dev /dev --proc /proc --unshare-pid true) and user namespaces are off; fix: henki mods swap exec std"
   else die "no bwrap, no user namespaces; fix: install bubblewrap, or henki mods swap exec std"
   fi
 fi

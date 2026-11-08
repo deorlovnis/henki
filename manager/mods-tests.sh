@@ -707,11 +707,27 @@ s = socket.socket(socket.AF_UNIX); s.bind(sys.argv[1]); s.listen(8); time.sleep(
   n=0; while [ ! -S "$1" ] && [ "$n" -lt 40 ]; do sleep 0.05; n=$((n + 1)); done; }
 conn() { printf "python3 -I -c 'import socket, sys; socket.socket(socket.AF_UNIX).connect(sys.argv[1])' '%s'" "$1"; }
 uid=$(id -u)
+# A dir of the person's outside the home, the temp dirs and the project that stays visible inside: in the checkout
+# (EXE is CHECKOUT/mods/sandbox/port/exec). Only every mount being read-only keeps a write there from the host.
+out=$(cd -P "${exe%/*}/../../.." && mktemp -d "$PWD/.sandbox-test.XXXXXX") || { echo "FAIL no dir in the checkout"; exit 1; }
+# Inside, every mount but the project, the temp dir, the kernel's, the hides (a tmpfs with dirs only) and the masks
+# (/dev/null over a file) is read-only: prints `root ro`, then the others. Per mount point the last entry is the one on
+# top; a mount point that is not there inside (under a hide) cannot be reached.
+ro_all='awk '"'"'{ i = 7; while ($i != "-") i++; split($6, o, ","); top[$5] = o[1] " " $(i + 1) }
+  END { for (m in top) print top[m], m }'"'"' /proc/self/mountinfo |
+  while read -r rw t m; do
+    [ "$m" = / ] && echo "root $rw"
+    [ "$rw" = ro ] || [ ! -e "$m" ] && continue
+    case $m in "$PWD" | "$TMPDIR" | /proc | /proc/* | /sys | /sys/* | /dev | /dev/*) continue ;; esac
+    [ -c "$m" ] && continue
+    [ "$t" = tmpfs ] && [ -z "$(find "$m" -xdev -mindepth 1 ! -type d 2>/dev/null | head -n 1)" ] && continue
+    echo "writable: $m ($t)"
+  done | sort'
 
 for be in "$@"; do
   root=$(mktemp -d "${TMPDIR:-/tmp}/sandbox-test.XXXXXX"); root=$(cd -P "$root" && pwd)
   H=$root/home
-  mkdir -p "$H/.ssh" "$H/.config/henki" "$H/.local/state/henki" "$H/code/projB" "$root/projA" "$root/other" \
+  mkdir -p "$H/.ssh" "$H/.config/henki" "$H/.local/state/henki" "$H/code/projB" "$root/projA" \
     "$root/xstate/henki" "$root/run" "$root/agent" "$root/tmp"
   echo secret-kh >"$H/.ssh/known_hosts"; echo 'model = "x"' >"$H/.config/henki/config.toml"
   echo secret-state >"$root/xstate/henki/s"; echo secret-run >"$root/run/r"; echo sock >"$root/agent/sock"
@@ -729,6 +745,9 @@ for be in "$@"; do
   for proj in "$root/projA" "$H/code/projB"; do
     case $proj in "$H"/*) where="project in home" ;; *) where="project outside home" ;; esac
     printf -- '-- %s %s\n' "$be" "$where"
+    # (a bwrap on PATH that cannot set up here, as in some containers, is passed over)
+    r=$(cd "$proj" && env -u HENKI_SANDBOX HENKI_USER_PATH="$PATH" "$exe" "$bash_abs" --noprofile --norc -c 'echo ran' 2>&1 </dev/null); s=$?
+    [ "$s" = 0 ] && [ "$r" = ran ] && ok "the auto pick finds a backend that works" || bad "the auto pick fails (exit $s: $r)"
     r=$(cd "$proj" && HENKI_SANDBOX=$be bash "$mods" test --port exec "$exe" 2>&1 </dev/null); s=$?
     [ "$s" = 0 ] && ok "exec/1 R01-R07 ($where)" || bad "exec/1 R01-R07 ($where): $r"
     check "cat ~/.ssh/known_hosts fails" 1 'cat ~/.ssh/known_hosts'
@@ -738,7 +757,14 @@ for be in "$@"; do
     check "the agent socket's dir hidden" 1 "cat '$root/agent/sock'"
     check "SSH_AUTH_SOCK is unset" 0 '[ -z "${SSH_AUTH_SOCK+x}" ]'
     check "a write to /etc/x fails" 1 'echo x >/etc/x'
-    check "a write outside the project fails" 1 "echo x >'$root/other/x'"
+    if inside "[ -d '$out' ] && echo seen" | command grep -qx seen; then
+      check "a write outside the project fails" 1 "echo x >'$out/x'"
+      [ ! -e "$out/x" ] && ok "no write outside the project reaches the host" || { bad "a write outside the project reached the host"; rm -f "$out/x"; }
+    else echo "sandbox: $be: the write outside the project not tried ($out is hidden inside)"
+    fi
+    if [ "$be" != seatbelt ]; then
+      r=$(inside "$ro_all"); [ "$r" = "root ro" ] && ok "every other mount is read-only" || bad "mounts left writable: $r"
+    fi
     check "a write to the project works" 0 'echo x >in-project && [ -s in-project ]'
     check "a write to TMPDIR works" 0 'echo x >"$TMPDIR/in-tmp"'
     [ -f "$proj/in-project" ] && [ -f "$root/tmp/in-tmp" ] && ok "project and TMPDIR writes reach the host" || bad "project or TMPDIR write lost"
@@ -747,7 +773,7 @@ for be in "$@"; do
     if [ "$be" != seatbelt ]; then
       check "umount of the home fails" 1 'umount "$HOME" 2>&1 && ls -A "$HOME" | command grep -q .ssh'
       check "a nested namespace cannot unmount it" 1 'unshare -rm sh -c "umount \"\$HOME\" 2>/dev/null; ls -A \"\$HOME\"" | command grep -q .ssh'
-      check "a remount read-write fails" 1 "mount -o remount,rw / 2>/dev/null || unshare -rm sh -c 'mount -o remount,bind,rw $root/other' 2>/dev/null; echo x >'$root/other/y'"
+      check "a remount read-write fails" 1 "mount -o remount,rw / 2>/dev/null || unshare -rm sh -c 'mount -o remount,bind,rw $out' 2>/dev/null; echo x >'$out/y'"
       sleep 300 & hp=$!
       check "a host process's environ is unreadable" 1 "cat /proc/$hp/environ"
       check "a host process's root is unreadable" 1 "ls /proc/$hp/root/"
@@ -846,6 +872,7 @@ if [ "$(uname -s)" = Linux ]; then
   rm -rf "$root"
 fi
 
+rm -rf "$out" # not by an EXIT trap: a subshell that a TERM ends before its exec runs that trap too
 echo "sandbox tests: $fails failed"
 [ "$fails" = 0 ]
 SH

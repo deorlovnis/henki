@@ -23,11 +23,12 @@ Inside a call:
   `TMPDIR` that is `/`, a hidden dir, or neither yours nor a shared temp dir.
 
 Backends, picked per call:
-- Linux with `bwrap` (bubblewrap): a new mount, pid and IPC namespace.
-- Linux without it, where user namespaces work: `unshare` and the setup script in `.henki/ns-setup`: a new mount, pid
-  and IPC namespace; the command runs as your uid with no capabilities, in a nested namespace where the mounts are
-  locked. The project and the temp dir are bound from the host; `/proc` is the host's (other processes' command lines
-  are visible, their files and environment are not).
+- Linux with `bwrap` (bubblewrap) that works here (a trial `bwrap ... true` per call; in some containers it cannot
+  mount a `/proc`): a new mount, pid and IPC namespace.
+- Linux without a working one, where user namespaces work: `unshare` and the setup script in `.henki/ns-setup`: a new
+  mount, pid and IPC namespace; the command runs as your uid with no capabilities, in a nested namespace where the
+  mounts are locked. The project and the temp dir are bound from the host; `/proc` is the host's (other processes'
+  command lines are visible, their files and environment are not).
 - macOS: `sandbox-exec` with `.henki/macos.sb`. It hides a list (`~/.ssh`, `~/.config`, `~/.aws`, `~/.gnupg`,
   `~/.docker`, `~/.kube`, `~/.netrc`, `~/.git-credentials`, the Keychains and cookies, henki's config, state and data)
   rather than the whole home, and allows writes to the project, the temp dirs and `/private/tmp`. It refuses unix
