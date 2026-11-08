@@ -1,0 +1,11 @@
+#!/bin/sh
+# r09_door_log (running boxes)
+. "$EVAL_LIB/check"
+same approved/box.crewpoint.json crewpoint
+same current/box.crewpoint.json crewpoint
+answer_has 'hooks\.slack\.com'
+called '^(log|box log) crewpoint([^[:alnum:]_]|$)'
+never '^(allow|open|close|stop|set|copy|with|login|jobs|clone|temp|ws)([^[:alnum:]_]|$)'
+never '^policy (approve|edit)([^[:alnum:]_]|$)'
+never '^box (approve|stop|new|delete|run|edit)([^[:alnum:]_]|$)'
+verdict

@@ -882,6 +882,62 @@ SH
   [ "$RC" = 0 ] || { FAILS=$((FAILS + 1)) && printf '%s\n' "$OUT" >&2; }
 }
 
+# The halti module's eval tasks: every scripted solution in testdata/halti/scripts.json, its commands run with sh in
+# the task's world (as a model's calls would, fake-bin first on PATH) and its answer on check's stdin: the known-good
+# ones pass, the known-bad ones fail. No henki and no model: this holds the checks to what they are meant to catch.
+t_halti_eval() {
+  case_ "halti eval: each check passes the known-good solutions and fails the known-bad ones"
+  local ev="$MODS_DIR/halti/eval" sol t r n=0 got want
+  command -v python3 >/dev/null 2>&1 || {
+    fail "python3 is not on PATH (the stand-in halti needs it)"
+    return
+  }
+  python3 -I - "$(pwd -P)/manager/testdata/halti/scripts.json" "$D/sol" <<'PY' || fail "cannot read scripts.json"
+import json, os, sys
+scripts = json.load(open(sys.argv[1]))["scripts"]
+for t, lst in scripts.items():
+    for s in lst:
+        d = os.path.join(sys.argv[2], t, s["kind"])
+        os.makedirs(d)
+        open(os.path.join(d, "answer"), "w").write(s["answer"])
+        open(os.path.join(d, "want"), "w").write("pass" if s["pass"] else "fail")
+        recs = []
+        for i, c in enumerate(s["cmds"]):
+            open(os.path.join(d, "cmd.%02d" % i), "w").write(c + "\n")
+            recs.append({"msg": {"content": "", "role": "assistant", "tool_calls": [{"args": {"command": c}, "id": "c%d" % i, "name": "shell"}]}, "t": "assistant"})
+        recs.append({"msg": {"content": s["answer"], "role": "assistant", "tool_calls": []}, "t": "assistant"})
+        with open(os.path.join(d, "henki.jsonl"), "w") as f:
+            for r in recs:
+                f.write(json.dumps(r, sort_keys=True, separators=(",", ":"), ensure_ascii=False) + "\n")
+PY
+  for sol in "$D"/sol/*/*; do
+    t=${sol%/*}
+    t=${t##*/}
+    r="$D/run"
+    rm -rf "$r" && mkdir -p "$r/home" "$r/work" && cp "$sol/henki.jsonl" "$r/henki.jsonl"
+    (
+      cd "$r/work" || exit 1
+      export HOME="$r/home" EVAL_HOME="$r/home" EVAL_ROOT="$r" EVAL_LIB="$ev/lib" EVAL_DIR="$ev/$t" PATH="$ev/$t/fake-bin:/usr/bin:/bin"
+      unset HALTI_FAKE_STATE HALTI_FAKE_CONFIG HALTI_FAKE_LOG HALTI_FAKE_DENY
+      "$ev/$t/setup" </dev/null >"$r/setup.log" 2>&1 || { echo "setup failed" >"$r/why"; exit 1; }
+      for c in "$sol"/cmd.*; do
+        [ -f "$c" ] || continue
+        sh "$c" </dev/null >/dev/null 2>&1
+      done
+      "$ev/$t/check" <"$sol/answer" >"$r/why" 2>&1
+    ) && got=pass || got=fail
+    want=$(cat "$sol/want")
+    n=$((n + 1))
+    [ "$got" = "$want" ] || fail "$t ${sol##*/}: $got, wanted $want: $(tr '\n' ' ' <"$r/why")"
+  done
+  [ "$n" = 63 ] || fail "$n solutions, wanted 63"
+  # The stand-in never runs in the account's own home: there it would see a real halti's rules.
+  RC=0
+  OUT=$(cd "$D" && env -u HALTI_FAKE_CONFIG -u HALTI_FAKE_STATE HOME="$(python3 -I -c 'import os, pwd; print(pwd.getpwuid(os.getuid()).pw_dir)')" "$ev/lib/halti" ls 2>&1) || RC=$?
+  rc_is 3
+  out_has "is the account's own ~/.config/cred; refusing"
+}
+
 t_sessions
 t_prompts
 t_project
@@ -892,6 +948,7 @@ t_checkpoints_kept
 t_notify
 t_compact
 t_sandbox
+t_halti_eval
 if [ "$FAILS" != 0 ]; then
   echo "mods-tests.sh: $FAILS checks failed in $CASES cases" >&2
   exit 1

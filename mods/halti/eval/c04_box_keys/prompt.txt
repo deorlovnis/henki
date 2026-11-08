@@ -1,0 +1,1 @@
+Which keys may my research workspace's boxes use, and to which hosts does halti send each of them?

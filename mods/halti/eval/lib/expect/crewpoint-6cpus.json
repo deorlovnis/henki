@@ -1,0 +1,44 @@
+{
+ "about": "Crewpoint client work: payments service",
+ "browser": {
+  "downloads": false,
+  "keep_sessions": true
+ },
+ "cpus": 6,
+ "docker": false,
+ "image": "cred-agent@sha256:5bb242f03dde4031bcb3b765a8fd174a2c353e4c03ccc19ba144fa2097790425",
+ "keep": true,
+ "memory": "4G",
+ "model": "anthropic",
+ "mount": [
+  {
+   "mode": "clone",
+   "path": "~/Git/payments"
+  }
+ ],
+ "net": {
+  "allow": [
+   "https://api.github.com",
+   "https://api.trello.com",
+   "https://codeload.github.com",
+   "https://files.pythonhosted.org",
+   "https://github.com",
+   "https://pypi.org",
+   "https://registry.npmjs.com"
+  ],
+  "allow_writes": [],
+  "writes": "deny"
+ },
+ "rosetta": false,
+ "run": [
+  "claude"
+ ],
+ "sites": [
+  "github",
+  "trello"
+ ],
+ "standins": [
+  "GH_TOKEN",
+  "TRELLO_API_KEY"
+ ]
+}

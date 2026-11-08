@@ -1,0 +1,11 @@
+evalrun/1	20270111T220000Z-a1b2	halti	0.3.0	hd1:5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e	Qwen3.5-2B-Q8_0	own	on	1	c01	1	ok	4	11.1	412
+evalrun/1	20270111T220000Z-a1b2	halti	0.3.0	hd1:5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e	Qwen3.5-2B-Q8_0	own	off	1	c01	0	ok	4	11.1	0
+evalrun/1	20270111T220000Z-a1b2	halti	0.3.0	hd1:5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e	Qwen3.5-2B-Q8_0	own	off	2	c01	0	ok	5	12.2	0
+evalrun/1	20270111T220000Z-a1b2	halti	0.3.0	hd1:5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e	Qwen3.5-2B-Q8_0	own	on	2	c01	1	ok	5	12.2	412
+evalrun/1	20270111T220000Z-a1b2	halti	0.3.0	hd1:5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e	Qwen3.5-2B-Q8_0	own	on	3	c01	0	gave_up:max_steps	6	13.3	412
+evalrun/1	20270111T220000Z-a1b2	halti	0.3.0	hd1:5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e	Qwen3.5-2B-Q8_0	own	off	3	c01	0	gave_up:max_steps	6	13.3	0
+evalrun/1	20270111T220000Z-a1b2	halti	0.3.0	hd1:5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e	Qwen3.5-2B-Q8_0	own	off	1	c02	1	ok	5	18.2	0
+evalrun/1	20270111T220000Z-a1b2	halti	0.3.0	hd1:5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e	Qwen3.5-2B-Q8_0	own	on	1	c02	1	ok	5	18.2	412
+evalrun/1	20270111T220000Z-a1b2	halti	0.3.0	hd1:5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e	Qwen3.5-2B-Q8_0	own	on	2	c02	0	ok	6	19.3	412
+evalrun/1	20270111T220000Z-a1b2	halti	0.3.0	hd1:5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e	Qwen3.5-2B-Q8_0	own	off	2	c02	0	ok	6	19.3	0
+evalrun/1	20270111T220000Z-a1b2	halti	0.3.0	hd1:5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e	Qwen3.5-2B-Q8_0	own	off	3	c02	0	gave_up:max_steps	7	20.4	0

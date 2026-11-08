@@ -1,0 +1,8 @@
+#!/bin/sh
+# r10_stop_box (running boxes)
+. "$EVAL_LIB/check"
+holds status/box/crewpoint.main stopped
+holds status/ws/crewpoint open
+called '^(stop|box stop) crewpoint([^[:alnum:]_]|$)'
+never '^close([^[:alnum:]_]|$)'
+verdict

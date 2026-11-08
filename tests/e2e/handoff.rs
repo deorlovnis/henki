@@ -336,6 +336,42 @@ fn handoff_official_mods() {
     assert!(user[1].starts_with("Review the uncommitted changes") && user[1].ends_with("\n\nthe parser\n"), "{user:?}");
 }
 
+/// An Agent Skill the manager imported (`henki-mods add --skill`) is a template: `/NAME TEXT` shows the skill's
+/// instructions, TEXT after them, and sends them on a yes. It costs no prompt bytes, and its files stay data.
+#[test]
+fn handoff_skill_import() {
+    let m = Mock::start(vec![say("checked")]);
+    let r = Run::new(&m.url());
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let out = std::process::Command::new("bash")
+        .arg(root.join("manager/henki-mods"))
+        .args(["add", "--skill"])
+        .arg(root.join("manager/testdata/skills/plain-skill"))
+        .arg("--yes")
+        .env_clear()
+        .env("HOME", &r.home)
+        .env("PATH", "/usr/local/bin:/usr/bin:/bin")
+        .env("XDG_DATA_HOME", r.dir.join("xdg/data"))
+        .env("TMPDIR", &r.dir)
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let p = start(&r, &[]);
+    p.line("/plain-skill focus on 0.3");
+    p.expect("[from /plain-skill]\r\n(This skill's files are in ", W);
+    p.expect("/.henki/skill; read them when the text names them.)\r\n# Changelog check\r\n", W);
+    p.expect("3. Say which commits have no entry.\r\n\r\nfocus on 0.3\r\n", W);
+    p.expect("send? [Y/n] ", W);
+    p.line("y");
+    p.expect("checked", W);
+    p.prompt(W);
+    exit(&r, p);
+    let log = m.log();
+    let (system, user) = (log[0].system(), log[0].contents("user"));
+    assert!(!system.contains("plain-skill"), "{system}");
+    assert!(user[0].contains("\n\n(This skill's files are in ") && user[0].contains("2. Read `references/STYLE.md`") && user[0].ends_with("\n\nfocus on 0.3\n"), "{user:?}");
+}
+
 /// A `restart` after the history link changed (as `/mods swap history ...` does) starts a new session on the new
 /// binding: a resume there would be refused, since the session stays in the store it was kept in, which a note names.
 #[test]

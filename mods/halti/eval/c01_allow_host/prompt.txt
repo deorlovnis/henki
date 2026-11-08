@@ -1,0 +1,1 @@
+Add docs.gradle.org to the hosts my crewpoint workspace's boxes may read, then tell me exactly what halti asked of me.

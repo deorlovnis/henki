@@ -1,0 +1,1 @@
+Run the payments tests inside my crewpoint box (they start with ./run-tests.sh in the box's payments folder) and tell me which test fails.

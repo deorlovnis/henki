@@ -1,0 +1,8 @@
+FAIL: no rows of the general suite
+eval_suite = "halti"
+eval_model = "Qwen3.5-2B-Q8_0"
+eval_hd1 = "hd1:5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e"
+eval_repeats = 3
+eval_on = "26/36"
+eval_off = "1/36"
+eval_effect = "+25 per 36 (95% CI +19 to +30; tasks 11 better, 0 worse, 1 equal; sign p 0.001)"

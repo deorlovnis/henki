@@ -1,0 +1,4 @@
+#!/bin/sh
+# c03_why_refused: the halti world
+. "$EVAL_LIB/world"
+seed

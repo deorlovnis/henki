@@ -47,6 +47,10 @@ A program reads the contracts this henki ships from the rows of this table: each
 | `bind/1` | henki-mods | the lock lines of bound ports, in `mods.lock` |
 | `hd1` | henki-mods | the tree hash that pins a module's files |
 | `eval/1` | henki-mods | a module's eval tasks, the two arms they run in, and the line that records them |
+| `evalrun/1` | henki-mods | an eval run's dir and rows, its statistics, and the badge an index entry carries |
+| `hist/1` | henki-mods | the lock lines a change replaced or removed, `mods.history` |
+| `index/1` | henki-mods | a signed module index: its entries, its signature chain, and what henki-mods reads from it |
+| `pack/1` | henki-mods | a pack of modules for a machine with no network: its members and its `PACK` |
 
 ## journal/1
 
@@ -523,44 +527,83 @@ summary = "..."                  # optional, at most 160 bytes; defaults to doc.
 license = "Apache-2.0"           # required, an SPDX id or expression
 requires = ["henki >= 0.1"]      # optional
 contracts = ["ext/1"]            # optional; refused when this henki's index lacks one
-os = ["macos", "linux"]          # optional; refused on another OS
+os = ["linux", "macos"]          # optional; refused on another OS
 needs = ["git"]                  # optional; looked for on PATH, never installed (a warning, not a refusal)
 shadow = ["halti/pbpaste"]       # optional; the NAME/COMMAND entries the user must add to the config's shadow
 caps_net = "none"                # optional: none | loopback | any (declared, NOT enforced)
 maintainer = "..."               # optional
 ports = ["history"]              # optional; exactly the programs in port/ (port/1), each a port henki can bind
+asset_aarch64_apple_darwin = ["bin/x", "https://...", "sha256:..."]   # optional; a prebuilt program per target
 ```
+
+`asset_TARGET` names a prebuilt program for one machine: TARGET is `aarch64_apple_darwin`, `x86_64_apple_darwin`,
+`aarch64_unknown_linux_musl`, `x86_64_unknown_linux_musl`, `aarch64_unknown_linux_gnu` or `x86_64_unknown_linux_gnu`
+(on Linux the musl one is taken first), and the array holds the program's place (`bin/NAME`, NAME not `.` or `..`),
+an https URL and the SHA-256 of its bytes (64 lowercase hex digits). At an install henki-mods downloads this machine's
+one (curl, https only, at most 64 MiB), refuses other bytes, and puts it at its place in the store copy, as a program;
+the module's own files must not hold that place. A module with assets but none for this machine is refused. The asset
+is left out of the hd1 (which stays the hash of the module's own files, the one an index lists) and is checked by its
+SHA-256 instead, whenever the store copy is (`verify`, `on`, a swap).
 
 A module without a manifest is unmanaged (allowed for path and URL installs, and listed as such). `port/PORT` is a
 program its owner can run (a file, or a link inside the module), PORT one that henki binds (`history`, `policy`,
 `context` or `exec`). `cmd/`, `ctx/` and `eval/` are ext/2's (`ctx/` holds context sources, `eval/` eval/1 tasks),
 `on/` observe/1's; `.henki/template` may hold a program that `cmd/` links run. Any other file under `.henki/` is data
-the module's own programs read (a library, a setup script they run with `sh`): a regular file of mode 644, never a
-link or a program, which nothing puts on a PATH. A module with `ctx/` says `requires = ["henki >= 0.3"]`, and so does
-one with `port/context` or `port/exec`.
+the module's own programs read (a library, a setup script they run with `sh`, an Agent Skill's files): a regular
+file of mode 644, never a link or a program, which nothing puts on a PATH. A module with `ctx/` says `requires =
+["henki >= 0.3"]`, and so does one with `port/context` or `port/exec`.
 
 A git source (`URL[@REF][#SUBDIR]`) is cloned only over `https`, `http`, `ssh`, `git` or `file` URLs, or scp's
 `USER@HOST:PATH`; a remote helper (`ext::`, `fd::`, any other `SCHEME::` or unknown `SCHEME://`) is refused before
 git runs. The module is copied from the commit's raw blobs, and refused when a `.gitattributes` in it or in a
 directory above it sets `export-subst`, `export-ignore`, `ident`, `filter`, `text`, `eol`, `crlf` or
 `working-tree-encoding` (a checkout would hold other bytes), or when two of its paths differ only in ASCII case (one
-name on a Mac).
+name on a Mac). `add SRC --expect hd1:HASH` installs only a copy of that hd1 (the line `henki-mods share NAME`
+prints, with the full commit).
 
+**Agent Skills.** `henki-mods add --skill SRC [--as NAME]` makes a module from an Agent Skill (agentskills.io: a
+directory whose `SKILL.md` starts with YAML frontmatter, then markdown instructions), SRC being a path or a git source
+as above; the source is copied the same way, and nothing of it runs. The frontmatter is read for top-level scalars
+(plain, quoted on one line, `|` and `>` blocks) and `metadata`'s block map, which is skipped; anything else is refused.
+`name` follows the format (1 to 64 of `a-z`, `0-9` and inner single hyphens, the directory's name) and must also be a
+henki name (else `--as`), not one henki keeps, an official module's, or one an added module or its command has; the
+body is at most 16 KiB of UTF-8 without a code point henki escapes, the skill at most 200 files and 4 MiB, with no
+links. The module is made the same way each time (so its hd1 is too): `doc.md` (line 1 the `description` on one line,
+cut to 160 bytes, then where it came from), `cmd/NAME.md` (the body), `cmd/NAME -> ../.henki/template` (the `prompts`
+module's template, which hands the text back as `send`, with a line naming `.henki/skill` when the skill has other
+files), `.henki/skill/...` (the skill's other files, mode 644; `LICENSE*` at the top as well) and a manifest
+(`version = "skill-"` and 12 hex digits of the commit, or of the source's hd1; `license` the frontmatter's when it is
+one the index accepts, else `NOASSERTION`; `requires = ["henki >= 0.2"]`). `allowed-tools` is shown and ignored.
 ## lock/1
 
 Owned by henki-mods. `CONFIG_DIR/mods.lock` holds one line per module, fields separated by tabs, lines sorted by name,
 written atomically (a temp file, then a rename):
 
 ```
-lock/1 NAME STATE VERSION SOURCE_KIND SOURCE COMMIT HD1 ADDED HOW MASK
+lock/1 NAME STATE VERSION SOURCE_KIND SOURCE COMMIT HD1 ADDED HOW FLAGS
 ```
 
-- STATE `on` or `off`; SOURCE_KIND `official`, `path` or `url`; SOURCE the module's name (official), the path, or
-  `URL` or `URL#SUBDIR`; COMMIT 40 hex digits or `-`; HD1 the module's `hd1:` hash; ADDED the UTC time,
-  `YYYY-MM-DDTHH:MMZ`; HOW `tty` (answered on the terminal) or `yes` (`--yes`); MASK empty in this version.
-- A line whose first field is not `lock/1` (or `bind/1`, after them) is refused: `this lock is newer than this
-  henki-mods; upgrade henki`.
-- On means the link `CONFIG_DIR/ext/NAME` points at the module's store copy; off means no link.
+- STATE `on` or `off`; SOURCE_KIND `official`, `path`, `url`, `skill` or `index:INDEX`; SOURCE the module's name
+  (official), the path, `URL` or `URL#SUBDIR` (for `skill` too: the skill's directory or git source), or for
+  `index:INDEX` the package's name in index INDEX (index/1);
+  COMMIT 40 hex digits or `-`; HD1 the module's `hd1:` hash; ADDED the UTC time, `YYYY-MM-DDTHH:MMZ`; HOW `tty`
+  (answered on the terminal) or `yes` (`--yes`).
+- FLAGS is empty or a comma-separated list: `pin` (an update leaves the module as it is), `ref=REF` (the ref a URL
+  install follows: the branch or tag it named, `HEAD` for the default branch; none when it named a commit),
+  `yanked=malicious` or `yanked=buggy` (an index yanked this version; a malicious one stays off), `skill=hd1:HASH`
+  (the hd1 of the Agent Skill's directory the module was made from; a skill from a URL has `ref=` too), `mask=cmd/NAME`, one per masked command (`henki-mods off NAME/CMD`: the
+  link names a copy of the store copy without `cmd/CMD` and `cmd/CMD.md`, beside it as `ID.mHASH`, where HASH is 8 hex
+  digits of the SHA-256 of the masked names, sorted, one per line; HD1 stays the module's own).
+- A line whose first field is not `lock/1` (or `bind/1`, after them), or that holds a kind or flag henki-mods does not
+  know, is refused: `this lock is newer than this henki-mods; upgrade henki`. So no rewrite of the lock drops what a
+  later henki-mods wrote.
+- On means the link `CONFIG_DIR/ext/NAME` points at the module's store copy (or its masked copy); off means no link.
+- A profile is a file of lock/1 lines that `henki-mods init PROFILE` adds: lines of kind `official` (VERSION, COMMIT,
+  HD1, ADDED and HOW `-`: the copy this henki ships) and of kind `index:INDEX` (a package pinned by VERSION and HD1).
+  henki ships some in `share/henki/mod-profiles/NAME.lock`, an index may hold more in `profiles/NAME.lock`, and
+  `henki-mods profile save FILE` writes the modules on as one. A module the lock has already is left as it is: an off
+  line is never turned on by a profile. Each module is staged and checked as `add` does: a package yanked or removed
+  as malicious refuses.
 
 ## bind/1
 
@@ -574,9 +617,115 @@ bind/1 PORT NAME ID ADDED HOW
   as in lock/1. The binding is the link `CONFIG_DIR/port/PORT` -> `DATA/henki/mods/NAME/ID/port/PORT`, which
   `henki-mods swap PORT NAME` writes (after the conformance suite passes and the user says yes) and `swap PORT std`
   removes. henki reads the link only, never this line.
+- HOW `yanked`: an index yanked NAME as malicious while it held a port that has no safe fallback (any but `policy` and
+  `context`, which go back to std). The link is then `CONFIG_DIR/port/PORT -> yanked`, which names nothing, so henki
+  refuses to start until the user runs `henki-mods swap PORT std` (or another package), or starts with
+  `--port PORT=std`: a sandbox or a history store never silently falls back.
 - `henki-mods rm NAME` is refused while a link in `CONFIG_DIR/port/` leads into NAME's store copies. A henki-mods that
   does not know `bind/1` refuses the lock, so it never drops a binding it cannot see; one that knows it refuses a line
   for a port it does not bind the same way (`this lock is newer than this henki-mods`).
+
+## hist/1
+
+Owned by henki-mods. `CONFIG_DIR/mods.history` keeps every lock/1 line a change replaced or removed, one per line,
+appended:
+
+```
+hist/1 TIME WHY LOCK_LINE
+```
+
+- TIME is the UTC time (`YYYY-MM-DDTHH:MMZ`), WHY the verb (`rm`, `update`, `rollback`, `unpack`, `init`) and
+  LOCK_LINE the whole lock/1 line as it was, its tabs included. A rollback takes the pin it goes back to from here,
+  never from the module's source.
+- The store (`DATA/henki/mods/`) and the index clones are shared by every config dir henki-mods runs on, each listed
+  once in `DATA/henki/mods.users`. `henki-mods gc` keeps whatever the lock, the port links, the history and
+  `mods.index` of any of them name.
+
+## index/1
+
+Owned by henki-mods. A module index is a git repository whose `main` lists modules someone has read, each pinned to a
+full commit and its hd1; it never holds module code. henki-mods reads it to search, show and install modules, and to
+apply yanks.
+
+- **Files.** `mods/NAME.toml` (a package), `mods/NAME/VERSION.toml` (one per indexed version), `profiles/NAME.lock`
+  (a profile, lock/1), `removed.toml`
+  (`NAME = "malicious|buggy|withdrawn: REASON (YYYY-MM-DD)"`, a name taken out for good), `.signers` (who may sign
+  `main`, git's allowed_signers format), and the index's own gate and docs. Entries are in module/1's grammar; an
+  unknown key is refused, and `index = 2` is a later format (`this index is newer than this henki-mods`).
+- **A package**: `index = 1`, `name` (the file's), `kind` (`git`, or `official` for a record about a module henki
+  ships, never installed from the index), for `git` a `repo` (an https URL; henki-mods also reads a `file:///` one,
+  which the index's own gate refuses, for an index on a local disk: hd1 binds the files either way) and a `path` (the
+  module's directory in it, `""` for the root), `summary` (at most 160 bytes), `maintainer`, `license`, `latest` (an
+  indexed version, not yanked) and `added` (`YYYY-MM-DD`).
+- **A version**: `index = 1`, `version` (the file's), `commit` (40 hex digits), `hd1` (of the module's directory at
+  that commit, from its raw blobs), the keys the module itself decides (`requires`, `contracts`, `os`, `ports`,
+  `commands`, `bins`, `observers`, `ctx`, `prompt_bytes`, `card_bytes`, `caps_net`; `henki-mods-dev entry derive`
+  prints them), `conform` with `ports`, `asset_TARGET` and `asset_check_TARGET` for a prebuilt binary, `reviewed`
+  and `reviewer` (who read this version, and when), `yanked` (`malicious|buggy|withdrawn: REASON (YYYY-MM-DD)`) and
+  the `eval_*` keys of a badge, all or none.
+- **The signature chain.** Every commit on `main`'s first-parent line is SSH-signed (namespace `git`) by a key listed
+  in the `.signers` of its first parent (at most 64 KiB), the root commit by a key of the anchor; a line whose key
+  blob is in the refused keys never counts, and neither does an OpenPGP or X.509 signature, whatever the person's own
+  gpg says of it. A key changes only through a commit, signed by a current key, that edits `.signers`. At most 5,000
+  commits are on the line.
+- **Anchors.** The default index's are beside henki-mods (`share/henki/index/`, or `HENKI_SHARE/index/`, which every
+  index screen then names): `NAME.url`, `NAME.signers` (its root's keys; with no key line the index is not live yet),
+  `NAME.checkpoint` (a commit on its first-parent line) and `refused.keys` (key blobs that never verify, one per
+  line). More indexes are `index/1<TAB>NAME<TAB>URL` lines in `CONFIG_DIR/mods.index`, each with its pinned
+  `CONFIG_DIR/index/NAME.signers` and, optionally, `NAME.checkpoint` (`henki-mods index add NAME URL --signers FILE
+  [--checkpoint COMMIT]` writes them after showing the keys' fingerprints, `index rm NAME` takes them out). Index URLs are https, ssh or file. A first sync
+  of the default index with no checkpoint beside henki-mods is refused; elsewhere (`HENKI_SHARE`, `mods.index`) it is
+  a warning.
+- **A sync** fetches `main` into the bare clone `DATA/henki/index/NAME.git` (`refs/henki/fetched`). The commit verified
+  before (`refs/henki/verified`), or at a first sync the checkpoint, must be on the fetched first-parent line: no
+  rollback, and no branch grafted by a key since rotated out. Then the chain is checked for the commits after it, and
+  `refs/henki/verified` moves to the fetched commit; on any refusal, or offline, the verified commit stays in use.
+  `DATA/henki/index/NAME.synced` holds the time of the last good sync. `index add NAME` starts a new clone (one left
+  by `index rm` is removed first), unless another config dir uses the same index (URL, anchor and checkpoint); a
+  different one by that name is refused.
+- **Reading.** Entries are read with git from the verified commit only, never from a checkout. Once per run before
+  the first read, that commit's own signature is checked again against the `.signers` of its first parent: a ref
+  edited to point at an unsigned commit is refused, but a history crafted by someone who can write `DATA` is not
+  (only a sync checks the chain from the anchor). An entry henki-mods cannot read is skipped with a warning; a version file it parses but skips (an unknown key or value, a later `index`) still yanks, and an install
+  that finds no version names the skipped ones. A verified commit over 30 days old is a warning on every index screen.
+- **Tiers.** A version with `reviewed` and `reviewer` shows `reviewed by REVIEWER (signed index PRINCIPAL, DATE)`,
+  PRINCIPAL being the anchor's; `source only` is added when the asset for this machine has `asset_check = "none"`;
+  without a review it is red, `UNREVIEWED: listed in PRINCIPAL, but no reviewer has read this version`. A URL or path
+  install whose hd1 an index lists shows that version's review.
+- **Names.** `add NAME` takes an official module of that name first, then the one index that lists the package
+  (`NAME@INDEX` when more than one does). An index from `mods.index` never provides a name henki keeps (`std`,
+  `henki`, `mods`, `allow`, `help`, `exit`, `index`, the ports' names, `x-*`) or an official module's.
+- **Yanks** act only on what their index provided: on an `index:INDEX` lock line, index INDEX's yank of that version,
+  its removal of the package, or its yank of a version with the same hd1; on a `url`, `path` or `skill` line, a yank
+  of a version with the same hd1 in the default index; on an `official` line, nothing. They are applied at every
+  sync, and checked at every install from the verified commit, with no network. A malicious one refuses the install;
+  at a sync it turns the module off (a pin too) with the flag `yanked=malicious`, puts `policy` and `context`
+  bindings of it back to std, and makes any other binding of it the `yanked` marker (bind/1). A buggy or withdrawn
+  one is said and flagged; nothing else changes.
+
+## pack/1
+
+Owned by henki-mods. `henki-mods pack [NAME...] [--with-index] -o FILE` writes modules into a gzip ustar archive that
+`henki-mods unpack FILE` installs on another machine without the network. The same store copies give the same bytes:
+members sorted by name, owner 0, every time 1970-01-01, gzip without a name or time. Members:
+
+- `PACK`: line 1 `pack/1`; then one lock/1 line per module (FLAGS without a yank); then one line per prebuilt program,
+  `asset/1<TAB>NAME<TAB>DEST<TAB>SHA256` (module/1's asset of the machine it was packed on).
+- `store/NAME/ID/...`: each module's store copy as it is (asset in place), ID as for its lock line.
+- `index/INDEX.bundle` (with `--with-index`): a git bundle of `refs/henki/verified` of each index in use.
+
+`unpack` lists the members before it extracts anything and refuses an absolute path, a `..`, a name twice, a member
+under a link, a link outside a store copy, and anything but files, directories and links. Each copy must hold its
+line's hd1 and its asset's SHA-256, and fit this machine (module/1's `os`, `requires`, assets). A bundle counts only
+for an index in use here, checked from the anchor and checkpoint here (never a key or anchor in the pack), and only when
+its head has the commit verified here on its first-parent line (or nothing is verified here); it never moves
+`refs/henki/verified`, and the yanks and removals of the commit verified here apply after its own. A line's fields are
+checked, not believed: no control character, COMMIT a full commit or `-`, HD1 an hd1, a `path` SOURCE an absolute
+path, each `mask=cmd/CMD` a command the copy has; KIND `official` only when this henki's module of that name has that
+hd1, `index:INDEX` only for an index in use here whose commit is verified here (or whose bundle is used) and lists that
+hd1 as the line's package and version (the default index's yanks of the same hd1 apply to it too). A malicious yank
+refuses the install. A module the lock holds with the same hd1 is left as it is; another one is replaced, its line
+going to the history (hist/1, `unpack`).
 
 ## hd1
 
@@ -901,22 +1050,42 @@ TASK/setup               required: a program that makes the task's files in an e
 TASK/check               required: a program; exit 0 is a pass
 TASK/fake-bin/CMD        optional: programs first on PATH in the run (a tool the task's machine lacks, or must not run)
 TASK/task.toml           optional, module/1's grammar: max_steps (1 to 10000), max_seconds (1 to 9999; default 120)
+lib/                     optional: data and programs the tasks share (never a task); a fake-bin entry may be a
+                         relative link into it
 ```
 
 Dot files are ignored anywhere, and so are `README*` and `LICENSE*` next to the tasks; anything else is refused.
-`henki-mods eval --check DIR` checks this layout and runs nothing; `add` and `verify --dir` check a module's `eval/`.
+`henki-mods eval --check DIR` checks this layout and runs nothing; `add` and `verify --dir` check a module's `eval/`
+(its links, as every link in a module, stay inside the module).
 
-- **A run.** `setup` runs in a new empty work dir with `EVAL_DIR` (the task's directory) and stdin empty; a setup that
-  fails stops the eval. Then, in that dir, `henki run --json --approve auto --config ARM/config.toml [--model M]
-  --max-seconds S [--max-steps N] -` with prompt.txt on stdin, `fake-bin/` first on PATH and `XDG_STATE_HOME` the
-  arm's. Then `check` runs in the same dir with `EVAL_DIR`, and on stdin the `text` of henki's `result` record
-  (json/1), byte for byte, with no newline added. Its exit status is the result; what it prints is not kept.
-- **The arms.** The module on and the module off, each a config dir of its own: the user's `config.toml` without its
-  `ext` key, the user's `AGENTS.md` with the mods cards block holding only the module's card (on) or none (off), the
-  link `ext/NAME` to the module (on) or no module (off), no allow file and no port link. In each repeat every task
-  runs once per arm, the arms taking turns going first. 3 repeats; when the arms' passes then differ by at most one,
-  10 more; `--repeats N` runs exactly N.
-- **The record.** Per arm one line, printed and appended to `$XDG_STATE_HOME/henki/eval.tsv` (else
+- **A run.** Each run of a task has a fresh root dir of its own holding `home/` (the run's `HOME`),
+  `xdg/{config,data,state,cache}` (the four `XDG_*_HOME`) and `work/` (the cwd); nothing of the person's own home,
+  config, state or data is read or written in it. `setup` runs in `work/` with stdin empty, on a copy of the task and
+  of the suite's `lib/` in the root; then `henki run --json --approve auto [--model M] --max-seconds S [--max-steps N]
+  -` with prompt.txt on stdin and plain copies of `fake-bin/`'s programs first on PATH, while the root holds no other
+  file of the suite; then `check` in `work/`, on a fresh copy of the task and `lib/` (the root as henki left it, but
+  no dir the run's commands made), without `fake-bin/` on PATH, with, on stdin, the `text` of henki's `result`
+  record (json/1), byte for byte, with no newline added. Its exit status is the result. Setup and check get
+  `EVAL_DIR` (the task's copy), `EVAL_LIB` (the copy of `lib/`), `EVAL_HOME` (= `HOME`) and `EVAL_ROOT` (the root);
+  henki does not. henki's records of the run (its `--json` stdout) go to the run dir, out of the root, and are copied
+  to `EVAL_ROOT/henki.jsonl` for `check`. A setup or a check is stopped after 60 seconds. A setup that fails stops
+  the eval, and its run is VOID (evalrun/1).
+- **The sandbox.** Each of the three runs inside the official `sandbox` module's program (`port/exec`, run directly,
+  not as an exec binding, so henki keeps all four tools), started in the root with the person's own `HOME`, which it
+  hides (on macOS only its listed secret paths), as it hides henki's own dirs (the run dir among them). It hides
+  nothing else: a suite kept elsewhere on the machine, such as an official module's `eval/` or the general suite in
+  henki's share dir, is in the model's reach.
+  Where it does not run, `eval` refuses unless `--unsandboxed` is given; then only `HOME` and the XDG dirs are
+  scratch dirs.
+- **The arms.** The module on and the module off: in each run's home the person's `config.toml` without its `ext` and
+  `shadow` keys and their `AGENTS.md` without the mods cards block; in the on arm the module is then added there as a
+  person adds one (`henki-mods add DIR --yes`: its store copy, its link, its card, and the `shadow` line it names). No
+  allow file and no port link. Before any task each arm answers `Reply with the word ready.`; a status other than
+  `ok` stops the eval. In each repeat every task runs once per arm, the arms taking turns going first. 3 repeats; a
+  suite other than `general` whose effect after them is positive with 0 inside its 95% CI (evalrun/1) gets 10 more;
+  `--repeats N` runs exactly N. `--suite` names one suite or several, comma-separated (`own` is the module's own tasks,
+  the default), all in one run.
+- **The record.** Per suite and arm one line, printed and appended to `$XDG_STATE_HOME/henki/eval.tsv` (else
   `~/.local/state/henki/eval.tsv`), fields separated by tabs:
 
 ```
@@ -926,7 +1095,97 @@ eval/1 PKG VERSION HD1 MODEL SUITE ARM PASSES RUNS SECONDS
   PKG is the module's name, VERSION its manifest's (`-` without one), HD1 its tree hash, MODEL `--model`, else
   `HENKI_MODEL`, else the config's `model` (`-` with none), SUITE the module's name (its own tasks), `general`, another
   module's name or a suite's path, ARM `on` or `off`, PASSES and RUNS counts, SECONDS the sum of the runs'
-  `duration_s`.
+  `duration_s`. Each run is also an evalrun/1 row.
 - **The general suite** uses POSIX tools and git only, no network, and every check is deterministic.
-- eval runs a module's `setup` and `check` as the user, and henki with `approve = "auto"`, so it shows what it will run
-  and asks first (`--yes` once the screen was read); it refuses to run inside henki (`HENKI_DEPTH` set).
+- eval runs a module's `setup` and `check`, and henki with `approve = "auto"`, so it shows what it will run and asks
+  first (`--yes` once the screen was read); it refuses to run inside henki (`HENKI_DEPTH` set). `--server URL` (a
+  loopback `http://HOST:PORT/PATH`, passed as `HENKI_BASE_URL`) names the model server; `--model-file F` the model's
+  file, whose SHA-256 the run records.
+
+## evalrun/1
+
+Owned by henki-mods; henki never reads it. One eval run's record, and the badge a module's index entry carries.
+
+- **The run dir** `$XDG_STATE_HOME/henki/eval/RUN/` (RUN is `YYYYMMDDTHHMMSSZ-XXXX`, UTC and 4 hex digits) holds
+  `run.toml` (module/1's grammar: `run`, `package`, `version`, `hd1`, `model`, `server`, `server_model` and
+  `server_build` from the server's `GET /props` when it answers one (llama.cpp's), else `-`, `henki` (its `--version`),
+  `model_file` and `model_sha256` with `--model-file`, `sandbox` (the program, or `none`), `repeats`, `started`,
+  `ended`), `runs.tsv` (one row per run, in run order), `VOID` when a run was VOID, and per run a dir
+  `NNNN-ARM-REPEAT-TASK/` with henki's records (`henki.jsonl`), its journal, and what setup and check printed.
+- **A row**, fields separated by tabs, none empty, none holding `"`, `\` or a control character:
+
+```
+evalrun/1 RUN PKG VERSION HD1 MODEL SUITE ARM REPEAT TASK PASS STATUS STEPS SECONDS PROMPT_BYTES
+```
+
+  RUN, PKG, VERSION, HD1 and MODEL as eval/1's (the same in every row of a run); SUITE as eval/1's (one suite besides
+  `general` per run); ARM `on` or `off`; REPEAT from 1; TASK the task's name; PASS `1` or `0`; STATUS henki's result
+  (`ok`, `gave_up:REASON`, `needs_approval`, `budget`, `interrupted`, `output_closed`, `error:KIND`; json/1), or
+  `none` (no result) or `setup` (the setup failed); STEPS and SECONDS the result's `steps` and `duration_s`;
+  PROMPT_BYTES what the arm adds to the system prompt (the module's doc line with the extensions header, and its
+  card), 0 in the off arm. A run whose STATUS is `none`, `setup` or `error:` `config`, `nested`, `journal`,
+  `internal` or `tampered` is VOID: it measured henki or its setup, not the model.
+- **The statistics** (`henki-mods eval report RUN`), per suite, with tasks as the unit: d(t) = passes on minus
+  passes off over the R repeats of task t; the effect is the sum of d(t) per R×T runs. Its 95% CI is a bootstrap
+  over the tasks: 2,000 resamples with replacement, each task drawn as `s % T` (tasks in byte order) with the
+  Park-Miller generator `s = s * 16807 % 2147483647` from seed 1 for each suite, the 50th and the 1,951st of the
+  sorted sums. The sign test is the exact two-sided binomial over the tasks better and worse.
+- **The badge rule** (`henki-mods eval badge RUN`: PASS or FAIL with the reason): no VOID run; rows of the module's
+  own suite and of `general`, at least 3 repeats of each; the own suite's CI lower bound above 0 and its sign p at
+  most 0.05; the general suite's CI upper bound at least 0. Below 13 repeats, an own suite with a positive effect and
+  0 in its CI fails with "rerun with --repeats 13".
+- **In an index** (index/1) a version's badge is the `eval_*` keys `henki-mods-dev publish --eval RUN` prints:
+  `eval_suite`, `eval_model`, `eval_hd1` (= the version's `hd1`), `eval_repeats`, `eval_on`, `eval_off`,
+  `eval_effect` and `eval_general` as the statistics give them, `eval_model_sha256` and `eval_server` from the run,
+  and `eval_by` (who ran it, and when); the rows behind it are `evals/NAME/VERSION.tsv`, byte for byte the run's
+  `runs.tsv`. `henki-mods-dev eval badge --check ROWS FILE` passes when the rows give a PASS whose keys equal FILE's.
+  henki-mods recomputes the badge from those rows the same way; a reviewed version whose badge recomputes is
+  `measured` when `eval_by`'s login is its `reviewer` (the reviewer reran it), and otherwise shows it as the author's.
+
+## The module manager's programs and files
+
+Not a contract of its own: where the formats above that henki-mods owns live, which program reads and writes each, and
+what any program can rely on when it runs the manager.
+
+- **Two programs**, shipped side by side in `bin/`: `henki-mods`, the person's verbs (and `test --port PORT
+  NAME|DIR|PROGRAM`, which `swap` runs, and `eval`), and `henki-mods-dev`, the author's verbs (`new`, `test [DIR]`,
+  `try`, `publish`, `share`, `entry`, `eval report|badge`). `henki-mods VERB` and `henki mods VERB` reach both:
+  henki-mods runs henki-mods-dev for the author's verbs. henki-mods-dev reads a module with henki-mods's own code (it
+  sources it), so an author's `test` checks what an install checks.
+- **Messages.** A refusal is one line on stderr, `henki-mods: PROBLEM; fix: WHAT TO DO`, and exit 1; a warning is
+  `henki-mods: warning: ...`; a usage error is exit 2. `doctor` exits 1 when it found a problem, and `eval badge`
+  exits 0 only on PASS. Screens and texts may change.
+- **Questions.** A change shows a screen, then asks on `HENKI_MODS_TTY` (default `/dev/tty`); `--yes` answers yes for a
+  screen already read; without a terminal and without `--yes` it refuses. Inside a tool call (`HENKI_SESSION` set and
+  no `HENKI_NEXT`, which henki gives only to a command the person typed) `add`, `on`, `update`, `rollback`, `unpack`,
+  `init`, `index add` and `swap` refuse whatever `--yes` says: `run it at the prompt with /mods`. A model can change
+  its environment, so this only slows it down; the guard is henki asking before each shell call.
+- **A change made under henki** writes `restart` into `HENKI_NEXT` (handoff/1); run alone it prints how to restart.
+- **The share dir**, SHARE below, is looked for in `HENKI_SHARE` when it is set, then in `share/henki/` beside the
+  program's own dir (`bin/../share/henki`, as a release and Homebrew lay it out), then in the repository's layout
+  (`mods/`, `manager/`), per kind of file. Every index screen names the anchor's path when it is not the one beside
+  the program.
+- **`contracts`** in a manifest may name the contracts of this file's index; the manager's list of them is tested
+  against the index.
+
+| Path | Holds | Written by | Format |
+|---|---|---|---|
+| `CONFIG_DIR/mods.lock` | the modules and the bound ports | henki-mods | lock/1, bind/1 |
+| `CONFIG_DIR/mods.history` | the lock lines a change replaced or removed | henki-mods | hist/1 |
+| `CONFIG_DIR/mods.index`, `CONFIG_DIR/index/NAME.signers`, `NAME.checkpoint` | the indexes added with `index add`, their pinned anchors | henki-mods | index/1 |
+| `CONFIG_DIR/ext/NAME` | a link to the module's store copy: the module is on | henki-mods | lock/1 |
+| `CONFIG_DIR/port/PORT` | a link to a store copy's `port/PORT`, or to the missing `yanked` | henki-mods (`swap`, a yank) | bind/1, port/1 |
+| `CONFIG_DIR/AGENTS.md` | only the block between `# >>> mods cards` and `# <<< mods cards` | henki-mods | module/1 (`.henki/card.md`) |
+| `DATA/henki/mods/NAME/ID/` | read-only store copies (a masked copy is `ID.mHASH`) | henki-mods | hd1, lock/1 |
+| `DATA/henki/mods.users` | the config dirs that use the store | henki-mods | hist/1 |
+| `DATA/henki/index/NAME.git`, `NAME.synced` | an index's bare clone (`refs/henki/verified`) and its last good sync | henki-mods | index/1 |
+| `STATE/henki/eval.tsv`, `STATE/henki/eval/RUN/` | eval's lines and runs | henki-mods | eval/1, evalrun/1 |
+| `SHARE/official/NAME/` | the official modules | release | module/1, ext/2 |
+| `SHARE/index/` | the default index's `NAME.url`, `NAME.signers`, `NAME.checkpoint` and `refused.keys` | release | index/1 |
+| `SHARE/mod-profiles/NAME.lock` | the shipped module profiles | release | lock/1 |
+| `SHARE/conform/PORT.tsv`, `SHARE/conform/fixtures/` | the conformance suites | release | conform/1 |
+| `SHARE/eval/general/` | the general eval suite | release | eval/1 |
+
+CONFIG_DIR is `~/.config/henki` (or `HENKI_CONFIG`, which henki sets for `/mods`), DATA `$XDG_DATA_HOME` (else
+`~/.local/share`), STATE `$XDG_STATE_HOME` (else `~/.local/state`). henki itself reads only the links in `ext/` and
+`port/`, and `AGENTS.md`; every other file here is the manager's.

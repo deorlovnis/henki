@@ -1,0 +1,1005 @@
+#!/usr/bin/env bash
+# henki-mods-dev: the module author's tools, beside henki-mods (`henki mods new|test|try|publish|share|entry ...` reach
+# them through it). It takes henki-mods' functions (it sources henki-mods, which stops before its own verbs), so a
+# module is read here by the rules it is installed by. Bash 3.2 compatible, as henki-mods.
+#
+#   henki-mods-dev new NAME [--tool|--cmd|--template|--observer EVENT|--port history] [--dir D]
+#       a working module of that kind in D/NAME (D default ./NAME), and around a first one test.sh, README.md and a
+#       0BSD LICENSE: a tool for the model (bin/NAME, with an eval/ task), a command for the person that hands back a
+#       message (cmd/NAME), a prompt template (cmd/NAME.md), an observer (on/EVENT), or a history binding in bash
+#   henki-mods-dev test [DIR]
+#       the checks an install makes, plus the names henki keeps, the official modules' commands, each port/PORT's
+#       conformance suite and shellcheck (when installed), on module DIR or on each module in DIR (default .), then
+#       DIR/test.sh in DIR with HOME and the XDG dirs in a scratch dir. It runs the module's code
+#   henki-mods-dev try [DIR|NAME] [--keep] [-- HENKI_ARGS]
+#       henki with only that module on (added from DIR, default ., or as add takes NAME), HOME and the four XDG dirs in a
+#       scratch dir holding a copy of this config.toml without its ext key; the scratch dir goes at the end
+#   henki-mods-dev publish [DIR] [--eval RUN] [--by LOGIN]
+#       for the committed and pushed module DIR: mods/NAME.toml and mods/NAME/VERSION.toml for the index, derived from
+#       the commit and checked by the index's lint; writes nothing anywhere. With --eval, the badge block from eval run
+#       RUN (it must pass the badge rule) and evals/NAME/VERSION.tsv, the rows behind it. An official module (one henki
+#       ships) gets a badge record: kind "official", its version henki's, and only hd1 and the badge
+#   henki-mods-dev eval report RUN | eval badge RUN | eval badge --check ROWS VERSION_FILE
+#       the statistics of eval run RUN (a name under STATE/henki/eval/, or a run dir or rows file): per suite and task
+#       the passes on and off, the effect with its bootstrap 95% CI and the sign test; badge: PASS or FAIL by the badge
+#       rule and the eval_* keys. --check: ROWS recompute to a passing badge equal to VERSION_FILE's (an index's check)
+#   henki-mods-dev share NAME
+#       one line that installs NAME's files elsewhere: add NAME (official, index) or add URL@COMMIT#DIR --expect hd1:H
+#   henki-mods-dev entry derive REPO PATH COMMIT
+#       the keys of an index version file (index/1) that the module itself decides, for the module in directory PATH
+#       ("" for the root) of git repository REPO at the full commit COMMIT: version, commit, hd1, requires, contracts,
+#       os, ports, commands, bins, observers, ctx, prompt_bytes, card_bytes and caps_net. Read from the commit's raw
+#       blobs, as `henki-mods add` copies a module; no code of the module runs. The index's own check.sh compares a
+#       version file against this.
+#   henki-mods-dev entry lint FILE
+#       one entry file, mods/NAME.toml (a package) or mods/NAME/VERSION.toml (a version), against the index's rules; a
+#       version may still lack its review (reviewed, reviewer and asset checks are the reviewer's to add)
+set -u
+p="$0"
+while [ -L "$p" ]; do
+  t=$(readlink "$p") || break
+  case "$t" in /*) p=$t ;; *) p="$(dirname "$p")/$t" ;; esac
+done
+# shellcheck source=manager/henki-mods
+. "$(cd -P "$(dirname "$p")" && pwd)/henki-mods" || exit 1
+
+usage() {
+  cat >&2 <<'EOF'
+usage: henki-mods-dev new NAME [--tool|--cmd|--template|--observer EVENT|--port history] [--dir D]
+                                                 a working module to start from, in D (default ./NAME)
+       henki-mods-dev test [DIR]                 the checks of module DIR, or of each module in DIR (default .), then
+                                                 DIR/test.sh in a scratch home
+       henki-mods-dev try [DIR|NAME] [--keep] [-- HENKI_ARGS]
+                                                 henki with only that module on, in a scratch home
+       henki-mods-dev publish [DIR] [--eval RUN] [--by LOGIN]
+                                                 the index entry files for the committed, pushed module DIR
+       henki-mods-dev eval report RUN | eval badge RUN | eval badge --check ROWS VERSION_FILE
+                                                 an eval run's statistics, its badge, an index entry's badge
+       henki-mods-dev share NAME                 one line that installs these files of NAME on another machine
+       henki-mods-dev entry derive REPO PATH COMMIT   the derived keys of an index version file
+       henki-mods-dev entry lint FILE                 one index entry file (mods/NAME.toml, mods/NAME/VERSION.toml)
+       henki-mods-dev help | --version
+EOF
+  exit 2
+}
+
+# A TOML array of the lines of LIST: ["a", "b"].
+toml_array() { printf '%s\n' "$1" | awk 'NF { s = s (n++ ? ", " : "") "\"" $0 "\"" } END { print "[" s "]" }'; }
+
+# The names under DIR/ in the listing (STAGE_LIST) that henki takes as entries: no .md data, no dot files.
+listed() { HM_D="$1/" awk -F '\t' 'BEGIN { d = ENVIRON["HM_D"] } index($1, d) == 1 { n = substr($1, length(d) + 1); if (index(n, "/") == 0 && n !~ /\.md$/ && n !~ /^\./) print n }' "$STAGE_LIST"; }
+
+entry_derive() { # REPO PATH COMMIT
+  local repo="$1" path="$2" commit="$3" x fallback b
+  case "$commit" in *[!0-9a-f]*) commit=x ;; esac
+  [ ${#commit} = 40 ] || die "\"$3\" is not a full commit id; fix: give all 40 hex digits (an entry pins a commit, never a branch)"
+  case "/$path/" in *//* | */./* | */../*) [ -z "$path" ] || die "\"$path\" is not a directory path in the repository; fix: give it like mods/NAME, or \"\" for the root" ;; esac
+  x=${repo%/}
+  x=${x##*/}
+  fallback=${path##*/}
+  fallback=${fallback:-${x%.git}}
+  copy_git "$repo" "$commit" "$path" "$STAGE/m"
+  inspect "$STAGE/m" "$fallback" 0 || die "$(printf '%s' "$ERR" | sed "s|$STAGE/m|$repo${path:+#$path}|g")"
+  [ "$M_has" = 1 ] || die "$repo${path:+#$path}: no .henki/module.toml; fix: an indexed module has a manifest (name, version, license)"
+  b=$(prompt_bytes "$I_name" "$STAGE/m")
+  [ "$b" = 0 ] || b=$((b + ${#HEADER} + 2))
+  printf 'version = "%s"\n' "$M_version"
+  printf 'commit = "%s"\n' "$COMMIT"
+  printf 'hd1 = "%s"\n' "$I_hd1"
+  printf 'requires = %s\n' "$(toml_array "$M_requires")"
+  printf 'contracts = %s\n' "$(toml_array "$M_contracts")"
+  printf 'os = %s\n' "$(toml_array "$M_os")"
+  printf 'ports = %s\n' "$(toml_array "$M_ports")"
+  printf 'commands = %s\n' "$(toml_array "$(listed cmd)")"
+  printf 'bins = %s\n' "$(toml_array "$(listed bin)")"
+  printf 'observers = %s\n' "$(toml_array "$(listed on)")"
+  printf 'ctx = %s\n' "$(toml_array "$(listed ctx)")"
+  printf 'prompt_bytes = %s\n' "$b"
+  printf 'card_bytes = %s\n' "$I_card"
+  printf 'caps_net = "%s"\n' "${M_caps:-none}"
+  printf '%s' "$M_assets" | awk -F '\t' 'NF == 4 { printf "asset_%s = [\"%s\", \"%s\", \"%s\"]\n", $1, $2, $3, $4 }'
+}
+
+entry_lint() { # FILE
+  local f="$1" n v k kind why out
+  [ -f "$f" ] && [ ! -L "$f" ] || die "$f is not a regular file; fix: name an entry file"
+  case "/$f" in
+    */mods/*/*.toml)
+      v=${f##*/}
+      v=${v%.toml}
+      n=${f%/*}
+      n=${n##*/}
+      k=ver
+      ;;
+    */mods/*.toml)
+      n=${f##*/}
+      n=${n%.toml}
+      k=pkg
+      ;;
+    *) die "$f is neither mods/NAME.toml nor mods/NAME/VERSION.toml; fix: name the file in an index's tree" ;;
+  esac
+  why=$(invisible_check "$f") || die "$f holds $why, which a terminal does not show; fix: remove it"
+  out=$(toml <"$f") || die "$f:$out"
+  printf '%s\n' "$out" | command grep -v '^$' >"$STAGE/rec"
+  if [ "$k" = pkg ]; then
+    out=$(lint_pkg "$STAGE/rec" "$n" "$f")
+  else
+    kind=git
+    if [ -f "${f%/*}.toml" ] && toml <"${f%/*}.toml" >"$STAGE/pkg" 2>/dev/null; then kind=$(rget "$STAGE/pkg" kind) || kind=git; fi
+    out=$(CK_PR=1 lint_ver "$STAGE/rec" "$v" "$kind" "$f")
+  fi
+  if [ -n "$out" ]; then
+    printf 'henki-mods-dev: %s\n' "$out" >&2
+    die "entry lint: $(printf '%s\n' "$out" | wc -l | tr -d ' ') problems (above); fix: as each one says"
+  fi
+  say "$f: ok"
+}
+
+# --- new: the skeletons --------------------------------------------------------------------------------------------------
+# Each kind is a working module that `test` passes and `add` installs. The text is fixed but for NAME (and EVENT), so
+# the module template repository can hold exactly what `new` writes (its check.sh compares the two).
+
+# stdin into FILE with mode MODE, @NAME@ and @EVENT@ replaced (both are [A-Za-z0-9._-], safe in sed).
+put() { # FILE MODE
+  mkdir -p "${1%/*}" && sed "s/@NAME@/$N_name/g; s/@EVENT@/$N_event/g" >"$1" && chmod "$2" "$1" ||
+    die "cannot write $1; fix: make its directory writable"
+}
+
+# The manifest of the new module: CONTRACTS (the formats it is written for) and PORTS.
+new_manifest() { # CONTRACTS PORTS
+  put "$N_dir/.henki/module.toml" 644 <<EOF
+# The manifest (module/1). henki-mods shows it on the install screen and checks it before anything goes on; henki
+# itself never reads it. Unknown keys are refused; CONTRACTS.md module/1 lists them all.
+henki_module = 1
+# The module's name: keep it the directory's.
+name = "@NAME@"
+# A label for people (an index wants MAJOR.MINOR.PATCH); an install is pinned by commit and tree hash, not by this.
+version = "0.1.0"
+# An SPDX id or expression; the index takes the licenses its CONTRIBUTING.md lists.
+license = "0BSD"
+requires = ["henki >= 0.2"]
+# The formats it is written for (CONTRACTS.md); a henki-mods that lacks one refuses the module. An index wants each
+# array sorted, without repeats.
+contracts = [$1]
+os = ["linux", "macos"]
+# Where its programs connect: none, loopback or any (declared for the reader, not enforced).
+caps_net = "none"
+# The ports its port/ programs bind (port/1), each once henki-mods swap binds it.
+ports = [$2]
+EOF
+}
+
+new_tool() {
+  put "$N_dir/doc.md" 644 <<'EOF'
+# greets someone by name: `@NAME@ [WHO]`; an example command that changes nothing
+
+`@NAME@ [WHO]` prints `hello, WHO` on stdout (WHO defaults to `world`). It reads no files, writes none and connects
+nowhere, so it is always safe to run.
+
+- `@NAME@ --help` prints the usage.
+- Exit codes: 0 greeted; 2 usage (more than one WHO, or an unknown option), with the problem on stderr.
+
+Example: `@NAME@ henki` prints `hello, henki`. A name with spaces is one argument: `@NAME@ "the reader"`.
+EOF
+  put "$N_dir/bin/$N_name" 755 <<'EOF'
+#!/bin/sh
+# @NAME@: a command for the model. What makes it a good one, and worth keeping in yours: a --help, one line per problem
+# on stderr that says what to do next, and the exit codes the doc lists.
+set -eu
+case "${1:-}" in
+  -h | --help)
+    echo 'usage: @NAME@ [WHO]'
+    echo 'prints "hello, WHO" (WHO defaults to world)'
+    exit 0
+    ;;
+  -*)
+    echo "@NAME@: unknown option $1; fix: run @NAME@ --help" >&2
+    exit 2
+    ;;
+esac
+if [ $# -gt 1 ]; then
+  echo "@NAME@: takes one WHO, got $#; fix: quote a name that holds spaces" >&2
+  exit 2
+fi
+printf 'hello, %s\n' "${1:-world}"
+EOF
+  put "$N_dir/eval/greet/prompt.txt" 644 <<'EOF'
+Greet the reader with the @NAME@ command, then tell me exactly what it printed.
+EOF
+  put "$N_dir/eval/greet/setup" 755 <<'EOF'
+#!/bin/sh
+# Makes the task's files in the empty work dir it runs in (EVAL_DIR is the task's own dir). This task needs none.
+exit 0
+EOF
+  put "$N_dir/eval/greet/check" 755 <<'EOF'
+#!/bin/sh
+# Exit 0 is a pass. It runs in the work dir after henki, with the model's last answer on stdin.
+grep -q 'hello, the reader'
+EOF
+  new_manifest '"eval/1", "ext/2", "module/1"' ''
+}
+
+new_cmd() {
+  put "$N_dir/doc.md" 644 <<'EOF'
+# /@NAME@ [TEXT]: puts a message about this directory up as your next one; an example command for you
+
+`/@NAME@` in henki runs `cmd/@NAME@` on your terminal; the model is not told, and the module costs no prompt bytes.
+It hands henki a message asking the model to describe the files here, with TEXT after it, which henki shows and sends
+when you press Enter (`send? [Y/n]`). Outside henki it says so and exits 2.
+EOF
+  put "$N_dir/cmd/$N_name" 755 <<'EOF'
+#!/bin/sh
+# /@NAME@ [TEXT]: a command for you (handoff/1). henki runs it on your terminal when you type /@NAME@, with TEXT as one
+# argument. What it writes into the file $HENKI_NEXT names is handed back to henki: `send`, then a text, puts the text
+# up as your next message. It may also print, ask on the terminal and run anything you could.
+set -eu
+if [ -z "${HENKI_NEXT:-}" ]; then
+  echo "@NAME@: run it in henki as /@NAME@; fix: start henki and type /@NAME@" >&2
+  exit 2
+fi
+{
+  echo send
+  printf 'List the files in %s and say in one line each what it is for.\n' "$PWD"
+  if [ -n "${1:-}" ]; then printf '\n%s\n' "$1"; fi
+} >"$HENKI_NEXT"
+EOF
+  new_manifest '"ext/2", "handoff/1", "module/1"' ''
+}
+
+new_template() {
+  put "$N_dir/doc.md" 644 <<'EOF'
+# /@NAME@ [TEXT]: sends a prepared prompt, with TEXT after it; an example template for you
+
+`/@NAME@` in henki shows the prompt in `cmd/@NAME@.md`, then TEXT after a blank line, and sends it as your next message
+when you press Enter (`send? [Y/n]`). The model is not told, and the module costs no prompt bytes. Edit
+`cmd/@NAME@.md` for another prompt; for more of them, add `cmd/OTHER.md` and the link `cmd/OTHER -> ../.henki/template`.
+EOF
+  put "$N_dir/cmd/$N_name.md" 644 <<'EOF'
+Explain what the code in this directory does: find where it starts, read the main files, and say in plain words what
+each part is for and how they connect, naming the files. Do not change any file.
+EOF
+  skill_template 0 | put "$N_dir/.henki/template" 755
+  ln -s ../.henki/template "$N_dir/cmd/$N_name" || die "cannot link $N_dir/cmd/$N_name; fix: check the disk"
+  new_manifest '"ext/2", "handoff/1", "module/1"' ''
+}
+
+new_observer() {
+  put "$N_dir/doc.md" 644 <<'EOF'
+# keeps a log of henki's @EVENT@ events in $HENKI_STATE/@NAME@/events.jsonl; an example observer
+
+henki runs `on/@EVENT@` once per `@EVENT@` event, unasked, with the event as one JSON line on stdin (observe/1); it
+appends the line to `events.jsonl` in the dir `@NAME@` of henki's state dir (`~/.local/state/henki`). Nothing an
+observer does changes the session, and the module costs no prompt bytes.
+EOF
+  put "$N_dir/on/$N_event" 755 <<'EOF'
+#!/bin/sh
+# on/@EVENT@: an observer (observe/1). henki runs it once per @EVENT@ event, unasked, in a process group of its own,
+# with the event as one JSON line on stdin; its exit status and output change nothing. Keep it quick, and leave no
+# process behind.
+set -eu
+log="$HENKI_STATE/@NAME@/events.jsonl"
+mkdir -p "${log%/*}"
+cat >>"$log"
+EOF
+  new_manifest '"ext/2", "module/1", "observe/1"' ''
+}
+
+new_port() {
+  put "$N_dir/doc.md" 644 <<'EOF'
+# a history binding that keeps henki's sessions as files, one per session; an example to make your own
+
+`henki mods swap history @NAME@` binds it once its conformance suite passes (`henki mods test --port history ./@NAME@`
+runs the suite here); `henki mods swap history std` goes back. `port/history` speaks port/1 and history/1 on stdin and
+stdout: each session is `ID.jsonl` (one record per line) with its scope in `ID.scope`, in the state dir its hello
+names, and a held session is the dir `ID.lock` holding the holder's pid. It is a start: it does not fsync.
+EOF
+  put "$N_dir/port/history" 755 <<'EOF'
+#!/usr/bin/env bash
+# @NAME@: a history/1 binding in bash. henki writes canonical lines (compact, keys sorted), so sed and parameter
+# expansion can take them apart. Each session is STATE/ID.jsonl (one record per line) with its scope in STATE/ID.scope;
+# STATE is the dir hello names. A session is held by the dir STATE/ID.lock holding the holder's pid; a lock whose pid is
+# gone (a SIGKILL) is taken over. Durable here means in the file before the answer, which a SIGKILL of either side does
+# not undo (no fsync).
+set -u
+state=. held="" fresh=0 gone=0
+str() { printf '%s' "$1" | sed -n 's/.*"'"$2"'":"\([^"\\]*\)".*/\1/p'; }
+answer() { printf '{"id":%s,%s}\n' "$id" "$1"; }
+fail() { answer "\"error\":{\"code\":\"$1\",\"message\":\"$2\"}"; }
+take() {
+  local l="$state/$1.lock"
+  mkdir "$l" 2>/dev/null || { kill -0 "$(cat "$l/pid" 2>/dev/null)" 2>/dev/null && return 1; rm -rf "$l" && mkdir "$l"; } || return 1
+  echo $$ >"$l/pid" && held=$1 fresh=0 gone=0
+}
+release() { [ -z "$held" ] || rm -rf "$state/$held.lock"; held=""; }
+newest() { # SCOPE: the session ids of SCOPE, newest first
+  local f
+  for f in $(ls -t "$state" 2>/dev/null | sed -n 's/\.jsonl$//p'); do
+    [ "$(cat "$state/$f.scope" 2>/dev/null)" = "$1" ] && echo "$f"
+  done
+}
+while IFS= read -r line; do
+  id=$(printf '%s' "$line" | sed -n 's/^{"id":\([0-9]*\),.*/\1/p')
+  method=$(printf '%s' "$line" | sed -n 's/^{"id":[0-9]*,"method":"\([^"]*\)".*/\1/p')
+  s=$(str "$line" session)
+  case "$method" in
+    hello)
+      v=$(printf '%s' "$line" | sed -n 's/.*"versions":\[\([0-9,]*\)\].*/\1/p')
+      case ",$v," in *,1,*) ;; *) fail version "@NAME@ speaks history/1 only" && continue ;; esac
+      state=$(str "$line" state) && mkdir -p "$state"
+      answer '"result":{"caps":[],"impl":"0.1.0","name":"@NAME@","protocol":1,"version":1}'
+      ;;
+    create)
+      h=$(str "$line" hint)
+      [ -z "$h" ] || [ ! -e "$state/$h.jsonl" ] || { fail exists "session $h exists" && continue; }
+      release
+      s=${h:-s-$$-$RANDOM$RANDOM}
+      : >"$state/$s.jsonl" && str "$line" scope >"$state/$s.scope" && take "$s" && fresh=1
+      answer "\"result\":{\"session\":\"$s\"}"
+      ;;
+    open)
+      release
+      [ -z "$s" ] || [ -e "$state/$s.jsonl" ] || { fail not_found "no session $s" && continue; }
+      for c in ${s:-$(newest "$(str "$line" scope)")}; do take "$c" && break; done
+      if [ -n "$held" ]; then answer "\"result\":{\"session\":\"$held\"}"; elif [ -n "$s" ]; then fail busy "session $s is in use"; else fail not_found "no session to open"; fi
+      ;;
+    read)
+      [ -n "$s" ] && [ -e "$state/$s.jsonl" ] || { fail not_found "no session $s" && continue; }
+      from=$(printf '%s' "$line" | sed -n 's/.*"from":\([0-9]*\).*/\1/p')
+      answer "\"result\":{\"records\":[$(tail -n +$((${from:-0} + 1)) "$state/$s.jsonl" | paste -s -d , -)]}"
+      ;;
+    append)
+      [ -n "$s" ] && [ "$s" = "$held" ] || { fail not_found "session $s is not held" && continue; }
+      rec=${line#*\"params\":\{\"record\":}
+      rec=${rec%,\"session\":*}
+      case "$rec" in '{'*) ;; *) fail invalid "a record is a JSON object" && continue ;; esac
+      [ "$gone" = 1 ] || printf '%s\n' "$rec" >>"$state/$s.jsonl"
+      answer '"result":null'
+      ;;
+    discard)
+      [ -n "$s" ] && [ "$s" = "$held" ] || { fail not_found "session $s is not held" && continue; }
+      if [ "$fresh" = 1 ] && [ "$gone" = 0 ] && ! grep -q '"t":"user"' "$state/$s.jsonl"; then
+        rm -f "$state/$s.jsonl" "$state/$s.scope" && gone=1
+      fi
+      if [ "$gone" = 1 ]; then answer '"result":{"removed":true}'; else answer '"result":{"removed":false}'; fi
+      ;;
+    list)
+      out=""
+      for c in $(newest "$(str "$line" scope)"); do
+        out="$out${out:+,}{\"session\":\"$c\",\"updated\":$(date -r "$state/$c.jsonl" +%s 2>/dev/null || echo 0)}"
+      done
+      answer "\"result\":{\"sessions\":[$out]}"
+      ;;
+    bye) release && answer '"result":null' && exit 0 ;;
+    *) fail unsupported "no method $method" ;;
+  esac
+done
+release
+EOF
+  new_manifest '"ext/2", "history/1", "module/1", "port/1"' '"history"'
+}
+
+# The files around a first module in D: test.sh (the tests of the module's own programs, which `henki mods test D`
+# runs after its checks), README.md and LICENSE; each only when D has none yet.
+new_repo() { # KIND
+  local d=${N_dir%/*}
+  [ -e "$d/LICENSE" ] || put "$d/LICENSE" 644 <<'EOF'
+BSD Zero Clause License
+
+Copyright (c) 2026 the henki authors
+
+Permission to use, copy, modify, and/or distribute this software for any
+purpose with or without fee is hereby granted.
+
+THE SOFTWARE IS PROVIDED "AS IS" AND THE AUTHOR DISCLAIMS ALL WARRANTIES WITH
+REGARD TO THIS SOFTWARE INCLUDING ALL IMPLIED WARRANTIES OF MERCHANTABILITY
+AND FITNESS. IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR ANY SPECIAL, DIRECT,
+INDIRECT, OR CONSEQUENTIAL DAMAGES OR ANY DAMAGES WHATSOEVER RESULTING FROM
+LOSS OF USE, DATA OR PROFITS, WHETHER IN AN ACTION OF CONTRACT, NEGLIGENCE OR
+OTHER TORTIOUS ACTION, ARISING OUT OF OR IN CONNECTION WITH THE USE OR
+PERFORMANCE OF THIS SOFTWARE.
+EOF
+  [ -e "$d/README.md" ] || put "$d/README.md" 644 <<'EOF'
+# @NAME@
+
+A henki module, made with `henki mods new`. `@NAME@/` is the module; this directory around it is its repository, so
+tests and notes stay out of what henki loads.
+
+    henki mods test             the checks an install makes, then ./test.sh (a scratch home; it runs your code)
+    henki mods try ./@NAME@     henki with only @NAME@ on, in a scratch home
+    henki mods add ./@NAME@     install it for yourself
+    henki mods publish ./@NAME@ the index entry, once it is committed and pushed
+
+Others add it from git with `henki mods add https://HOST/YOU/REPO#@NAME@`.
+EOF
+  [ -e "$d/test.sh" ] || {
+    cat <<'EOF'
+#!/bin/sh
+# The tests of the modules' own programs. `henki mods test` runs it from this directory, after the checks an install
+# makes, with HOME and the XDG dirs in a scratch dir: test what each doc promises the model or you.
+set -eu
+cd "$(dirname "$0")"
+FAILS=0
+fail() {
+  echo "test.sh: FAIL: $*" >&2
+  FAILS=$((FAILS + 1))
+}
+# expect WANT_CODE WANT_STDOUT COMMAND...: runs COMMAND and compares its exit code and its whole stdout.
+expect() {
+  want_code=$1 want_out=$2
+  shift 2
+  code=0
+  out=$("$@" 2>/dev/null) || code=$?
+  [ "$code" = "$want_code" ] || fail "$*: exit $code, want $want_code"
+  [ "$out" = "$want_out" ] || fail "$*: printed \"$out\", want \"$want_out\""
+}
+
+EOF
+    new_tests "$1"
+    cat <<'EOF'
+
+if [ "$FAILS" != 0 ]; then
+  echo "test.sh: $FAILS checks failed" >&2
+  exit 1
+fi
+echo "test.sh: ok"
+EOF
+  } | put "$d/test.sh" 755
+}
+
+# test.sh's lines for the first module (KIND).
+new_tests() { # KIND
+  case "$1" in
+    tool)
+      cat <<'EOF'
+expect 0 'hello, world' @NAME@/bin/@NAME@
+expect 0 'hello, the reader' @NAME@/bin/@NAME@ 'the reader'
+expect 2 '' @NAME@/bin/@NAME@ a b
+expect 2 '' @NAME@/bin/@NAME@ --nope
+EOF
+      ;;
+    cmd)
+      cat <<'EOF'
+next=$(mktemp)
+HENKI_NEXT=$next @NAME@/cmd/@NAME@ 'only the scripts'
+[ "$(head -n 1 "$next")" = send ] || fail "/@NAME@ hands back no send"
+grep -q 'only the scripts' "$next" || fail "/@NAME@ leaves out its TEXT"
+rm -f "$next"
+expect 2 '' @NAME@/cmd/@NAME@
+EOF
+      ;;
+    template)
+      cat <<'EOF'
+next=$(mktemp)
+HENKI_MODULE=$PWD/@NAME@ HENKI_NEXT=$next @NAME@/cmd/@NAME@ 'the parser'
+[ "$(head -n 1 "$next")" = send ] || fail "/@NAME@ hands back no send"
+[ "$(sed -n 2p "$next")" = "$(head -n 1 @NAME@/cmd/@NAME@.md)" ] || fail "/@NAME@ does not send cmd/@NAME@.md"
+[ "$(tail -n 1 "$next")" = 'the parser' ] || fail "/@NAME@ leaves out its TEXT"
+rm -f "$next"
+EOF
+      ;;
+    observer)
+      cat <<'EOF'
+state=$(mktemp -d)
+echo '{"data":{},"event":"@EVENT@","seq":1,"session":"s1","v":1}' | HENKI_STATE=$state @NAME@/on/@EVENT@
+expect 0 '{"data":{},"event":"@EVENT@","seq":1,"session":"s1","v":1}' cat "$state/@NAME@/events.jsonl"
+rm -rf "$state"
+EOF
+      ;;
+    port) printf '# port/history is held to the history/1 suite by henki mods test itself.\n' ;;
+  esac
+}
+
+# new NAME [KIND] [--dir D]: the module D/NAME (D default ./NAME) of KIND, and around a first one test.sh, README.md
+# and LICENSE; then the next commands.
+dev_new() {
+  local kind=tool d="" x
+  N_name="" N_event=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --tool | --cmd | --template) kind=${1#--} ;;
+      --observer)
+        [ $# -ge 2 ] || usage
+        kind=observer N_event=$2
+        shift
+        ;;
+      --port)
+        [ $# -ge 2 ] || usage
+        [ "$2" = history ] || die "--port $2: new writes a history binding only; fix: --port history (the other ports' contracts are in CONTRACTS.md)"
+        kind=port
+        shift
+        ;;
+      --dir)
+        [ $# -ge 2 ] || usage
+        d=$2
+        shift
+        ;;
+      -*) usage ;;
+      *) [ -z "$N_name" ] && N_name=$1 || usage ;;
+    esac
+    shift
+  done
+  [ -n "$N_name" ] || usage
+  is_name "$N_name" || die "$N_name: $NAME_RULE; fix: choose another"
+  ! skill_reserved "$N_name" || die "$N_name is a name henki keeps for itself, or an official module's; fix: choose another"
+  if [ "$kind" = observer ]; then
+    case " $EVENTS " in *" $N_event "*) ;; *) die "--observer $N_event: not an event; fix: one of $EVENTS" ;; esac
+  fi
+  d=${d:-./$N_name}
+  case "$d" in *[[:cntrl:]]*) die "the path $d holds a control character; fix: name another" ;; esac
+  mkdir -p "$d" || die "cannot make $d; fix: name a directory you can write"
+  d=$(cd -P "$d" && pwd) || die "cannot enter $d; fix: make it readable"
+  N_dir="$d/$N_name"
+  [ ! -e "$N_dir" ] && [ ! -L "$N_dir" ] || die "$N_dir exists; fix: choose another name, or another --dir"
+  x=0
+  [ -e "$d/test.sh" ] || x=1
+  "new_$kind"
+  new_repo "$kind"
+  inspect "$N_dir" "$N_name" 0 || die "the new module does not pass its own checks ($ERR); fix: report it, this is a bug"
+  say "made $(shown "$N_dir") ($kind), $I_hd1"
+  [ "$x" = 1 ] || say "$(shown "$d/test.sh") was there already: add $N_name's tests to it"
+  say "next, in $(shown "$d"):"
+  printf '  %-40s %s\n' "henki mods test" "the checks an install makes, then ./test.sh" "henki mods try ./$N_name" \
+    "henki with only $N_name on, in a scratch home" "henki mods add ./$N_name" "install it for yourself"
+}
+
+# --- test --------------------------------------------------------------------------------------------------------------
+T_fail=0
+t_ok() { say "ok   $1: $2"; }
+t_warn() { say "warn $1: $2"; }
+t_fail() {
+  say "FAIL $1: $2"
+  T_fail=$((T_fail + 1))
+}
+
+# The official modules' names, one per line (the first dir official_dir would look in that has any).
+official_names() {
+  local d n
+  for d in ${HENKI_SHARE:+"$HENKI_SHARE/official"} "$SELF/../share/henki/official" "$SELF/../mods"; do
+    [ -d "$d" ] || continue
+    for n in "$d"/*/doc.md; do [ ! -f "$n" ] || { n=${n%/doc.md} && printf '%s\n' "${n##*/}"; }; done
+    return 0
+  done
+}
+
+# A scratch home under a new dir: HOME and the four XDG dirs (the caller removes $T_root).
+scratch_home() {
+  T_root=$(mktemp -d "${TMPDIR:-/tmp}/henki-$1.XXXXXX") || die "cannot make a scratch dir; fix: check TMPDIR"
+  chmod 700 "$T_root"
+  mkdir -p "$T_root/home/.config/henki" "$T_root/config" "$T_root/data" "$T_root/state" "$T_root/cache" ||
+    die "cannot make $T_root; fix: check TMPDIR"
+}
+
+# COMMAND... with the scratch home of scratch_home, outside any henki session.
+in_scratch() {
+  (
+    unset HENKI_CONFIG HENKI_NEXT HENKI_SESSION HENKI_MODS_TTY
+    HOME="$T_root/home" XDG_CONFIG_HOME="$T_root/config" XDG_DATA_HOME="$T_root/data" XDG_STATE_HOME="$T_root/state" \
+      XDG_CACHE_HOME="$T_root/cache" exec "$@"
+  )
+}
+
+# The checks of the module in DIR: an install's (inspect: layout, the manifest, every text and link, eval/), the names
+# henki keeps and the official modules' commands, each port/PORT's conformance suite, shellcheck when installed.
+test_module() { # DIR
+  local d="$1" n c o p x h
+  if ! inspect "$d" "${d##*/}" 0; then
+    t_fail "${d##*/}" "$(printf '%s' "$ERR" | sed "s|$d|.|g")"
+    return 0
+  fi
+  n=$I_name
+  t_ok "$n" "layout, texts and links as an install checks them (${M_version:-no version}, $(prompt_bytes "$n" "$d") B of prompt, $I_hd1)"
+  [ "$M_has" = 1 ] || t_warn "$n" "no .henki/module.toml: an index lists only modules with one (name, version, license); fix: henki mods new shows one"
+  [ "$n" = "${d##*/}" ] || t_warn "$n" "the directory is named ${d##*/}: a URL install names the module after its manifest, a path one after the directory too; fix: rename one"
+  ! skill_reserved "$n" || t_fail "$n" "a name henki keeps for itself, or an official module's; fix: rename the module"
+  # A command name in two modules stops henki at start when both are on.
+  for o in $(official_names); do
+    [ "$o" != "$n" ] && x=$(official_dir "$o") || continue
+    for c in $(printf '%s' "$I_runs" | awk -F '\t' '$1 ~ /^(bin|cmd)\// { print $1 }'); do
+      [ ! -e "$x/$c" ] || t_warn "$n" "$c is also the official module $o's; henki does not start with both on; fix: rename it"
+    done
+  done
+  [ ! -d "$d/eval" ] || t_ok "$n" "eval/: $(printf '%s' "$E_tasks" | awk 'NF' | wc -l | tr -d ' ') tasks (eval/1)"
+  for p in $(printf '%s' "$I_ports"); do
+    C_suite="$(conform_dir)/$p.tsv" || die "no conformance suites found; fix: reinstall henki"
+    if ! h=$(henki_bin 2>/dev/null); then
+      t_fail "$n" "port/$p: no henki to run the $p/1 suite with; fix: put henki on PATH"
+    elif conform_run "$p" "$d/port/$p" "$h" >"$STAGE/conform"; then
+      t_ok "$n" "port/$p passes the $p/1 suite ($C_checks checks)"
+    else
+      sed 's/^/     | /' "$STAGE/conform"
+      t_fail "$n" "port/$p fails the $p/1 suite (above); fix: as each FAIL line says"
+    fi
+  done
+  command -v shellcheck >/dev/null 2>&1 || return 0
+  for p in $(printf '%s' "$I_runs" | cut -f 1) .henki/template; do
+    [ -f "$d/$p" ] && [ ! -L "$d/$p" ] || continue
+    case "$(head -n 1 "$d/$p")" in '#!'*/sh | '#!'*/bash | '#!'*' sh' | '#!'*' bash') ;; *) continue ;; esac
+    shellcheck -S warning "$d/$p" >"$STAGE/sc" 2>&1 || t_warn "$n" "shellcheck on $p:$nl$(sed 's/^/     | /' "$STAGE/sc")"
+  done
+}
+
+# test [DIR]: test_module on DIR, or on each module in DIR (default .) and then DIR/test.sh, run in DIR with a
+# scratch home; exit 1 on any FAIL. It runs the module's code (the suites, test.sh): an author's own, on purpose.
+dev_test() {
+  local d="${1:-.}" m n=0 rc=0
+  [ -d "$d" ] || die "$d is not a directory; fix: name a module directory, or the one that holds modules"
+  d=$(cd -P "$d" && pwd) || die "cannot enter $1; fix: make it readable"
+  if [ -f "$d/doc.md" ]; then
+    test_module "$d"
+  else
+    for m in "$d"/*/; do
+      m=${m%/}
+      [ -f "$m/doc.md" ] || continue
+      n=$((n + 1))
+      test_module "$m"
+    done
+    [ "$n" -gt 0 ] || die "$d holds no module (a directory holding doc.md); fix: name one, or make one with henki mods new NAME"
+    if [ -f "$d/test.sh" ]; then
+      scratch_home test
+      (cd "$d" && in_scratch sh ./test.sh) >"$STAGE/own" 2>&1 || rc=$?
+      sed 's/^/     | /' "$STAGE/own"
+      if [ "$rc" = 0 ]; then t_ok test.sh "exit 0 (a scratch home)"; else t_fail test.sh "exit $rc (above)"; fi
+      rm -rf "$T_root"
+    fi
+  fi
+  [ "$T_fail" = 0 ] || die "$T_fail checks failed (the FAIL lines above); fix: as each one says"
+  say "test: ok"
+}
+
+# --- try ---------------------------------------------------------------------------------------------------------------
+
+# try [DIR|NAME] [--keep] [-- HENKI_ARGS]: henki with only one module on, in a scratch home: HOME and the four XDG dirs
+# under a new temp dir, the config.toml of this config dir (without its ext key) copied in, the module added there
+# from DIR (default .) or as add takes NAME, then henki run with HENKI_ARGS. The temp dir goes at the end, but with
+# --keep. Nothing of the try reaches this config dir, the store or the state dir, nor anything of those the try.
+dev_try() {
+  local src="" keep=0 h rc=0 out line
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --keep) keep=1 ;;
+      --)
+        shift
+        break
+        ;;
+      -*) usage ;;
+      *) [ -z "$src" ] && src=$1 || usage ;;
+    esac
+    shift
+  done
+  case "${HENKI_DEPTH:-0}" in 0) ;; *) die "try starts henki, and this runs inside henki (HENKI_DEPTH=$HENKI_DEPTH); fix: run henki mods try in a terminal outside henki" ;; esac
+  src=${src:-.}
+  case "$src" in
+    . | .. | /* | ./* | ../*)
+      [ -f "$src/doc.md" ] || die "$src is not a module (no doc.md); fix: name the module's directory, like ./NAME"
+      src=$(cd -P "$src" && pwd) || die "cannot enter $src; fix: make it readable"
+      ;;
+  esac
+  h=$(henki_bin) || exit 1
+  scratch_home try
+  if [ -f "$CONF/config.toml" ]; then
+    awk '{ l = $0; sub(/^[ \t]+/, "", l) } l !~ /^ext[ \t]*=/' "$CONF/config.toml" >"$T_root/home/.config/henki/config.toml"
+    chmod 600 "$T_root/home/.config/henki/config.toml"
+  fi
+  out=$(in_scratch "$SELF/henki-mods" add "$src" --yes 2>&1) || rc=$?
+  printf '%s\n' "$out" | sed 's/^/  | /'
+  if [ "$rc" != 0 ]; then
+    rm -rf "$T_root"
+    die "$src could not be added in the scratch home (above); fix: henki mods test $src"
+  fi
+  # A command that shadows one on PATH loads only with the shadow line add printed; the scratch config gets it.
+  line=$(printf '%s\n' "$out" | sed -n 's/^add to .*: \(shadow = \[.*\]\)$/\1/p')
+  if [ -n "$line" ]; then
+    { awk '{ l = $0; sub(/^[ \t]+/, "", l) } l !~ /^shadow[ \t]*=/' "$T_root/home/.config/henki/config.toml" 2>/dev/null; printf '%s\n' "$line"; } >"$T_root/config.toml.new" &&
+      mv -f "$T_root/config.toml.new" "$T_root/home/.config/henki/config.toml" && chmod 600 "$T_root/home/.config/henki/config.toml"
+  fi
+  say "try: henki with only that module, home $(shown "$T_root/home")$([ "$keep" = 1 ] || printf ' (removed at the end)')"
+  rc=0
+  in_scratch "$h" "$@" || rc=$?
+  if [ "$keep" = 1 ]; then say "try: kept $T_root"; else chmod -R u+w "$T_root" 2>/dev/null; rm -rf "$T_root"; fi
+  exit "$rc"
+}
+
+# --- publish -----------------------------------------------------------------------------------------------------------
+
+# A git remote URL as an index's package names it: https, else the https form of a GitHub ssh URL; else nothing. A
+# file:/// URL passes under HENKI_INDEX_ALLOW_FILE=1 (an index on a local disk, as the index's own lint allows).
+https_url() {
+  case "$1" in
+    https://*) printf '%s\n' "$1" ;;
+    git@github.com:*) printf 'https://github.com/%s\n' "${1#git@github.com:}" ;;
+    ssh://git@github.com/*) printf 'https://github.com/%s\n' "${1#ssh://git@github.com/}" ;;
+    file:///*) [ "${HENKI_INDEX_ALLOW_FILE:-}" != 1 ] || printf '%s\n' "$1" ;;
+  esac
+}
+
+# publish [DIR] [--eval RUN] [--by LOGIN]: for the module in DIR (default .), committed and pushed: the two index entry
+# files, from the commit's raw blobs (entry derive, as the index's check does), checked by the index's own lint, then
+# how to send them. With --eval RUN, the badge block and the rows file (evals/NAME/VERSION.tsv) too. An official
+# module (DIR is the one henki ships) has no commit or repo in an index, only a badge record under henki's version.
+# Writes nothing anywhere.
+dev_publish() {
+  local d="" run="" by="" top rel head r remote url login n v h p o hv
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --eval | --by)
+        [ $# -ge 2 ] || usage
+        case "$1" in --eval) run=$2 ;; *) by=$2 ;; esac
+        shift 2
+        ;;
+      -*) usage ;;
+      *) [ -z "$d" ] && d=$1 && shift || usage ;;
+    esac
+  done
+  d=${d:-.}
+  case "$by" in '' | [A-Za-z0-9]*) ;; *) die "--by $by: not a GitHub login; fix: name one" ;; esac
+  case "$by" in *[!A-Za-z0-9-]*) die "--by $by: not a GitHub login; fix: name one" ;; esac
+  [ -f "$d/doc.md" ] || die "$d is not a module (no doc.md); fix: name the module's directory"
+  d=$(cd -P "$d" && pwd) || die "cannot enter $d; fix: make it readable"
+  [ -z "$run" ] || eval_rows "$run"
+  top=$(git -C "$d" rev-parse --show-toplevel 2>/dev/null) && top=$(cd -P "$top" && pwd) || top=""
+  if o=$(official_dir "${d##*/}") && [ "$o" = "$d" ]; then
+    publish_official "$d" "$top" "$by"
+    return 0
+  fi
+  [ -n "$top" ] || die "$d is not in a git work tree; fix: commit the module to a git repository and push it"
+  rel=${d#"$top"}
+  rel=${rel#/}
+  [ -z "$(git -C "$top" status --porcelain --untracked-files=all -- "${rel:-.}")" ] ||
+    die "$d has changes that are not committed; fix: commit them (an index entry pins a commit, and only its files)"
+  head=$(git -C "$top" rev-parse -q --verify 'HEAD^{commit}') || die "$top has no commit; fix: commit the module"
+  remote=""
+  for r in $(git -C "$top" branch -r --contains "$head" 2>/dev/null | sed 's/^ *//; s/ .*//'); do
+    remote=${r%%/*}
+    break
+  done
+  if [ -z "$remote" ] && [ -n "$(git -C "$top" tag --contains "$head" 2>/dev/null)" ]; then remote=origin; fi
+  [ -n "$remote" ] || die "no remote branch or tag holds $head; fix: push it (git push), so the index can name a commit others can fetch"
+  url=$(git -C "$top" remote get-url "$remote" 2>/dev/null) || die "the remote $remote has no URL; fix: git remote add origin https://..."
+  r=$(https_url "$url")
+  [ -n "$r" ] || die "the remote URL $url is not https; fix: an index names an https URL: push to one and set it with git remote set-url $remote URL"
+  url=$r
+  entry_derive "file://$top" "$rel" "$head" >"$STAGE/ver.body"
+  n=$I_name v=$M_version
+  [ -n "$M_license" ] || die "$d/.henki/module.toml has no license; fix: set license"
+  login=$(publish_login "$by" "$url")
+  mkdir -p "$STAGE/ix/mods/$n"
+  {
+    printf 'index = 1\nname = "%s"\nkind = "git"\nrepo = "%s"\npath = "%s"\n' "$n" "$url" "$rel"
+    printf 'summary = "%s"\nmaintainer = "%s"\nlicense = "%s"\n' "${M_summary:-$I_line}" "$login" "$M_license"
+    printf 'latest = "%s"\nadded = "%s"\n' "$v" "$(date -u +%Y-%m-%d)"
+  } >"$STAGE/ix/mods/$n.toml"
+  {
+    printf 'index = 1\n'
+    cat "$STAGE/ver.body"
+    for p in $(printf '%s' "$I_ports"); do
+      C_suite="$(conform_dir)/$p.tsv" || die "no conformance suites found; fix: reinstall henki"
+      h=$(henki_bin) || exit 1
+      conform_run "$p" "$STAGE/m/port/$p" "$h" >"$STAGE/conform" || {
+        cat "$STAGE/conform"
+        die "port/$p fails the $p/1 suite (above); an index lists only bindings that pass; fix: henki mods test $d"
+      }
+      printf 'conform = "%s/1 %s/%s"\n' "$p" "$C_passed" "$C_checks"
+      break
+    done
+    [ -z "$run" ] || badge_block "$I_hd1" "$login"
+  } >"$STAGE/ix/mods/$n/$v.toml"
+  publish_print "$n" "$v" "$login"
+  say "# to list it: fork $(cat "$(index_share)/$INDEX_DEFAULT.url" 2>/dev/null || echo the index), add the files,"
+  say "# run ./check.sh pr main HEAD there (the checks a reviewer runs first), and open a pull request. A reviewer reads"
+  say "# the code at $head, adds reviewed and reviewer, and signs the merge. Nothing was sent anywhere."
+}
+
+# The maintainer login of an entry: --by, else the manifest's maintainer, else the GitHub owner of URL.
+publish_login() { # BY URL
+  local login=${1:-$M_maintainer}
+  case "$login" in '' | *[!A-Za-z0-9-]*) login="" ;; esac
+  case "$2" in https://github.com/*/*) [ -n "$login" ] || login=${2#https://github.com/} login=${login%%/*} ;; esac
+  printf '%s\n' "${login:-YOUR-GITHUB-LOGIN}"
+}
+
+# An official module's badge record: the package (kind "official") and the version file keyed by henki's version,
+# holding the module's hd1 (of henki's tree, committed) and the badge.
+publish_official() { # DIR TOP BY
+  local d=$1 n v login rel
+  [ -n "$EV_rows" ] || die "$d is an official module: an index lists one for its badge only; fix: publish $d --eval RUN"
+  inspect "$d" "${d##*/}" 0 || die "$ERR"
+  if [ -n "$2" ]; then
+    rel=${d#"$2"}
+    rel=${rel#/}
+    [ -z "$(git -C "$2" status --porcelain --untracked-files=all -- "${rel:-.}")" ] ||
+      die "$d has changes that are not committed; fix: commit them (the record names the hd1 of henki's own files)"
+  fi
+  n=$I_name
+  v=$("$(henki_bin)" --version 2>/dev/null | awk '{ print $2 }')
+  case "$v" in [0-9]*.[0-9]*) ;; *) die "cannot tell henki's version (henki --version said \"$v\"); fix: put the henki that ships $n on PATH" ;; esac
+  login=$(publish_login "$3" "")
+  mkdir -p "$STAGE/ix/mods/$n"
+  {
+    printf 'index = 1\nname = "%s"\nkind = "official"\n' "$n"
+    printf 'summary = "%s"\nmaintainer = "%s"\nlicense = "%s"\n' "${M_summary:-$I_line}" "$login" "${M_license:-Apache-2.0}"
+    printf 'latest = "%s"\nadded = "%s"\n' "$v" "$(date -u +%Y-%m-%d)"
+  } >"$STAGE/ix/mods/$n.toml"
+  {
+    printf 'index = 1\nversion = "%s"\nhd1 = "%s"\n' "$v" "$I_hd1"
+    badge_block "$I_hd1" "$login"
+  } >"$STAGE/ix/mods/$n/$v.toml"
+  publish_print "$n" "$v" "$login"
+  say "# an official module ships with henki $v; the index holds its badge. Add the files to the index and sign them."
+}
+
+# The entry files in STAGE/ix (and the rows with --eval), checked by the index's lint, printed under their paths.
+publish_print() { # NAME VERSION LOGIN
+  local p
+  for p in "$STAGE/ix/mods/$1.toml" "$STAGE/ix/mods/$1/$2.toml"; do
+    (entry_lint "$p" >/dev/null) || die "the entry above does not pass the index's checks; fix: as each line says (the manifest, or the module)"
+  done
+  say "# mods/$1.toml (a package the index does not list yet; for one it does, set only latest = \"$2\")"
+  cat "$STAGE/ix/mods/$1.toml"
+  say ""
+  say "# mods/$1/$2.toml"
+  cat "$STAGE/ix/mods/$1/$2.toml"
+  say ""
+  if [ -n "$EV_rows" ]; then
+    say "# evals/$1/$2.tsv (the rows behind the badge, exactly these bytes)"
+    cat "$EV_rows"
+    say ""
+  fi
+  [ "$3" != YOUR-GITHUB-LOGIN ] || say "# set maintainer (and eval_by) to your GitHub login (or maintainer in the manifest, or --by)"
+}
+
+# --- eval report and badge -----------------------------------------------------------------------------------------
+
+EV_rows=""
+# The rows of eval run RUN: a run name (a dir under STATE/henki/eval/), a run dir, or a rows file. Sets EV_rows and
+# EV_dir (the run dir, holding run.toml when eval made it).
+eval_rows() { # RUN
+  local st
+  case "$1" in
+    */*)
+      if [ -d "$1" ]; then EV_dir=$(cd -P "$1" && pwd) EV_rows="$EV_dir/runs.tsv"; else EV_rows=$1 EV_dir=$(dirname "$1"); fi
+      ;;
+    *)
+      st=${XDG_STATE_HOME:-}
+      case "$st" in /*) ;; *) st="$HOME/.local/state" ;; esac
+      EV_dir="$st/henki/eval/$1" EV_rows="$st/henki/eval/$1/runs.tsv"
+      ;;
+  esac
+  [ -f "$EV_rows" ] || die "no eval run $1 ($(shown "$EV_rows") is missing); fix: henki mods eval NAME runs one and names it"
+}
+
+# The badge block of the run in EV_rows for a version whose hd1 is HD1: the statistics' keys (a PASS only), the model
+# file's SHA-256 and the server from the run's run.toml, and eval_by.
+badge_block() { # HD1 LOGIN
+  local out rc=0 x
+  out=$(evalstats badge "$EV_rows" 2>&1) || rc=$?
+  [ "$rc" != 2 ] || die "the rows of $(shown "$EV_rows") do not read: $out; fix: give the runs.tsv eval wrote"
+  [ "$rc" = 0 ] || die "no badge from this run: $(printf '%s\n' "$out" | head -n 1); fix: as it says (or publish without --eval)"
+  x=$(awk -F '\t' 'NR == 1 { print $5 }' "$EV_rows")
+  [ "$x" = "$1" ] || die "the run measured other files ($x), not these ($1); fix: henki mods eval this version, then publish"
+  [ -f "$EV_dir/run.toml" ] && toml <"$EV_dir/run.toml" >"$STAGE/run.rec" 2>/dev/null ||
+    die "no run.toml beside $(shown "$EV_rows"); fix: name the run by its name or dir, as eval printed it"
+  x=$(rget "$STAGE/run.rec" model_sha256) ||
+    die "the run names no model file, so the badge could not say which model it measured; fix: henki mods eval with --model-file F"
+  printf '%s\n' "$out" | sed -n '/^eval_suite = /p; /^eval_model = /p'
+  printf 'eval_model_sha256 = "%s"\n' "$x"
+  x=$(rget "$STAGE/run.rec" server_build) || x=-
+  case "$x" in - | '') x="unknown server" ;; *) x="llama.cpp $x" ;; esac
+  printf 'eval_server = "%s"\n' "$x"
+  printf '%s\n' "$out" | sed -n '/^eval_hd1 = /p; /^eval_repeats = /p; /^eval_on = /p; /^eval_off = /p; /^eval_effect = /p; /^eval_general = /p'
+  printf 'eval_by = "%s %s"\n' "$2" "$(date -u +%Y-%m-%d)"
+}
+
+# badge --check ROWS FILE: the rows recompute to a passing badge whose keys equal FILE's (index/1); exit 0 or 1.
+badge_check() { # ROWS FILE
+  local out rc=0 k want got bad=0
+  [ -f "$1" ] && [ -f "$2" ] || die "no file $1 or $2; fix: name the rows file and the version file"
+  out=$(evalstats badge "$1" 2>&1) || rc=$?
+  if [ "$rc" != 0 ]; then
+    say "FAIL: $(printf '%s\n' "$out" | head -n 1 | sed 's/^FAIL: //')"
+    exit 1
+  fi
+  toml <"$2" >"$STAGE/ver.rec" || die "$2: $(cat "$STAGE/ver.rec")"
+  for k in eval_suite eval_model eval_hd1 eval_repeats eval_on eval_off eval_effect eval_general; do
+    want=$(printf '%s\n' "$out" | sed -n "s/^$k = //p" | sed 's/^"//; s/"$//')
+    got=$(rget "$STAGE/ver.rec" "$k") || got="(none)"
+    [ "$want" = "$got" ] || {
+      say "FAIL: $k is \"$got\"; the rows give \"$want\""
+      bad=1
+    }
+  done
+  got=$(rget "$STAGE/ver.rec" hd1) || got=""
+  [ "$got" = "$(rget "$STAGE/ver.rec" eval_hd1 2>/dev/null)" ] || {
+    say "FAIL: eval_hd1 is not the version's hd1"
+    bad=1
+  }
+  [ "$bad" = 0 ] || exit 1
+  say "ok: the rows recompute to the badge (PASS)"
+}
+
+dev_eval() {
+  local rc=0
+  case "${1:-}" in
+    report)
+      [ $# = 2 ] || usage
+      eval_rows "$2"
+      evalstats report "$EV_rows" || die "the rows do not read (above); fix: give the runs.tsv eval wrote"
+      ;;
+    badge)
+      if [ "${2:-}" = --check ]; then
+        [ $# = 4 ] || usage
+        badge_check "$3" "$4"
+        return 0
+      fi
+      [ $# = 2 ] || usage
+      eval_rows "$2"
+      evalstats badge "$EV_rows" || rc=$?
+      [ "$rc" != 2 ] || die "the rows do not read (above); fix: give the runs.tsv eval wrote"
+      exit "$rc"
+      ;;
+    *) usage ;;
+  esac
+}
+
+# --- share -------------------------------------------------------------------------------------------------------------
+
+# share NAME: the line that installs NAME's files on another machine: `add NAME` for an official or index module (the
+# review travels with the name), else `add URL@COMMIT#DIR --expect hd1:H`, which installs these files or refuses.
+dev_share() { # NAME
+  local x
+  lock_check
+  lock_get "$1" || die "$1 is not added; fix: henki mods list shows what is"
+  x=${L_source%%#*}@$L_commit
+  case "$L_source" in *'#'*) x="$x#${L_source#*#}" ;; esac
+  case "$L_kind:$L_source" in
+    official:*) say "henki mods add $L_name" ;;
+    index:"$INDEX_DEFAULT":*) say "henki mods add $L_source" ;;
+    index:*) say "henki mods add $L_source@${L_kind#index:}   (once: henki mods index add ${L_kind#index:} URL --signers FILE)" ;;
+    url:*) say "henki mods add $x --expect $L_hd1" ;;
+    skill:[!/]*) say "henki mods add --skill $x --as $L_name --expect $L_hd1" ;;
+    *) die "$1 comes from a directory on this machine ($L_source), which no one else can add; fix: push it to a git repository and share that (henki mods add URL#DIR)" ;;
+  esac
+  x=$(masks_of)
+  [ -z "$x" ] || say "(here $(printf '%s\n' "$x" | sed 's|^|/|' | tr '\n' ' ')is masked; the line installs the whole module)"
+}
+
+setup
+case "${1:-}" in
+  entry)
+    case "${2:-}" in
+      derive)
+        [ $# = 5 ] || usage
+        scratch
+        entry_derive "$3" "$4" "$5"
+        ;;
+      lint)
+        [ $# = 3 ] || usage
+        scratch
+        entry_lint "$3"
+        ;;
+      *) usage ;;
+    esac
+    ;;
+  new) shift && scratch && dev_new "$@" ;;
+  test)
+    [ $# -le 2 ] || usage
+    scratch
+    dev_test "${2:-}"
+    ;;
+  try) shift && scratch && dev_try "$@" ;;
+  publish) shift && scratch && dev_publish "$@" ;;
+  eval) shift && scratch && dev_eval "$@" ;;
+  share)
+    [ $# = 2 ] && is_name "$2" || usage
+    scratch
+    dev_share "$2"
+    ;;
+  help | -h | --help)
+    usage 2>&1 | sed 's/^usage: //;s/^       //'
+    exit 0
+    ;;
+  --version)
+    [ $# = 1 ] || usage
+    say "henki-mods-dev $(henki_version)"
+    ;;
+  *) usage ;;
+esac

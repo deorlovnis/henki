@@ -1,0 +1,1 @@
+Change the memory of my crewpoint box from 4G to 8G in its halti rules. Change nothing else.

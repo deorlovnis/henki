@@ -1,0 +1,253 @@
+# The world of the halti tasks, for a task's setup to source in its empty work dir: a git repository standing for
+# a Mac clone of a client's `payments` service, halti's config folder under the run's HOME (three workspaces: crewpoint,
+# a client's, open with its box running; research, a client's, open and stopped; emanative, the user's own, closed),
+# and the stand-in halti's state (box contents under box/, door logs). The setup then adds its own files and calls seed.
+set -eu
+EVAL_HOME=${EVAL_HOME:-$HOME}
+S=${HALTI_FAKE_STATE:-$EVAL_HOME/.halti-fake}
+put() { mkdir -p "$(dirname "$1")" && cat >"$1"; }
+# seed: the stand-in approves the rules as they are now (the user's last approval).
+seed() { PATH=/usr/bin:/bin "$EVAL_LIB/halti" --fake-init; }
+put "README.md" <<'EOF'
+# payments
+
+Crewpoint's payments service (client work). This is the Mac clone; agents work on it in the
+crewpoint workspace's box (halti), where it is the payments folder under /work.
+EOF
+put "tests/integration.sh" <<'EOF'
+#!/bin/sh
+# needs GH_TOKEN in the environment
+: "${GH_TOKEN:?set GH_TOKEN}"
+echo "integration tests against api.github.com: ok"
+EOF
+put ".env.example" <<'EOF'
+GH_TOKEN=
+EOF
+git init -q
+git add -A
+git -c user.name=user -c user.email=user@example.com -c commit.gpgsign=false commit -q -m 'initial import: payments service (Mac clone)'
+put "$EVAL_HOME/.config/cred/box/crewpoint.toml" <<'EOF'
+# Crewpoint's rules (client workspace). halti reads this file; an edit counts only once it is
+# approved with Touch ID: halti policy crewpoint
+about = "Crewpoint client work: payments service"
+run = ["claude"]
+image = "cred-agent@sha256:5bb242f03dde4031bcb3b765a8fd174a2c353e4c03ccc19ba144fa2097790425"
+model = "anthropic"
+sites = ["github", "trello"]
+standins = ["GH_TOKEN", "TRELLO_API_KEY"]
+keep = true
+cpus = 4
+memory = "4G"
+
+[net]
+allow = [
+  "https://github.com",
+  "https://api.github.com",
+  "https://codeload.github.com",
+  "https://api.trello.com",
+  "https://pypi.org",
+  "https://files.pythonhosted.org",
+  "https://registry.npmjs.com",
+]
+writes = "deny"
+allow_writes = []
+
+[[mount]]
+path = "~/Git/payments"
+mode = "clone"
+EOF
+put "$EVAL_HOME/.config/cred/box/emanative.toml" <<'EOF'
+# My own workspace. An edit counts only once approved: halti policy emanative
+about = "Own work: halti, henki, itse"
+run = ["claude"]
+image = "cred-agent-rust@sha256:f0c74fa9b8c7e3f94792a78c7291cd2bb41f89a620e949562c6600e7e7428969"
+model = "anthropic"
+sites = ["github"]
+standins = ["GH_TOKEN"]
+cpus = 6
+memory = "8G"
+docker = true
+
+[net]
+allow = [
+  "https://github.com",
+  "https://api.github.com",
+  "https://codeload.github.com",
+  "https://crates.io",
+  "https://index.crates.io",
+  "https://static.crates.io",
+  "https://static.rust-lang.org",
+  "https://pypi.org",
+  "https://files.pythonhosted.org",
+]
+writes = "ask"
+allow_writes = ["https://api.github.com/repos/deorlovnis/"]
+EOF
+put "$EVAL_HOME/.config/cred/box/research.toml" <<'EOF'
+# Research (client workspace). An edit counts only once approved: halti policy research
+about = "Market research for Nordlake"
+image = "cred-agent@sha256:5bb242f03dde4031bcb3b765a8fd174a2c353e4c03ccc19ba144fa2097790425"
+model = "anthropic"
+sites = ["github", "sentry"]
+standins = ["GH_TOKEN", "SENTRY_AUTH_TOKEN"]
+cpus = 2
+memory = "4G"
+
+[net]
+allow = ["https://github.com", "https://api.github.com", "https://sentry.io", "https://*.wikipedia.org", "https://arxiv.org"]
+writes = "deny"
+EOF
+put "$EVAL_HOME/.config/cred/policy/github.toml" <<'EOF'
+[run]
+mode = "ask"
+export = { token = "GH_TOKEN" }
+
+[agent]
+consent = "session"
+
+[fetch]
+hosts = ["https://api.github.com", "https://github.com"]
+writes = "ask"
+auth = "Bearer {token}"
+EOF
+put "$EVAL_HOME/.config/cred/policy/trello.toml" <<'EOF'
+[run]
+mode = "deny"
+
+[fetch]
+hosts = ["https://api.trello.com"]
+writes = "allow"
+auth = "{token}"
+EOF
+put "$EVAL_HOME/.config/cred/policy/sentry.toml" <<'EOF'
+[run]
+mode = "deny"
+
+[fetch]
+hosts = ["https://sentry.io"]
+writes = "deny"
+auth = "Bearer {token}"
+EOF
+put "$EVAL_HOME/.config/cred/policy/anthropic.toml" <<'EOF'
+[run]
+mode = "deny"
+
+[fetch]
+hosts = ["https://api.anthropic.com"]
+writes = "allow"
+auth = "{key}"
+auth_header = "x-api-key"
+EOF
+put "$EVAL_HOME/.config/cred/index.json" <<'EOF'
+{
+  "anthropic": {
+    "url": "https://console.anthropic.com",
+    "description": "model key for boxes",
+    "fields": {
+      "key": {
+        "updated": "2026-09-30"
+      }
+    }
+  },
+  "github": {
+    "url": "https://github.com/settings/tokens",
+    "description": "rkoski, fine-grained",
+    "fields": {
+      "token": {
+        "updated": "2026-10-20",
+        "expires": "2026-12-16"
+      }
+    }
+  },
+  "trello": {
+    "url": "https://trello.com/app-key",
+    "description": "Crewpoint Trello",
+    "fields": {
+      "token": {
+        "updated": "2026-08-14",
+        "expires": "2026-11-14"
+      }
+    }
+  },
+  "sentry": {
+    "url": "https://sentry.io/settings/account/api/auth-tokens/",
+    "description": "Nordlake Sentry",
+    "fields": {
+      "token": {
+        "updated": "2026-10-01",
+        "expires": "2027-04-01"
+      }
+    }
+  }
+}
+EOF
+put "$S/status/own" <<'EOF'
+emanative
+EOF
+put "$S/status/ws/crewpoint" <<'EOF'
+open
+EOF
+put "$S/status/ws/research" <<'EOF'
+open
+EOF
+put "$S/status/ws/emanative" <<'EOF'
+closed
+EOF
+put "$S/status/box/crewpoint.main" <<'EOF'
+running
+EOF
+put "$S/status/box/research.main" <<'EOF'
+stopped
+EOF
+put "$S/status/box/emanative.main" <<'EOF'
+stopped
+EOF
+put "$S/box/crewpoint/payments/README.md" <<'EOF'
+# payments (agent's copy)
+EOF
+put "$S/box/crewpoint/payments/run-tests.sh" <<'EOF'
+#!/bin/sh
+# payments test runner (inside the box)
+echo "collected 15 items"
+echo
+echo "tests/test_charge.py ........                                    [ 53%]"
+echo "tests/test_refund.py .....F.                                     [100%]"
+echo
+echo "FAILED tests/test_refund.py::test_refund_rounding - assert 10.01 == 10.0"
+echo "========================= 1 failed, 14 passed in 0.42s ========================="
+exit 1
+EOF
+put "$S/box/emanative/TODO.md" <<'EOF'
+# TODO
+
+- wire the henki halti extension (doc.md + bin/)
+- bump the rust image to 1.92
+- answer the Mac RAM question for the 27B kit
+EOF
+put "$S/box/emanative/henki/README.md" <<'EOF'
+# henki
+EOF
+put "$S/box/research/notes.md" <<'EOF'
+# Nordlake market notes
+EOF
+put "$S/doorlog/crewpoint.log" <<'EOF'
+08:58:10 main GET https://api.github.com/repos/crewpoint/payments 200 allowed
+09:02:44 main POST https://github.com/crewpoint/payments.git/git-upload-pack 200 allowed
+09:13:05 main GET https://docs.gradle.org/8.10/userguide/toolchains.html 403 REFUSED (not in [net] allow)
+09:13:07 main GET https://docs.gradle.org/8.10/userguide/toolchains.html 403 REFUSED (not in [net] allow)
+09:40:11 main GET https://registry.npmjs.org/left-pad 403 REFUSED (not in [net] allow)
+09:40:12 main GET https://registry.npmjs.org/left-pad 403 REFUSED (not in [net] allow)
+09:40:15 main GET https://registry.npmjs.org/typescript 403 REFUSED (not in [net] allow)
+10:21:30 main POST https://api.trello.com/1/cards 200 allowed (key trello)
+11:02:40 main POST https://hooks.slack.com/services/T0000/B0000/******** 403 REFUSED (a write to a host no key covers; [net] writes = "deny")
+11:05:02 main GET https://pypi.org/simple/requests/ 200 allowed
+EOF
+put "$S/doorlog/research.log" <<'EOF'
+10:01:12 main GET https://en.wikipedia.org/wiki/Nordic_countries 200 allowed
+10:03:40 main GET https://arxiv.org/abs/2410.01234 200 allowed
+10:07:02 main GET https://www.statista.com/statistics/1234/ 403 REFUSED (not in [net] allow)
+10:30:55 halti stopped box main
+EOF
+put "$S/doorlog/emanative.log" <<'EOF'
+07:45:00 halti closed emanative (Mac slept)
+EOF

@@ -1,0 +1,9 @@
+FAIL: the halti suite gains too little: CI lower bound -5, not above 0
+eval_suite = "halti"
+eval_model = "Qwen3.5-2B-Q8_0"
+eval_hd1 = "hd1:5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e"
+eval_repeats = 13
+eval_on = "73/156"
+eval_off = "71/156"
+eval_effect = "+2 per 156 (95% CI -5 to +9; tasks 4 better, 4 worse, 4 equal; sign p 1.000)"
+eval_general = "on 105/156, off 105/156: 0 per 156 (95% CI -5 to +5)"
