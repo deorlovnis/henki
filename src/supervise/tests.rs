@@ -500,7 +500,7 @@ fn kernel_observer_run_reaped_by_its_waiter() {
     fs::set_permissions(&script, std::os::unix::fs::PermissionsExt::from_mode(0o700)).unwrap();
     let c = kernel_child(&script, &t.0, &path_env(), [Stdio::null(), Stdio::null(), Stdio::null()]).unwrap();
     let pid = c.id() as i32;
-    sys::exited(pid);
+    assert!(sys::exited(pid));
     let bg = fs::read_to_string(t.0.join("bg")).unwrap().trim().parse::<i32>().unwrap();
     assert!(sys::procs().iter().any(|p| p.pid == pid && p.zombie), "exited reaped the run");
     // Its orphan is henki's child now: counted as background, as an orphan of a call's would be.
@@ -509,8 +509,10 @@ fn kernel_observer_run_reaped_by_its_waiter() {
     kernel_end(Some(c), false);
     assert!(!lock(&KERNEL).contains(&pid) && !sys::procs().iter().any(|p| p.pid == pid));
     assert!(alive(bg), "the run's background process was killed with it");
-    kernel_kill(&[pid]); // forgotten: nothing is signalled, so a recycled pid is safe
-    assert!(alive(bg));
+    // Forgotten: the pid is not signalled (a recycled one is safe), yet the sweep after it takes the orphan the ended
+    // run left, as at the session end.
+    kernel_kill(&[pid]);
+    until("the ended run's orphan to be swept", || !alive(bg));
     // A live run is killed with its session; the sweep after it takes the orphan (henki's child once its parent died).
     let script = t.0.join("slow");
     fs::write(&script, "#!/bin/bash\nsleep 3133.7\n").unwrap();
@@ -519,10 +521,8 @@ fn kernel_observer_run_reaped_by_its_waiter() {
     let slow = c.id() as i32;
     until("the slow run's sleep", || sys::procs().iter().any(|p| p.sid == slow && p.pid != slow));
     kernel_kill(&[slow]);
-    sys::exited(slow);
+    assert!(sys::exited(slow));
     kernel_end(Some(c), false);
     until("the slow run's session to die", || !sys::procs().iter().any(|p| p.sid == slow));
-    sys::kill(bg, libc::SIGKILL);
-    until("the background sleep to die", || !alive(bg));
     sweep_pass();
 }
