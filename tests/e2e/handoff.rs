@@ -310,7 +310,9 @@ fn handoff_official_mods() {
     p.expect(" 2   ", W);
     p.expect("B  first task\r\n", W);
     p.prompt(W);
-    let first = r.journals().into_iter().map(|j| j.file_stem().unwrap().to_string_lossy().into_owned()).min().unwrap();
+    // Two sessions started in one second sort by their random part: the first is the one holding the first task.
+    let first = r.journals().into_iter().find(|j| fs::read_to_string(j).unwrap().contains("first task")).unwrap();
+    let first = first.file_stem().unwrap().to_string_lossy().into_owned();
     p.line("/resume 2");
     p.expect(&format!("switch to session {first}? [y/N] "), W);
     p.line("y");
