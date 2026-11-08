@@ -36,14 +36,15 @@ EOF
 }
 
 # The work tree as a git tree object: every file git does not ignore, tracked or not, through a temporary index that
-# starts as a copy of the real one (so unchanged files are known by their stat data and not read again). The ignore
+# starts as a copy of the real one (so unchanged files are known by their stat data and not read again; the copy keeps
+# the index's mtime, by which git knows an entry whose file changed in the second the index was written). The ignore
 # rules are the work tree's of now: once an edit drops one, the files it hid are in the snapshots after it. A file or
 # directory git cannot read (mode 000, a root-owned volume, a nested repo with no commit) would fail the whole add, and
 # every snapshot after it, unseen: it is left out instead, and git's reasons follow the tree id, each after "; ".
 tree() {
   t_dir=$(mktemp -d "${TMPDIR:-/tmp}/henki-checkpoint.XXXXXX") || return 1
   t_real=$(g rev-parse --path-format=absolute --git-path index 2>/dev/null || g rev-parse --git-path index)
-  [ ! -f "$t_real" ] || cp "$t_real" "$t_dir/index"
+  [ ! -f "$t_real" ] || cp -p "$t_real" "$t_dir/index"
   t_id=$(cd "$top" && export GIT_INDEX_FILE="$t_dir/index" && { g add -A --ignore-errors 2>"$t_dir/err" || echo "error: git add failed" >>"$t_dir/err"; } && g write-tree)
   t_rc=$?
   cat "$t_dir/err" >&2

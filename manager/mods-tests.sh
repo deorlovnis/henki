@@ -262,7 +262,7 @@ t_checkpoints() {
 }
 
 t_checkpoints_missed() {
-  case_ "checkpoints: what git cannot read is left out and said; a filter git -c cannot turn off"
+  case_ "checkpoints: what git cannot read is left out and said; a filter git -c cannot turn off; a racy index"
   local m="$MODS_DIR/checkpoints" here
   here=$(pwd)
   export GIT_CEILING_DIRECTORIES="$D" HENKI_MODULE="$m"
@@ -308,6 +308,13 @@ t_checkpoints_missed() {
     out_has "no checkpoint before edit $D/plain/x.txt: cannot copy"
   fi
   chmod 644 x.txt
+  # A file changed in the second the index was written has the stat data git keeps for it (ctime aside, which this
+  # repo's config does not trust): git reads it again only as long as the index's mtime says so.
+  mkdir -p "$D/racy" && cd "$D/racy" && git init -q . && git config core.trustctime false && printf 'one\n' >a.txt || return
+  touch -t 202301010000 a.txt && git add a.txt && printf 'two\n' >a.txt && touch -t 202301010000 a.txt .git/index
+  event write "$D/racy/a.txt" >"$D/ev"
+  run "$m/on/call_start.wait" <"$D/ev"
+  [ "$(git show "refs/henki/checkpoints/$HENKI_SESSION/1:a.txt")" = two ] || fail "the snapshot holds a.txt as the index has it"
   cd "$here" || exit 1
   unset GIT_CEILING_DIRECTORIES
 }
