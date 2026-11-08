@@ -13,7 +13,9 @@ An observer and commands for you, not for the model (they cost no prompt bytes):
   snapshot, so the next `/undo` goes one call further back. Files made since then are removed.
 - `/rewind N`: the same for snapshot N; it drops N and every later one.
 
-Ignored files (`.gitignore`) are never in a snapshot. A snapshot that takes over 2 s (a very large work tree) still
-finishes, but henki stops waiting for it, says so, and runs the calls after it without waiting. The model is not told
-about an `/undo`: say so in your next message. Old snapshots stay until you remove them:
+Ignored files (`.gitignore`) are never in a snapshot. Its git calls run no program your git config names (no
+`core.fsmonitor`, hook, pager or filter driver such as Git LFS): a snapshot holds the files' bytes as they are, and
+`/undo` puts those bytes back. A snapshot that takes over 2 s (a very large work tree) still finishes, but henki stops
+waiting for it, says so, and runs the calls after it without waiting. The model is not told about an `/undo`: say so
+in your next message. Old snapshots stay until you remove them:
 `git for-each-ref --format='%(refname)' refs/henki/ | xargs -n 1 git update-ref -d`.

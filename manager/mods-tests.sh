@@ -199,6 +199,20 @@ t_checkpoints() {
   run "$m/cmd/undo"
   rc_is 1
   err_has "no checkpoints in this session"
+  # A repo whose config names programs for git to run (a model can write .git/config): no snapshot or /undo runs one.
+  mkdir -p "$D/trap/hooks" && cd "$D/trap" || return
+  printf '#!/bin/sh\necho >>"%s/ran"; cat\n' "$D" >"$D/prog" && chmod 755 "$D/prog" && cp "$D/prog" hooks/reference-transaction
+  git init -q . && git config core.fsmonitor "$D/prog" && git config core.hooksPath "$D/trap/hooks" && git config core.pager "$D/prog"
+  for k in clean smudge process; do git config "filter.x.$k" "$D/prog"; done
+  git config filter.x.required true && printf '* filter=x\n' >.gitattributes && printf 'one\n' >a.txt
+  event write "$D/trap/a.txt" >"$D/ev"
+  run "$m/on/call_start.wait" <"$D/ev"
+  rc_is 0
+  printf 'two\n' >a.txt
+  run "$m/cmd/undo" <<<y
+  rc_is 0
+  [ "$(cat a.txt)" = one ] || fail "/undo did not put a.txt back in a repo with filters"
+  [ ! -e "$D/ran" ] || fail "a program the repo's config names ran: $(wc -l <"$D/ran") times"
   # Outside git: the write and edit targets, kept or noted absent.
   mkdir -p "$D/plain" && cd "$D/plain" || return
   printf 'old\n' >x.txt
