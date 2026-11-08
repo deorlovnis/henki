@@ -1,8 +1,8 @@
 //! One session: the step loop of a turn, the only place the main thread waits, and the single way a turn and a session end.
-use crate::{anthropic, config::Config, ext, http, journal, journal::Journal, journal::rec, supervise, sys, term, term::Out, term::Reader};
+use crate::{anthropic, config::Config, ext, http, journal, journal::rec, observe, observe::Observers, port, port::Ports, supervise, sys, term, term::Out, term::Reader};
 use crate::{tools, tools::Killed, types::*};
 use call::Stuck;
-use serde_json::Value;
+use serde_json::{Value, json};
 use std::{convert::Infallible, ffi::OsString, path::Path, path::PathBuf, sync::mpsc::Receiver, sync::mpsc::Sender, time::Duration, time::Instant};
 
 mod approve;
@@ -17,13 +17,20 @@ pub const SLICE: Duration = Duration::from_millis(50); // how often a kill step 
 // The 1,800 s attempt limit is `http::LIMITS.request`, held in `Session.lim` so a unit test can shorten it.
 
 pub struct Session {
-    /// The REPL reads it (the banner, the allow rules) and replaces `cfg.allow` after removing a rule.
+    /// The REPL reads it: the banner, the allow rules, the paths and the environment for `!cmd` and `/mods`.
     /// Its `snap` is what the tripwire compares with: the trust files as `config::load` found them.
     pub(crate) cfg: Config,
     /// The signal that ended the last wait: INT and QUIT cancel a REPL turn, TERM and HUP end the REPL (and stay while
     /// the turn finishes).
     pub(crate) sig: Option<i32>,
-    j: Journal,
+    /// The history and policy bindings; the session `sid` is held in the history binding.
+    ports: Ports,
+    sid: String,
+    /// The last spill file's number (`journal::spill`).
+    spill_n: usize,
+    /// The modules' `on/` programs; silent while `opened` holds the `session` record that `session_start` carries.
+    obs: Observers,
+    pub(crate) opened: Option<Value>,
     out: Out,
     /// Exactly the `user`, `assistant` and `tool_result` records, in journal order: what the next request renders.
     hist: Vec<Value>,
@@ -70,22 +77,28 @@ struct Turn {
 }
 
 impl Session {
-    /// The child environment from `cfg.env`, `cfg.pass_env`, the extensions' `bin/` dirs, `cfg.user_path` and `j.id()`;
-    /// the cwd is `cfg.cwd`. `reader`: Some in the REPL (approvals are asked on the terminal), None in `run`.
-    pub fn new(cfg: Config, j: Journal, hist: Vec<Value>, out: Out, tx: Sender<Ev>, rx: Receiver<Ev>, deadline: Option<Instant>, reader: Option<Reader>) -> Session {
-        let env = supervise::child_env(&cfg.env, &cfg.pass_env, &ext::child_path(&cfg.exts, &cfg.user_path), &cfg.user_path, j.id());
+    /// Session `sid`, held in `ports.history`, with its replayed `hist`. The child environment from `cfg.env`,
+    /// `cfg.pass_env`, the extensions' `bin/` dirs, `cfg.user_path` and `sid`; the cwd is `cfg.cwd`. `reader`: Some in
+    /// the REPL (approvals are asked on the terminal), None in `run`.
+    pub fn new(cfg: Config, ports: Ports, sid: String, hist: Vec<Value>, out: Out, ch: (Sender<Ev>, Receiver<Ev>), deadline: Option<Instant>, reader: Option<Reader>) -> Session {
+        let env = supervise::child_env(&cfg.env, &cfg.pass_env, &ext::child_path(&cfg.exts, &cfg.user_path), &cfg.user_path, &sid);
         let system = tools::system(cfg.agents.as_deref(), &ext::prompt(&cfg.exts, &cfg.home));
         // The Anthropic API can be silent for minutes while it buffers a large tool input.
         let lim = http::Limits { stall: if cfg.dialect == "anthropic" { anthropic::STALL } else { http::LIMITS.stall }, ..http::LIMITS };
-        let (tools, next_h) = (tools::schema(&cfg.tools), journal::next_h(&hist));
+        let (tools, next_h, spill_n) = (tools::schema(&cfg.tools), journal::next_h(&hist), journal::spill_n(&cfg.state, &sid, &hist));
+        let obs = Observers::new(&cfg.exts, env.clone(), &cfg.cwd, &cfg.state, &port::kernel_log(&cfg), ch.0.clone());
         Session {
             cfg,
             sig: None,
-            j,
+            ports,
+            sid,
+            spill_n,
+            obs,
+            opened: None,
             out,
             hist,
-            tx,
-            rx,
+            tx: ch.0,
+            rx: ch.1,
             deadline,
             lim,
             env,
@@ -114,11 +127,16 @@ impl Session {
     }
 
     /// Session end: kill and sweep everything henki started (every path, `ok` included), then `result` (when given),
-    /// then `close`. A journal failure is the `Err`, and the `--json` reader still gets one result.
+    /// then `close`. A journal failure is the `Err`, and the `--json` reader still gets one result. Then the observer
+    /// runs still going (`session_end`'s too) get `GRACE`, which a signal cuts short, and the kill.
     pub fn close(&mut self, result: Option<Value>) -> Result<(), Outcome> {
         self.finishing = true;
         let (_, n) = self.stop_all(false);
-        self.end(n, result)
+        // A run that ends sends tag 0; the slices also catch one whose waiter thread did not start.
+        let (end, until) = (self.end(n, result), Instant::now() + supervise::GRACE);
+        while !self.obs.running().is_empty() && Instant::now() < until && self.wait(0, Some(until.min(Instant::now() + SLICE))).is_ok() {}
+        supervise::kernel_kill(&self.obs.running());
+        end
     }
 
     /// The last records: the kill notice, `result`, `close`; then the result on `--json` stdout, or in plain mode the
@@ -127,17 +145,21 @@ impl Session {
     /// kill notice goes to the terminal only.
     fn end(&mut self, killed: usize, result: Option<Value>) -> Result<(), Outcome> {
         let stopped = (killed > 0).then(|| format!("stopped {} background processes at exit", term::num(killed as u64)));
-        if self.reader.is_some() && !self.hist.iter().any(|r| r["t"] == "user") && self.j.discard() {
+        if self.reader.is_some() && !self.hist.iter().any(|r| r["t"] == "user") && self.ports.history.discard(&self.sid).unwrap_or(false) {
             stopped.iter().for_each(|m| self.out.note(m)); // no journal to write it to
             return Ok(());
         }
         let written = (|| {
             stopped.iter().try_for_each(|m| self.notice(m))?;
-            let r = result.clone().map(|r| self.j.write(r)).transpose()?;
-            self.j.write(rec::close(self.j.bytes())).map(|_| r)
+            let r = result.clone().map(|r| journal::put(self.ports.history.as_mut(), &self.sid, r)).transpose()?;
+            journal::put(self.ports.history.as_mut(), &self.sid, rec::close()).map(|c| (r, c))
         })();
         let (r, end) = match written {
-            Ok(r) => (r, Ok(())),
+            Ok((r, c)) => {
+                // Nothing is journaled after `close`: its observers' notices go to the terminal only.
+                self.opened.is_none().then(|| self.obs.emit("session_end", &self.sid, &c, 0, intact(&self.cfg.snap)).1).into_iter().flatten().for_each(|n| self.out.note(&n));
+                (r, Ok(()))
+            }
             Err(e) => {
                 let ms = |r: &Value| (r["duration_s"].as_f64().unwrap_or_default() * 1e3) as u64;
                 let failed = |r: Value| if r["status"] == "error" { r } else { self.result(&e, ms(&r)) };
@@ -159,12 +181,17 @@ impl Session {
 
     /// The run's `result` record: the last assistant text (or ""), this turn's successful replies, this process's usage.
     pub fn result(&self, o: &Outcome, duration_ms: u64) -> Value {
-        rec::result(o, &self.t.text, self.usage_proc, Some(self.j.id()), self.t.steps, duration_ms)
+        rec::result(o, &self.t.text, self.usage_proc, Some(&self.sid), self.t.steps, duration_ms)
     }
 
-    /// For the bounded flush before exit.
+    /// For the bounded flush before exit: the bindings get `bye` and the kill first, then up to five sweeps take what
+    /// they left behind (Linux; an orphan of theirs is henki's child).
     pub fn into_out(self) -> Out {
-        self.out
+        let Session { out, ports, .. } = self;
+        let bound = !ports.bound.is_empty();
+        drop(ports);
+        _ = bound && (0..5).all(|_| supervise::sweep_pass() > 0);
+        out
     }
 
     /// `prompt`, then the line the user sends with Enter, read with the terminal in the editor's modes and bracketed paste
@@ -199,13 +226,16 @@ impl Session {
         got
     }
 
-    /// `!CMD` on the terminal: its exit code, None when bash did not start (a notice says why). INT and QUIT reach the
-    /// command alone (it runs in henki's process group); TERM, HUP and a closed stdout SIGKILL it and return Err.
-    pub fn bang(&mut self, cmd: &str) -> Result<Option<i32>, Stop> {
+    /// `prog ARGS` on the terminal with exactly `env` (`!CMD`, `/mods`): its exit code, None when it did not start (a
+    /// notice says why). INT and QUIT reach the command alone (it runs in henki's process group); TERM, HUP and a closed
+    /// stdout SIGKILL it and return Err.
+    pub fn bang(&mut self, prog: &Path, args: &[OsString], env: &[(OsString, OsString)]) -> Result<Option<i32>, Stop> {
         // The line's end and bracketed paste off reach the terminal before the command writes to it.
         self.sync().or_else(|s| if matches!(s, Stop::Signal(libc::SIGINT | libc::SIGQUIT)) { Ok(()) } else { Err(s) })?;
-        let (tag, env) = (self.next_tag(), supervise::bang_env(&self.cfg.env));
-        let Ok(pid) = supervise::bang(&self.cfg.bash, cmd, &self.cfg.cwd, &env, tag, &self.tx).map_err(|e| self.out.note(&tools::not_started(&e))) else { return Ok(None) };
+        let tag = self.next_tag();
+        let Ok(pid) = supervise::bang(prog, args, &self.cfg.cwd, env, tag, &self.tx).map_err(|e| self.out.note(&format!("cannot start {}: {e}", prog.display()))) else {
+            return Ok(None);
+        };
         let mut got = self.wait(tag, None);
         while let Err(Stop::Signal(libc::SIGINT | libc::SIGQUIT)) = got {
             got = self.wait(tag, None); // the command got it too
@@ -214,12 +244,26 @@ impl Session {
         Ok(done.and_then(|ev| if let Ev::BangDone { code, .. } = ev { Some(code) } else { None }))
     }
 
+    /// A typed command's environment (`/NAME`, `/mods`): the tool child's (every module's bin/ first on PATH, and no
+    /// name in two of them), plus HENKI_CONFIG (the config dir), HENKI_STATE, HENKI_NEXT, HENKI_BIN and HENKI_MODULE
+    /// (the module dir; none for `/mods`).
+    pub fn command_env(&self, module: Option<&Path>, next: &Path) -> Vec<(OsString, OsString)> {
+        let (bin, module) = (std::env::current_exe().unwrap_or_default(), module.map(|m| ("HENKI_MODULE", m.to_path_buf())));
+        let named = [("HENKI_CONFIG", self.cfg.dir.clone()), ("HENKI_STATE", self.cfg.state.clone()), ("HENKI_NEXT", next.into()), ("HENKI_BIN", bin)];
+        self.env.iter().cloned().chain(named.into_iter().chain(module).map(|(k, v)| (k.into(), v.into()))).collect()
+    }
+
+    /// The session to resume in a new henki: none before the first message (the session is discarded at close).
+    pub fn resumable(&self) -> Option<String> {
+        self.hist.iter().any(|r| r["t"] == "user").then(|| self.sid.clone())
+    }
+
     /// Every trust file whose stamps differ from the snapshot, in `cfg.trust` order.
     pub fn changed(&self) -> Vec<PathBuf> {
         self.cfg.snap.iter().filter(|(p, s)| sys::stamp(p) != *s).map(|(p, _)| p.clone()).collect()
     }
 
-    /// A new stamp of the allow file, after henki's own write to it (`always`, `/allow rm`) and right after a `changed()`
+    /// A new stamp of the allow file, after henki's own write to it (`always`) and right after a `changed()`
     /// that was empty. Every other trust file keeps its stamp, so no outside change is ever absorbed.
     pub fn rearm(&mut self) {
         self.cfg.snap.iter_mut().filter(|(p, _)| *p == self.cfg.allow.file).for_each(|(p, s)| *s = sys::stamp(p));
@@ -228,10 +272,12 @@ impl Session {
     /// Requests and calls until an outcome; `Err` is the only way out.
     fn step_loop(&mut self, task: Option<String>) -> Result<Infallible, Outcome> {
         (self.t, self.sig) = (Turn::default(), None);
+        // Observers start with this process's first turn: a REPL session with no message has none.
+        self.opened.take().map_or(Ok(()), |r| self.observe("session_start", &r))?;
         // The REPL's banner printed them already.
         std::mem::take(&mut self.cfg.notices).iter().try_for_each(|n| if self.reader.is_some() { self.record(rec::notice(n)) } else { self.notice(n) })?;
         match task {
-            // Where and when the model works goes on the session's first task only.
+            // Where and when the model works goes on the session's first task only; its record is `turn_start`.
             Some(t) => {
                 let head = if self.hist.iter().any(|r| r["t"] == "user") { String::new() } else { head(&self.cfg.cwd) };
                 self.record(rec::user(&(head + &t)))?;
@@ -242,7 +288,7 @@ impl Session {
                 let cut = self.hist.last().is_some_and(|r| r["finish"] == "interrupted" || r["finish"] == "error");
                 return Err(Outcome::error("config", if cut { "the last reply was cut short; give a TASK" } else { "nothing to continue; give a TASK" }));
             }
-            None => {}
+            None => self.observe("turn_start", &json!({"t": "turn_start"}))?,
         }
         loop {
             let mut r = self.request()?;
@@ -332,6 +378,7 @@ impl Session {
                 Some(Ev::OutputClosed) if !self.finishing => return Err(Stop::Closed),
                 Some(Ev::Part { tag: t, part }) if t == tag => self.part(part),
                 Some(ev @ (Ev::Reply { tag: t, .. } | Ev::Tool { tag: t, .. } | Ev::Input { tag: t, .. } | Ev::BangDone { tag: t, .. })) if t == tag => return Ok(Some(ev)),
+                Some(ev @ Ev::Observed { tag: t }) if t == tag => return Ok(Some(ev)),
                 _ => {} // stale: an ended attempt, a timer, an answered call, input nobody waits for
             }
         }
@@ -349,14 +396,35 @@ impl Session {
         found.map_or(Ok(()), Err)
     }
 
-    /// The journal first, then the `--json` line; only `user`, `assistant` and `tool_result` enter the history.
+    /// The journal first, then the `--json` line, then the record's events; only `user`, `assistant` and `tool_result`
+    /// enter the history.
     fn record(&mut self, rec: Value) -> Result<(), Outcome> {
-        let rec = self.j.write(rec)?;
+        let rec = journal::put(self.ports.history.as_mut(), &self.sid, rec)?;
         self.out.record(&rec);
+        let watched = observe::of(&rec).try_for_each(|e| self.observe(e, &rec));
         if matches!(rec["t"].as_str(), Some("user" | "assistant" | "tool_result")) {
             self.hist.push(rec);
         }
-        Ok(())
+        watched
+    }
+
+    /// Runs `event`'s observers (none before `session_start`), then waits for its `.wait` runs (turn_start and
+    /// call_start only), together, up to `observe::WAIT`; signals and the deadline end the wait as any other. Observers
+    /// whose runs miss it are not waited for again.
+    fn observe(&mut self, event: &str, data: &Value) -> Result<(), Outcome> {
+        let tag = self.next_tag();
+        let (n, notes) = if self.opened.is_some() { (0, Vec::new()) } else { self.obs.emit(event, &self.sid, data, tag, intact(&self.cfg.snap)) };
+        self.observed(notes)?;
+        // After a miss the others' waits end at once: `until` has passed.
+        let until = Instant::now() + observe::WAIT;
+        let all = (0..n).try_fold(true, |all, _| self.wait(tag, Some(until)).map(|e| all && e.is_some()))?;
+        let late = if all { Vec::new() } else { self.obs.unwait(event) };
+        self.observed(late)
+    }
+
+    /// Observer notices: on the terminal and in the journal, never events themselves.
+    fn observed(&mut self, notes: Vec<String>) -> Result<(), Outcome> {
+        notes.iter().try_for_each(|n| journal::put(self.ports.history.as_mut(), &self.sid, rec::notice(n)).map(|r| (self.out.note(n), self.out.record(&r)).1))
     }
 
     /// A notice: `henki: TEXT` on stderr (plain and REPL), a record in the journal and on `--json` stdout.
@@ -388,6 +456,11 @@ pub fn outcome_line(o: &Outcome) -> String {
         Outcome::NeedsApproval(c) => format!("(needs approval: {}; henki --resume continues this session in the REPL)", tools::head(c)),
         o => format!("({})", o.status().replace('_', " ")),
     }
+}
+
+/// Whether every trust file still has its snapshot's stamps, asked once an observer would run.
+fn intact(snap: &[(PathBuf, (sys::Stamp, sys::Stamp))]) -> impl Fn() -> bool + '_ {
+    || snap.iter().all(|(p, s)| sys::stamp(p) == *s)
 }
 
 /// What a session's first task starts with: where and when the model works.

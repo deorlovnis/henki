@@ -2,19 +2,24 @@
 # henki-mods: henki's module manager. A module is an extension directory (NAME/doc.md, an optional NAME/bin/, an
 # optional NAME/.henki/module.toml and .henki/card.md); this program copies one into a read-only store, pins it by
 # commit and tree hash in a lock, and turns it on and off by a symlink in the ext dir henki reads. It never runs code
-# from a module: no checkout, no hooks, no build step, no install script.
+# from a module to add, change or remove one: no checkout, no hooks, no build step, no install script. Only `eval`,
+# once the person said yes to its screen, runs a module's eval/1 tasks (and henki with the module on).
 #
 #   ~/.config/henki/ext/NAME -> ${XDG_DATA_HOME:-~/.local/share}/henki/mods/NAME/ID/   on = the link exists
 #   ~/.config/henki/mods.lock                                                          lock/1, one line per module
 #   ~/.config/henki/AGENTS.md                         only its "# >>> mods cards" block is written here
+#   ~/.config/henki/port/PORT -> .../mods/NAME/ID/port/PORT                            a port binding (swap); bind/1
 #
-# The config dir is ~/.config/henki whatever XDG_CONFIG_HOME says, because that is the dir henki reads (it takes
-# no XDG variable for it). Bash 3.2 (macOS) compatible: no arrays at all (an empty one is "unbound" under set -u
-# before bash 4.4), no associative arrays, mapfile, ${x,,}, declare -n or |&. POSIX tools plus git; LC_ALL=C, so
-# sorting, ${#x} and patterns work on bytes.
+# The config dir is ~/.config/henki whatever XDG_CONFIG_HOME says, because that is the dir henki reads (it takes no
+# XDG variable for it); under /mods it is the dir of henki's config, in HENKI_CONFIG. Bash 3.2 (macOS) compatible: no
+# arrays at all (an empty one is "unbound" under set -u before bash 4.4), no associative arrays, mapfile, ${x,,},
+# declare -n or |&. POSIX tools plus git; LC_ALL=C, so sorting, ${#x} and patterns work on bytes.
 #
 # Environment: HOME (required), XDG_DATA_HOME, HENKI_SHARE (the dir holding official/NAME, the official modules),
-# HENKI_MODS_TTY (the terminal the question is asked on; default /dev/tty).
+# HENKI_MODS_TTY (the terminal the question is asked on; default /dev/tty), HENKI_CONFIG (the config dir; henki sets
+# it for /mods), HENKI_BIN (the henki whose `henki port` runs the conformance suites and that eval runs; henki sets it),
+# HENKI_NEXT (the hand-off file of a henki that runs this as /mods: a change writes `restart` there, and henki asks to
+# restart on it), XDG_STATE_HOME (eval adds its lines to henki/eval.tsv there).
 set -u
 export LC_ALL=C
 umask 022
@@ -36,7 +41,11 @@ nl='
 # ext::prompt's header line; henki joins it to the rest of the system prompt with a blank line ("\n\n").
 HEADER='Extensions are commands on PATH; read the doc in brackets before first use.'
 # The named formats this henki ships (CONTRACTS.md); a module's `contracts` must all be here.
-CONTRACTS_KNOWN='journal/1 json/1 wire/1 ext/1 module/1 lock/1 hd1'
+CONTRACTS_KNOWN='journal/1 json/1 wire/1 ext/1 ext/2 handoff/1 observe/1 module/1 lock/1 hd1 port/1 history/1 policy/1 conform/1 bind/1 eval/1'
+# The ports a package may bind (henki's port::LINKED), and what each one gets to see, for the swap screen.
+PORTS_KNOWN='history policy'
+PORT_SEES_history='stores every session record'
+PORT_SEES_policy='decides every call before it runs; protected paths stay refused'
 AGENTS_MAX=4096 # henki refuses to start with a bigger AGENTS.md
 CARDS_BEGIN='# >>> mods cards'
 CARDS_END='# <<< mods cards'
@@ -44,6 +53,11 @@ CARDS_END='# <<< mods cards'
 # file), and the awk of macOS refuses a -v value holding a newline, then runs nothing ("newline in string").
 export HM_B="$CARDS_BEGIN" HM_E="$CARDS_END"
 RESTART='restart henki (or /exit and start again) to load the change'
+DOC_MAX=16384 # doc.md and cmd/*.md (ext/2)
+# The names henki keeps for its own commands; a module's cmd/ may not use them.
+RESERVED='exit help mods allow'
+# The names an observer in on/ may have (observe/1): an event, or a waited-for one.
+EVENTS='session_start turn_start turn_start.wait call_start call_start.wait call_end turn_end question session_end record'
 LICENSE_BAD='*[!A-Za-z0-9.+ ()-]*' # an SPDX expression: ids, AND/OR/WITH, parentheses
 NAME_RULE='a name is 1 to 32 of a-z, 0-9, _ and -, starting with a-z or 0-9'
 
@@ -53,6 +67,11 @@ die() {
 }
 warn() { printf 'henki-mods: warning: %s\n' "$*" >&2; }
 say() { printf '%s\n' "$*"; }
+# After a change: the henki that runs this as /mods asks to restart on it (handoff/1); else the line says how.
+restart() {
+  if [ -n "${HENKI_NEXT:-}" ] && [ -f "$HENKI_NEXT" ] && [ ! -L "$HENKI_NEXT" ] && printf 'restart\n' >"$HENKI_NEXT"; then return 0; fi
+  say "$RESTART"
+}
 usage() {
   cat >&2 <<'EOF'
 usage: henki-mods [list]              modules: state, version, source, prompt bytes
@@ -61,6 +80,12 @@ usage: henki-mods [list]              modules: state, version, source, prompt by
        henki-mods lock                print the lock
        henki-mods verify [NAME]       store copies against the lock, the links, the layout
        henki-mods verify --dir DIR    one module directory: layout and manifest
+       henki-mods swap PORT NAME|std [--yes]   bind henki's PORT to module NAME's port/PORT, or back to std
+       henki-mods test --port PORT NAME|std|/PROGRAM   the conformance suite of PORT against a binding
+       henki-mods eval NAME|/DIR [--suite NAME|general|/DIR] [--repeats N] [--model M] [--yes]
+                                      eval/1 tasks with the module on and off
+       henki-mods eval --check DIR    the layout of a directory of eval/1 tasks
+       henki-mods allow [--config FILE] [rm N]   henki's allow rules: list them, or remove rule N
        henki-mods help | --version
 EOF
   exit 2
@@ -112,6 +137,8 @@ setup() {
   case "${HOME:-}" in /*) ;; *) die "HOME is not set; fix: set HOME to your home directory" ;; esac
   while [ "$HOME" != / ] && [ "${HOME%/}" != "$HOME" ]; do HOME=${HOME%/}; done
   CONF="$HOME/.config/henki"
+  # henki names the config dir its session runs on (a --config profile's) when it runs this as /mods.
+  case "${HENKI_CONFIG:-}" in '') ;; /*) CONF=$HENKI_CONFIG ;; *) die "HENKI_CONFIG is not an absolute path; fix: unset it" ;; esac
   EXT="$CONF/ext"
   LOCK="$CONF/mods.lock"
   AGENTS="$CONF/AGENTS.md"
@@ -149,6 +176,12 @@ stage() {
 
 # --- text checks -------------------------------------------------------------------------------------------------------
 
+# The code points henki escapes on every output path (term::ESCAPE), as FIRST LAST pairs in decimal.
+ESCAPED="0 8 11 31 127 159 160 160 173 173 847 847 1536 1541 1564 1564 1757 1757 1807 1807 2192 2193 2274 2274 \
+4447 4448 5760 5760 6068 6069 6155 6159 8192 8207 8232 8239 8287 8303 12288 12288 12644 12644 \
+65024 65039 65279 65279 65440 65440 65520 65531 69821 69821 69837 69837 78896 78911 113824 113827 \
+119155 119162 917504 921599"
+
 # Exit 0 when FILE is UTF-8 without a code point henki escapes (term::ESCAPE: controls other than tab and newline,
 # C1, invisible and bidi format characters); else 1 with "U+XXXX" or "not UTF-8" on stdout. Without iconv, only the
 # ASCII controls are checked.
@@ -162,12 +195,9 @@ invisible_check() {
     echo "not UTF-8"
     return 1
   }
-  printf '%s\n' "$hex" | awk '
+  printf '%s\n' "$hex" | HM_ESC="$ESCAPED" awk '
     BEGIN {
-      split("0 8 11 31 127 159 160 160 173 173 847 847 1536 1541 1564 1564 1757 1757 1807 1807 2192 2193 2274 2274 " \
-        "4447 4448 5760 5760 6068 6069 6155 6159 8192 8207 8232 8239 8287 8303 12288 12288 12644 12644 " \
-        "65024 65039 65279 65279 65440 65440 65520 65531 69821 69821 69837 69837 78896 78911 113824 113827 " \
-        "119155 119162 917504 921599", r, " ")
+      split(ENVIRON["HM_ESC"], r, " ")
       for (i = 0; i < 16; i++) h[substr("0123456789abcdef", i + 1, 1)] = i
     }
     { for (i = 1; i <= NF; i++) { b[n++] = h[substr($i, 1, 1)] * 16 + h[substr($i, 2, 1)] } }
@@ -177,6 +207,21 @@ invisible_check() {
         for (j = 1; j in r; j += 2) if (c >= r[j] + 0 && c <= r[j + 1] + 0) { printf "U+%04X\n", c; exit 1 }
       }
     }'
+}
+
+# A doc.md or cmd/NAME.md as henki takes it (config::text): at most DOC_MAX bytes of UTF-8 without a code point it
+# escapes; else 1 with ERR.
+text_ok() {
+  local n why
+  n=$(wc -c <"$1") || n=0
+  if [ "$n" -gt "$DOC_MAX" ]; then
+    ERR="$1: $(num "$n") bytes, over $(num "$DOC_MAX"); fix: shorten it"
+    return 1
+  fi
+  why=$(invisible_check "$1") || {
+    ERR="$1: holds $why, which a terminal does not show; fix: remove it"
+    return 1
+  }
 }
 
 # Each line of a .gitattributes file that sets an attribute changing what a checkout or archive holds against the
@@ -412,10 +457,16 @@ EOF
     return 1
     ;;
   esac
-  if [ -n "$M_ports" ]; then
-    ERR="$f: ports must be empty in module/1 (port bindings come with a later henki); fix: set ports = []"
-    return 1
-  fi
+  while IFS= read -r x; do
+    [ -n "$x" ] || continue
+    case " $PORTS_KNOWN " in *" $x "*) ;; *)
+      ERR="$f: port $x is not one this henki binds ($PORTS_KNOWN); fix: upgrade henki, or drop it"
+      return 1
+      ;;
+    esac
+  done <<EOF
+$M_ports
+EOF
   while IFS= read -r x; do
     [ -n "$x" ] || continue
     case " $CONTRACTS_KNOWN " in *" $x "*) ;; *)
@@ -503,23 +554,24 @@ docline() {
 # A top-level NAME henki takes (anything but doc.md and bin, which inspect checks itself); else 1 with ERR.
 top_ok() {
   case "$2" in
-    cmd | ctx | on | port)
-      ERR="$1/$2/: a later module layout (commands, context, observers, ports) that this henki does not load; fix: remove it, or set henki_module and requires for the henki that loads it"
+    ctx)
+      ERR="$1/$2/: a later module layout (context) that this henki does not load; fix: remove it, or set henki_module and requires for the henki that loads it"
       return 1
       ;;
     README* | LICENSE* | CHANGELOG* | .*) ;;
     *)
-      ERR="$1/$2: unknown entry; an extension holds doc.md, bin/, README*, LICENSE*, CHANGELOG* and dot files only; fix: move it out of the module"
+      ERR="$1/$2: unknown entry; a module holds doc.md, bin/, cmd/, on/, port/, eval/, README*, LICENSE*, CHANGELOG* and dot files only; fix: move it out of the module"
       return 1
       ;;
   esac
 }
 
-# Everything about module DIR into I_* and M_*: hd1, doc line, commands, links, card, manifest; NAME the default
-# name (the source dir's), HOST 1 to check this machine too. Exit 1 with ERR at the first problem.
+# Everything about module DIR into I_* and M_*: hd1, doc line, commands, links, card, manifest, and I_runs: what runs
+# (PATH<TAB>WHEN, one per line: bin/, cmd/, on/ and port/ entries); NAME the default name (the source dir's), HOST 1
+# to check this machine too. Exit 1 with ERR at the first problem.
 inspect() {
   local dir="$1" fallback="$2" host="$3" p kind top rest x why
-  I_hd1="" I_line="" I_cmds="" I_links=0 I_files=0 I_card=0 I_name=""
+  I_hd1="" I_line="" I_cmds="" I_links=0 I_files=0 I_card=0 I_name="" I_ports="" I_runs=""
   listing "$dir" || return 1
   [ -s "$STAGE_LIST" ] || {
     ERR="$dir: empty; fix: a module holds doc.md"
@@ -535,14 +587,14 @@ inspect() {
   while IFS= read -r p; do
     [ -n "$p" ] || continue
     p=${p#"$dir"/}
-    case "$p" in bin/.* | doc.md | bin) ;; bin/*) p="$p/x" ;; *) top_ok "$dir" "$p" || return 1 ;; esac
-    case "$p" in bin/*/x)
-      ERR="$dir/${p%/x}: a directory; fix: a command is a file you can run, so move it out of bin/"
+    case "$p" in bin/.* | cmd/.* | on/.* | doc.md | bin | cmd | on | port | eval | eval/*) ;; bin/* | cmd/* | on/* | port/*) p="$p/x" ;; *) top_ok "$dir" "$p" || return 1 ;; esac
+    case "$p" in bin/*/x | cmd/*/x | on/*/x | port/*/x)
+      ERR="$dir/${p%/x}: a directory; fix: a command or a port binding is a file you can run, so move it out of ${p%%/*}/"
       return 1
       ;;
     esac
   done <<EOF
-$(find "$dir" -mindepth 1 -maxdepth 1 -print; [ ! -d "$dir/bin" ] || [ -L "$dir/bin" ] || find "$dir/bin" -mindepth 1 -maxdepth 1 -type d -print)
+$(find "$dir" -mindepth 1 -maxdepth 1 -print; for x in bin cmd on port; do [ ! -d "$dir/$x" ] || [ -L "$dir/$x" ] || find "$dir/$x" -mindepth 1 -maxdepth 1 -type d -print; done)
 EOF
   while IFS= read -r p; do
     kind=${p##*"$tab"}
@@ -584,6 +636,7 @@ EOF
             [ -n "$(find -L "$dir/$p" -prune -type f -perm -100 -print 2>/dev/null)" ] && x=1
             if [ "$x" = 1 ] && is_cmd "$rest"; then
               I_cmds="$I_cmds$rest$nl"
+              I_runs="${I_runs}bin/$rest${tab}when the model runs $rest$nl"
             elif [ "$x" = 1 ] || [ "${rest#.}" = "$rest" ]; then
               ERR="$dir/$p: a command is a file you can run, named with A-Z, a-z, 0-9, ., _ and -; fix: rename it or chmod u+x it, or move it out of bin/"
               return 1
@@ -591,11 +644,87 @@ EOF
             ;;
         esac
         ;;
+      cmd)
+        # cmd/NAME: the user's /NAME (handoff/1), henki's test as for bin/, and not a name henki keeps; cmd/NAME.md:
+        # its data, held to doc.md's rules.
+        case "$rest" in
+          '')
+            ERR="$dir/cmd: not a directory; fix: make cmd a directory of commands"
+            return 1
+            ;;
+          .*/*) ;;
+          */*)
+            ERR="$dir/cmd/${rest%%/*}: a directory; fix: a command is a file you can run, so move it out of cmd/"
+            return 1
+            ;;
+          *)
+            x=0
+            [ -n "$(find -L "$dir/$p" -prune -type f -perm -100 -print 2>/dev/null)" ] && x=1
+            if [ "$x" = 1 ] && is_cmd "$rest"; then
+              case " $RESERVED " in *" $rest "*)
+                ERR="$dir/$p: a name henki keeps for its own command; fix: rename it"
+                return 1
+                ;;
+              esac
+              I_runs="${I_runs}cmd/$rest${tab}when you type /$rest$nl"
+            elif [ "$x" = 0 ] && [ "${rest%.md}" != "$rest" ]; then
+              text_ok "$dir/$p" || return 1
+            elif [ "$x" = 1 ] || [ "${rest#.}" = "$rest" ]; then
+              ERR="$dir/$p: a command is a file you can run, named with A-Z, a-z, 0-9, ., _ and -; fix: rename it or chmod u+x it, or move it out of cmd/"
+              return 1
+            fi
+            ;;
+        esac
+        ;;
+      eval) ;; # eval/1 tasks, checked below: henki ignores them
+      on)
+        # on/EVENT: an observer henki runs once per event (observe/1); henki's test as for bin/, named for an event.
+        case "$rest" in
+          '')
+            ERR="$dir/on: not a directory; fix: make on a directory of observers"
+            return 1
+            ;;
+          .*/*) ;;
+          */*)
+            ERR="$dir/on/${rest%%/*}: a directory; fix: an observer is a file you can run, so move it out of on/"
+            return 1
+            ;;
+          *)
+            x=0
+            [ -n "$(find -L "$dir/$p" -prune -type f -perm -100 -print 2>/dev/null)" ] && x=1
+            if [ "$x" = 1 ]; then
+              case " $EVENTS " in *" $rest "*) ;; *)
+                ERR="$dir/$p: not an event; on/ holds $EVENTS; fix: rename it"
+                return 1
+                ;;
+              esac
+              x=""
+              [ "${rest%.wait}" = "$rest" ] || x="; henki waits for it, up to 2 s"
+              I_runs="${I_runs}on/$rest${tab}unasked, at every ${rest%.wait} event$x$nl"
+            elif [ "${rest#.}" = "$rest" ]; then
+              ERR="$dir/$p: an observer is a file you can run; fix: chmod u+x it, or move it out of on/"
+              return 1
+            fi
+            ;;
+        esac
+        ;;
+      port)
+        # port/PORT: a program henki runs as that port's binding, once a swap links it (henki's test, as for bin/).
+        x=0
+        [ -n "$(find -L "$dir/$p" -prune -type f -perm -100 -print 2>/dev/null)" ] && x=1
+        case " $PORTS_KNOWN :$x" in
+          *" ${rest:-/} "*:1) I_ports="$I_ports$rest$nl" I_runs="${I_runs}port/$rest${tab}as henki's $rest port, once henki-mods swap $rest binds it$nl" ;;
+          *)
+            ERR="$dir/$p: port/ holds a program you can run per port, named $PORTS_KNOWN; fix: rename it or chmod u+x it, or move it out"
+            return 1
+            ;;
+        esac
+        ;;
       .henki)
         case "$rest:$kind" in
-          module.toml:644 | module.toml:755 | card.md:644 | card.md:755) ;;
+          module.toml:644 | module.toml:755 | card.md:644 | card.md:755 | template:755) ;;
           *)
-            ERR="$dir/$p: .henki holds module.toml and card.md (regular files) only; fix: remove it"
+            ERR="$dir/$p: .henki holds module.toml, card.md and template (a program cmd/ links run; regular files) only; fix: remove it"
             return 1
             ;;
         esac
@@ -614,6 +743,12 @@ EOF
     ERR="$dir: no doc.md; fix: write doc.md with a summary of the module on line 1"
     return 1
   }
+  if [ "$M_has" = 1 ] && [ "$(printf '%s\n' "$M_ports" | awk 'NF' | sort)" != "$(printf '%s' "$I_ports" | sort)" ]; then
+    ERR="$dir/.henki/module.toml: ports must name exactly the programs in port/ ($(printf '%s' "$I_ports" | tr '\n' ' ')); fix: correct ports"
+    return 1
+  fi
+  text_ok "$dir/doc.md" || return 1
+  [ ! -e "$dir/eval" ] || eval_check "$dir/eval" || return 1
   I_line=$(docline "$dir/doc.md")
   printf '%s' "$I_line" >"$STAGE_LIST.line"
   why=$(invisible_check "$STAGE_LIST.line") || {
@@ -817,11 +952,20 @@ copy_git() {
 
 # --- the lock ----------------------------------------------------------------------------------------------------------
 
-# Validates the lock; exit 1 on a line this version cannot read.
+# Validates the lock; exit 1 on a line this version cannot read. The lock/1 lines come first, then the bind/1 lines,
+# bind/1<TAB>PORT<TAB>NAME<TAB>ID<TAB>ADDED<TAB>HOW: one per port bound to a module (swap).
 lock_check() {
   [ -f "$LOCK" ] || return 0
-  HM_F="$LOCK" awk -F '\t' '
+  HM_F="$LOCK" HM_P=" $PORTS_KNOWN " awk -F '\t' '
     BEGIN { f = ENVIRON["HM_F"] }
+    $1 == "bind/1" && (NF != 6 || $3 !~ /^[a-z0-9][a-z0-9_-]*$/ || $4 !~ /^[0-9a-f]+$/ || ($6 != "yes" && $6 != "tty")) {
+      known = index(ENVIRON["HM_P"], " " $2 " ") > 0
+      printf "henki-mods: %s:%d: not a bind/1 line; fix: %s\n", f, NR, known ? "henki-mods swap " $2 " std" : "remove the line"; exit 1 }
+    # A port a later henki binds (its manager wrote the line): swap PORT std cannot name it here.
+    $1 == "bind/1" && index(ENVIRON["HM_P"], " " $2 " ") == 0 {
+      p = $2; gsub(/[^a-z0-9_-]/, "?", p)
+      printf "henki-mods: %s:%d: this lock is newer than this henki-mods (it binds %s); fix: upgrade henki\n", f, NR, p; exit 1 }
+    $1 == "bind/1" { next }
     $1 != "lock/1" { printf "henki-mods: %s:%d: this lock is newer than this henki-mods; fix: upgrade henki\n", f, NR; exit 1 }
     NF != 11 || $2 !~ /^[a-z0-9][a-z0-9_-]*$/ || ($3 != "on" && $3 != "off") || $5 !~ /^(official|path|url)$/ {
       printf "henki-mods: %s:%d: not a lock/1 line; fix: henki-mods rm the module named on it, or remove the line\n", f, NR; exit 1 }
@@ -833,7 +977,7 @@ lock_get() {
   local line
   L_name="" L_state="" L_version="" L_kind="" L_source="" L_commit="" L_hd1="" L_added="" L_how=""
   [ -f "$LOCK" ] || return 1
-  line=$(HM_N="$1" awk -F '\t' '$2 == ENVIRON["HM_N"] { print; exit }' "$LOCK")
+  line=$(HM_N="$1" awk -F '\t' '$1 == "lock/1" && $2 == ENVIRON["HM_N"] { print; exit }' "$LOCK")
   [ -n "$line" ] || return 1
   # No field but the last (MASK, empty) is ever empty, so read's collapsing of tabs changes nothing.
   IFS="$tab" read -r _ L_name L_state L_version L_kind L_source L_commit L_hd1 L_added L_how _ <<EOF
@@ -848,13 +992,17 @@ store_of() {
   printf '%s/%s/%s\n' "$STORE" "$L_name" "${id%"${id#????????????}"}"
 }
 
-# Replaces NAME's line by LINE (or drops it when LINE is empty), sorted by name, written atomically.
-lock_put() {
-  local name="$1" line="$2" tmp="$LOCK.tmp.$$"
+# Replaces NAME's line by LINE (or drops it when LINE is empty), written atomically.
+lock_put() { lock_write lock/1 "$1" "$2"; }
+
+# Replaces the KIND line of KEY (a lock/1 NAME, a bind/1 PORT) by LINE, or drops it; the lock/1 lines first, then the
+# bind/1 lines, each sorted by their second field.
+lock_write() {
+  local tmp="$LOCK.tmp.$$"
   {
-    [ ! -f "$LOCK" ] || HM_N="$name" awk -F '\t' '$2 != ENVIRON["HM_N"]' "$LOCK"
-    [ -z "$line" ] || printf '%s\n' "$line"
-  } | sort -t "$tab" -k2,2 >"$tmp" && mv -f "$tmp" "$LOCK" || {
+    [ ! -f "$LOCK" ] || HM_K="$1" HM_N="$2" awk -F '\t' '$1 != ENVIRON["HM_K"] || $2 != ENVIRON["HM_N"]' "$LOCK"
+    [ -z "$3" ] || printf '%s\n' "$3"
+  } | sort -t "$tab" -k1,1r -k2,2 >"$tmp" && mv -f "$tmp" "$LOCK" || {
     rm -f "$tmp"
     die "cannot write $LOCK; fix: make $CONF writable"
   }
@@ -865,13 +1013,28 @@ lock_line() { # STATE (the rest from L_*)
   printf 'lock/1\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t' "$L_name" "$1" "$L_version" "$L_kind" "$L_source" "$L_commit" "$L_hd1" "$L_added" "$L_how"
 }
 
-lock_names() { [ ! -f "$LOCK" ] || awk -F '\t' '{ print $2 }' "$LOCK"; }
+lock_names() { [ ! -f "$LOCK" ] || awk -F '\t' '$1 == "lock/1" { print $2 }' "$LOCK"; }
+
+# The bind/1 line of PORT into B_name and B_id (exit 1 when PORT is std).
+bind_get() {
+  local line
+  B_name="" B_id=""
+  [ -f "$LOCK" ] || return 1
+  line=$(HM_P="$1" awk -F '\t' '$1 == "bind/1" && $2 == ENVIRON["HM_P"] { print $3 "\t" $4; exit }' "$LOCK")
+  [ -n "$line" ] || return 1
+  B_name=${line%"$tab"*} B_id=${line#*"$tab"}
+}
 
 # --- prompt bytes and cards --------------------------------------------------------------------------------------------
 
-# What NAME's module adds to the system prompt (ext::prompt): "\n- NAME: LINE [DOC]", DOC as henki shows it.
+# What NAME's module adds to the system prompt (ext::prompt): "\n- NAME: LINE [DOC]", DOC as henki shows it; nothing
+# for a module of commands, observers or bindings without bin/, whose doc is not for the model.
 prompt_bytes() { # NAME DIR
   local l
+  if [ ! -d "$2/bin" ] && { [ -e "$2/cmd" ] || [ -L "$2/cmd" ] || [ -e "$2/on" ] || [ -L "$2/on" ] || [ -e "$2/port" ] || [ -L "$2/port" ]; }; then
+    echo 0
+    return 0
+  fi
   l=$(docline "$2/doc.md") || return 1
   l="$nl- $1: $l [$(shown "$EXT/$1/doc.md")]"
   printf '%s\n' "${#l}"
@@ -905,7 +1068,7 @@ cards_block() {
   rm -f "$out.cards"
 }
 
-lock_names_on() { [ ! -f "$LOCK" ] || awk -F '\t' '$3 == "on" { print $2 }' "$LOCK"; }
+lock_names_on() { [ ! -f "$LOCK" ] || awk -F '\t' '$1 == "lock/1" && $3 == "on" { print $2 }' "$LOCK"; }
 
 # AGENTS.md with its cards block replaced by BLOCK (a file; empty removes the block), into OUT; the lines outside the
 # block stay as they are. A new block goes at the end after a blank line, and that blank line goes with it again.
@@ -1149,7 +1312,7 @@ cmd_add() {
   bytes=$(prompt_bytes "$n" "$STAGE/m")
   total=$(total_on)
   x=""
-  if [ "$total" = 0 ]; then
+  if [ "$total" = 0 ] && [ "$bytes" != 0 ]; then
     x=" with the $((${#HEADER} + 2)) B header, as the first module on"
     bytes=$((bytes + ${#HEADER} + 2))
   fi
@@ -1168,14 +1331,17 @@ cmd_add() {
   say "  summary  ${M_summary:-$I_line}"
   say "  prompt   +$(num "$bytes") B on every request$x (total on after: $(num $((total + bytes))) B)"
   [ "$I_card" = 0 ] || say "  card     +$(num "$I_card") B into $(shown "$AGENTS") (henki's limit: $(num $AGENTS_MAX) B for the file)"
-  x=""
-  while IFS= read -r a; do
+  say "  files    $I_files ($I_links links)"
+  # Every program henki may run from it, a link with its target: on/ runs without anyone asking, so it is named too.
+  [ -z "$I_runs" ] || say "  runs as you, unsandboxed:"
+  while IFS="$tab" read -r a x; do
     [ -n "$a" ] || continue
-    x="$x${x:+; }bin/$a ($(file_kind "$STAGE/m/bin/$a"))"
+    d=""
+    [ ! -L "$STAGE/m/$a" ] || d=" -> $(target "$STAGE/m/$a" | sed 's/[[:cntrl:]]/?/g')"
+    say "    $a$d ($(file_kind "$STAGE/m/$a")): $x"
   done <<EOF
-$I_cmds
+$I_runs
 EOF
-  say "  files    $I_files ($I_links links)${x:+; runs as you, unsandboxed: $x}"
   while IFS= read -r a; do
     [ -n "$a" ] || continue
     if command -v "$a" >/dev/null 2>&1; then say "  needs    $a (found)"; else say "  needs    $a: NOT on PATH; install it yourself (henki-mods installs nothing)"; fi
@@ -1217,7 +1383,7 @@ EOF
   say "added $n: on, $(shown "$store")"
   [ -z "$line" ] || say "add to $(shown "$CONF/config.toml"): $line"
   ext_path_warning
-  say "$RESTART"
+  restart
 }
 
 # The prompt bytes of everything on now: the header and each module in the ext dir (managed or not).
@@ -1269,17 +1435,19 @@ cmd_onoff() { # on|off NAME
   cards_write 0 || die "$ERR"
   say "$n: $verb"
   [ "$verb" = off ] || ext_path_warning
-  say "$RESTART"
+  restart
 }
 
 cmd_rm() {
-  local n="${1:-}" store
+  local n="${1:-}" store a
   [ -n "$n" ] && [ $# = 1 ] || usage
   busy
   lock_check
   STAGE=$(mktemp -d "${TMPDIR:-/tmp}/henki-mods.XXXXXX") || die "cannot make a scratch dir; fix: check TMPDIR"
   STAGE_LIST="$STAGE/list"
   lock_get "$n" || die "$n is not added; fix: henki-mods list shows what is"
+  a=$(bound_to "$n" | head -n 1)
+  [ -z "$a" ] || die "$n holds the $a binding; fix: henki-mods swap $a std"
   cards_ok
   store=$(store_of)
   if [ -L "$EXT/$n" ]; then
@@ -1290,7 +1458,7 @@ cmd_rm() {
   lock_put "$n" ""
   cards_write 0 || die "$ERR"
   say "removed $n; its store copy stays in $(shown "$store") for a rollback"
-  say "$RESTART"
+  restart
 }
 
 cmd_lock() {
@@ -1300,7 +1468,7 @@ cmd_lock() {
 }
 
 cmd_list() {
-  local n b on_b=0 cards=0 c src mods=0 off_names x d agents_now agents_none state
+  local n b on_b=0 on_n=0 cards=0 c src mods=0 off_names x d agents_now agents_none state
   [ $# = 0 ] || usage
   lock_check
   STAGE=$(mktemp -d "${TMPDIR:-/tmp}/henki-mods.XXXXXX") || die "cannot make a scratch dir; fix: check TMPDIR"
@@ -1327,7 +1495,7 @@ cmd_list() {
       d="$EXT/$n" state=on x=- src="not added by henki-mods ($(shown "$EXT/$n"))"
     fi
     if b=$(prompt_bytes "$n" "$d" 2>/dev/null); then
-      [ "$state" != on ] || on_b=$((on_b + b))
+      [ "$state" != on ] || on_b=$((on_b + b)) on_n=$((on_n + 1))
       b="$(num "$b") B"
     else
       b="unreadable"
@@ -1344,6 +1512,15 @@ cmd_list() {
     break
   done
   [ -z "$off_names" ] || say "official, not added:$off_names (henki-mods add NAME)"
+  for n in $PORTS_KNOWN; do
+    if bind_get "$n"; then
+      x=-
+      ! lock_get "$B_name" || x=$L_version
+      say "$n: $B_name $x (bound)"
+    else
+      say "$n: std"
+    fi
+  done
   # The cards' share of the prompt: AGENTS.md as it is, against AGENTS.md without the block.
   agents_now=$(agents_bytes "$AGENTS")
   if [ -f "$AGENTS" ]; then
@@ -1353,8 +1530,10 @@ cmd_list() {
     cards=$((agents_now - agents_none))
   fi
   [ "$on_b" = 0 ] || on_b=$((on_b + ${#HEADER} + 2))
-  if [ "$on_b" = 0 ] && [ "$cards" = 0 ]; then
+  if [ "$on_n" = 0 ] && [ "$cards" = 0 ]; then
     say "on: nothing (0 B of prompt)"
+  elif [ "$on_b" = 0 ] && [ "$cards" = 0 ]; then
+    say "on: $on_n module(s), 0 B of prompt"
   else
     say "on: $(num $((on_b + cards))) B of prompt (extensions $(num "$on_b") B with the $((${#HEADER} + 2)) B header, cards $(num "$cards") B)"
   fi
@@ -1421,6 +1600,20 @@ cmd_verify() {
       problem "$n is off in the lock, but $(shown "$EXT/$n") exists; fix: henki-mods off $n"
     fi
   done
+  # Each port is std (no link, no bind/1 line) or bound: its link points at the locked copy's port/PORT.
+  for n in $PORTS_KNOWN; do
+    if bind_get "$n"; then
+      if ! lock_get "$B_name"; then
+        problem "$n is bound to $B_name, which is not added; fix: henki-mods swap $n std"
+      elif [ "$(store_of)" != "$STORE/$B_name/$B_id" ]; then
+        problem "$n is bound to $B_name $B_id, but the lock has another copy; fix: henki-mods swap $n $B_name"
+      elif [ ! -L "$CONF/port/$n" ] || [ "$(target "$CONF/port/$n")" != "$STORE/$B_name/$B_id/port/$n" ]; then
+        problem "$(shown "$CONF/port/$n") is not the link to $STORE/$B_name/$B_id/port/$n; fix: henki-mods swap $n $B_name"
+      fi
+    elif [ -e "$CONF/port/$n" ] || [ -L "$CONF/port/$n" ]; then
+      problem "$(shown "$CONF/port/$n") exists without a bind/1 line; fix: henki-mods swap $n std"
+    fi
+  done
   # The cards block must be the cards of the modules on.
   if [ -z "${1:-}" ]; then
     if cards_write 1; then
@@ -1437,6 +1630,707 @@ cmd_verify() {
   say "verify: ok ($(printf '%s\n' "$names" | awk 'NF' | wc -l | tr -d ' ') modules)"
 }
 
+# --- port bindings: conformance, swap ---------------------------------------------------------------------------------
+
+# The dir holding the conformance suites (conform/1): beside the official modules in a release, manager/conform/ in
+# the repository.
+conform_dir() {
+  local d
+  for d in ${HENKI_SHARE:+"$HENKI_SHARE/conform"} "$SELF/../share/henki/conform" "$SELF/conform"; do
+    [ ! -f "$d/history.tsv" ] || { (cd -P "$d" && pwd) && return 0; }
+  done
+  return 1
+}
+
+# The henki whose hidden `henki port` runs the suites: HENKI_BIN (henki sets it), else beside this program, else PATH.
+henki_bin() {
+  local h
+  for h in ${HENKI_BIN:-} "$SELF/henki" "$(command -v henki 2>/dev/null)"; do
+    [ -n "$h" ] && [ -x "$h" ] && [ ! -d "$h" ] && printf '%s\n' "$h" && return 0
+  done
+  die "no henki to run; fix: run it as henki mods, or put henki on PATH"
+}
+
+# An EXPECT of conform/1 as a bash pattern: `*` any text, `@(A|B)` A or B, every other character itself.
+conform_pat() {
+  printf '%s' "$1" | awk '{
+    o = ""; g = 0
+    for (i = 1; i <= length($0); i++) {
+      c = substr($0, i, 1)
+      if (!g && c == "@" && substr($0, i + 1, 1) == "(") { o = o "@("; g = 1; i++ }
+      else if (g && (c == ")" || c == "|")) { o = o c; if (c == ")") g = 0 }
+      else if (c == "*") o = o c
+      else if (index("\\[]?+!()|", c)) o = o "\\" c
+      else o = o c
+    }
+    printf "%s", o }'
+}
+
+# conform/1 instance X (a, b, or v for a +V step): `henki port PORT [--offer V] -- PROGRAM` in the scope dir, fed
+# through two FIFOs (bash 3.2 has no coproc) on fixed fds; its hello line goes into H_LINE.
+inst_start() { # X [V]
+  local x="$1" w r
+  case "$x" in a) w=7 r=8 ;; b) w=5 r=6 ;; *) w=3 r=4 ;; esac
+  rm -f "$CT/$x.in" "$CT/$x.out" && mkfifo "$CT/$x.in" "$CT/$x.out" || die "cannot make a FIFO in $CT; fix: check TMPDIR"
+  # A home of its own, so the binding keeps its state in the scratch dir (hello names it).
+  # The other instances' FIFO ends stay out of it, or their EOF would never come.
+  (cd "$CT/scope" && exec 3>&- 4>&- 5>&- 6>&- 7>&- 8>&- && HOME="$CT/home" XDG_STATE_HOME="$CT/home/state" exec "$C_henki" port "$C_port" ${2:+--offer "$2"} -- "$C_exe" <"$CT/$x.in" >"$CT/$x.out" 2>>"$CT/stderr") &
+  eval "P_$x=\$! && exec $w>\"\$CT/\$x.in\" $r<\"\$CT/\$x.out\""
+  IFS= read -r -t 30 -u "$r" H_LINE || H_LINE="(no hello line)"
+  eval "U_$x=1 H_$x=\$H_LINE"
+}
+
+# Ends instance X: its stdin closes, and `henki port` (its bye, then the kill) must be gone within 1 s. With KILL,
+# SIGKILL first, without bye.
+inst_end() { # X [kill]
+  local x="$1" w r pid i
+  case "$x" in a) w=7 r=8 ;; b) w=5 r=6 ;; *) w=3 r=4 ;; esac
+  eval "[ \"\${U_$x:-0}\" = 1 ] && pid=\$P_$x" || return 0
+  [ -z "${2:-}" ] || printf '{"kill":true}\n' >&"$w"
+  eval "exec $w>&- $r<&-; U_$x=0"
+  for i in 1 2 3 4 5 6 7 8 9 10; do kill -0 "$pid" 2>/dev/null || break; sleep 0.1; done
+  if kill -0 "$pid" 2>/dev/null; then
+    kill -9 "$pid" 2>/dev/null
+    C_fail="$C_fail end-$x"
+    say "FAIL end of instance $x: henki port did not end within 1 s of its stdin closing"
+  fi
+  wait "$pid" 2>/dev/null
+}
+
+# Runs SUITE (a conform/1 file) for PORT against PROGRAM through HENKI: "ok NAME" or "FAIL NAME: got LINE" per check,
+# then "PORT/1: N checks, N passed"; exit 1 on any failure. A step whose name ends in a lowercase letter prepares a
+# check: it counts only when it fails. Last, PROGRAM run on its own must exit within 1 s of reading EOF on stdin.
+conform_run() { # PORT PROGRAM HENKI
+  local name inst req want save got n=0 ok=0 v w r pid big i x
+  C_port=$1 C_exe=$2 C_henki=$3 C_fail="" U_a=0 U_b=0 U_v=0
+  CT=$(mktemp -d "${TMPDIR:-/tmp}/henki-conform.XXXXXX") || die "cannot make a scratch dir; fix: check TMPDIR"
+  mkdir -p "$CT/scope" "$CT/scope2" "$CT/home"
+  SAVED="SCOPE=$(cd -P "$CT/scope" && pwd)$nl""SCOPE2=$(cd -P "$CT/scope2" && pwd)"
+  big=$(head -c 1048576 /dev/zero | tr '\000' x)
+  shopt -s extglob
+  # An instance that ended (a failed hello) must not end the run when the next request goes to its FIFO.
+  trap '' PIPE
+  while IFS="$tab" read -r name inst req want save; do
+    case "$name" in '' | '#'*) continue ;; esac
+    case "$inst" in
+      *!)
+        inst_end "${inst%!}" kill
+        continue
+        ;;
+      +*)
+        inst_start v "${inst#+}"
+        inst=v
+        ;;
+      *) eval "[ \"\${U_$inst:-0}\" = 1 ]" || inst_start "$inst" ;;
+    esac
+    case "$inst" in a) w=7 r=8 ;; b) w=5 r=6 ;; *) w=3 r=4 ;; esac
+    # Saved values go into the request as they are, and into the pattern with every pattern character escaped.
+    want=$(conform_pat "$want")
+    while IFS='=' read -r v x; do
+      [ -n "$v" ] || continue
+      req=${req//@$v@/$x}
+      x=$(printf '%s' "$x" | sed 's/[][\\?*+!()|@]/\\&/g')
+      want=${want//@$v@/$x}
+    done <<EOF
+$SAVED
+EOF
+    req=${req//@BIG@/$big} want=${want//@BIG@/$big}
+    if [ "$req" = hello ]; then
+      eval "got=\$H_$inst"
+    else
+      printf '%s\n' "$req" >&"$w"
+      IFS= read -r -t 30 -u "$r" got || got="(no answer: the instance ended, or 30 s passed)"
+    fi
+    [ "$inst" != v ] || inst_end v
+    if [[ $got == $want ]]; then
+      case "$name" in *[a-z]) ;; *) n=$((n + 1)) ok=$((ok + 1)) && say "ok $name" ;; esac
+      [ -z "$save" ] || { x=${got#*\"${save#*=}\":\"} && SAVED="$SAVED$nl${save%%=*}=${x%%\"*}"; }
+    else
+      case "$name" in *[a-z]) ;; *) n=$((n + 1)) ;; esac
+      C_fail="$C_fail $name"
+      say "FAIL $name: got $(printf '%s' "$got" | cut -c 1-300)"
+    fi
+  done <"$C_suite"
+  inst_end a
+  inst_end b
+  # The binding alone, its stdin at EOF: it must end (on macOS nothing else stops it when henki is killed).
+  n=$((n + 1))
+  (cd "$CT/scope" && exec 3>&- 4>&- 5>&- 6>&- 7>&- 8>&- && HOME="$CT/home" exec "$C_exe" </dev/null >/dev/null 2>&1) &
+  pid=$!
+  for i in 1 2 3 4 5 6 7 8 9 10; do kill -0 "$pid" 2>/dev/null || break; sleep 0.1; done
+  if kill -0 "$pid" 2>/dev/null; then
+    kill -9 "$pid" 2>/dev/null
+    C_fail="$C_fail eof"
+    say "FAIL eof: the binding did not exit within 1 s of EOF on its stdin"
+  else
+    ok=$((ok + 1)) && say "ok eof"
+  fi
+  wait "$pid" 2>/dev/null
+  [ ! -s "$CT/stderr" ] || say "(the binding's stderr: $(head -c 300 "$CT/stderr" | tr '\n' ' '))"
+  rm -rf "$CT"
+  C_checks=$n C_passed=$ok
+  say "$C_port/1: $n checks, $ok passed"
+  [ -z "$C_fail" ]
+}
+
+# test --port PORT NAME|std|/PROGRAM: the suite of PORT against module NAME's port/PORT (its store copy), a program
+# by path (while writing one), or std.
+cmd_test() {
+  local port="${2:-}" what="${3:-}" exe h
+  [ "${1:-}" = --port ] && [ $# = 3 ] || usage
+  case " $PORTS_KNOWN " in *" $port "*) ;; *) die "$port is not a port this henki binds ($PORTS_KNOWN); fix: name one of them" ;; esac
+  C_suite="$(conform_dir)/$port.tsv" || die "no conformance suites found; fix: reinstall henki"
+  case "$what" in
+    std) say "std passes this suite in henki's own tests" && return 0 ;;
+    /*) exe=$what ;;
+    *)
+      lock_check
+      lock_get "$what" || die "$what is not added; fix: henki-mods add SRC first, or name a program by its absolute path"
+      exe="$(store_of)/port/$port"
+      ;;
+  esac
+  [ -f "$exe" ] && [ -x "$exe" ] || die "$exe is not a program; fix: name a module with port/$port"
+  h=$(henki_bin) || exit 1 # its die ends only the command substitution
+  conform_run "$port" "$exe" "$h" || exit 1
+}
+
+# swap PORT NAME|std [--yes]: binds henki's PORT to module NAME's port/PORT (its store copy, after the suite passes and
+# the person says yes), or back to std, which always works: the link CONFIG/port/PORT and the bind/1 line.
+cmd_swap() {
+  local port="${1:-}" n="${2:-}" yes=0 a store exe was tty answer how id h
+  [ $# -ge 2 ] || usage
+  for a in "${3:-}" "${4:-}"; do case "$a" in '') ;; --yes | -y) yes=1 ;; *) usage ;; esac; done
+  case " $PORTS_KNOWN " in *" $port "*) ;; *) die "$port is not a port this henki binds ($PORTS_KNOWN); fix: name one of them" ;; esac
+  busy
+  lock_check
+  if [ "$n" = std ]; then
+    rm -f "$CONF/port/$port" || die "cannot remove $(shown "$CONF/port/$port"); fix: make it writable"
+    lock_write bind/1 "$port" ""
+    say "$port: std"
+    restart
+    return 0
+  fi
+  lock_get "$n" || die "$n is not added; fix: henki-mods add SRC first (henki-mods list shows what is)"
+  store=$(store_of)
+  exe="$store/port/$port"
+  [ -f "$exe" ] && [ -x "$exe" ] || die "$n has no port/$port; fix: swap to a module that binds $port"
+  STAGE=$(mktemp -d "${TMPDIR:-/tmp}/henki-mods.XXXXXX") || die "cannot make a scratch dir; fix: check TMPDIR"
+  STAGE_LIST="$STAGE/list"
+  inspect "$store" "$n" 0 || die "$n: $ERR"
+  [ "$I_hd1" = "$L_hd1" ] || die "the store copy $store does not match the lock (it changed); fix: henki-mods rm $n and add it again"
+  printf '%s\n' "$M_ports" | command grep -qx "$port" || die "$n's manifest does not list $port in ports; fix: swap to a module that declares it"
+  C_suite="$(conform_dir)/$port.tsv" || die "no conformance suites found; fix: reinstall henki"
+  h=$(henki_bin) || exit 1
+  conform_run "$port" "$exe" "$h" >"$STAGE/conform" || {
+    cat "$STAGE/conform"
+    die "$n does not pass the $port/1 suite (above); fix: ask its author, or keep std"
+  }
+  was=std
+  ! bind_get "$port" || was="$B_name $B_id"
+  id=${store##*/}
+  say "$port: $was -> $n ${L_version} ($id) · conformance: passed ($port/1, $C_checks checks) · it runs with your rights and $(eval "printf '%s' \"\$PORT_SEES_$port\"")"
+  [ "$port" != history ] || say "  your sessions in the std store stay there; henki --port history=std --resume reaches them; import comes with a later henki"
+  [ "$port" != policy ] || [ "$(toml approve <"$CONF/config.toml" 2>/dev/null)" != "approve${tab}S${tab}auto" ] ||
+    say "  henki refuses approve = auto with a policy binding; set approve = \"ask\" in $(shown "$CONF/config.toml")"
+  if [ "$yes" = 1 ]; then
+    how=yes
+  else
+    tty=${HENKI_MODS_TTY:-/dev/tty}
+    (: <"$tty") 2>/dev/null || die "no terminal to ask on; fix: run it in a terminal, or add --yes once you have read the screen above"
+    if [ -c "$tty" ]; then printf 'swap? [y/N] ' >"$tty"; else printf 'swap? [y/N] \n' >&2; fi
+    read -r answer <"$tty" || answer=""
+    case "$answer" in y | Y | yes | YES) how=tty ;; *) die "not swapped (the answer was no); fix: run swap again and answer y" ;; esac
+  fi
+  mkdir -p "$CONF/port" && ln -s -- "$exe" "$CONF/port/.$port.$$" && mv -f "$CONF/port/.$port.$$" "$CONF/port/$port" || {
+    rm -f "$CONF/port/.$port.$$"
+    die "cannot link $(shown "$CONF/port/$port"); fix: make $(shown "$CONF") writable"
+  }
+  lock_write bind/1 "$port" "$(printf 'bind/1\t%s\t%s\t%s\t%s\t%s' "$port" "$n" "$id" "$(date -u +%Y-%m-%dT%H:%MZ)" "$how")"
+  say "$port: $n $id"
+  restart
+}
+
+# The ports linked into NAME's store copies, one per line (rm refuses while there is one).
+bound_to() {
+  local p t
+  for p in $PORTS_KNOWN; do
+    [ -L "$CONF/port/$p" ] || continue
+    t=$(target "$CONF/port/$p")
+    case "$t" in "$STORE/$1/"*) printf '%s\n' "$p" ;; esac
+  done
+}
+
+# --- eval/1: a module's tasks, run with the module on and off -------------------------------------------------------
+
+EVAL_PROMPT_MAX=4096 # prompt.txt
+EVAL_SECONDS=120     # a run's --max-seconds when task.toml sets none
+
+# The general suite: beside the official modules in a release, eval/general/ in the repository.
+eval_general() {
+  local d
+  for d in ${HENKI_SHARE:+"$HENKI_SHARE/eval/general"} "$SELF/../share/henki/eval/general" "$SELF/../eval/general"; do
+    [ ! -d "$d" ] || { (cd -P "$d" && pwd) && return 0; }
+  done
+  return 1
+}
+
+# eval/1's layout of DIR: every entry but dot files, README* and LICENSE* a task, a directory named as a module is,
+# holding prompt.txt (1 to 4 KiB of UTF-8 without a code point henki escapes), setup and check (programs), and maybe
+# fake-bin/ (programs) and task.toml (max_steps, max_seconds); nothing else but dot files. Sets E_tasks, the task dirs
+# one per line in name order; else 1 with ERR.
+eval_check() { # DIR
+  local d=$1 t e x n why rec
+  E_tasks=""
+  [ -d "$d" ] || {
+    ERR="$d: not a directory; fix: name a directory of eval/1 tasks"
+    return 1
+  }
+  for t in "$d"/*; do
+    [ -e "$t" ] || [ -L "$t" ] || continue
+    x=${t##*/}
+    case "$x" in README* | LICENSE*) continue ;; esac
+    if ! is_name "$x" || [ ! -d "$t" ]; then
+      ERR="$t: a task is a directory, and its name as a module's: $NAME_RULE; fix: rename it, or move it out of $d"
+      return 1
+    fi
+    for x in prompt.txt setup check; do
+      [ -f "$t/$x" ] || {
+        ERR="$t: no $x; fix: an eval/1 task holds prompt.txt, setup and check"
+        return 1
+      }
+    done
+    for e in "$t"/*; do
+      [ -e "$e" ] || [ -L "$e" ] || continue
+      x=${e##*/}
+      case "$x" in
+        prompt.txt)
+          n=$(wc -c <"$e") && n=$((n)) || n=0
+          if [ "$n" = 0 ] || [ "$n" -gt "$EVAL_PROMPT_MAX" ]; then
+            ERR="$e: $(num "$n") bytes; fix: write a prompt of 1 to $(num "$EVAL_PROMPT_MAX") bytes"
+            return 1
+          fi
+          why=$(invisible_check "$e") || {
+            ERR="$e: holds $why, which a terminal does not show; fix: remove it"
+            return 1
+          }
+          ;;
+        setup | check)
+          [ -x "$e" ] || {
+            ERR="$e: a program, which this is not; fix: chmod u+x it"
+            return 1
+          }
+          ;;
+        fake-bin)
+          [ -d "$e" ] || {
+            ERR="$e: not a directory; fix: make fake-bin a directory of programs"
+            return 1
+          }
+          for x in "$e"/*; do
+            [ -e "$x" ] || [ -L "$x" ] || continue
+            if [ ! -f "$x" ] || [ ! -x "$x" ] || ! is_cmd "${x##*/}"; then
+              ERR="$x: fake-bin/ holds programs named with A-Z, a-z, 0-9, ., _ and -; fix: rename it or chmod u+x it, or move it out"
+              return 1
+            fi
+          done
+          ;;
+        task.toml)
+          rec=$(toml <"$e") || {
+            ERR="$e:$rec"
+            return 1
+          }
+          while IFS="$tab" read -r x n why; do
+            case "$x:$n:$why" in
+              ::) ;;
+              max_steps:I:[1-9] | max_steps:I:[1-9][0-9] | max_steps:I:[1-9][0-9][0-9] | max_steps:I:[1-9][0-9][0-9][0-9] | max_steps:I:10000) ;;
+              max_seconds:I:[1-9] | max_seconds:I:[1-9][0-9] | max_seconds:I:[1-9][0-9][0-9] | max_seconds:I:[1-9][0-9][0-9][0-9]) ;;
+              *)
+                ERR="$e: $x: task.toml takes max_steps (1 to 10000) and max_seconds (1 to 9999), integers; fix: correct it"
+                return 1
+                ;;
+            esac
+          done <<TOML
+$rec
+TOML
+          ;;
+        *)
+          ERR="$e: unknown entry; an eval/1 task holds prompt.txt, setup, check, fake-bin/, task.toml and dot files only; fix: move it out"
+          return 1
+          ;;
+      esac
+    done
+    E_tasks="$E_tasks$t$nl"
+  done
+  [ -n "$E_tasks" ] || {
+    ERR="$d: no task; fix: add a task directory with prompt.txt, setup and check"
+    return 1
+  }
+}
+
+# The string of KEY in LINE, a canonical JSON object as henki writes one (compact, keys sorted, so `"KEY":"` after a
+# `{` or a `,` is the key and never text inside a string), as printf %b takes it: printable ASCII as it is, any other
+# byte as \0NNN, \uXXXX (a surrogate pair too) as its UTF-8 bytes. The bytes reach awk as hex, so no awk has to read
+# a byte outside ASCII. Exit 1 when LINE has no such key.
+json_str() { # KEY LINE
+  printf '%s' "$2" | od -An -v -tx1 | HM_K="$1" awk '
+    function out(c) { if (c >= 32 && c < 127 && c != 92) printf "%c", c; else printf "\\0%03o", c }
+    function utf8(c) {
+      if (c < 128) out(c)
+      else if (c < 2048) { out(192 + int(c / 64)); out(128 + c % 64) }
+      else if (c < 65536) { out(224 + int(c / 4096)); out(128 + int(c / 64) % 64); out(128 + c % 64) }
+      else { out(240 + int(c / 262144)); out(128 + int(c / 4096) % 64); out(128 + int(c / 64) % 64); out(128 + c % 64) }
+    }
+    function hex4(i,   v, j, x) {
+      v = 0
+      for (j = 0; j < 4; j++) { x = b[i + j]; v = v * 16 + (x >= 97 ? x - 87 : x >= 65 ? x - 55 : x - 48) }
+      return v
+    }
+    BEGIN {
+      for (i = 0; i < 16; i++) h[substr("0123456789abcdef", i + 1, 1)] = i
+      for (i = 32; i < 127; i++) ord[sprintf("%c", i)] = i
+      k = "\"" ENVIRON["HM_K"] "\":\""
+      for (i = 1; i <= length(k); i++) p[i - 1] = ord[substr(k, i, 1)]
+      m = length(k)
+    }
+    { for (i = 1; i <= NF; i++) b[n++] = h[substr($i, 1, 1)] * 16 + h[substr($i, 2, 1)] }
+    END {
+      for (i = 1; i + m <= n; i++) {
+        if (b[i - 1] != 44 && b[i - 1] != 123) continue
+        j = 0
+        while (j < m && b[i + j] == p[j]) j++
+        if (j == m) break
+      }
+      if (i + m > n) exit 1
+      for (j = i + m; j < n && b[j] != 34; ) {
+        if (b[j] != 92) { out(b[j]); j++; continue }
+        e = b[j + 1]
+        if (e == 117) {
+          v = hex4(j + 2); j += 6
+          if (v >= 55296 && v < 56320 && b[j] == 92 && b[j + 1] == 117 && (w = hex4(j + 2)) >= 56320 && w < 57344) { v = 65536 + (v - 55296) * 1024 + w - 56320; j += 6 }
+          utf8(v)
+          continue
+        }
+        out(e == 110 ? 10 : e == 116 ? 9 : e == 114 ? 13 : e == 98 ? 8 : e == 102 ? 12 : e)
+        j += 2
+      }
+    }'
+}
+
+# The number after `"KEY":` in LINE (as json_str finds the key), or nothing.
+json_num() { printf '%s\n' "$2" | sed -n "s/.*[{,]\"$1\":\([0-9.]*\).*/\1/p"; }
+
+# The config dir of arm ARM (on or off) in STAGE/ARM: config.toml without its ext key (the ext dir is the arm's own),
+# AGENTS.md with the mods cards block replaced by NAME's card in the on arm and by none in the off arm, and in the on
+# arm the one link ext/NAME -> DIR. No allow file and no port link: std history, std policy in auto mode.
+eval_arm() { # ARM NAME DIR
+  local a="$STAGE/$1"
+  mkdir -p "$a/ext" "$a/state" && chmod 700 "$a" || die "cannot make $a; fix: check TMPDIR"
+  : >"$a/block"
+  if [ -f "$CONF/config.toml" ]; then
+    awk '{ l = $0; sub(/^[ \t]+/, "", l) } l !~ /^ext[ \t]*=/' "$CONF/config.toml" >"$a/config.toml"
+  else
+    : >"$a/config.toml"
+  fi
+  chmod 600 "$a/config.toml"
+  if [ "$1" = on ]; then
+    ln -s -- "$3" "$a/ext/$2" || die "cannot link $a/ext/$2; fix: check TMPDIR"
+    if [ -f "$3/.henki/card.md" ]; then
+      {
+        say "$CARDS_BEGIN"
+        cat "$3/.henki/card.md"
+        [ -z "$(tail -c 1 "$3/.henki/card.md")" ] || echo
+        say "$CARDS_END"
+      } >"$a/block"
+    fi
+  fi
+  splice "$a/block" "$a/AGENTS.md" || die "$ERR"
+  [ -s "$a/AGENTS.md" ] || rm -f "$a/AGENTS.md"
+}
+
+# Run N of task T in arm ARM: setup in a fresh work dir, `henki run --json -` on prompt.txt with the arm's config dir
+# and state dir (fake-bin/ first on PATH), then check in that dir with the answer's text on stdin. Counts into the
+# arm's P_ARM (passes), N_ARM (runs) and S_ARM (henki's seconds), and prints a line.
+eval_run() { # T ARM
+  local t=$1 arm=$2 w line text status steps secs s pass=fail fb="" max_steps="" max_secs=$EVAL_SECONDS rc=0
+  RUN_N=$((RUN_N + 1))
+  w="$STAGE/run/$RUN_N"
+  mkdir -p "$w/work" || die "cannot make $w; fix: check TMPDIR"
+  (cd "$w/work" && EVAL_DIR=$t exec "$t/setup") </dev/null >"$w/setup" 2>&1 || rc=$?
+  if [ "$rc" != 0 ]; then
+    tail -n 20 "$w/setup" | sed 's/^/  | /' >&2
+    die "${t##*/}: setup exited $rc (its last lines above); fix: run $t/setup in an empty dir to see why"
+  fi
+  [ ! -d "$t/fake-bin" ] || fb="$t/fake-bin:"
+  if [ -f "$t/task.toml" ]; then
+    max_steps=$(toml max_steps <"$t/task.toml" | cut -f 3)
+    max_secs=$(toml max_seconds <"$t/task.toml" | cut -f 3)
+    max_secs=${max_secs:-$EVAL_SECONDS}
+  fi
+  (cd "$w/work" && PATH="$fb$PATH" XDG_STATE_HOME="$STAGE/$arm/state" exec "$E_henki" run --json --approve auto \
+    --config "$STAGE/$arm/config.toml" ${E_model:+--model "$E_model"} --max-seconds "$max_secs" ${max_steps:+--max-steps "$max_steps"} - \
+    <"$t/prompt.txt" >"$w/out" 2>"$w/err")
+  line=$(tail -n 1 "$w/out")
+  case "$line" in *',"t":"result",'*) ;; *) line="" ;; esac
+  status=$(json_str status "$line") || status="no result: $(head -c 200 "$w/err" | tr '\n' ' ')"
+  steps=$(json_num steps "$line")
+  secs=$(json_num duration_s "$line")
+  text=$(json_str text "$line") || text=""
+  printf '%b' "$text" >"$w/text"
+  (cd "$w/work" && EVAL_DIR=$t exec "$t/check") <"$w/text" >"$w/check" 2>&1 && pass=pass
+  [ "$pass" = fail ] || eval "P_$arm=\$((P_$arm + 1))"
+  eval "s=\$S_$arm"
+  s=$(HM_A="$s" HM_B="${secs:-0}" awk 'BEGIN { printf "%.1f", ENVIRON["HM_A"] + ENVIRON["HM_B"] }')
+  eval "S_$arm=\$s N_$arm=\$((N_$arm + 1))"
+  printf '%-16s %-3s %s  (%s, %s steps, %s s)\n' "${t##*/}" "$arm" "$pass" "$status" "${steps:-0}" "${secs:-0}"
+  chmod -R u+w "$w" 2>/dev/null
+  rm -rf "$w"
+}
+
+# eval NAME|/DIR [--suite NAME|general|/DIR] [--repeats N] [--model M] [--yes]: the tasks of the suite (the module's
+# own eval/ by default) with the module on and off, the arms taking turns; 3 repeats, 13 when the arms end within one
+# pass of each other, or N. One eval/1 line per arm, printed and added to STATE/henki/eval.tsv. `eval --check DIR`:
+# the layout only.
+cmd_eval() {
+  local pkg="" suite="" reps="" yes=0 dir name ver hd1 sdir label n model total r t a tty answer st line p c s
+  E_model=""
+  if [ "${1:-}" = --check ]; then
+    [ $# = 2 ] || usage
+    eval_check "$2" || die "$ERR"
+    say "$2: ok: eval/1, $(printf '%s' "$E_tasks" | awk 'NF' | wc -l | tr -d ' ') tasks"
+    return 0
+  fi
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --suite | --repeats | --model)
+        [ $# -ge 2 ] || usage
+        case "$1" in --suite) suite=$2 ;; --repeats) reps=$2 ;; *) E_model=$2 ;; esac
+        shift 2
+        ;;
+      --yes | -y) yes=1 && shift ;;
+      -*) usage ;;
+      *) [ -z "$pkg" ] && pkg=$1 && shift || usage ;;
+    esac
+  done
+  [ -n "$pkg" ] || usage
+  case "$reps" in '' | [1-9] | [1-9][0-9]) ;; *) die "--repeats $reps: not a number from 1 to 99; fix: name one" ;; esac
+  case "$E_model$suite" in *"$tab"* | *"$nl"*) die "a tab or a newline in --model or --suite; fix: name them without one" ;; esac
+  case "${HENKI_DEPTH:-0}" in 0) ;; *) die "eval starts henki, and this runs inside henki (HENKI_DEPTH=$HENKI_DEPTH); fix: run henki mods eval in a terminal outside henki" ;; esac
+  STAGE=$(mktemp -d "${TMPDIR:-/tmp}/henki-mods.XXXXXX") || die "cannot make a scratch dir; fix: check TMPDIR"
+  STAGE_LIST="$STAGE/list"
+  E_henki=$(henki_bin) || exit 1
+  case "$pkg" in
+    /* | ./* | ../*)
+      [ -d "$pkg" ] || die "$pkg is not a directory; fix: name a module directory"
+      dir=$(cd -P "$pkg" && pwd)
+      inspect "$dir" "${dir##*/}" 0 || die "$ERR"
+      name=$I_name ver=${M_version:--} hd1=$I_hd1
+      ;;
+    *)
+      lock_check
+      lock_get "$pkg" || die "$pkg is not added; fix: henki-mods add SRC first, or name a module directory by its path"
+      dir=$(store_of)
+      inspect "$dir" "$pkg" 0 || die "$pkg: $ERR"
+      [ "$I_hd1" = "$L_hd1" ] || die "the store copy $dir does not match the lock (it changed); fix: henki-mods rm $pkg and add it again"
+      name=$pkg ver=$L_version hd1=$L_hd1
+      ;;
+  esac
+  case "$suite" in
+    '') sdir="$dir/eval" label=$name ;;
+    general)
+      sdir=$(eval_general) || die "no general suite found; fix: reinstall henki"
+      label=general
+      ;;
+    /*) sdir=$suite label=$suite ;;
+    *)
+      lock_check
+      lock_get "$suite" || die "$suite is not added; fix: name general, an added module or a directory of tasks"
+      sdir="$(store_of)/eval" label=$suite
+      ;;
+  esac
+  [ -d "$sdir" ] || die "$label has no eval/ tasks; fix: henki-mods eval $pkg --suite general"
+  eval_check "$sdir" || die "$ERR"
+  n=$(printf '%s' "$E_tasks" | awk 'NF' | wc -l | tr -d ' ')
+  model=${E_model:-${HENKI_MODEL:-$(toml model <"$CONF/config.toml" 2>/dev/null | cut -f 3)}}
+  model=${model:--}
+  say "eval: $name $ver ($hd1) on $label, $n tasks, model $model"
+  say "  arms: $name on, $name off; each a copy of $(shown "$CONF/config.toml") and AGENTS.md with no other module"
+  case "$reps" in
+    '') say "  3 runs of each task per arm, 13 when the arms end within one pass of each other" ;;
+    1) say "  1 run of each task per arm" ;;
+    *) say "  $reps runs of each task per arm" ;;
+  esac
+  say "  each task's setup and check run as you, and henki with approve = auto: the model's calls run without asking"
+  if [ "$yes" != 1 ]; then
+    tty=${HENKI_MODS_TTY:-/dev/tty}
+    (: <"$tty") 2>/dev/null || die "no terminal to ask on; fix: run it in a terminal, or add --yes once you have read the screen above"
+    if [ -c "$tty" ]; then printf 'eval? [y/N] ' >"$tty"; else printf 'eval? [y/N] \n' >&2; fi
+    read -r answer <"$tty" || answer=""
+    case "$answer" in y | Y | yes | YES) ;; *) die "not run (the answer was no); fix: run eval again and answer y" ;; esac
+  fi
+  eval_arm on "$name" "$dir"
+  eval_arm off "$name" "$dir"
+  P_on=0 P_off=0 N_on=0 N_off=0 S_on=0 S_off=0 RUN_N=0 total=${reps:-3} r=0
+  while [ "$r" -lt "$total" ]; do
+    r=$((r + 1))
+    while IFS= read -r t; do
+      [ -n "$t" ] || continue
+      # The arms take turns going first, so neither always meets a cold server.
+      for a in $([ $((r % 2)) = 1 ] && echo on off || echo off on); do eval_run "$t" "$a"; done
+    done <<TASKS
+$E_tasks
+TASKS
+    if [ -z "$reps" ] && [ "$total" = 3 ] && [ "$r" = 3 ] && [ $((P_on - P_off)) -le 1 ] && [ $((P_off - P_on)) -le 1 ]; then
+      total=13
+      say "the arms are within one pass of each other after 3 repeats: 10 more"
+    fi
+  done
+  st=${XDG_STATE_HOME:-}
+  case "$st" in /*) ;; *) st="$HOME/.local/state" ;; esac
+  mkdir -p "$st/henki" || die "cannot make $st/henki; fix: make it a directory you own"
+  for a in on off; do
+    eval "p=\$P_$a c=\$N_$a s=\$S_$a"
+    line=$(printf 'eval/1\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s' "$name" "$ver" "$hd1" "$model" "$label" "$a" "$p" "$c" "$s")
+    say "$line"
+    printf '%s\n' "$line" >>"$st/henki/eval.tsv" || die "cannot write $st/henki/eval.tsv; fix: make it writable"
+  done
+  say "$name: on $P_on of $N_on passed, off $P_off of $N_off; added to $(shown "$st/henki/eval.tsv")"
+}
+
+# --- allow rules -------------------------------------------------------------------------------------------------------
+
+# henki's allow file: ROOT<TAB>COMMAND per line, the user's standing approvals. henki reads it at start and appends to it
+# when asked to; listing and removing rules happen here. Both are lenient where henki's start is strict: any mode, and
+# an invalid line is listed (and removable) as one.
+ALLOW_MAX=65536
+
+# Per rule of FILE, in order: "N FROM TO<TAB>SHOWN". A rule is a line that is not empty or a comment, valid or not,
+# once one trailing CR is dropped (allow::numbered); FROM and TO are the bytes its removal cuts: the line and the
+# newline after it, or the one before it for a last line without one (so the rest is joined as henki joins it).
+# SHOWN is "ROOT  COMMAND" with HOME as ~, or "!LINE  (invalid: REASON)" with LINE as henki's term::escape writes it
+# (invalid UTF-8 as U+FFFD first), as printf %b text: every byte but printable ASCII is \0OOO, a backslash \\. The
+# checks are allow::rule's: ROOT * or an absolute path of UTF-8 without a control or escaped code point; COMMAND 1 to
+# 200 bytes of printable ASCII, not starting with # or a space.
+allow_rules() {
+  local home
+  home=$(printf '%s' "$HOME" | od -An -v -tu1)
+  od -An -v -tu1 <"$1" | HM_ESC="$ESCAPED" HM_HOME="$home" awk '
+    function raw(c) { return (c >= 32 && c < 127 && c != 92) ? sprintf("%c", c) : (c == 92 ? "\\\\" : sprintf("\\0%03o", c)) }
+    function esc(u, j) { for (j = 1; j in r; j += 2) if (u >= r[j] + 0 && u <= r[j + 1] + 0) return 1; return 0 }
+    # One code point at j (before e): CP, BAD (an invalid sequence, Rust`s maximal subpart), and its length.
+    function dec(j, e, c, need, lo, hi, m) {
+      c = b[j]; BAD = 0; CP = c
+      if (c < 128) return 1
+      if (c >= 194 && c <= 223) { need = 1; lo = 128; hi = 191; CP = c - 192 }
+      else if (c >= 224 && c <= 239) { need = 2; lo = c == 224 ? 160 : 128; hi = c == 237 ? 159 : 191; CP = c - 224 }
+      else if (c >= 240 && c <= 244) { need = 3; lo = c == 240 ? 144 : 128; hi = c == 244 ? 143 : 191; CP = c - 240 }
+      else { BAD = 1; return 1 }
+      for (m = 1; m <= need; m++) {
+        if (j + m >= e || b[j + m] < lo || b[j + m] > hi) { BAD = 1; return m }
+        CP = CP * 64 + b[j + m] - 128; lo = 128; hi = 191
+      }
+      return need + 1
+    }
+    function bytes(s, e, o) { o = ""; for (; s < e; s++) o = o raw(b[s]); return o }
+    # The ROOT bytes are UTF-8 without a control (Cc) or escaped code point.
+    function clean(s, e, n) {
+      for (; s < e; s += n) { n = dec(s, e); if (BAD || CP <= 31 || (CP >= 127 && CP <= 159) || esc(CP)) return 0 }
+      return 1
+    }
+    function escline(s, e, n, o) {
+      o = ""
+      for (; s < e; s += n) {
+        n = dec(s, e)
+        if (BAD) o = o "\\0357\\0277\\0275"
+        else if (esc(CP)) o = o (CP < 256 ? sprintf("\\\\x%02x", CP) : sprintf("\\\\u{%04x}", CP))
+        else o = o bytes(s, s + n)
+      }
+      return o
+    }
+    function rule(k, s, e, i, t, j, why, root, from, to) {
+      t = -1
+      for (j = s; j < e; j++) if (b[j] == 9) { t = j; break }
+      why = ""
+      if (t < 0) why = "no TAB between ROOT and COMMAND"
+      else if (!(t - s == 1 && b[s] == 42) && !(t > s && b[s] == 47 && clean(s, t))) why = "ROOT is not * or an absolute path"
+      else if (e - t - 1 < 1 || e - t - 1 > 200 || b[t + 1] == 35 || b[t + 1] == 32) why = "COMMAND is not one printable-ASCII line of 1 to 200 bytes"
+      else for (j = t + 1; j < e; j++) if (b[j] < 32 || b[j] > 126) why = "COMMAND is not one printable-ASCII line of 1 to 200 bytes"
+      if (i < nb) { from = s; to = i + 1 } else if (s > 0) { from = s - 1; to = i } else { from = 0; to = i }
+      if (why != "") { printf "%d %d %d\t!%s  (invalid: %s)\n", k, from, to, escline(s, e), why; return }
+      root = bytes(s, t)
+      if (root == home) root = "~"
+      else if (substr(root, 1, length(home) + 1) == home "/") root = "~" substr(root, length(home) + 1)
+      printf "%d %d %d\t%s  %s\n", k, from, to, root, bytes(t + 1, e)
+    }
+    BEGIN {
+      split(ENVIRON["HM_ESC"], r, " ")
+      n = split(ENVIRON["HM_HOME"], h, " "); home = ""
+      for (i = 1; i <= n; i++) home = home raw(h[i] + 0)
+    }
+    { for (i = 1; i <= NF; i++) b[nb++] = $i + 0 }
+    END {
+      s = 0; k = 0
+      for (i = 0; i <= nb; i++) {
+        if (i < nb && b[i] != 10) continue
+        e = i
+        if (e > s && b[e - 1] == 13) e--
+        if (e > s && b[s] != 35) rule(++k, s, e, i)
+        s = i + 1
+      }
+    }'
+}
+
+# Why FILE (it exists) cannot be read as an allow file, on stdout; exit 1 then.
+allow_unreadable() {
+  local size
+  if [ ! -f "$1" ]; then echo "not a regular file"; elif [ ! -r "$1" ]; then echo "permission denied"; else
+    size=$(wc -c <"$1") || return 0
+    [ $((size)) -gt "$ALLOW_MAX" ] || return 1
+    echo "over $(num "$ALLOW_MAX") bytes"
+  fi
+}
+
+# allow [--config FILE] [rm N]: the allow file in the config dir (or beside FILE, from the working directory, as henki
+# takes --config). Lists its path, then "N  SHOWN" per rule; or removes rule N, every other byte kept, through a
+# 0600 file in the same dir renamed over it. henki holds no lock across a session: a henki appending a rule meanwhile
+# finds its file replaced and says so, and a henki that loaded the old rules trips on the change.
+cmd_allow() {
+  local file="$CONF/allow" n="" why hit dir tmp
+  if [ "${1:-}" = --config ]; then
+    [ $# -ge 2 ] || usage
+    case "$2" in /*) file=$2 ;; *) file="$(pwd -P)/$2" ;; esac
+    file="$(dirname "$file")/allow"
+    shift 2
+  fi
+  case "$#:${1:-}" in
+    0:) ;;
+    2:rm) case "$2" in '' | *[!0-9]*) usage ;; esac ;;
+    *) usage ;;
+  esac
+  if [ $# = 0 ]; then
+    say "$file"
+    [ -e "$file" ] || return 0
+    if why=$(allow_unreadable "$file"); then
+      say "cannot read it: $why"
+      return 0
+    fi
+    allow_rules "$file" | while IFS="$tab" read -r n why; do printf '%s  %b\n' "${n%% *}" "$why"; done
+    return 0
+  fi
+  n=$(printf '%s' "$2" | sed 's/^0*//')
+  [ -e "$file" ] || die "no rule ${n:-0} in $file; fix: henki-mods allow lists the rules"
+  why=$(allow_unreadable "$file") && die "$file: $why; fix: make it a regular file of at most $(num "$ALLOW_MAX") bytes you can read"
+  hit=$(allow_rules "$file" | while IFS= read -r why; do case "$why" in "$n "*) printf '%s\n' "$why" && break ;; esac; done)
+  [ -n "$hit" ] || die "no rule ${n:-0} in $file; fix: henki-mods allow lists the rules"
+  set -- ${hit%%"$tab"*}
+  dir=$(cd -P "$(dirname "$file")" && pwd) || die "cannot reach the dir of $file; fix: check its permissions"
+  tmp="$dir/.allow.henki-mods-$$"
+  if ! (set -C && umask 077 && { head -c "$2" "$file" && tail -c +$(($3 + 1)) "$file"; } >"$tmp") || ! mv -f "$tmp" "$dir/${file##*/}"; then
+    rm -f "$tmp"
+    die "cannot write $file; fix: make $dir writable"
+  fi
+  printf 'removed rule %s: %b\n' "$n" "${hit#*"$tab"}"
+  [ -z "${HENKI_NEXT:-}" ] || restart
+}
+
 setup
 case "${1:-list}" in
   list) shift $(($# > 0 ? 1 : 0)) && cmd_list "$@" ;;
@@ -1445,6 +2339,10 @@ case "${1:-list}" in
   rm) shift && cmd_rm "$@" ;;
   lock) shift && cmd_lock "$@" ;;
   verify) shift && cmd_verify "$@" ;;
+  allow) shift && cmd_allow "$@" ;;
+  swap) shift && cmd_swap "$@" ;;
+  test) shift && cmd_test "$@" ;;
+  eval) shift && cmd_eval "$@" ;;
   help | -h | --help)
     usage 2>&1 | sed 's/^usage: //;s/^       //'
     exit 0

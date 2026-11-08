@@ -1,0 +1,80 @@
+#!/usr/bin/env bash
+# toy-history: a history/1 binding in bash, the "community binding in sh" henki's tests hold to the conformance suite.
+# henki writes canonical lines (compact, keys sorted), so sed and parameter expansion can take them apart. Each session
+# is STATE/ID.jsonl (one record per line) with its scope in STATE/ID.scope; STATE is the dir hello names. A session is
+# held by the dir STATE/ID.lock holding the holder's pid; a lock whose pid is gone (a SIGKILL) is taken over.
+# Durable here means in the file before the answer, which a SIGKILL of either side does not undo (no fsync: a toy).
+set -u
+state=. held="" fresh=0 gone=0
+str() { printf '%s' "$1" | sed -n 's/.*"'"$2"'":"\([^"\\]*\)".*/\1/p'; }
+answer() { printf '{"id":%s,%s}\n' "$id" "$1"; }
+fail() { answer "\"error\":{\"code\":\"$1\",\"message\":\"$2\"}"; }
+take() {
+  local l="$state/$1.lock"
+  mkdir "$l" 2>/dev/null || { kill -0 "$(cat "$l/pid" 2>/dev/null)" 2>/dev/null && return 1; rm -rf "$l" && mkdir "$l"; } || return 1
+  echo $$ >"$l/pid" && held=$1 fresh=0 gone=0
+}
+release() { [ -z "$held" ] || rm -rf "$state/$held.lock"; held=""; }
+newest() { # SCOPE: the session ids of SCOPE, newest first
+  local f
+  for f in $(ls -t "$state" 2>/dev/null | sed -n 's/\.jsonl$//p'); do
+    [ "$(cat "$state/$f.scope" 2>/dev/null)" = "$1" ] && echo "$f"
+  done
+}
+while IFS= read -r line; do
+  id=$(printf '%s' "$line" | sed -n 's/^{"id":\([0-9]*\),.*/\1/p')
+  method=$(printf '%s' "$line" | sed -n 's/^{"id":[0-9]*,"method":"\([^"]*\)".*/\1/p')
+  s=$(str "$line" session)
+  case "$method" in
+    hello)
+      v=$(printf '%s' "$line" | sed -n 's/.*"versions":\[\([0-9,]*\)\].*/\1/p')
+      case ",$v," in *,1,*) ;; *) fail version "toy-history speaks history/1 only" && continue ;; esac
+      state=$(str "$line" state) && mkdir -p "$state"
+      answer '"result":{"caps":[],"impl":"0.1.0","name":"toy-history","protocol":1,"version":1}'
+      ;;
+    create)
+      h=$(str "$line" hint)
+      [ -z "$h" ] || [ ! -e "$state/$h.jsonl" ] || { fail exists "session $h exists" && continue; }
+      release
+      s=${h:-toy-$$-$RANDOM$RANDOM}
+      : >"$state/$s.jsonl" && str "$line" scope >"$state/$s.scope" && take "$s" && fresh=1
+      answer "\"result\":{\"session\":\"$s\"}"
+      ;;
+    open)
+      release
+      [ -z "$s" ] || [ -e "$state/$s.jsonl" ] || { fail not_found "no session $s" && continue; }
+      for c in ${s:-$(newest "$(str "$line" scope)")}; do take "$c" && break; done
+      if [ -n "$held" ]; then answer "\"result\":{\"session\":\"$held\"}"; elif [ -n "$s" ]; then fail busy "session $s is in use"; else fail not_found "no session to open"; fi
+      ;;
+    read)
+      [ -n "$s" ] && [ -e "$state/$s.jsonl" ] || { fail not_found "no session $s" && continue; }
+      from=$(printf '%s' "$line" | sed -n 's/.*"from":\([0-9]*\).*/\1/p')
+      answer "\"result\":{\"records\":[$(tail -n +$((${from:-0} + 1)) "$state/$s.jsonl" | paste -s -d , -)]}"
+      ;;
+    append)
+      [ -n "$s" ] && [ "$s" = "$held" ] || { fail not_found "session $s is not held" && continue; }
+      rec=${line#*\"params\":\{\"record\":}
+      rec=${rec%,\"session\":*}
+      case "$rec" in '{'*) ;; *) fail invalid "a record is a JSON object" && continue ;; esac
+      [ "$gone" = 1 ] || printf '%s\n' "$rec" >>"$state/$s.jsonl"
+      answer '"result":null'
+      ;;
+    discard)
+      [ -n "$s" ] && [ "$s" = "$held" ] || { fail not_found "session $s is not held" && continue; }
+      if [ "$fresh" = 1 ] && [ "$gone" = 0 ] && ! grep -q '"t":"user"' "$state/$s.jsonl"; then
+        rm -f "$state/$s.jsonl" "$state/$s.scope" && gone=1
+      fi
+      if [ "$gone" = 1 ]; then answer '"result":{"removed":true}'; else answer '"result":{"removed":false}'; fi
+      ;;
+    list)
+      out=""
+      for c in $(newest "$(str "$line" scope)"); do
+        out="$out${out:+,}{\"session\":\"$c\",\"updated\":$(date -r "$state/$c.jsonl" +%s 2>/dev/null || echo 0)}"
+      done
+      answer "\"result\":{\"sessions\":[$out]}"
+      ;;
+    bye) release && answer '"result":null' && exit 0 ;;
+    *) fail unsupported "no method $method" ;;
+  esac
+done
+release

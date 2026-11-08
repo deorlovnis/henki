@@ -141,6 +141,7 @@ fn render_skips_other_kinds() {
 #[test]
 #[ignore = "release gate"]
 fn bench_render_3200() {
+    let _timed = crate::types::lock(&crate::types::TIMED);
     let out = "x".repeat(2000) + "\n[exit 0, 0.1 s]";
     let mut h = vec![json!({"msg": {"content": "do the thing", "role": "user"}, "t": "user"})];
     for i in 0..1600 {

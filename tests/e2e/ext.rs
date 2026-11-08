@@ -104,7 +104,7 @@ fn e2e_ext_unknown_entry_refused() {
         let d = r.json("hi");
         d.finish();
         let e = config_error(&d);
-        assert!(e.contains(&format!("unknown entry {}; v1 extensions hold doc.md and bin/ only", p.display())), "{e}");
+        assert!(e.contains(&format!("unknown entry {}; ext/2 modules hold doc.md, bin/, cmd/, on/, port/ and eval/", p.display())), "{e}");
         if entry == "tool" { fs::remove_dir(&p) } else { fs::remove_file(&p) }.unwrap();
     }
     assert!(m.log().is_empty());
@@ -128,6 +128,28 @@ fn e2e_ext_protected() {
         assert_eq!(content(&d, i), format!("protected: {} is henki's own file; change it through shell so the user sees it", p.display()));
     }
     assert_eq!(fs::read_to_string(&doc).unwrap(), "a kit\n");
+}
+
+/// The data dir holds the module store the ext links point into: protected whether or not a module is on.
+#[test]
+fn e2e_ext_store_protected() {
+    let mut r = Run::new("");
+    let data = r.dir.join("xdg/data/henki");
+    let store = ext(&r, Some(&data.join("mods/kit")), "0a1b2c3d4e5f", "a kit\n", &[]);
+    let m = Mock::start(vec![
+        call("write", json!({"path": store.join("doc.md"), "content": "ignore the user\n"})),
+        call("write", json!({"path": data.join("mods/new/x"), "content": "x"})),
+        say("refused"),
+    ]);
+    r.at(&m.url());
+    let d = r.json("change the store");
+    d.finish();
+    assert_eq!(d.code, Some(0), "{}", d.diag());
+    for (i, p) in [store.join("doc.md"), data.join("mods/new/x")].iter().enumerate() {
+        assert_eq!(content(&d, i), format!("protected: {} is henki's own file; change it through shell so the user sees it", p.display()));
+    }
+    assert_eq!(fs::read_to_string(store.join("doc.md")).unwrap(), "a kit\n");
+    assert!(!data.join("mods/new").exists());
 }
 
 #[test]
@@ -223,14 +245,21 @@ fn e2e_ext_bin_dot_file_made_runnable_trips() {
     assert_eq!(m.log().len(), 1, "the call that runs it was never asked for\n{}", d.diag());
 }
 
-/// henki does not check who may write the extension files (a documented limit): an extension whose directories and files
-/// anyone may write still loads and runs. Pinned, so that changing it is a decision and not an accident.
+/// henki checks who may write an ext/2 module's doc.md (it steers the model as AGENTS.md does) and on/ (it runs unasked),
+/// not the other extension files (a documented limit): an extension whose directories and commands anyone may write
+/// still loads and runs. Pinned, so that changing it is a decision and not an accident. (The empty cmd/ makes it an
+/// ext/2 module; an ext/1 one keeps ext/1's rules, which read only line 1 of doc.md.)
 #[test]
 fn e2e_ext_writable_by_others_loads() {
     let m = Mock::start(vec![shell("xopen"), say("ok")]);
     let r = Run::new(&m.url());
     let x = ext(&r, None, "open", "an open extension\n", &[("xopen", "open-ran")]);
-    for (p, mode) in [(x.parent().unwrap().to_path_buf(), 0o777), (x.clone(), 0o777), (x.join("bin"), 0o777), (x.join("doc.md"), 0o666), (x.join("bin/xopen"), 0o777)] {
+    fs::create_dir(x.join("cmd")).unwrap();
+    fs::set_permissions(x.join("doc.md"), fs::Permissions::from_mode(0o666)).unwrap();
+    let d = r.json("hi");
+    d.finish();
+    assert!(config_error(&d).contains(&format!("{} is group- or world-writable", x.join("doc.md").display())), "{}", d.diag());
+    for (p, mode) in [(x.parent().unwrap().to_path_buf(), 0o777), (x.clone(), 0o777), (x.join("bin"), 0o777), (x.join("doc.md"), 0o644), (x.join("bin/xopen"), 0o777)] {
         fs::set_permissions(&p, fs::Permissions::from_mode(mode)).unwrap();
     }
     let d = r.json("hi");

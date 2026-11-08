@@ -1,0 +1,10 @@
+#!/bin/sh
+# Prints the clipboard's text with the first clipboard tool found on PATH (so a wrapper earlier on PATH, such as the
+# halti mod's pbpaste, has its say).
+has() { command -v "$1" >/dev/null 2>&1; }
+if has pbpaste; then exec pbpaste; fi
+if [ -n "${WAYLAND_DISPLAY:-}" ] && has wl-paste; then exec wl-paste --no-newline; fi
+if [ -n "${DISPLAY:-}" ] && has xclip; then exec xclip -selection clipboard -o; fi
+if [ -n "${DISPLAY:-}" ] && has xsel; then exec xsel --clipboard --output; fi
+echo "clip-get: no clipboard here; fix: on Linux install wl-clipboard, xclip or xsel, and add pass_env = [\"WAYLAND_DISPLAY\", \"DISPLAY\"] to henki's config" >&2
+exit 1

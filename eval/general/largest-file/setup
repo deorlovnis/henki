@@ -1,0 +1,5 @@
+#!/bin/sh
+# Five files in a small tree; the largest is three levels down.
+mkdir -p data/a/b data/c/d/e || exit 1
+f() { head -c "$2" /dev/zero | tr '\000' x >"$1"; }
+f data/a/small.txt 100 && f data/a/b/medium.log 2000 && f data/c/d/e/huge.bin 5000 && f data/notes.md 3000 && f data/.cache 4000

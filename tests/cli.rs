@@ -1,6 +1,7 @@
 #![allow(clippy::disallowed_methods, clippy::print_stdout, clippy::print_stderr, clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::string_slice)]
 //! The command line: `--version`, `--help`, refused arguments, the argument errors of `run`, the REPL's refusal
-//! without a terminal, and `henki allow`, which lists and removes allow rules without reading a config.
+//! without a terminal, `henki mods` (`henki allow`), which becomes the module manager without reading a config, and the
+//! hidden `henki port`, a port binding's pipe.
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
@@ -8,9 +9,9 @@ use std::process::{Command, Output, Stdio};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
-const USAGE: &str = "usage: henki [--config FILE] [--approve ask|auto] [--model NAME] [--resume[=ID]] [--nested]
-       henki run [--json] [--max-steps N] [--max-seconds N] [--approve ask|auto] [--config FILE] [--model NAME] [--resume[=ID]] [--nested] [TASK | -]
-       henki allow [--config FILE] [rm N]
+const USAGE: &str = "usage: henki [--config FILE] [--approve ask|auto] [--model NAME] [--resume[=ID]] [--port PORT=std] [--nested]
+       henki run [--json] [--max-steps N] [--max-seconds N] [--approve ask|auto] [--config FILE] [--model NAME] [--resume[=ID]] [--port PORT=std] [--nested] [TASK | -]
+       henki mods [ARGS] | henki allow [rm N]
        henki --version | --help
 ";
 
@@ -57,10 +58,6 @@ impl Drop for Home {
 fn write(path: &Path, text: &str, mode: u32) {
     fs::write(path, text).unwrap();
     fs::set_permissions(path, fs::Permissions::from_mode(mode)).unwrap();
-}
-
-fn mode(p: &Path) -> u32 {
-    fs::metadata(p).unwrap().permissions().mode() & 0o777
 }
 
 #[test]
@@ -136,145 +133,101 @@ fn repl_needs_terminal() {
     assert!(files.is_empty(), "a session file: {files:?}");
 }
 
-#[test]
-fn allow_list_and_rm() {
-    let h = Home::new();
-    let (file, mine) = (h.allow(), h.0.join("proj"));
-    write(&file, &format!("# my rules\n/src/app\tgit status\n\n/src/app\tmake test\n{}\tls -la\n", mine.display()), 0o600);
-    let out = h.run(&["allow"], &[]);
-    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
-    assert_eq!(text(&out.stdout), format!("{}\n1  /src/app  git status\n2  /src/app  make test\n3  ~/proj  ls -la\n", file.display()));
-    let out = h.run(&["allow", "rm", "1"], &[]);
-    assert_eq!((out.status.code(), text(&out.stdout), text(&out.stderr)), (Some(0), "removed rule 1: /src/app  git status\n", ""));
-    assert_eq!(fs::read_to_string(&file).unwrap(), format!("# my rules\n\n/src/app\tmake test\n{}\tls -la\n", mine.display()), "everything else byte for byte");
-    assert_eq!(mode(&file), 0o600);
-    let out = h.run(&["allow"], &[]);
-    assert_eq!(text(&out.stdout), format!("{}\n1  /src/app  make test\n2  ~/proj  ls -la\n", file.display()));
-    fs::remove_file(&file).unwrap();
-    assert_eq!(text(&h.run(&["allow"], &[]).stdout), format!("{}\n", file.display()), "no file: the path alone");
+/// A stand-in manager in DIR: it prints its arguments, HENKI_BIN and its signal mask and ignored set (Linux), then
+/// exits 7.
+fn fake_manager(dir: &Path) {
+    fs::create_dir_all(dir).unwrap();
+    let script = "#!/bin/sh\nfor a in \"$@\"; do echo \"arg $a\"; done\necho \"bin $HENKI_BIN\"\n\
+        [ -r /proc/self/status ] && grep -E '^Sig(Blk|Ign)' /proc/self/status\nexit 7\n";
+    write(&dir.join("henki-mods"), script, 0o755);
 }
 
+/// `henki mods ARGS` and `henki allow ARGS` become the manager with ARGS untouched and HENKI_BIN set, without reading
+/// a config or checking HENKI_DEPTH, its exit code henki's; the signals henki blocks and ignores are back to their
+/// defaults.
 #[test]
-fn allow_config_flag() {
+fn mods_execs_manager() {
     let h = Home::new();
-    let alt = h.0.join("alt");
-    fs::create_dir_all(&alt).unwrap();
-    write(&alt.join("allow"), "/src/app\techo alt\n", 0o600);
-    write(&h.allow(), "/src/app\techo home\n", 0o600);
-    let conf = alt.join("henki.toml");
-    let out = h.run(&["allow", "--config", conf.to_str().unwrap()], &[]);
-    assert_eq!((out.status.code(), text(&out.stdout)), (Some(0), format!("{}\n1  /src/app  echo alt\n", alt.join("allow").display()).as_str()));
-    let out = h.run(&["allow", "--config", conf.to_str().unwrap(), "rm", "1"], &[]);
-    assert_eq!((out.status.code(), text(&out.stdout)), (Some(0), "removed rule 1: /src/app  echo alt\n"), "{}", text(&out.stderr));
-    assert_eq!(fs::read_to_string(alt.join("allow")).unwrap(), "");
-    assert_eq!(fs::read_to_string(h.allow()).unwrap(), "/src/app\techo home\n", "the default file is untouched");
+    fake_manager(&h.0.join("bin"));
+    write(&h.0.join(".config/henki/config.toml"), "not toml\n", 0o600);
+    let path = format!("{}:/usr/bin:/bin", h.0.join("bin").display());
+    let env = [("PATH", path.as_str()), ("HENKI_DEPTH", "3")];
+    let bin = env!("CARGO_BIN_EXE_henki");
+    let cases: [(&[&str], &str); 3] = [
+        (&["mods", "add", "./x", "--yes", "--config", "a b"], "arg add\narg ./x\narg --yes\narg --config\narg a b\n"),
+        (&["allow", "rm", "1"], "arg allow\narg rm\narg 1\n"),
+        (&["mods"], ""),
+    ];
+    for (args, want) in cases {
+        let out = h.run(args, &env);
+        assert_eq!((out.status.code(), text(&out.stderr)), (Some(7), ""), "{args:?}");
+        assert!(text(&out.stdout).starts_with(&format!("{want}bin {bin}\n")), "{args:?}: {}", text(&out.stdout));
+    }
+    if cfg!(target_os = "linux") {
+        // Started with INT and QUIT ignored, as a background job of a script is.
+        let mut c = Command::new("sh");
+        c.args(["-c", "trap '' INT QUIT; exec \"$0\" mods", bin]).current_dir(&h.0).env_clear().env("HOME", &h.0).env("PATH", &path);
+        let out = c.stdin(Stdio::null()).output().unwrap();
+        assert_eq!(out.status.code(), Some(7), "{}", text(&out.stderr));
+        // HUP, INT, QUIT and TERM: bits 0, 1, 2 and 14.
+        let mask = |name: &str| text(&out.stdout).lines().find_map(|l| l.strip_prefix(name)).map(|m| u64::from_str_radix(m.trim(), 16).unwrap() & 0x4007);
+        assert_eq!((mask("SigBlk:"), mask("SigIgn:")), (Some(0), Some(0)), "{}", text(&out.stdout));
+    }
 }
 
-/// Listing and removing never fail closed: an invalid line and a mode others can write are shown, and `rm` works.
+/// No manager next to henki or on PATH: exit 2 with the fix, nothing read.
 #[test]
-fn allow_broken_file_lists() {
+fn mods_manager_missing() {
     let h = Home::new();
-    write(&h.allow(), "/src/app\tgit status\nno tab here\n", 0o666);
-    let out = h.run(&["allow"], &[]);
-    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
-    assert_eq!(text(&out.stdout), format!("{}\n1  /src/app  git status\n2  !no tab here  (invalid: no TAB between ROOT and COMMAND)\n", h.allow().display()));
-    let out = h.run(&["allow", "rm", "2"], &[]);
-    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
-    assert!(text(&out.stdout).starts_with("removed rule 2: "), "{}", text(&out.stdout));
-    assert_eq!((fs::read_to_string(h.allow()).unwrap().as_str(), mode(&h.allow())), ("/src/app\tgit status\n", 0o600));
-}
-
-#[test]
-fn allow_rm_missing_exit2() {
-    let h = Home::new();
-    write(&h.allow(), "/src/app\tgit status\n", 0o600);
-    let out = h.run(&["allow", "rm", "9"], &[]);
-    assert_eq!((out.status.code(), text(&out.stdout)), (Some(2), ""));
-    assert_eq!(text(&out.stderr), format!("henki: no rule 9 in {}\n", h.allow().display()));
-    for args in [&["allow", "rm", "x"][..], &["allow", "rm"][..], &["allow", "clear"][..]] {
+    for args in [&["mods"][..], &["allow", "rm", "1"][..]] {
         let out = h.run(args, &[]);
         assert_eq!((out.status.code(), text(&out.stdout)), (Some(2), ""), "{args:?}");
-        assert!(text(&out.stderr).starts_with("henki: ") && text(&out.stderr).ends_with(USAGE), "{args:?}: {}", text(&out.stderr));
+        assert_eq!(text(&out.stderr), "henki: henki mods needs henki-mods next to henki or on PATH: not found; fix: reinstall henki\n");
     }
-    assert_eq!(fs::read_to_string(h.allow()).unwrap(), "/src/app\tgit status\n");
 }
 
+/// The manager next to henki's realpath (the release tarball's bin/) wins over PATH, also when henki is run through a
+/// link elsewhere (Homebrew links bin/henki into its prefix).
 #[test]
-fn allow_ignores_nested() {
+fn mods_manager_beside_realpath() {
     let h = Home::new();
-    write(&h.allow(), "/src/app\tgit status\n", 0o600);
-    let out = h.run(&["allow"], &[("HENKI_DEPTH", "1")]);
-    assert_eq!((out.status.code(), text(&out.stdout)), (Some(0), format!("{}\n1  /src/app  git status\n", h.allow().display()).as_str()), "{}", text(&out.stderr));
+    let tarball = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(format!("henki-cli-bin-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&tarball);
+    fake_manager(&tarball);
+    fs::copy(env!("CARGO_BIN_EXE_henki"), tarball.join("henki")).unwrap();
+    std::os::unix::fs::symlink(tarball.join("henki"), h.0.join("henki")).unwrap();
+    write(&h.0.join("henki-mods"), "#!/bin/sh\necho wrong one\n", 0o755);
+    let mut c = Command::new(h.0.join("henki"));
+    c.arg("mods").current_dir(&h.0).env_clear().env("HOME", &h.0).env("PATH", format!("{}:/usr/bin:/bin", h.0.display()));
+    let out = c.stdin(Stdio::null()).output().unwrap();
+    let _ = fs::remove_dir_all(&tarball);
+    assert_eq!(out.status.code(), Some(7), "{}", text(&out.stderr));
+    assert!(text(&out.stdout).starts_with(&format!("bin {}\n", tarball.join("henki").display())), "{}", text(&out.stdout));
 }
 
-/// A relative `--config` is taken from the working directory.
+/// `henki allow` reaches the shipped manager's `allow`: the rules of the allow file in the config dir, or beside a
+/// relative `--config`, and `rm N` (the manager's own tests hold the rest).
 #[test]
-fn allow_config_flag_relative() {
+fn allow_through_manager() {
     let h = Home::new();
+    let path = format!("{}/manager:/usr/bin:/bin", env!("CARGO_MANIFEST_DIR"));
+    let env = [("PATH", path.as_str())];
+    write(&h.allow(), &format!("# mine\n/src/app\tgit status\n{}\tls -la\n", h.0.join("proj").display()), 0o600);
+    let out = h.run(&["allow"], &env);
+    assert_eq!(
+        (out.status.code(), text(&out.stdout)),
+        (Some(0), format!("{}\n1  /src/app  git status\n2  ~/proj  ls -la\n", h.allow().display()).as_str()),
+        "{}",
+        text(&out.stderr)
+    );
+    let out = h.run(&["allow", "rm", "1"], &env);
+    assert_eq!((out.status.code(), text(&out.stdout)), (Some(0), "removed rule 1: /src/app  git status\n"), "{}", text(&out.stderr));
+    assert_eq!(fs::read_to_string(h.allow()).unwrap(), format!("# mine\n{}\tls -la\n", h.0.join("proj").display()));
     fs::create_dir_all(h.0.join("alt")).unwrap();
     write(&h.0.join("alt/allow"), "/src/app\techo alt\n", 0o600);
-    let out = h.run(&["allow", "--config", "alt/henki.toml"], &[]);
-    assert_eq!((out.status.code(), text(&out.stdout)), (Some(0), format!("{}\n1  /src/app  echo alt\n", h.0.join("alt/allow").display()).as_str()), "{}", text(&out.stderr));
-}
-
-/// N is a rule number: anything else is a usage error, and nothing is removed.
-#[test]
-fn allow_rm_not_a_number() {
-    let h = Home::new();
-    write(&h.allow(), "/src/app\tgit status\n", 0o600);
-    for n in ["x", "-1", "18446744073709551616", ""] {
-        let out = h.run(&["allow", "rm", n], &[]);
-        assert_eq!((out.status.code(), text(&out.stdout)), (Some(2), ""), "rm {n:?}");
-        assert!(text(&out.stderr).starts_with("henki: ") && text(&out.stderr).ends_with(USAGE), "rm {n:?}: {}", text(&out.stderr));
-    }
-    assert_eq!(fs::read_to_string(h.allow()).unwrap(), "/src/app\tgit status\n");
-}
-
-/// Without an absolute HOME there is no allow file to name: the config's own refusal, exit 2, nothing read or written
-/// below the working directory.
-#[test]
-fn allow_home_unset_refused() {
-    let h = Home::new();
-    fs::create_dir_all(h.0.join("rel/.config/henki")).unwrap();
-    write(&h.0.join("rel/.config/henki/allow"), "/x\tls\n", 0o600);
-    write(&h.0.join(".config/henki/allow"), "/x\tls\n", 0o600);
-    for home in [None, Some("rel"), Some("")] {
-        let mut c = Command::new(env!("CARGO_BIN_EXE_henki"));
-        c.args(["allow", "rm", "1"]).current_dir(&h.0).env_clear().env("PATH", "/usr/bin:/bin").stdin(Stdio::null());
-        home.iter().for_each(|v| _ = c.env("HOME", v));
-        let out = c.output().unwrap();
-        assert_eq!((out.status.code(), text(&out.stdout)), (Some(2), ""), "HOME {home:?}");
-        assert_eq!(text(&out.stderr), "henki: HOME is not set; fix: set HOME to your home directory\n", "HOME {home:?}");
-    }
-    for f in [h.0.join("rel/.config/henki/allow"), h.0.join(".config/henki/allow")] {
-        assert_eq!(fs::read_to_string(&f).unwrap(), "/x\tls\n", "{}", f.display());
-    }
-}
-
-/// An allow file that is a FIFO is neither opened for reading nor waited on: the list names the problem, `rm` fails.
-#[test]
-fn allow_fifo_not_blocking() {
-    let h = Home::new();
-    assert!(Command::new("mkfifo").arg(h.allow()).status().unwrap().success());
-    let run = |args: &[&str]| {
-        let mut c = Command::new(env!("CARGO_BIN_EXE_henki"));
-        c.args(args).current_dir(&h.0).env_clear().env("HOME", &h.0).env("PATH", "/usr/bin:/bin").stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
-        let mut child = c.spawn().unwrap();
-        let end = Instant::now() + Duration::from_secs(10);
-        while child.try_wait().unwrap().is_none() {
-            if Instant::now() > end {
-                let _ = child.kill();
-                panic!("henki {args:?} waits on the FIFO");
-            }
-            std::thread::sleep(Duration::from_millis(5));
-        }
-        child.wait_with_output().unwrap()
-    };
-    let out = run(&["allow"]);
-    assert_eq!((out.status.code(), text(&out.stdout)), (Some(0), format!("{}\ncannot read it: not a regular file\n", h.allow().display()).as_str()));
-    let out = run(&["allow", "rm", "1"]);
-    assert_eq!((out.status.code(), text(&out.stdout)), (Some(2), ""));
-    assert_eq!(text(&out.stderr), format!("henki: {}: not a regular file\n", h.allow().display()));
+    let out = h.run(&["allow", "--config", "alt/henki.toml"], &env);
+    let here = fs::canonicalize(&h.0).unwrap();
+    assert_eq!((out.status.code(), text(&out.stdout)), (Some(0), format!("{}\n1  /src/app  echo alt\n", here.join("alt/allow").display()).as_str()), "{}", text(&out.stderr));
 }
 
 #[test]
@@ -290,4 +243,96 @@ fn version_le_10ms() {
     times.sort();
     println!("--version: median {:?}, max {:?}", times[10], times[19]);
     assert!(times[10] <= Duration::from_millis(10), "median {:?}", times[10]);
+}
+
+/// `--port` takes PORT=std for the six ports, in the REPL's flags and in `run`'s, and nothing else.
+#[test]
+fn port_flag() {
+    for bad in ["history", "history=tree", "nope=std", "=std"] {
+        for args in [&["--port", bad][..], &["run", "--port", bad, "task"][..]] {
+            let out = henki(args);
+            assert_eq!(out.status.code(), Some(2), "{args:?}");
+            let want = "henki: --port takes PORT=std, PORT one of model, history, context, exec, policy, frontend\n";
+            assert!(text(&out.stderr).starts_with(want), "{args:?}: {}", text(&out.stderr));
+        }
+    }
+    // A broken link in CONFIG/port/ stops the start; `--port history=std` runs past it.
+    let h = Home::new();
+    fs::create_dir_all(h.0.join(".config/henki/port")).unwrap();
+    std::os::unix::fs::symlink("/nonexistent/binding", h.0.join(".config/henki/port/history")).unwrap();
+    let env = [("HENKI_BASE_URL", "http://127.0.0.1:9/v1"), ("HENKI_MODEL", "m")];
+    let out = h.run(&["run", "--max-seconds", "1", "task"], &env);
+    let link = h.0.join(".config/henki/port/history");
+    let want = format!("henki: {}: not a link to a program; fix: henki mods swap history std, or start with --port history=std\n", link.display());
+    assert_eq!((out.status.code(), text(&out.stderr)), (Some(2), want.as_str()));
+    let out = h.run(&["run", "--port", "history=std", "--port", "policy=std", "--max-seconds", "1", "task"], &env);
+    assert_eq!(out.status.code(), Some(124), "{}", text(&out.stderr));
+}
+
+/// A history binding in bash for `henki port`: hello (it checks the offer), then `create` and an echo of the request
+/// as an error; it writes its environment to its state dir.
+fn echo_binding(dir: &Path) -> PathBuf {
+    let b = dir.join("binding");
+    let text = r#"#!/bin/bash
+while IFS= read -r line; do
+  id=$(printf '%s' "$line" | sed -n 's/^{"id":\([0-9]*\),.*/\1/p')
+  case "$line" in
+    *'"method":"hello"'*'"versions":[1]'*) env >"$(printf '%s' "$line" | sed -n 's/.*"state":"\([^"]*\)".*/\1/p')/env"; printf '{"id":%s,"result":{"caps":["fork"],"impl":"2.0","name":"echo","protocol":1,"version":1}}\n' "$id" ;;
+    *'"method":"hello"'*) printf '{"id":%s,"error":{"code":"version","message":"history/1 only"}}\n' "$id" ;;
+    *'"method":"create"'*) printf '{"result":{"session":"e-1"},"id":%s}\n' "$id" ;;
+    *'"method":"bye"'*) printf '{"id":%s,"result":null}\n' "$id"; exit 0 ;;
+    *) printf '{"id":%s,"error":{"code":"x-said","message":"%s"}}\n' "$id" "$(printf '%s' "$line" | sed 's/"/~/g')" ;;
+  esac
+done
+"#;
+    write(&b, text, 0o700);
+    b
+}
+
+/// `henki port PORT [--offer V] -- PROGRAM`: no config read, the hello line, one canonical answer per request line, a
+/// binding error with its code (an unknown one as `other`), `kill`; the binding's state dir and environment.
+#[test]
+fn port_pipe() {
+    let h = Home::new();
+    let b = echo_binding(&h.0);
+    let mut c = Command::new(env!("CARGO_BIN_EXE_henki"));
+    c.args(["port", "history", "--", b.to_str().unwrap()]).current_dir(&h.0).env_clear().env("HOME", &h.0).env("PATH", "/usr/bin:/bin");
+    c.env("XDG_STATE_HOME", h.0.join("state")).env("HENKI_API_KEY", "secret").env("SOME_TOKEN", "t");
+    let mut child = c.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().unwrap();
+    let input = "{\"method\":\"create\",\"params\":{\"hint\":null,\"scope\":\"/\"}}\n{\"method\":\"x-up\",\"params\":{\"b\":1,\"a\":\"\u{202e}\"}}\n{\"kill\":true}\n{\"method\":\"create\"}\n";
+    std::io::Write::write_all(child.stdin.as_mut().unwrap(), input.as_bytes()).unwrap();
+    let out = child.wait_with_output().unwrap();
+    assert_eq!((out.status.code(), text(&out.stderr)), (Some(0), ""));
+    let lines: Vec<&str> = text(&out.stdout).lines().collect();
+    assert_eq!(lines[..2], ["{\"result\":{\"caps\":[\"fork\"],\"name\":\"echo 2.0\"}}", "{\"result\":{\"session\":\"e-1\"}}"]);
+    let said =
+        format!("{{\"error\":{{\"code\":\"other\",\"message\":\"history binding {}: x-said: {{~id~:2,~method~:~x-up~,~params~:{{~a~:~\\\\u{{202e}}~,~b~:1}}}}\"}}}}", b.display());
+    assert_eq!((lines[2], lines.len()), (said.as_str(), 3), "the request is canonical; kill ends the pipe");
+    let env = fs::read_to_string(h.0.join("state/henki/port/history/env")).unwrap();
+    for (k, v) in [("HENKI_DEPTH", Some("1")), ("HENKI_SESSION", Some("")), ("HENKI_API_KEY", None), ("SOME_TOKEN", None), ("HOME", Some(h.0.to_str().unwrap()))] {
+        assert_eq!(env.lines().find_map(|l| l.strip_prefix(&format!("{k}="))), v, "{k}: {env}");
+    }
+    // An offer the binding does not take: its version error as the first line, exit 2.
+    let out = h.run(&["port", "history", "--offer", "99", "--", b.to_str().unwrap()], &[]);
+    assert_eq!(out.status.code(), Some(2));
+    assert_eq!(text(&out.stdout), format!("{{\"error\":{{\"code\":\"version\",\"message\":\"history binding {}: version: history/1 only\"}}}}\n", b.display()));
+    for (args, says) in [(&["port", "context", "--", "/x"][..], "henki port takes history or policy, not context"), (&["port", "history"][..], "henki port needs -- PROGRAM")] {
+        let out = h.run(args, &[]);
+        assert_eq!(out.status.code(), Some(2), "{args:?}");
+        assert!(text(&out.stderr).starts_with(&format!("henki: {says}\n")), "{args:?}: {}", text(&out.stderr));
+    }
+    // Linux: a daemon the binding started in a session of its own is henki's child once its parent ends; the sweep after
+    // the binding's end takes it, as at a session's end.
+    if cfg!(target_os = "linux") {
+        let mark = format!("3133.8{:07}", std::process::id());
+        let w = h.0.join("daemon");
+        write(&w, &format!("#!/bin/sh\n(setsid sleep {mark} </dev/null >/dev/null 2>&1 &)\nexec {}\n", b.display()), 0o700);
+        assert_eq!(h.run(&["port", "history", "--", w.to_str().unwrap()], &[]).status.code(), Some(0));
+        let live = || fs::read_dir("/proc").unwrap().flatten().any(|p| fs::read(p.path().join("cmdline")).is_ok_and(|c| c.ends_with(format!("{mark}\0").as_bytes())));
+        let until = Instant::now() + Duration::from_secs(2);
+        while live() && Instant::now() < until {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(!live(), "the binding's daemon outlived henki port");
+    }
 }

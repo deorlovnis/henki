@@ -101,16 +101,6 @@ fn allow_invalid_lines() {
 }
 
 #[test]
-fn allow_numbers_count_invalid() {
-    let t = T::new();
-    let f = t.allow("# c\n/a\tok1\nbad line\n\n# c2\n/a\tok2\n", 0o600);
-    let want = [f.display().to_string(), "1  /a  ok1".into(), format!("2  !bad line  (invalid: {NO_TAB})"), "3  /a  ok2".into()];
-    assert_eq!(list(&f, Path::new("/home/u")), want);
-    assert_eq!(remove(&f, 3, Path::new("/home/u")).unwrap(), "removed rule 3: /a  ok2");
-    assert_eq!(read(&f), "# c\n/a\tok1\nbad line\n\n# c2\n");
-}
-
-#[test]
 fn allow_exact_only() {
     let a = rules(vec![r(1, "/r", "git status")]);
     let root = Path::new("/r");
@@ -212,7 +202,7 @@ fn allow_append_creates_with_header() {
     assert_eq!(a.append(&t.0, "git status").unwrap(), 1);
     let want = format!(
         "# henki allow rules: ROOT<TAB>COMMAND, one per line; COMMAND then runs without asking in ROOT.\n\
-         # List and remove them with /allow in henki or henki allow [rm N]; or edit this file.\n{}\tgit status\n",
+         # List and remove them with henki mods allow [rm N] (/allow in henki); or edit this file.\n{}\tgit status\n",
         t.0.display()
     );
     assert_eq!(read(&f), want);
@@ -247,7 +237,6 @@ fn allow_append_locked() {
     hold.lock().unwrap();
     assert_eq!(a.append(Path::new("/x"), "make").unwrap_err().to_string(), "locked by another henki");
     assert_eq!(read(&f), "/x\tls\n");
-    assert_eq!(remove(&f, 1, &t.0).unwrap_err(), format!("{}: locked by another henki", f.display()));
     drop(hold);
     assert_eq!(unlocked(|| a.append(Path::new("/x"), "make")).unwrap(), 2);
 }
@@ -294,7 +283,7 @@ fn allow_append_over_limit() {
     let mut a = load(&f, true).unwrap();
     assert_eq!(unlocked(|| a.append(Path::new("/src/app"), &"x".repeat(100))).unwrap_err().to_string(), "would be over 65,536 bytes");
     assert_eq!(fs::metadata(&f).unwrap().len(), 65_500);
-    assert_eq!(list(&f, &t.0), [f.display().to_string()], "list and remove still read it");
+    assert!(load(&f, true).unwrap().rules.is_empty(), "the file still loads");
 }
 
 #[test]
@@ -335,7 +324,6 @@ fn allow_load_non_utf8_comment() {
     let t = T::new();
     let f = t.allow(b"# caf\xe9 \x1b[31m\n/a\tls\n", 0o600);
     assert_eq!(load(&f, true).unwrap().rules, [r(1, "/a", "ls")], "a comment is never parsed or shown");
-    assert_eq!(list(&f, &t.0), [f.display().to_string(), "1  /a  ls".into()]);
 }
 
 #[test]
@@ -363,49 +351,7 @@ fn allow_fits_shapes() {
 }
 
 #[test]
-fn allow_list_format() {
-    let t = T::new();
-    let home = t.p("h");
-    let f = t.allow(format!("# c\n{0}/src/app\tgit status\n*\tmake\n/opt/x\tls\n{0}\tpwd\n", home.display()), 0o600);
-    let want = [f.display().to_string(), "1  ~/src/app  git status".into(), "2  *  make".into(), "3  /opt/x  ls".into(), "4  ~  pwd".into()];
-    assert_eq!(list(&f, &home), want);
-    assert_eq!(list(&t.p("none"), &home), [t.p("none").display().to_string()]);
-    assert_eq!(shown(Path::new("/elsewhere/h"), &home), "/elsewhere/h");
-}
-
-#[test]
-fn allow_list_invalid_escaped() {
-    let t = T::new();
-    let f = t.allow(b"/a\x1b[31m\tls\n/b\xff\tls\n", 0o600);
-    let want = [f.display().to_string(), format!("1  !/a\\x1b[31m\tls  (invalid: {BAD_ROOT})"), format!("2  !/b\u{fffd}\tls  (invalid: {BAD_ROOT})")];
-    assert_eq!(list(&f, &t.0), want);
-    fs::remove_file(&f).unwrap();
-    fs::create_dir(&f).unwrap();
-    assert_eq!(list(&f, &t.0), [f.display().to_string(), "cannot read it: not a regular file".into()]);
-}
-
-#[test]
-fn allow_list_any_mode() {
-    let t = T::new();
-    let f = t.allow("/a\tls\n", 0o666);
-    assert!(load(&f, true).is_err());
-    assert_eq!(list(&f, &t.0), [f.display().to_string(), "1  /a  ls".into()]);
-    assert_eq!(remove(&f, 1, &t.0).unwrap(), "removed rule 1: /a  ls");
-}
-
-#[test]
-fn allow_remove_keeps_rest() {
-    let t = T::new();
-    let f = t.allow("# head\r\n/a\tone\r\n\nbad line\n*\ttwo\n# tail", 0o600);
-    assert_eq!(remove(&f, 2, &t.0).unwrap(), format!("removed rule 2: !bad line  (invalid: {NO_TAB})"));
-    assert_eq!(read(&f), "# head\r\n/a\tone\r\n\n*\ttwo\n# tail");
-    assert_eq!(remove(&f, 1, &t.0).unwrap(), "removed rule 1: /a  one");
-    assert_eq!(read(&f), "# head\r\n\n*\ttwo\n# tail");
-    assert_eq!(fs::read_dir(&t.0).unwrap().count(), 1, "no temp file left");
-}
-
-#[test]
-fn allow_remove_symlinked_config_dir() {
+fn allow_append_symlinked_config_dir() {
     let t = T::new();
     fs::create_dir(t.p("real")).unwrap();
     symlink(t.p("real"), t.p("henki")).unwrap();
@@ -413,32 +359,14 @@ fn allow_remove_symlinked_config_dir() {
     let mut a = load(&f, true).unwrap();
     assert_eq!(a.append(Path::new("/src/app"), "ls").unwrap(), 1);
     assert_eq!(load(&f, true).unwrap().rules, [r(1, "/src/app", "ls")]);
-    assert_eq!(list(&f, &t.0), [f.display().to_string(), "1  /src/app  ls".into()]);
-    assert_eq!(unlocked(|| remove(&f, 1, &t.0)).unwrap(), "removed rule 1: /src/app  ls");
-    assert!(load(&f, true).unwrap().rules.is_empty());
     assert!(fs::symlink_metadata(t.p("henki")).unwrap().file_type().is_symlink(), "the link stays");
     assert!(fs::symlink_metadata(t.p("real/allow")).unwrap().is_file());
-    assert_eq!(fs::read_dir(t.p("real")).unwrap().count(), 1, "no temp file left");
 }
 
 #[test]
-fn allow_remove_no_such_rule() {
-    let t = T::new();
-    let f = t.allow("# c\n/a\tone\n*\ttwo\n", 0o600);
-    for n in [0, 3] {
-        assert_eq!(unlocked(|| remove(&f, n, &t.0)).unwrap_err(), format!("no rule {n} in {}", f.display()));
-    }
-    assert_eq!(read(&f), "# c\n/a\tone\n*\ttwo\n");
-    assert_eq!(remove(&t.p("none"), 1, &t.0).unwrap_err(), format!("no rule 1 in {}", t.p("none").display()));
-}
-
-#[test]
-fn allow_remove_mode_0600() {
-    let t = T::new();
-    let f = t.allow("/a\tone\n/a\ttwo\n", 0o644);
-    remove(&f, 1, &t.0).unwrap();
-    assert_eq!(fs::metadata(&f).unwrap().permissions().mode() & 0o7777, 0o600);
-    assert_eq!(load(&f, true).unwrap().rules, [r(1, "/a", "two")]);
+fn allow_shown() {
+    let home = Path::new("/home/u");
+    assert_eq!([shown(Path::new("/home/u/src/app"), home), shown(home, home), shown(Path::new("/home/u2"), home)], ["~/src/app", "~", "/home/u2"]);
 }
 
 #[test]
@@ -448,4 +376,87 @@ fn allow_hash() {
     assert_eq!(load(&f, true).unwrap().hash, Some(sys::fnv(b"# c\n/a\tls\n")));
     assert_eq!(load(&f, false).unwrap().hash, None);
     assert_eq!(load(&t.p("none"), true).unwrap().hash, None);
+}
+
+/// The std policy: auto allows everything; ask allows a call that needs no approval and a shell command an allow rule
+/// holds (with the rule's line), and asks for the rest, offering `always` only for a command a rule can hold.
+#[test]
+fn std_decide_table() {
+    let t = T::new();
+    let mut cfg = Config::test(&t.0);
+    cfg.allow.rules = vec![r(1, "*", "ls"), r(2, "/elsewhere", "make")];
+    let call = |name: &str, args: serde_json::Value| Call { id: "h1".into(), name: name.into(), args, ..Default::default() };
+    let shown = |d: Decision| match d {
+        Decision::Allow { verdict, rule, line } => format!("{verdict} {rule:?} {line:?}"),
+        Decision::Ask { always, .. } => format!("ask {always}"),
+        Decision::Deny(why) => format!("deny {why}"),
+    };
+    let decide = |cfg: &Config, c: &Call| shown(Std.decide(c, None, cfg, "s"));
+    let ls = r#"rule Some(1) Some("$ ls  (allowed by rule 1 for *, ~/allow)")"#;
+    assert_eq!(decide(&cfg, &call("shell", serde_json::json!({"command": "ls"}))), ls);
+    assert_eq!(decide(&cfg, &call("shell", serde_json::json!({"command": "make"}))), "ask true");
+    assert_eq!(decide(&cfg, &call("shell", serde_json::json!({"command": "a\tb"}))), "ask false");
+    assert_eq!(decide(&cfg, &call("shell", serde_json::json!({"command": "x".repeat(201)}))), "ask false");
+    assert_eq!(decide(&cfg, &call("write", serde_json::json!({"path": "ls", "content": ""}))), "ask false");
+    assert_eq!(decide(&cfg, &call("read", serde_json::json!({"path": "/etc/passwd"}))), "ask false");
+    cfg.auto = true;
+    for (name, args) in [("shell", serde_json::json!({"command": "make"})), ("write", serde_json::json!({"path": "x", "content": ""}))] {
+        assert_eq!(decide(&cfg, &call(name, args)), "auto None None");
+    }
+}
+
+/// `always` through the std policy: the rule appended to the allow file, its number, and today's line; a file that
+/// cannot be written is the reason, and nothing is kept.
+#[test]
+fn std_record() {
+    let t = T::new();
+    let mut cfg = Config::test(&t.0);
+    let c = Call { id: "h1".into(), name: "shell".into(), args: serde_json::json!({"command": "make test"}), ..Default::default() };
+    let line = "added to ~/allow as rule 1 for ~; /allow lists and removes rules";
+    assert_eq!(Std.record(&c, &mut cfg), Ok((line.to_string(), Some(1))));
+    assert_eq!(load(&t.p("allow"), true).unwrap().rules, [Rule { n: 1, root: t.0.to_string_lossy().into(), cmd: "make test".into() }]);
+    cfg.allow.file = t.p("missing/allow");
+    assert_eq!(Std.record(&c, &mut cfg), Err("could not write ~/missing/allow: No such file or directory (os error 2)".to_string()));
+}
+
+/// conform/1's policy suite (manager/conform/policy.tsv), the file every outside binding is held to, run against the
+/// std policy in ask mode: each view as the call and its target (resolved as the kernel resolves it), the answers
+/// rendered as `henki port` renders them. Std speaks no protocol, so the hello and version steps are skipped.
+#[test]
+fn conform_policy_std() {
+    let t = T::new();
+    fs::write(t.p("a.txt"), "x").unwrap();
+    let mut cfg = Config::test(&t.0);
+    let saved = [("@SCOPE@".to_string(), t.0.display().to_string()), ("@BIG@".into(), "x".repeat(1 << 20))];
+    let (mut checks, mut steps) = (0, 0);
+    for line in include_str!("../../manager/conform/policy.tsv").lines().filter(|l| !l.starts_with('#') && !l.is_empty()) {
+        let f: Vec<&str> = line.split('\t').collect();
+        let sub = |s: &str| saved.iter().fold(s.to_string(), |s, (k, v)| s.replace(k.as_str(), v));
+        if f[1].starts_with('+') || f[2] == "hello" {
+            continue;
+        }
+        let q: serde_json::Value = serde_json::from_str(&sub(f[2])).unwrap_or_else(|e| panic!("{}: {e}", f[0]));
+        let p = &q["params"];
+        let c = Call {
+            id: p["call"]["id"].as_str().unwrap_or_default().into(),
+            name: p["call"]["name"].as_str().unwrap_or_default().into(),
+            args: p["call"]["args"].clone(),
+            ..Default::default()
+        };
+        let target = p["target"]["path"].as_str().and_then(|path| tools::target(path, c.name != "read", &cfg).ok());
+        let a = match q["method"].as_str().unwrap() {
+            "decide" => Ok(match Std.decide(&c, target.as_ref(), &cfg, "conform-1") {
+                Decision::Allow { .. } => serde_json::json!({"decision": "allow"}),
+                Decision::Ask { always, .. } => serde_json::json!({"decision": "ask", "always": always}),
+                Decision::Deny(why) => serde_json::json!({"decision": "deny", "reason": why}),
+            }),
+            "record" => Std.record(&c, &mut cfg).map(|(shown, _)| serde_json::json!({"shown": shown})).map_err(|e| ("io", e)),
+            m => Err(("unsupported", format!("no method {m}"))),
+        };
+        let got = term::json_line(&a.map_or_else(|(code, message)| serde_json::json!({"error": {"code": code, "message": message}}), |r| serde_json::json!({"result": r})));
+        assert!(crate::journal::tests::conform_match(&sub(f[3]), &got), "{}: got {}", f[0], got.chars().take(400).collect::<String>());
+        steps += 1;
+        checks += usize::from(!f[0].ends_with(|c: char| c.is_ascii_lowercase()));
+    }
+    assert_eq!((steps, checks), (10, 10), "the suite changed: say so here (std skips Q01 and Q02)");
 }

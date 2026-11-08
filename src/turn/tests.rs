@@ -48,12 +48,19 @@ fn cfg(d: &Path, port: u16) -> Config {
 fn open(mut cfg: Config, mode: Mode, input: Option<std::io::PipeReader>) -> (Session, Buf, Buf) {
     cfg.snap = cfg.trust.iter().map(|p| (p.clone(), sys::stamp(p))).collect();
     journal::state_dir(&cfg.state).unwrap();
-    let j = Journal::create(&cfg.state, &cfg.cwd).unwrap();
+    let (ports, sid) = std_ports(&cfg);
     let (tx, rx) = mpsc::channel();
     let (out, err) = (Buf::default(), Buf::default());
     let o = Out::with(mode, tx.clone(), Box::new(out.clone()), Box::new(err.clone()), false);
     let reader = input.map(|i| Reader::with(i, tx.clone()).unwrap());
-    (Session::new(cfg, j, Vec::new(), o, tx, rx, None, reader), out, err)
+    (Session::new(cfg, ports, sid, Vec::new(), o, (tx, rx), None, reader), out, err)
+}
+
+/// The std bindings, with a new session held in the history.
+fn std_ports(cfg: &Config) -> (Ports, String) {
+    let mut ports = Ports { history: Box::new(crate::journal::Journal::new(&cfg.state)), policy: Box::new(crate::allow::Std), bound: Vec::new() };
+    let sid = ports.history.create(&cfg.cwd, None).unwrap();
+    (ports, sid)
 }
 
 /// A `--json` session in `d` with no history, its stdout captured, and the model at `127.0.0.1:port`.
@@ -196,7 +203,7 @@ fn ctx_use_estimate() {
 fn record_hist_kinds() {
     let d = dir("hist");
     let (mut s, buf) = session(&d, 9);
-    s.record(rec::approval("h1", "auto", None)).unwrap();
+    s.record(rec::approval("h1", "auto", None, None)).unwrap();
     s.notice("a notice").unwrap();
     s.record(rec::tool_result("h1", "shell", "ok", false, 1, 2)).unwrap();
     assert_eq!(kinds(&s.hist), ["tool_result"]);
@@ -321,7 +328,7 @@ fn end_writes_result_then_close() {
     let d = dir("end");
     let (mut s, buf) = session(&d, 9);
     s.t.text = "the answer".into();
-    let id = s.j.id().to_string();
+    let id = s.sid.clone();
     s.end(0, Some(rec::result(&Outcome::Ok, "the answer", Usage::default(), Some(&id), 1, 1_234))).unwrap();
     s.into_out().flush(Instant::now() + Duration::from_secs(1));
     let out = lines(&buf);
@@ -337,7 +344,7 @@ fn end_writes_result_then_close() {
 fn end_journal_failure_json_result() {
     let d = dir("endfail");
     let (mut s, buf) = session(&d, 9);
-    let id = s.j.id().to_string();
+    let id = s.sid.clone();
     // The file changes behind henki's back: every later write fails the size check.
     std::fs::OpenOptions::new().append(true).open(journal_file(&d)).unwrap().write_all(b"{\"t\":\"x\"}\n").unwrap();
     let e = s.end(2, Some(rec::result(&Outcome::Ok, "", Usage { input: 7, output: 3, cached: 0 }, Some(&id), 4, 2_500))).unwrap_err();
@@ -355,7 +362,7 @@ fn end_journal_failure_json_result() {
 fn end_journal_failure_keeps_turn_error() {
     let d = dir("endfail2");
     let (mut s, buf) = session(&d, 9);
-    let id = s.j.id().to_string();
+    let id = s.sid.clone();
     std::fs::OpenOptions::new().append(true).open(journal_file(&d)).unwrap().write_all(b"{\"t\":\"x\"}\n").unwrap();
     let auth = Outcome::error("auth", "bad key");
     let given = rec::result(&auth, "", Usage::default(), Some(&id), 0, 100);
@@ -374,7 +381,7 @@ fn end_journal_failure_plain_no_answer() {
     s.out = Out::with(Mode::Plain, tx, Box::new(out.clone()), Box::new(err.clone()), false);
     drop(rx);
     s.t.text = "an answer".into();
-    let id = s.j.id().to_string();
+    let id = s.sid.clone();
     std::fs::OpenOptions::new().append(true).open(journal_file(&d)).unwrap().write_all(b"{\"t\":\"x\"}\n").unwrap();
     assert!(s.end(0, Some(rec::result(&Outcome::Ok, "an answer", Usage::default(), Some(&id), 1, 0))).is_err());
     s.into_out().flush(Instant::now() + Duration::from_secs(1));
@@ -711,10 +718,10 @@ fn snapshot_from_config() {
     c.snap = vec![(agents.clone(), sys::stamp(&agents))];
     std::fs::write(&agents, "changed before the session started\n").unwrap();
     journal::state_dir(&c.state).unwrap();
-    let j = Journal::create(&c.state, &c.cwd).unwrap();
+    let (ports, sid) = std_ports(&c);
     let (tx, rx) = mpsc::channel();
     let o = Out::with(Mode::Json, tx.clone(), Box::new(Buf::default()), Box::new(Buf::default()), false);
-    let s = Session::new(c, j, Vec::new(), o, tx, rx, None, None);
+    let s = Session::new(c, ports, sid, Vec::new(), o, (tx, rx), None, None);
     assert_eq!(s.changed(), [agents]);
     std::fs::remove_dir_all(d).unwrap();
 }
@@ -799,8 +806,20 @@ fn free_read_ext_doc_auto_approval() {
     std::fs::write(&doc, "# tool: does things\n").unwrap();
     std::fs::write(&other, "notes\n").unwrap();
     let mut c = in_app(&d, 9);
-    let ext =
-        Ext { name: "tool".into(), line: "tool: does things".into(), doc: doc.clone(), bin: None, cmds: Vec::new(), shadows: Vec::new(), paths: Vec::new(), targets: Vec::new() };
+    let ext = Ext {
+        name: "tool".into(),
+        line: "tool: does things".into(),
+        dir: d.join("ext/tool"),
+        doc: doc.clone(),
+        bin: None,
+        cmds: Vec::new(),
+        user: Vec::new(),
+        on: Vec::new(),
+        prompt: true,
+        shadows: Vec::new(),
+        paths: Vec::new(),
+        targets: Vec::new(),
+    };
     c.exts = vec![ext];
     let (mut s, _, _) = open(c, Mode::Json, None);
     // Ask mode and outside the root: the doc is approved and started; the wait then ends at the deadline, so nothing is

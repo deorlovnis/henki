@@ -1,0 +1,1 @@
+./test.sh fails. Fix sum.sh so that the test passes. Do not change test.sh.

@@ -31,10 +31,19 @@ A program reads the contracts this henki ships from the rows of this table: each
 | `journal/1` | henki | the session journal: files, records, identity, resume, repair |
 | `json/1` | henki | the record stream of `henki run --json` |
 | `wire/1` | henki | what henki sends to and accepts from a model server, in both dialects |
-| `ext/1` | henki | the extension directory layout henki loads |
+| `ext/1` | henki | the extension directory layout henki loaded first; a module without ext/2's entries keeps its rules |
+| `ext/2` | henki | the module directory layout henki loads: doc, tools, user commands, bindings |
+| `handoff/1` | henki | a user command's environment, and what it hands back to henki in `HENKI_NEXT` |
+| `observe/1` | henki | a module's observers: the session's events, how henki runs them, and what it waits for |
+| `port/1` | henki | how henki talks to a port binding: a program it starts, JSON lines both ways |
+| `history/1` | henki | the history port's methods over port/1: where sessions are kept |
+| `policy/1` | henki | the policy port's methods over port/1: who may run a call |
+| `conform/1` | henki | the conformance suite files a binding is held to |
 | `module/1` | henki-mods | the module manifest, `.henki/module.toml` |
 | `lock/1` | henki-mods | the module lock, `mods.lock` |
+| `bind/1` | henki-mods | the lock lines of bound ports, in `mods.lock` |
 | `hd1` | henki-mods | the tree hash that pins a module's files |
+| `eval/1` | henki-mods | a module's eval tasks, the two arms they run in, and the line that records them |
 
 ## journal/1
 
@@ -60,7 +69,8 @@ it. Other programs read it, to list, show, search or replay sessions.
 - Every record has `t`, its kind, and `ts`, the UTC time it was written (`YYYY-MM-DDTHH:MM:SSZ`).
 - henki appends only, through one `O_APPEND` descriptor, and syncs the file (fdatasync) after every record but `ask`,
   `approval` and `notice`, before the effect the record explains. Before each write it checks that the file is exactly
-  as long as what it wrote; if not, the session ends `error tampered`.
+  as long as what it wrote and that its path still names that file (an edit that puts a new file in its place, as
+  `sed -i` does, keeps the size); if not, the session ends `error tampered`.
 
 ### Record kinds
 
@@ -70,17 +80,17 @@ values of `args` and `blocks` are opaque JSON.
 
 | Kind | Fields |
 |---|---|
-| `session` | `t` `ts` `v` `henki` `id` `cwd` `model` `dialect` `base_url` `base_url_from` `approve` `approve_from` `config` `tools` `shell` `exts` `pass_env` `ctx` `config_hash` `allow_hash` `agents_hash` `project_agents_hash` `resumed` `resumed.from_bytes?` |
+| `session` | `t` `ts` `v` `henki` `id` `cwd` `model` `dialect` `base_url` `base_url_from` `approve` `approve_from` `config` `tools` `shell` `exts` `pass_env` `ctx` `config_hash` `allow_hash` `agents_hash` `project_agents_hash` `resumed` `resumed.from_bytes?` `ports?` `ports.history?` `ports.policy?` |
 | `user` | `t` `ts` `msg` `msg.content` `msg.role` |
 | `assistant` | `t` `ts` `msg` `msg.content` `msg.role` `msg.tool_calls` `msg.tool_calls[].args` `msg.tool_calls[].id` `msg.tool_calls[].name` `msg.tool_calls[].raw?` `finish` `usage` `usage.cached` `usage.in` `usage.out` `blocks?` |
 | `ask` | `t` `ts` `id` `name` `args` `target?` |
-| `approval` | `t` `ts` `id` `verdict` `rule?` |
+| `approval` | `t` `ts` `id` `verdict` `rule?` `by?` `reason?` |
 | `tool_result` | `t` `ts` `id` `name` `content` `is_error` `ms` `bytes` |
 | `notice` | `t` `ts` `text` |
 | `elide` | `t` `ts` `ids` |
 | `turn_end` | `t` `ts` `status` `steps` `usage` `usage.cached` `usage.in` `usage.out` `reason?` |
 | `result` | `t` `ts?` `status` `exit` `text` `usage` `usage.cached` `usage.in` `usage.out` `session` `steps` `duration_s` `reason?` `error?` `error.kind?` `error.message?` `call?` `call.args?` `call.id?` `call.name?` |
-| `close` | `t` `ts` `bytes` |
+| `close` | `t` `ts` `bytes?` |
 
 - `session` starts a segment (a run of henki on the file). `v` is the journal major, `1`. `henki` is henki's version,
   `id` the session id, `cwd` the working directory, `model` and `dialect` (`openai` or `anthropic`) the model in use,
@@ -90,7 +100,8 @@ values of `args` and `blocks` are opaque JSON.
   `pass_env` the variable names passed to tools, `shell` the bash that runs calls, `ctx` the context window in tokens.
   The `*_hash` fields are FNV-1a 64 hashes of the bytes of the config file, the allow file and the global `AGENTS.md`
   as read, or `null` when absent or not read; `project_agents_hash` is always `null` in this version. `resumed` is
-  `null` for a new session, else `{"from_bytes": N}`: the file's length when this segment began.
+  `null` for a new session, else `{"from_bytes": N}`: the file's length when this segment began (`{}` in a session a
+  history binding keeps: history/1).
 - `user` is a message from the user; `msg.role` is `user`. A session's first task starts with
   `cwd: DIR\nos: OS ARCH\ndate: YYYY-MM-DD\n\n`; later ones do not.
 - `assistant` is one model reply; `msg.role` is `assistant`, `msg.content` its text. Each `msg.tool_calls` entry is a
@@ -104,7 +115,9 @@ values of `args` and `blocks` are opaque JSON.
 - `ask`: the call `id` needs a human; `target` is the file a `read`, `write` or `edit` call resolves to, as shown.
   In `henki run` an `ask` ends the turn with `needs_approval`.
 - `approval`: who let call `id` run, or not: `verdict` is `auto` (no approval needed), `rule` (allow rule number
-  `rule`), `yes`, `always` (the user saved rule number `rule`) or `no`.
+  `rule`), `policy` (a policy binding allowed it; `by` names it as the binding notice does), `yes`, `always` (the user
+  saved rule number `rule`, or a policy binding kept it), `no`, or `deny` (a policy binding refused it; `reason` is the
+  call's result text).
 - `tool_result`: the result of call `id`; `content` is what the model sees (its wording may change), `is_error` whether
   it failed, `ms` how long it ran, `bytes` the output's full size before any cut.
 - `notice`: something henki told the user (`text` may change).
@@ -113,7 +126,8 @@ values of `args` and `blocks` are opaque JSON.
 - `turn_end`: the end of one turn: `status` (see json/1), `steps` (model replies in the turn), `usage` (the turn's),
   `reason` when the status is `gave_up`.
 - `result`: the end of a `henki run` (a REPL session has none): see json/1. In the journal it always has `ts`.
-- `close`: the session ended cleanly; `bytes` is the file's length before this line.
+- `close`: the session ended cleanly; `bytes` is the file's length before this line (absent in a session a history
+  binding keeps: history/1).
 
 ### Segments, close and resume
 
@@ -313,7 +327,7 @@ default config). henki runs nothing while it loads them; a violation of any rule
   `[A-Za-z0-9._-]+`. A dot file that cannot run is ignored (but watched); any other entry is refused. bin/'s path holds
   no `:` and is UTF-8. A command name in two extensions is refused.
 - Names starting with `README`, `LICENSE`, `CHANGELOG` or `.` are ignored (so `.henki/module.toml` and `.henki/card.md`
-  may be there). Any other entry is refused (`unknown entry PATH; v1 extensions hold doc.md and bin/ only`).
+  may be there). Any other entry is refused (`unknown entry PATH; ...`), unless ext/2 names it.
 - A command with the name of an executable on the user's PATH loads only when the config's `shadow` list holds
   `NAME/COMMAND`.
 - The system prompt gets, when any extension is loaded, the line
@@ -325,6 +339,126 @@ default config). henki runs nothing while it loads them; a violation of any rule
   session id), `HENKI_VERSION` and `HENKI_DEPTH` (1 inside a call of a top-level henki).
 - The extension directory, doc.md, bin/ and each bin/ entry are trust files: when one changes during a session, the
   turn ends `error changed`.
+
+## ext/2
+
+ext/2 is ext/1 with user commands, observers and bindings, and stricter text and link rules. A module with none of
+`cmd/`, `on/`, `port/` and `eval/` is an ext/1 module, and henki holds it to ext/1's rules for at least one release
+more, as the Stability section asks: only line 1 of its doc.md is read, and its links may leave it. Every other module
+is held to the rules below.
+
+```
+NAME/doc.md              required: line 1 the summary; the whole file a text (below)
+NAME/bin/CMD             tools: commands first on the calls' PATH (ext/1)
+NAME/cmd/CMD             a user command /CMD (handoff/1); CMD as for bin/, not exit, help, mods or allow
+NAME/cmd/CMD.md          data for a command: a text (below)
+NAME/on/EVENT            an observer of EVENT (observe/1); EVENT.wait for turn_start and call_start
+NAME/port/PORT           a binding program (port/1); run only through a link in CONFIG_DIR/port/
+NAME/eval/...            tasks for the manager (eval/1); henki ignores them
+NAME/README* LICENSE* CHANGELOG* .*   ignored
+```
+
+- **Texts.** doc.md and each `cmd/*.md` are at most 16 KiB of UTF-8 without a code point henki escapes (on any line),
+  regular files (or links to them) owned by the user or root and not group- or world-writable, as AGENTS.md is. A
+  failure names the file and the line (`PATH:LINE: holds U+202E, which a terminal does not show; fix: remove it`).
+- **Entries.** `bin/`, `cmd/`, `on/` and `port/` hold files their owner can run, named `[A-Za-z0-9._-]+`; in `on/`
+  the name is an event (observe/1), in `port/` a port (`model`, `history`, `context`, `exec`, `policy`, `frontend`). A
+  dot file that cannot run is ignored but watched; in `cmd/` a `NAME.md` that cannot run is data. Anything else there
+  is refused. `ctx/` and any other name are refused (`unknown entry PATH; ext/2 modules hold doc.md, bin/, cmd/, on/,
+  port/ and eval/`). At most 16 `on/` files over all modules. `on/` and its files run unasked, so, as a port binding,
+  `on/`, the real file of each `on/` entry and every directory from it up to the module's real directory must be owned
+  by the user or root and not group- or world-writable (`PATH is group- or world-writable; fix: chmod go-w PATH`);
+  henki does not check the owner or mode of the module's other files and directories, nor of the ext path.
+- **Links.** Inside an ext/2 module every link must be relative and lead to a path inside it (`a link that leaves the
+  module; fix: copy the file in`); the module directory itself may be a link (the manager's store copy).
+- **Names across modules.** A `bin/` or a `cmd/` name in two modules stops the start.
+- **Trust.** The module directory, doc.md, `bin/`, `cmd/`, `on/`, `port/` and every entry of them are trust files;
+  the realpaths of the links among them are protected.
+- **The prompt.** A module enters the system prompt (ext/1's line) only with `bin/`, or with none of `cmd/`, `on/` and
+  `port/`: a module of commands, observers or bindings costs no prompt bytes. The banner says `ext NAME: CMDS` (its
+  `bin/` names), `doc only` or `no tools`; `/help` lists every user command as `/CMD  (NAME)`.
+
+## handoff/1
+
+A typed line `/CMD REST` runs the module command `cmd/CMD`, with REST (trimmed) as one argument and none when empty;
+`/mods ARGS` and `/allow ARGS` (as `/mods allow ARGS`) run the shipped manager, `henki-mods` next to henki's realpath
+or else on the user's PATH (never a module's), with ARGS split at spaces. A pasted line is never a command.
+
+- **The run.** On the terminal, in henki's process group, in the session's working directory, as `!CMD` runs: INT and
+  QUIT reach it (henki waits on), TERM, HUP and a closed stdout kill it and end henki. The model is not told.
+- **The environment.** The tool environment (ext/1: every module's `bin/` first on `PATH`), plus `HENKI_CONFIG` (the
+  config dir), `HENKI_STATE` (the state dir), `HENKI_BIN` (henki's path), `HENKI_MODULE` (the module dir; not for the
+  manager) and `HENKI_NEXT`. A std session's journal is `$HENKI_STATE/sessions/*/$HENKI_SESSION.jsonl` (journal/1);
+  none is found when history is bound to another store. Tools, bindings and observers never get `HENKI_NEXT`.
+- **`HENKI_NEXT`** names an empty file henki made (0600, `STATE/spill/.next-PID-RAND`). Afterwards henki reads it only
+  if it is still that regular file, at most 64 KiB of UTF-8; anything else is a notice and ignored. It is removed
+  then. Line 1 is `VERB [ARG]`; the rest of the file is the text of `send`.
+
+| Line 1 | henki |
+|---|---|
+| (empty, or no file) | nothing |
+| `send`, then TEXT | shows `[from /CMD]` and the whole TEXT, asks `send? [Y/n]` (Enter or y sends it as the next message); refused when TEXT holds a code point henki escapes |
+| `resume ID` | ID as history/1's id rule (`ID@N` is refused); asks `switch to session ID? [y/N]`, then closes the session as `/exit` does and starts `henki ... --resume=ID` in its place |
+| `new` | closes the session and starts `henki ...` without `--resume`, no question |
+| `restart` | as `new` with `--resume=THIS`, or as `new` while the session has no message, or after the command changed `CONFIG_DIR/port/history` (the session stays in the history it was kept in, which a notice names) |
+| anything else | a notice naming the verb |
+
+- **Trust files.** A trust file the command changed is listed (`changed while /CMD ran: PATH`). Then no text is sent,
+  the REPL refuses messages until a restart, and `new`, `resume` and `restart` ask `restart on these changes? [y/N]`
+  (`switch to session ID on these changes? [y/N]`; n refuses messages). After a change from before the command, no
+  verb starts a new henki: `restart henki yourself`.
+- **The new henki** is `henki` (its realpath) with this henki's arguments without `--resume` and `--resume=ID`, so
+  `--config`, `--approve`, `--model`, `--nested` and every `--port` stay, then `--resume=ID`; it gets the environment
+  henki started with. `henki run` has no hand-off.
+- **The manager** writes `restart` into `HENKI_NEXT` after every change (add, on, off, rm, swap, allow rm), and without
+  `HENKI_NEXT` prints `restart henki (or /exit and start again) to load the change`. `HENKI_CONFIG`, when set, is the
+  config dir it changes.
+
+## observe/1
+
+A module's `on/EVENT` programs watch a session. henki runs each once per event, as git runs a hook, and nothing they
+do changes the session.
+
+```
+NAME/on/EVENT            runs once per EVENT; never waited for
+NAME/on/EVENT.wait       turn_start and call_start only: henki waits for it, up to 2 s
+```
+
+| Event | When | `data` |
+|---|---|---|
+| `session_start` | the first turn of the session in this henki; a REPL session that gets no message has none | the `session` record |
+| `turn_start` | each `user` record; a `run --resume` without TASK | that record; `{"t":"turn_start"}` |
+| `call_start` | after a call's approval, before henki's last trust check and the run | `{"call":{"args","id","name"},"rule","target","verdict"}` |
+| `call_end` | each `tool_result` record | the record |
+| `question` | each `ask` record | the record |
+| `turn_end` | each `turn_end` record | the record |
+| `session_end` | the `close` record | the record |
+| `record` | every record a turn journals, after the record's own event; not observer notices | the record |
+
+`call_start`'s `verdict` is the `approval` record's (`auto`, `rule`, `policy`, `yes`, `always`), `rule` the rule's number or
+null, `target` the resolved path of a file tool's target, or null (a shell call, or a path that is not UTF-8, which
+JSON cannot hold). No event comes before `session_start`.
+
+- **The run.** The program with no arguments, in the session's working directory, in a process group and session of
+  its own, with the tool environment (ext/1: every module's `bin/` first on `PATH`) plus `HENKI_EVENT` (the event),
+  `HENKI_MODULE` (the module dir) and `HENKI_STATE` (the state dir); never `HENKI_NEXT`. stdin is one line
+  `{"data":DATA,"event":"EVENT","seq":N,"session":"ID","v":1}` in journal/1's JSON, read from a file, so a run that
+  never reads it holds up nothing. `seq` counts this henki's events, so runs that overlap can be put in order. stdout
+  and stderr go to henki's log, `STATE/spill/.kernel-PID.log`; the exit status is ignored. An observer whose run does
+  not start gets one notice, the first time, not one per event. No run starts once a trust file changed (the tripwire
+  tells): a changed `on/` file, or a trust file it runs (`bin/`, `cmd/`), is used only after a restart. Other files of
+  the module (a dot file) are not trust files and may change under a running henki, so an observer should run only
+  trust files.
+- **Waiting.** The `.wait` runs of one event are waited for together, for at most 2 s; a signal or the run's time
+  budget ends that wait as it ends any other. An observer whose run misses the 2 s gets one notice and is not waited
+  for again in this henki; the run goes on. No other run is waited for, and no run is killed for being slow.
+- **Slow observers.** An observer with 4 runs still going misses events, with one notice.
+- **No power.** What an observer writes is the user's doing: a trust file it changes ends the turn (`error changed`)
+  as any other change does, `call_start`'s included, since henki checks after it. Observer notices are journaled as
+  `notice` records and are never events.
+- **The session end.** After `close`, the runs still going get 300 ms; then henki kills each one's process group and
+  session. An observer must not leave processes behind: one it leaves counts among the background processes of
+  earlier calls in notices, and on Linux goes in the next stop's sweep or the session end's.
 
 ## module/1
 
@@ -344,12 +478,13 @@ needs = ["git"]                  # optional; looked for on PATH, never installed
 shadow = ["halti/pbpaste"]       # optional; the NAME/COMMAND entries the user must add to the config's shadow
 caps_net = "none"                # optional: none | loopback | any (declared, NOT enforced)
 maintainer = "..."               # optional
-ports = []                       # reserved for port bindings; must be empty in this version
+ports = ["history"]              # optional; exactly the programs in port/ (port/1), each a port henki can bind
 ```
 
-A module without a manifest is unmanaged (allowed for path and URL installs, and listed as such). The directories
-`cmd/`, `ctx/`, `on/` and `port/` are reserved for later layouts: henki-mods refuses them unless `requires` names a
-henki that has them (`needs henki >= X`).
+A module without a manifest is unmanaged (allowed for path and URL installs, and listed as such). `port/PORT` is a
+program its owner can run (a file, or a link inside the module), PORT one that henki binds (`history` or `policy`).
+`cmd/` and `eval/` are ext/2's (`eval/` holds eval/1 tasks), `on/` observe/1's; `.henki/template` may hold a program
+that `cmd/` links run. The directory `ctx/` is reserved for a later layout: henki-mods refuses it.
 
 A git source (`URL[@REF][#SUBDIR]`) is cloned only over `https`, `http`, `ssh`, `git` or `file` URLs, or scp's
 `USER@HOST:PATH`; a remote helper (`ext::`, `fd::`, any other `SCHEME::` or unknown `SCHEME://`) is refused before
@@ -370,8 +505,25 @@ lock/1 NAME STATE VERSION SOURCE_KIND SOURCE COMMIT HD1 ADDED HOW MASK
 - STATE `on` or `off`; SOURCE_KIND `official`, `path` or `url`; SOURCE the module's name (official), the path, or
   `URL` or `URL#SUBDIR`; COMMIT 40 hex digits or `-`; HD1 the module's `hd1:` hash; ADDED the UTC time,
   `YYYY-MM-DDTHH:MMZ`; HOW `tty` (answered on the terminal) or `yes` (`--yes`); MASK empty in this version.
-- A line whose first field is not `lock/1` is refused: `this lock is newer than this henki-mods; upgrade henki`.
+- A line whose first field is not `lock/1` (or `bind/1`, after them) is refused: `this lock is newer than this
+  henki-mods; upgrade henki`.
 - On means the link `CONFIG_DIR/ext/NAME` points at the module's store copy; off means no link.
+
+## bind/1
+
+Owned by henki-mods. After the lock/1 lines, `mods.lock` holds one line per port bound to a module, sorted by port:
+
+```
+bind/1 PORT NAME ID ADDED HOW
+```
+
+- NAME is the module, ID the first 12 hex digits of its store copy's name (its commit, else its hd1), ADDED and HOW
+  as in lock/1. The binding is the link `CONFIG_DIR/port/PORT` -> `DATA/henki/mods/NAME/ID/port/PORT`, which
+  `henki-mods swap PORT NAME` writes (after the conformance suite passes and the user says yes) and `swap PORT std`
+  removes. henki reads the link only, never this line.
+- `henki-mods rm NAME` is refused while a link in `CONFIG_DIR/port/` leads into NAME's store copies. A henki-mods that
+  does not know `bind/1` refuses the lock, so it never drops a binding it cannot see; one that knows it refuses a line
+  for a port it does not bind the same way (`this lock is newer than this henki-mods`).
 
 ## hd1
 
@@ -382,3 +534,176 @@ symbolic link, `MODE SHA256 PATH\n`, sorted bytewise (`LC_ALL=C`) by PATH:
   target string; PATH is relative to the module root, with `/`.
 - Directories are not listed. `.git` is left out. A link whose target is absolute, leaves the module, or goes through
   another link (a link as any name of the target but the last) is refused when the module is added.
+
+## port/1
+
+A port is a part without which there is no agent: `model`, `history`, `context`, `exec`, `policy`, `frontend`. Each
+has one binding: the std one built into henki, or a program that `CONFIG_DIR/port/PORT` links to. This henki binds
+`history` and `policy` that way; `--port PORT=std` (repeatable, all six names) runs a session on std whatever the links say.
+
+- **The link.** henki reads `CONFIG_DIR/port/` at start: names starting with `.` are skipped; any other name must be a
+  port this henki binds, and a link to a regular file its owner can run (or that file itself, which the manager never
+  writes), that file and its directory owned by the user (or the file by root) and not group- or world-writable.
+  Anything else stops the start (`error config`) with the fix `henki mods swap PORT std, or start with --port
+  PORT=std`. The directory, the link and the program are trust files, and the program is protected from the model's
+  write and edit tools. The binding's name in notices and records is `NAME ID` for a program at
+  `.../mods/NAME/ID/port/PORT`, else its path.
+- **The process.** Once per session, before the first record, henki runs the program with no arguments in the session's
+  working directory, in a session and process group of its own, without a terminal. Its environment is the tool
+  environment without the extensions' `bin/` (the allowlist and `pass_env`, `HENKI_DEPTH` one deeper, `HENKI_SESSION`
+  empty, no API key). Its stderr goes to henki's kernel log, `STATE/spill/.kernel-PID.log` (0600, removed with the
+  spill files after 24 hours). It must exit when its stdin closes, and leave no process behind: at the session's end
+  henki sends `bye`, waits 300 ms for the answer, then kills the process group and, on Linux, every process of the
+  binding's session. The working directory and the state dir go to it as JSON strings: when either path is not
+  UTF-8, which JSON cannot hold, the start stops (`error config`, naming the binding and the path).
+- **Lines.** UTF-8 JSON, one object per line, `\n` after it, at most 16 MiB each way. henki writes canonical lines
+  (compact, keys sorted, invisible code points escaped). A request is `{"id":N,"method":M,"params":P}`, ids from 0, one
+  at a time. An answer is `{"id":N,"result":R}` or `{"error":{"code":C,"message":S},"id":N}`. A line with another id
+  (or a second answer to one) is dropped as henki reads it, while it waits and between calls; a line without `id` (or
+  with `"id":null`) is a notification, which this version reads and skips. More than 256 MiB of such lines between two
+  answers is a broken line (the dead rule).
+- **hello**, the first request: params `henki` (its version), `port`, `protocol` (`[1]`), `versions` (the port's
+  method set majors henki offers, `[1]`), `scope` (the session's working directory) and `state`
+  (`STATE/port/PORT/`, 0700, the binding's own dir). The answer: `{"caps":[...],"impl":V,"name":N,"protocol":1,
+  "version":1}`, `name` and `impl` 1 to 64 bytes without spaces or invisible characters, at most 16 `caps`; or error
+  `version`. `NAME IMPL` is shown in parentheses in the binding notice.
+- **Codes** a binding may send: `invalid`, `unsupported` (a method it does not know), `io`, `not_found`, `busy`,
+  `exists`, `tampered`, `corrupt`, `version`; anything else arrives as `other`. henki adds `timeout`, `crashed`,
+  `protocol`, `interrupted` (a signal) and `budget` (the session's time ran out).
+- **Timeouts.** `hello` 5 s, `create` 2 s, `open` 5 s, `read` 10 s per page, `list` 5 s, `append` 2 s, `discard` 2 s,
+  `decide` 5 s, `record` 2 s, `bye` 300 ms. A signal or the session deadline ends a wait for `hello`, `create`, `open`,
+  `read`, `list` or `decide` within 50 ms, never one for a method that changes state.
+- **The dead rule.** A timeout, a closed stdout, a line over the cap or cut at EOF, a non-object line, or an answer
+  with both or neither of `result` and `error`, or 256 MiB of lines no request asked for, kills the binding for the
+  rest of the session: every later call fails at once. An error answer is one failed call; the binding lives on.
+- **Visibility.** A bound port is a notice at start (`history: NAME ID (port/1, N V); henki --port history=std runs a
+  session without it`), and the journal's `session` record names it in `ports` (`{"history":"NAME ID"}`).
+- **`henki port PORT [--offer V]... -- PROGRAM`** (not in the usage text): no config read, the same environment, the
+  state dir `STATE/port/PORT/`, the working directory as scope. It prints the hello result as `{"result":{"caps":[...],
+  "name":"N V"}}` (or the error, then exit 2), then for each request line on stdin, `{"method":M,"params":P}`, one
+  canonical answer line, `{"result":R}` or `{"error":{"code":C,"message":S}}`. `{"kill":true}` kills the binding
+  without `bye` and ends it. The conformance suites run through it.
+
+## history/1
+
+The history port over port/1: where sessions are kept. Records are journal/1 objects; a binding keeps them as given
+(it may add fields named `x-*`). henki sends them as the std binding gets them, before std fills the fields of its own
+file: `close` without `bytes`, and a resumed `session` with `resumed` `{}` (journal/1 marks both). A store exported
+to std goes through std's `append`, which fills them; a binding's file copied into std's sessions dir is no journal/1
+file and is refused. Session ids follow journal/1's rule for any id henki makes, and any id is 1 to 64 of
+`A-Z a-z 0-9 . _ -`, not starting with `.` or `-`. A session is held by one binding process at a time, from `create`
+or `open` until another `create` or `open`, `bye`, or the process's end (a kill included).
+
+| Method | Params | Result | Errors |
+|---|---|---|---|
+| `create` | `scope`, `hint` (an id or null) | `{"session":ID}`, held; a `hint` that is not null is the id | `invalid`, `exists` (the hint is taken), `io` |
+| `open` | `scope`, `session` (an id, looked up in every scope, or null: the newest session of `scope` nothing holds) | `{"session":ID}`, held; the id asked | `not_found`, `busy`, `corrupt`, `io` |
+| `read` | `session`, `from` (a record index) | `{"records":[...],"next"?:N,"notices"?:[...]}`; `next` (the count so far) asks for another page | `not_found`, `tampered`, `corrupt`, `io` |
+| `append` | `session` (held), `record` | `null`, once the record is durable (it survives a kill of the binding and of henki) | `not_found`, `invalid`, `tampered`, `io` |
+| `discard` | `session` (held) | `{"removed":B}`: a session this process created that has no `user` record is removed | `not_found` |
+| `list` | `scope` | `{"sessions":[{"session":ID,"updated":SECONDS},...]}`, newest first | `io` |
+| `bye` | `{}` | `null`, then exit | |
+
+henki checks every answer as it checks its own journal: the id rule, `read` records are objects with a string `t`,
+`next` grows and equals the count so far, at most 256 MiB over all pages; then the replay, the repairs (appended) and
+the pairing of calls and results at start. A history failure in a session ends the turn `error journal` (exit 2) with
+the fix `henki --port history=std for this session, or henki mods swap history std`; henki never falls back to std in
+a session. `list` is for tools (henki-mods, an import); henki itself does not call it. The cap `fork` is reserved.
+
+## policy/1
+
+The policy port over port/1: who may run a call. henki asks it about every call that passed henki's own checks (the
+call's arguments, its target, the tripwire) and before the call runs.
+
+| Method | Params | Result |
+|---|---|---|
+| `decide` | `call` (`args`, `id`, `name`), `cwd`, `root` (the project root), `session`, `target` (a file tool's: `outside`, `path` as resolved, `protected`, `shown`; null for a shell call; a call whose resolved path is not UTF-8 is asked without `decide`) | `{"decision":"allow","reason"?:S}`, `{"decision":"ask","always"?:B}` or `{"decision":"deny","reason":S}` |
+| `record` (cap `record`) | `call`, `verdict` (`always`) | `null` or `{"shown":S}`, once it is kept |
+| `bye` | `{}` | `null`, then exit |
+
+- **allow** runs the call and shows `HEAD  (allowed by policy NAME ID: REASON)`; the `approval` record has verdict
+  `policy` and `by`. **deny** does not run it: its result is `denied by policy NAME ID: REASON`, journaled with verdict
+  `deny` and that `reason`, and it counts for the stuck rule. **ask** asks the user in the REPL, and ends `henki run`'s
+  turn `needs_approval`. `always` is offered only when the binding has cap `record` and asked with `always: true`, for a
+  shell call while no earlier process still runs; the user's `always` then calls `record`. A `reason` is shown escaped
+  and cut at 200 characters.
+- **henki's floor**, which no binding changes. A write or edit under a protected path is refused before `decide`. An
+  allow is asked instead, with the notice `asked: the call touches henki's own files`, when the call's target is
+  protected (the config file and dir, AGENTS.md, the state and data dirs, the module paths, the port links and their
+  programs), a read too, except the files henki points the model at (a module's `doc.md`, this session's spill files),
+  or when a shell command's text names a protected path, absolute or with `~/`. That text match is a seatbelt only: a
+  command can name a path in ways no match sees, as with `approve = "auto"`; the tripwire stays the floor for the
+  trust files.
+- **Failure asks.** A binding that does not start or answer `hello` stops the start. In a session a timeout, an exit,
+  a broken line or a decision that is none of the three asks, with one notice naming the binding and ending `every
+  call is asked`; the binding is then dead for the session and every later call is asked at once. An error answer asks
+  that call only, with a notice ending `this call is asked`; the binding lives on and decides the next call. A signal
+  or the session deadline ends a `decide` within 50 ms and the turn with it.
+- **Std.** `approve = "auto"` is a mode of the std policy: henki refuses to start with it while a policy binding is
+  linked (`error config`). While one is linked henki reads no allow rules; `--port policy=std` runs a session on std.
+
+## conform/1
+
+A conformance suite is a file of steps, `PORT.tsv`, shipped with henki-mods (`manager/conform/` in the repository),
+and `henki-mods test --port PORT NAME|/PROGRAM` runs it through `henki port`. One step per line, TAB-separated,
+`#` comments:
+
+```
+NAME INST REQUEST EXPECT [SAVE]
+```
+
+- INST is `a` or `b`, an instance (`henki port PORT -- PROGRAM`, started on first use), `a!` (kill instance a without
+  `bye`; the next `a` step starts a fresh one; its REQUEST and EXPECT are `-`), or `+V` (a fresh instance offering
+  version V).
+- REQUEST is `hello` (the instance's first line) or `{"method":M,"params":P}`. `@NAME@` is a saved value; `@SCOPE@` and
+  `@SCOPE2@` are two empty directories, `@BIG@` 1 MiB of text.
+- EXPECT is the canonical answer line, where `*` is any text and `@(A|B)` is A or B; every other character stands for
+  itself. SAVE is `NAME=KEY`: the first string value of `"KEY"` in the answer.
+- A step named with a trailing lowercase letter prepares a check and counts only when it fails. After the steps, each
+  `henki port` must end within 1 s of its stdin closing, and the program run alone must exit within 1 s of EOF on its
+  stdin. henki's own tests run the history file against the std binding through its trait: std speaks no protocol,
+  so the hello, version and kill steps are skipped, and the test itself answers `list`, `read`'s `from` (std reads
+  whole sessions) and an unknown method (`unsupported`).
+
+
+## eval/1
+
+Owned by henki-mods; henki never reads it. A module's `eval/` holds tasks that show what it does for a model, and the
+general suite (`share/henki/eval/general/` in a release, `eval/general/` in the repository) holds everyday shell tasks,
+run to show that a module costs a model nothing on tasks it is not for. Each task is a directory, named as a module is:
+
+```
+TASK/prompt.txt          required: the task, 1 to 4 KiB of UTF-8 without a code point henki escapes
+TASK/setup               required: a program that makes the task's files in an empty work dir
+TASK/check               required: a program; exit 0 is a pass
+TASK/fake-bin/CMD        optional: programs first on PATH in the run (a tool the task's machine lacks, or must not run)
+TASK/task.toml           optional, module/1's grammar: max_steps (1 to 10000), max_seconds (1 to 9999; default 120)
+```
+
+Dot files are ignored anywhere, and so are `README*` and `LICENSE*` next to the tasks; anything else is refused.
+`henki-mods eval --check DIR` checks this layout and runs nothing; `add` and `verify --dir` check a module's `eval/`.
+
+- **A run.** `setup` runs in a new empty work dir with `EVAL_DIR` (the task's directory) and stdin empty; a setup that
+  fails stops the eval. Then, in that dir, `henki run --json --approve auto --config ARM/config.toml [--model M]
+  --max-seconds S [--max-steps N] -` with prompt.txt on stdin, `fake-bin/` first on PATH and `XDG_STATE_HOME` the
+  arm's. Then `check` runs in the same dir with `EVAL_DIR`, and on stdin the `text` of henki's `result` record
+  (json/1), byte for byte, with no newline added. Its exit status is the result; what it prints is not kept.
+- **The arms.** The module on and the module off, each a config dir of its own: the user's `config.toml` without its
+  `ext` key, the user's `AGENTS.md` with the mods cards block holding only the module's card (on) or none (off), the
+  link `ext/NAME` to the module (on) or no module (off), no allow file and no port link. In each repeat every task
+  runs once per arm, the arms taking turns going first. 3 repeats; when the arms' passes then differ by at most one,
+  10 more; `--repeats N` runs exactly N.
+- **The record.** Per arm one line, printed and appended to `$XDG_STATE_HOME/henki/eval.tsv` (else
+  `~/.local/state/henki/eval.tsv`), fields separated by tabs:
+
+```
+eval/1 PKG VERSION HD1 MODEL SUITE ARM PASSES RUNS SECONDS
+```
+
+  PKG is the module's name, VERSION its manifest's (`-` without one), HD1 its tree hash, MODEL `--model`, else
+  `HENKI_MODEL`, else the config's `model` (`-` with none), SUITE the module's name (its own tasks), `general`, another
+  module's name or a suite's path, ARM `on` or `off`, PASSES and RUNS counts, SECONDS the sum of the runs'
+  `duration_s`.
+- **The general suite** uses POSIX tools and git only, no network, and every check is deterministic.
+- eval runs a module's `setup` and `check` as the user, and henki with `approve = "auto"`, so it shows what it will run
+  and asks first (`--yes` once the screen was read); it refuses to run inside henki (`HENKI_DEPTH` set).

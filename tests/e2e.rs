@@ -9,6 +9,8 @@ mod allow;
 mod anthropic;
 #[path = "e2e/ext.rs"]
 mod ext;
+#[path = "e2e/handoff.rs"]
+mod handoff;
 #[path = "e2e/harness.rs"]
 mod harness;
 #[path = "e2e/inert.rs"]
@@ -17,8 +19,14 @@ mod inert;
 mod input;
 #[path = "e2e/journal.rs"]
 mod journal;
+#[path = "e2e/observe.rs"]
+mod observe;
 #[path = "e2e/outcomes.rs"]
 mod outcomes;
+#[path = "e2e/policy.rs"]
+mod policy;
+#[path = "e2e/ports.rs"]
+mod ports;
 #[path = "e2e/processes.rs"]
 mod processes;
 #[path = "e2e/prompt.rs"]

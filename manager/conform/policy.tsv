@@ -1,0 +1,15 @@
+# conform/1: the policy/1 suite (CONTRACTS.md), in the format of history.tsv (see there). The checks hold a binding to
+# the protocol only: every view gets one of allow, ask and deny, whatever the call; what it decides is its own, since
+# henki's floor (protected paths, the tripwire, the failure rule) does not depend on it.
+Q01	a	hello	{"result":{"caps":[*],"name":"* *"}}
+Q02	+99	hello	{"error":{"code":"version",*
+Q03	a	{"method":"x-none","params":{}}	{"error":{"code":"unsupported",*
+Q04	a	{"method":"decide","params":{"call":{"args":{"command":"ls -l"},"id":"h1","name":"shell"},"cwd":"@SCOPE@","root":"@SCOPE@","session":"conform-1","target":null}}	{"result":{*"decision":"@(allow|ask|deny)"*}}
+Q05	a	{"method":"decide","params":{"call":{"args":{"path":"a.txt"},"id":"h2","name":"read"},"cwd":"@SCOPE@","root":"@SCOPE@","session":"conform-1","target":{"outside":false,"path":"@SCOPE@/a.txt","protected":false,"shown":"a.txt"}}}	{"result":{*"decision":"@(allow|ask|deny)"*}}
+Q06	a	{"method":"decide","params":{"call":{"args":{"content":"b\n","path":"b.txt"},"id":"h3","name":"write"},"cwd":"@SCOPE@","root":"@SCOPE@","session":"conform-1","target":{"outside":false,"path":"@SCOPE@/b.txt","protected":false,"shown":"b.txt"}}}	{"result":{*"decision":"@(allow|ask|deny)"*}}
+Q07	a	{"method":"decide","params":{"call":{"args":{"new":"y","old":"x","path":"a.txt"},"id":"h4","name":"edit"},"cwd":"@SCOPE@","root":"@SCOPE@","session":"conform-1","target":{"outside":false,"path":"@SCOPE@/a.txt","protected":false,"shown":"a.txt"}}}	{"result":{*"decision":"@(allow|ask|deny)"*}}
+Q08	a	{"method":"decide","params":{"call":{"args":{"command":"rm -rf ~"},"id":"h5","name":"shell"},"cwd":"@SCOPE@","root":"@SCOPE@","session":"conform-1","target":null}}	{"result":{@(*"decision":"a*|"decision":"deny","reason":"*)}}
+Q09	a	{"method":"decide","params":{"call":{"args":{"command":"echo @BIG@"},"id":"h6","name":"shell"},"cwd":"@SCOPE@","root":"@SCOPE@","session":"conform-1","target":null}}	{"result":{*"decision":"@(allow|ask|deny)"*}}
+Q10	a	{"method":"decide","params":{"call":{"args":{"x":1},"id":"h7","name":"x-future"},"cwd":"@SCOPE@","root":"@SCOPE@","session":"conform-1","target":null}}	{"result":{*"decision":"@(allow|ask|deny)"*}}
+Q11	a	{"method":"decide","params":{"call":{"args":{"command":"ls"},"id":"h8","name":"shell","x-later":1},"cwd":"@SCOPE@","root":"@SCOPE@","session":"conform-1","target":null,"x-later":{"y":[1]}}}	{"result":{*"decision":"@(allow|ask|deny)"*}}
+Q12	a	{"method":"record","params":{"call":{"args":{"command":"ls -l"},"id":"h1","name":"shell"},"verdict":"always"}}	@({"result":null}|{"result":{"shown":"*"}}|{"error":{"code":"unsupported",*)

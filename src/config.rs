@@ -1,7 +1,7 @@
 //! The configuration: one TOML-subset file, two environment variables and the flags, checked so that anything wrong
 //! stops henki with the file, the line and the fix; then what it names: the extensions, the allow rules, and the files
 //! henki protects from the model and watches for changes.
-use crate::{allow, ext, http, sys, term, types::TOOLS, types::Url};
+use crate::{allow, ext, http, port, sys, term, types::TOOLS, types::Url};
 use serde_json::Value;
 use std::path::{Component, Path, PathBuf};
 use std::{ffi::OsStr, ffi::OsString, fs, io::Read, net::Ipv6Addr, os::unix::fs::MetadataExt};
@@ -28,6 +28,8 @@ pub struct Flags {
     pub model: Option<String>,
     pub max_steps: Option<u32>,
     pub max_seconds: Option<u64>,
+    /// `--port NAME=std`: the names, each run on std whatever `CONFIG/port/` links.
+    pub ports: Vec<String>,
 }
 
 #[derive(Default)]
@@ -63,15 +65,19 @@ pub struct Config {
     pub agents: Option<String>, // <config dir>/AGENTS.md, trailing newlines trimmed
     pub agents_hash: Option<String>,
     pub allow: allow::Allow,     // <config dir>/allow, read only in ask mode
-    pub protected: Vec<PathBuf>, // the config file and dir, AGENTS.md, the state dir, the ext paths and the link targets in them; each also as its realpath
+    pub protected: Vec<PathBuf>, // the config file and dir, AGENTS.md, the state and data dirs, the ext paths and the link targets in them; each also as its realpath
     pub trust: Vec<PathBuf>,     // what the tripwire stamps, absent files included
     /// The stamps of `trust` as `load` found them: what the tripwire compares with.
     pub snap: Vec<(PathBuf, (sys::Stamp, sys::Stamp))>,
     pub notices: Vec<String>,
+    /// The port bindings `CONFIG/port/` links (`port::links`): (port, the program's realpath, its display name).
+    pub links: Vec<(&'static str, PathBuf, String)>,
 }
 
 /// The HENKI_* variables henki reads or sets for its children; any other gives a notice.
-const KNOWN: [&str; 6] = ["HENKI_MODEL", "HENKI_BASE_URL", "HENKI_DEPTH", "HENKI_SESSION", "HENKI_USER_PATH", "HENKI_VERSION"];
+#[rustfmt::skip]
+const KNOWN: [&str; 12] = ["HENKI_MODEL", "HENKI_BASE_URL", "HENKI_DEPTH", "HENKI_SESSION", "HENKI_USER_PATH", "HENKI_VERSION", "HENKI_CONFIG", "HENKI_BIN",
+    "HENKI_STATE", "HENKI_MODULE", "HENKI_NEXT", "HENKI_EVENT"];
 const KEYS: &str = "model, base_url, dialect, api_key, approve, tools, ext, shadow, pass_env, max_steps, max_seconds, tool_timeout_s, output_cap, context_window, max_tokens";
 /// The integer keys and their ranges; `context_window` also takes 0 (unknown).
 #[rustfmt::skip]
@@ -155,9 +161,11 @@ pub fn load(f: &Flags, env: &Env, cwd: &Path) -> Result<Config, String> {
     if let Some((at, ..)) = at("api_key").filter(|_| !c.api_key.is_empty() && !http::loopback_literal(&c.url.host)) {
         return Err(format!("{at}: api_key is sent only to a loopback host, not to {}; fix: remove api_key or use a loopback base_url", c.url.host));
     }
+    let remote = format!("requests leave this machine: prompts, files and command output go to {}, unencrypted", c.url.host);
+    c.notices.extend((!http::loopback_literal(&c.url.host)).then_some(remote));
     let unknown = env.0.iter().filter_map(|(k, _)| k.to_str()).filter(|k| k.starts_with("HENKI_") && !KNOWN.contains(k));
     c.notices.extend(unknown.map(|k| format!("ignoring {k}: henki does not read it")));
-    c.state = env.get("XDG_STATE_HOME").map(Path::new).filter(|p| p.is_absolute()).map_or_else(|| home.join(".local/state"), Path::to_path_buf).join("henki");
+    c.state = xdg(env, &home, "XDG_STATE_HOME", ".local/state");
     let listed = at("ext");
     let paths = listed.map_or_else(|| vec![c.dir.join("ext")], |l| l.2.as_array().into_iter().flatten().filter_map(Value::as_str).map(|p| expand(p, &home)).collect());
     let from = listed.map(|l| l.0.clone()).or_else(|| c.file.as_ref().map(|f| f.display().to_string()));
@@ -173,22 +181,23 @@ pub fn load(f: &Flags, env: &Env, cwd: &Path) -> Result<Config, String> {
     let found = ext::discover(&paths, listed.is_none() && !explicit, &c.shadow, env.get("PATH").unwrap_or_default()).map_err(at_ext)?;
     (c.exts, c.user_path) = (found.exts, found.user_path);
     // Looked up on the user PATH, so no extension's bin/ supplies the shell henki runs.
-    let exe = |b: &PathBuf| fs::metadata(b).is_ok_and(|m| m.is_file() && m.mode() & 0o111 != 0);
-    let dirs = std::env::split_paths(&c.user_path).filter(|d| d.is_absolute());
-    c.bash = dirs.map(|d| d.join("bash")).find(exe).ok_or("bash is not on PATH; fix: install bash, or add its directory to PATH")?;
+    c.bash = which("bash", Some(c.user_path.as_ref()), false).ok_or("bash is not on PATH; fix: install bash, or add its directory to PATH")?;
     let agents = c.dir.join("AGENTS.md");
     if agents.exists() {
-        let text = read(&agents, 4 << 10)?;
-        if let Some((i, ch)) = text.split('\n').enumerate().find_map(|(i, l)| Some((i, l.chars().find(|&ch| term::escaped(ch))?))) {
-            return Err(format!("{}:{}: holds U+{:04X}, which a terminal does not show; fix: remove it", agents.display(), i + 1, ch as u32));
-        }
+        let text = text(&agents, 4 << 10)?;
         (c.agents_hash, c.agents) = (Some(sys::fnv(text.as_bytes())), Some(text.trim_end_matches('\n').to_string()).filter(|a| !a.is_empty()));
     }
+    c.links = port::links(&c.dir, &f.ports, &home)?;
+    // A policy binding decides every call: `auto` is a mode of the std policy, and the std rules are not read.
+    let std = !c.links.iter().any(|l| l.0 == "policy");
+    if c.auto && !std {
+        return Err(format!("{}: approve = auto with a policy binding; fix: set approve = \"ask\", or start with --port policy=std", c.approve_from));
+    }
     let allow = c.dir.join("allow");
-    if !c.auto && allow.exists() && inside(&allow) {
+    if !c.auto && std && allow.exists() && inside(&allow) {
         return Err(format!("{} is inside the project {} or named through it; fix: use a config dir outside the project", allow.display(), root.display()));
     }
-    c.allow = allow::load(&allow, !c.auto)?;
+    c.allow = allow::load(&allow, !c.auto && std)?;
     let n = c.allow.rules.iter().filter(|r| allow::applies(r, &root)).count() as u64;
     if n > 0 {
         c.notices.push(format!("allow: {} rules apply to this root ({}; /allow lists them)", term::num(n), allow::shown(&allow, &home)));
@@ -197,15 +206,31 @@ pub fn load(f: &Flags, env: &Env, cwd: &Path) -> Result<Config, String> {
         c.window = 32_768;
         c.notices.push("context_window is unknown; using 32,768 tokens".into());
     }
-    let own = c.file.iter().chain([&c.dir, &agents, &c.state]).chain(&paths).chain(c.exts.iter().flat_map(|e| &e.targets));
-    c.protected = own.flat_map(|p| [Some(p.clone()), fs::canonicalize(p).ok().filter(|r| r != p)]).flatten().collect();
-    // Absent files too: creating one is a change.
+    // The data dir holds the module store, which the ext links point into.
+    let data = xdg(env, &home, "XDG_DATA_HOME", ".local/share");
+    let own = c.file.iter().chain([&c.dir, &agents, &c.state, &data]).chain(&paths).chain(c.exts.iter().flat_map(|e| &e.targets));
+    c.protected = own.chain(c.links.iter().map(|l| &l.1)).flat_map(|p| [Some(p.clone()), fs::canonicalize(p).ok().filter(|r| r != p)]).flatten().collect();
+    // Absent files too: creating one is a change. A swap mid-session changes `port/` and a link.
     let exts = paths.into_iter().chain(c.exts.iter().flat_map(|e| e.paths.iter().cloned()));
-    c.trust = [file, allow, agents, c.bash.clone()].into_iter().chain(exts).collect();
+    let ports = [c.dir.join("port")].into_iter().chain(port::LINKED.map(|p| c.dir.join("port").join(p)));
+    c.trust = [file, allow, agents, c.bash.clone()].into_iter().chain(exts).chain(ports).collect();
     // Taken here, before startup waits for anything (a task on stdin, the journal), so that no change made meanwhile is
     // taken for the state henki read.
     c.snap = c.trust.iter().map(|p| (p.clone(), sys::stamp(p))).collect();
     Ok(c)
+}
+
+/// `$XDG_..._HOME/henki` when that is absolute, else `HOME/DEFAULT/henki`.
+pub fn xdg(env: &Env, home: &Path, var: &str, default: &str) -> PathBuf {
+    env.get(var).map(Path::new).filter(|p| p.is_absolute()).map_or_else(|| home.join(default), Path::to_path_buf).join("henki")
+}
+
+/// `name` next to henki's realpath when `near` (the release tarball's bin/), else the first executable `name` in the
+/// absolute dirs of `path`.
+pub fn which(name: &str, path: Option<&OsStr>, near: bool) -> Option<PathBuf> {
+    let here = near.then(|| std::env::current_exe().and_then(fs::canonicalize).ok()).flatten().map(|e| e.with_file_name(name));
+    let dirs = std::env::split_paths(path.unwrap_or_default()).filter(|d| d.is_absolute()).map(|d| d.join(name));
+    here.into_iter().chain(dirs).find(|b| fs::metadata(b).is_ok_and(|m| m.is_file() && m.mode() & 0o111 != 0))
 }
 
 /// One key into `c`. Err: "PROBLEM; fix: ...".
@@ -287,9 +312,19 @@ fn read(path: &Path, max: u64) -> Result<String, String> {
     String::from_utf8(b).map_err(|_| format!("{}: not UTF-8; fix: save it as UTF-8", path.display()))
 }
 
+/// `read`, then no code point a terminal does not show, which would steer the model unseen: AGENTS.md, and a module's
+/// doc.md and cmd/*.md.
+pub fn text(path: &Path, max: u64) -> Result<String, String> {
+    let text = read(path, max)?;
+    if let Some((i, ch)) = text.split('\n').enumerate().find_map(|(i, l)| Some((i, l.chars().find(|&ch| term::escaped(ch))?))) {
+        return Err(format!("{}:{}: holds U+{:04X}, which a terminal does not show; fix: remove it", path.display(), i + 1, ch as u32));
+    }
+    Ok(text)
+}
+
 /// The config file (`dir` false) may be owned by the euid or root, its directory only by the euid; neither may be
 /// group- or world-writable. Pure, so a test can give it another owner.
-fn owner_mode(path: &Path, mode: u32, uid: u32, euid: u32, dir: bool) -> Result<(), String> {
+pub fn owner_mode(path: &Path, mode: u32, uid: u32, euid: u32, dir: bool) -> Result<(), String> {
     let p = path.display();
     if uid != euid && (dir || uid != 0) {
         Err(format!("{p} is owned by uid {uid}, not by you (uid {euid}); fix: use a {} you own", if dir { "directory" } else { "file" }))

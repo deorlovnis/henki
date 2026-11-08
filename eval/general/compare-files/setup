@@ -1,0 +1,4 @@
+#!/bin/sh
+# Twelve lines, the same but line 7.
+awk 'BEGIN { for (i = 1; i <= 12; i++) print (i == 7 ? "color = teal" : "setting " i " = on") }' >old.txt
+awk 'BEGIN { for (i = 1; i <= 12; i++) print (i == 7 ? "color = navy" : "setting " i " = on") }' >new.txt

@@ -1,0 +1,7 @@
+#!/bin/sh
+# count-words runs and counts the words of files it has not seen: tabs, blank lines, an empty file, a name with a space.
+cat >/dev/null
+[ -x count-words ] || exit 1
+n() { ./count-words "$1" 2>/dev/null | tr -d ' \t\n'; }
+printf 'alpha beta\n\n  gamma\tdelta  epsilon\n' >.t1 && : >.t2 && printf 'a b c' >'.t 3'
+[ "$(n .t1)" = 5 ] && [ "$(n .t2)" = 0 ] && [ "$(n '.t 3')" = 3 ]

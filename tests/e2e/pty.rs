@@ -212,6 +212,12 @@ impl<'a> Pty<'a> {
         self.child.id() as i32
     }
 
+    /// The journals as they are now are the ones `wait` compares with: after a hand-off started another henki in this
+    /// process, the session that follows is the one checked.
+    pub fn renew(&mut self, r: &Run) {
+        self.before = r.sizes();
+    }
+
     /// The exit within `within` (a timeout kills henki and fails the test), then the screen until the terminal
     /// closes (at most 1 s more). `stdout` is the screen with the reset and "\r" of "\r\n" taken out.
     pub fn wait(mut self, within: Duration) -> Done {

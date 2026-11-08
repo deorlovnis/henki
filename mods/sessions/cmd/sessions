@@ -1,0 +1,51 @@
+#!/bin/sh
+# /sessions, and through links to this file /resume, /new and /reload (handoff/1). The sessions are henki's std
+# journals in this session's scope: the dir that holds $HENKI_STATE/sessions/*/$HENKI_SESSION.jsonl.
+LC_ALL=C
+export LC_ALL
+me=${0##*/}
+next() { printf '%s\n' "$1" >"$HENKI_NEXT"; }
+case "$me" in
+  new) next new && exit 0 ;;
+  reload) next restart && exit 0 ;;
+esac
+dir=""
+for f in "$HENKI_STATE"/sessions/*/"$HENKI_SESSION".jsonl; do [ -f "$f" ] && dir=${f%/*}; done
+if [ -z "$dir" ]; then
+  echo "$me: history is bound to another store; use its commands" >&2
+  exit 1
+fi
+# The 20 newest, newest first; ids are [A-Za-z0-9._-], so ls's lines are names.
+newest() { (cd "$dir" && ls -t -- *.jsonl 2>/dev/null) | sed -n 's/\.jsonl$//p' | head -n 20; }
+case "$me" in
+  resume)
+    want=${1:-}
+    case "$want" in
+      '') id=$(newest | command grep -vxF -- "$HENKI_SESSION" | head -n 1) ;;
+      *[!0-9]*) id=$want ;;
+      *) id=$(newest | sed -n "${want}p") ;;
+    esac
+    if [ -z "$id" ] || [ ! -f "$dir/$id.jsonl" ]; then
+      echo "resume: no session ${want:-other than this one} in this folder; fix: /sessions lists them" >&2
+      exit 1
+    fi
+    next "resume $id"
+    exit 0
+    ;;
+esac
+# The first message: the first user record's content (canonical JSON, escapes kept, so nothing reaches the terminal
+# raw), without the head henki puts before a session's first task, cut at its first line and at 60 characters.
+first() {
+  sed -n 's/^{"msg":{"content":"\(.*\)","role":"user"},"t":"user".*/\1/p' "$1" | head -n 1 |
+    sed 's/^cwd: [^\\]*\\nos: [^\\]*\\ndate: [^\\]*\\n\\n//; s/\\n.*//; s/\\"/"/g; s/\\\\/\\/g' | cut -c 1-60
+}
+n=0
+newest | while IFS= read -r id; do
+  n=$((n + 1))
+  f="$dir/$id.jsonl"
+  mark=" "
+  [ "$id" != "$HENKI_SESSION" ] || mark="*"
+  when=$(printf '%s\n' "$id" | sed -n 's/^\([0-9]\{4\}\)\([0-9]\{2\}\)\([0-9]\{2\}\)T\([0-9]\{2\}\)\([0-9]\{2\}\).*/\1-\2-\3 \4:\5/p')
+  size=$(wc -c <"$f" | tr -d ' ')
+  printf '%2d %s %-21s %-16s %9s B  %s\n' "$n" "$mark" "$id" "${when:--}" "$size" "$(first "$f")"
+done

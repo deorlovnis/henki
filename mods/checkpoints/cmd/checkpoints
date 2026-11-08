@@ -1,0 +1,238 @@
+#!/bin/sh
+# The checkpoints mod. As on/call_start.wait (observe/1, a link to this file): a snapshot of the work tree before each
+# write, edit and shell call, which henki waits for (up to 2 s) before the call runs. As /checkpoints, /undo and
+# /rewind (handoff/1; /undo and /rewind are links to this file): list the snapshots of this session, and put one back.
+#
+# In a git work tree a snapshot is a commit of every file git does not ignore, made through a temporary index (the work
+# tree, the real index and HEAD are never touched), kept as refs/henki/checkpoints/SESSION/N. Elsewhere the target of a
+# write or edit is copied to $HENKI_STATE/checkpoints/SESSION/N/ (or noted as absent); a shell call has no snapshot. So
+# is the target of a write or edit in a git work tree that the commit cannot hold: outside the work tree, in a repo
+# nested in it, or ignored there.
+LC_ALL=C
+export LC_ALL
+me=${0##*/}
+S=${HENKI_SESSION:-}
+case "$S" in '' | *[!A-Za-z0-9._-]* | [.-]*) echo "$me: no session (HENKI_SESSION); run it from henki" >&2 && exit 1 ;; esac
+top=$(git rev-parse --show-toplevel 2>/dev/null) || top=""
+refs="refs/henki/checkpoints/$S"
+kept="$HENKI_STATE/checkpoints/$S"
+die() {
+  echo "$me: $*" >&2
+  exit 1
+}
+
+# The repo's config can name programs git runs as it reads the work tree (core.fsmonitor, a filter driver's clean,
+# smudge or process command, in write-tree too) or updates a ref (a hook): a model's write to .git/config would have
+# them run unasked at the next snapshot, before henki's trust check. Every git call here turns them off, so a snapshot
+# holds the files' bytes as they are and a restore puts those bytes back. git -c splits at the first "=", so a driver
+# whose name holds one ([filter "a=b"]) cannot be turned off so: no git call runs in such a repo (`eq`).
+drivers=$(git config --name-only --get-regexp '^filter\..*\.(clean|smudge|process|required)$' 2>/dev/null)
+case "$drivers" in *=*) eq="the repo's config names a filter driver with \"=\" in its name, which this mod cannot turn off" ;; *) eq="" ;; esac
+g() {
+  while IFS= read -r k; do
+    [ -z "$k" ] || set -- -c "$k=" "$@"
+  done <<EOF
+$drivers
+EOF
+  git --no-pager -c core.fsmonitor=false -c core.hooksPath=/dev/null "$@"
+}
+
+# The work tree as a git tree object: every file git does not ignore, tracked or not, through a temporary index that
+# starts as a copy of the real one (so unchanged files are known by their stat data and not read again; the copy keeps
+# the index's mtime, by which git knows an entry whose file changed in the second the index was written). The ignore
+# rules are the work tree's of now: once an edit drops one, the files it hid are in the snapshots after it. A file or
+# directory git cannot read (mode 000, a root-owned volume, a nested repo with no commit) would fail the whole add, and
+# every snapshot after it, unseen: it is left out instead, and git's reasons follow the tree id, each after "; ".
+tree() {
+  t_dir=$(mktemp -d "${TMPDIR:-/tmp}/henki-checkpoint.XXXXXX") || return 1
+  t_real=$(g rev-parse --path-format=absolute --git-path index 2>/dev/null || g rev-parse --git-path index)
+  [ ! -f "$t_real" ] || cp -p "$t_real" "$t_dir/index"
+  t_id=$(cd "$top" && export GIT_INDEX_FILE="$t_dir/index" && { g add -A --ignore-errors 2>"$t_dir/err" || echo "error: git add failed" >>"$t_dir/err"; } && g write-tree)
+  t_rc=$?
+  cat "$t_dir/err" >&2
+  [ "$t_rc" != 0 ] || printf '%s%s\n' "$t_id" "$(sed -n -e 's/^error: /; /p' -e 's/^fatal: /; /p' -e 's/^warning: \(could not open\)/; \1/p' "$t_dir/err" | tr -d '\n')"
+  rm -rf "$t_dir"
+  return $t_rc
+}
+
+# A snapshot that failed or lacks files, as a line in $kept/missed: an observer's exit status and output reach only
+# henki's log, so /checkpoints, /undo and /rewind show these lines (`missed`).
+miss() {
+  mkdir -p "$kept" 2>/dev/null && printf '%s  %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$*" >>"$kept/missed"
+}
+missed() {
+  [ ! -s "$kept/missed" ] || { echo "calls with no checkpoint or a partial one:" && sed 's/^/  /' "$kept/missed"; }
+}
+
+# The snapshot numbers of this session, in order.
+numbers() {
+  if [ -n "$top" ]; then
+    g for-each-ref --format='%(refname)' "$refs/" | sed 's|.*/||'
+  else
+    ls "$kept" 2>/dev/null
+  fi | command grep -x '[0-9][0-9]*' | sort -n
+}
+
+snapshot() {
+  ev=$(cat)
+  # The call's name ends the call object, which the rule follows: the last match is the event's own.
+  name=$(printf '%s\n' "$ev" | sed -n 's/.*"name":"\([^"]*\)"},"rule":.*/\1/p')
+  case "$name" in write | edit | shell) ;; *) exit 0 ;; esac
+  path=$(printf '%s\n' "$ev" | sed -n 's/.*,"target":"\(.*\)","verdict":"[a-z]*"},"event":.*/\1/p')
+  no() {
+    miss "no checkpoint before $name${path:+ $path}: $*"
+    die "$*"
+  }
+  n=$(($(numbers | tail -n 1) + 1))
+  plain=$(case "$path" in '' | *\\*) ;; *) echo y ;; esac)
+  if [ -n "$top" ]; then
+    [ -z "$eq" ] || no "$eq"
+    t=$(tree) || no "cannot read the work tree"
+    why=""
+    case "$t" in *\;*) why=${t#*;} t=${t%%;*} ;; esac
+    head=$(g rev-parse -q --verify HEAD)
+    c=$(g -c user.name=henki -c user.email=henki@localhost -c commit.gpgsign=false commit-tree "$t" ${head:+-p "$head"} -m "before $name${path:+ $path}${why:+ (partial)}") ||
+      no "cannot make a commit"
+    # Another snapshot may have taken the number (a run that was not waited for): the next free one.
+    tries=0
+    until g update-ref "$refs/$n" "$c" "" 2>/dev/null; do
+      n=$((n + 1)) tries=$((tries + 1))
+      [ "$tries" -lt 100 ] || no "cannot keep the snapshot in $refs"
+    done
+    [ -z "$why" ] || miss "checkpoint $n, before $name${path:+ $path}, lacks what git could not read:${why#;}"
+    # A target with no plain path in the event (not UTF-8) cannot be told apart: the commit is all there is.
+    [ "$name" != shell ] && [ -n "$plain" ] && ! held || exit 0
+    rm -rf "${kept:?}/$n" && mkdir -p "$kept/$n" && keep || no "cannot copy $path, which the commit does not hold"
+    exit 0
+  fi
+  [ "$name" != shell ] || exit 0
+  [ -n "$plain" ] || no "cannot keep ${path:-the target}: no plain path in the event"
+  mkdir -p "$kept" || no "cannot make $kept"
+  until mkdir "$kept/$n" 2>/dev/null; do n=$((n + 1)); done
+  keep || no "cannot copy $path"
+}
+
+# Whether the commit holds the target $path: in the work tree, in no repo nested in it (the nearest directory that
+# exists has this top), and not ignored (a tracked file is held whatever the rules say).
+held() {
+  case "$path" in "$top"/*) ;; *) return 1 ;; esac
+  d=${path%/*}
+  while [ -n "$d" ] && [ ! -d "$d" ]; do d=${d%/*}; done
+  [ "$(g -C "${d:-/}" rev-parse --show-toplevel 2>/dev/null)" = "$top" ] && ! g -C "$top" check-ignore -q -- "$path"
+}
+
+# The target $path into $kept/$n: its path, then a copy, or a note that it is absent. A target that cannot be copied
+# leaves no snapshot that /undo would fail on.
+keep() {
+  printf '%s\n' "$path" >"$kept/$n/path" && if [ -f "$path" ]; then cp -p "$path" "$kept/$n/file"; else : >"$kept/$n/absent"; fi ||
+    { rm -rf "${kept:?}/$n" && return 1; }
+}
+
+# The snapshots from N on that keep a target, newest first: putting each back in turn leaves every target as it was
+# before call N, the oldest copy of a target last.
+targets() {
+  ls "$kept" 2>/dev/null | command grep -x '[0-9][0-9]*' | sort -rn | while read -r m; do
+    [ "$m" -lt "$1" ] || [ ! -f "$kept/$m/path" ] || echo "$m"
+  done
+}
+
+# What put_back will do, oldest first; control characters shown as ?.
+listed() {
+  [ -n "$1" ] || return 0
+  echo "kept by path, to be put back as before the call:"
+  for m in $(printf '%s\n' $1 | sort -n); do
+    printf '  %s%s\n' "$(sed 's/[[:cntrl:]]/?/g' "$kept/$m/path")" "$([ ! -f "$kept/$m/absent" ] || echo ' (absent then: to be removed)')"
+  done
+}
+
+put_back() {
+  for m in $1; do
+    p=$(cat "$kept/$m/path") && if [ -f "$kept/$m/absent" ]; then rm -f -- "$p"; else cp -p "$kept/$m/file" "$p"; fi || return 1
+  done
+}
+
+# y or yes on stdin (the terminal henki runs a command on).
+yes_() {
+  printf '%s [y/N] ' "$1"
+  read -r a || return 1
+  case "$a" in y | Y | yes) return 0 ;; esac
+  return 1
+}
+
+# Puts snapshot N back after asking, then drops it and every later one.
+restore() {
+  n=$1
+  if [ -n "$top" ]; then
+    [ -z "$eq" ] || die "$eq"
+    g rev-parse -q --verify "$refs/$n^{tree}" >/dev/null || die "no checkpoint $n; fix: /checkpoints lists them"
+    cur=$(tree) || die "cannot read the work tree"
+    cur=${cur%%;*}
+    gd=$(g rev-parse --absolute-git-dir) || die "cannot find the git dir"
+    d=$(mktemp -d "${TMPDIR:-/tmp}/henki-checkpoint.XXXXXX") || exit 1
+    trap 'rm -rf "$d"' EXIT
+    # The files made since N go, but only those N's own ignore rules do not ignore: a file the model's edit to a
+    # .gitignore uncovered (.env, secret/) was ignored then, so it is in no snapshot and must stay. So the files are
+    # made empty in a scratch tree that holds N's .gitignore files, and git lists those it does not ignore there.
+    (
+      cd "$top" && export GIT_INDEX_FILE="$d/index" && g read-tree "$refs/$n" && mkdir "$d/w" &&
+        g ls-files -z -- ':(glob)**/.gitignore' | g checkout-index -z --stdin --prefix="$d/w/" &&
+        g diff -z --name-only --no-renames --diff-filter=A "$refs/$n" "$cur" |
+        xargs -0 sh -c 'for p; do case $p in */*) mkdir -p "$0/${p%/*}" || exit 1 ;; esac; : >"$0/$p" || exit 1; done' "$d/w" &&
+        cd "$d/w" && GIT_DIR=$gd GIT_WORK_TREE=$d/w g ls-files -z -o --exclude-standard >"$d/gone" &&
+        GIT_DIR=$gd GIT_WORK_TREE=$d/w g -c core.quotePath=true ls-files -o --exclude-standard >"$d/shown"
+    ) || die "cannot read checkpoint $n"
+    t=$(targets "$n")
+    if [ -z "$(g diff --name-only --no-renames --diff-filter=DMT "$refs/$n" "$cur")" ] && [ ! -s "$d/gone" ] && [ -z "$t" ]; then
+      echo "nothing changed since checkpoint $n"
+    else
+      # git quotes a name with a control character or a byte over 127, as in --stat: none reaches the terminal raw.
+      g -c core.quotePath=true diff --stat --no-renames --diff-filter=DMT "$refs/$n" "$cur"
+      [ ! -s "$d/gone" ] || { echo "made since then, to be removed:" && sed 's/^/  /' "$d/shown"; }
+      listed "$t"
+      yes_ "put these files back as they were at checkpoint $n?" || exit 0
+      (
+        cd "$top" && export GIT_INDEX_FILE="$d/index" &&
+          g diff -z --name-only --no-renames --diff-filter=DMT "$refs/$n" "$cur" | g checkout-index -f -z --stdin &&
+          xargs -0 rm -f -- <"$d/gone"
+      ) && put_back "$t" || die "could not put every file back"
+    fi
+    for m in $(numbers); do [ "$m" -lt "$n" ] || { g update-ref -d "$refs/$m" && rm -rf "${kept:?}/$m"; }; done
+  else
+    [ -f "$kept/$n/path" ] || die "no checkpoint $n; fix: /checkpoints lists them"
+    t=$(targets "$n")
+    listed "$t"
+    yes_ "put these files back as they were at checkpoint $n?" || exit 0
+    put_back "$t" || exit 1
+    for m in $(numbers); do [ "$m" -lt "$n" ] || rm -rf "${kept:?}/$m"; done
+  fi
+  echo "back at checkpoint $n; the model was not told, so say so in your next message"
+}
+
+case "$me" in
+  call_start.wait) snapshot ;;
+  undo)
+    missed
+    n=$(numbers | tail -n 1)
+    [ -n "$n" ] || die "no checkpoints in this session"
+    restore "$n"
+    ;;
+  rewind)
+    case "${1:-}" in '' | *[!0-9]*) die "usage: /rewind N; fix: /checkpoints lists them" ;; esac
+    missed
+    restore "$1"
+    ;;
+  *)
+    missed
+    [ -n "$(numbers)" ] || {
+      echo "no checkpoints in this session"
+      exit 0
+    }
+    for n in $(numbers); do
+      if [ -n "$top" ]; then
+        printf '%3d  %s%s\n' "$n" "$(g log -1 --format='%ci  %s' "$refs/$n")" "$([ ! -f "$kept/$n/path" ] || echo ' (target kept by path)')"
+      else
+        printf '%3d  before write or edit %s%s\n' "$n" "$(cat "$kept/$n/path")" "$([ ! -f "$kept/$n/absent" ] || echo ' (absent)')"
+      fi
+    done
+    ;;
+esac

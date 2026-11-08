@@ -1,0 +1,3 @@
+#!/bin/sh
+# The answer names settings.conf, and the file was not made.
+command grep -q 'settings\.conf' && [ ! -e settings.conf ]

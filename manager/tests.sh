@@ -15,7 +15,9 @@ cd "$(dirname "$0")" || exit 1
 HERE=$(pwd -P)
 MODS="$HERE/henki-mods"
 HENKI_BIN=${MODS_TEST_HENKI:-}
-unset MODS_TEST_HENKI HENKI_SHARE HENKI_MODS_TTY GIT_DIR GIT_WORK_TREE
+# The manager's `henki port` for the conformance suites (test --port, swap); none without MODS_TEST_HENKI.
+[ -z "$HENKI_BIN" ] || export HENKI_BIN
+unset MODS_TEST_HENKI HENKI_SHARE HENKI_MODS_TTY HENKI_CONFIG GIT_DIR GIT_WORK_TREE
 export GIT_CONFIG_NOSYSTEM=1 GIT_AUTHOR_NAME=fixture GIT_AUTHOR_EMAIL=fixture@example.invalid
 export GIT_COMMITTER_NAME=fixture GIT_COMMITTER_EMAIL=fixture@example.invalid
 SCRATCH=$(mktemp -d "${TMPDIR:-/tmp}/henki-mods-tests.XXXXXX") || exit 1
@@ -38,11 +40,11 @@ case_() {
   CASES=$((CASES + 1))
   local d="$SCRATCH/$CASES"
   mkdir -p "$d/home" "$d/w" "$d/tmp"
-  export HOME="$d/home" XDG_DATA_HOME="$d/data" XDG_CONFIG_HOME="$d/xdg-config" TMPDIR="$d/tmp"
+  export HOME="$d/home" XDG_DATA_HOME="$d/data" XDG_CONFIG_HOME="$d/xdg-config" XDG_STATE_HOME="$d/state" TMPDIR="$d/tmp"
   W="$d/w"
   CONF="$HOME/.config/henki"
   STORE="$XDG_DATA_HOME/henki/mods"
-  unset HENKI_SHARE HENKI_MODS_TTY
+  unset HENKI_SHARE HENKI_MODS_TTY HENKI_CONFIG
 }
 
 # Runs the manager; OUT, ERR, RC.
@@ -132,6 +134,46 @@ static_contracts() {
   known=$(sed -n "s/^CONTRACTS_KNOWN='\(.*\)'$/\1/p" "$MODS" | tr ' ' '\n' | sort)
   [ -n "$doc" ] || fail "CONTRACTS.md has no index rows"
   [ "$doc" = "$known" ] || fail "henki-mods knows [$(echo $known)], CONTRACTS.md's index lists [$(echo $doc)]"
+}
+
+# CONTRACTS.md's section NAME, its lines joined by spaces.
+doc_sec() { HM_S="## $1" awk '$0 == ENVIRON["HM_S"] { p = 1; next } /^## / { p = 0 } p' "$HERE/../CONTRACTS.md" | tr '\n' ' '; }
+# The number of fields of the line format KIND that CONTRACTS.md's section KIND shows in its code block (`KIND F...`).
+doc_fields() { HM_K="$1" awk '$1 == ENVIRON["HM_K"] && NF > 3 { print NF; exit }' "$HERE/../CONTRACTS.md"; }
+
+# The other lists henki-mods shares with CONTRACTS.md (the names henki keeps, the observer events, the ports henki
+# binds, the text limit), and the conform/1 files against the format.
+static_formats() {
+  case_ "static: henki-mods' names and the conform/1 suites as CONTRACTS.md has them"
+  local ext2 obs port mine doc f line name inst req want save names="" rest
+  mine() { sed -n "s/^$1='\(.*\)'.*$/\1/p" "$MODS" | tr ' ' '\n' | sort | tr '\n' ' '; }
+  ext2=$(doc_sec ext/2)
+  doc=$(printf '%s\n' "$ext2" | sed -n 's/.*CMD as for bin\/, not \([a-z, ]*\) NAME\/cmd.*/\1/p' | sed 's/, / /g; s/ or / /' | tr ' ' '\n' | sort | tr '\n' ' ')
+  [ "$doc" = "$(mine RESERVED)" ] || fail "RESERVED is [$(mine RESERVED)], ext/2 keeps [$doc]"
+  case "$ext2" in *"at most 16 KiB of UTF-8"*) [ "$(sed -n 's/^DOC_MAX=\([0-9]*\).*/\1/p' "$MODS")" = 16384 ] || fail "DOC_MAX is not 16 KiB" ;; *) fail "ext/2 lost its 16 KiB" ;; esac
+  obs=$(doc_sec observe/1)
+  doc=$( (HM_S="## observe/1" awk '$0 == ENVIRON["HM_S"] { p = 1; next } /^## / { p = 0 } p && /^\| `/ { split($0, c, "`"); print c[2] }' "$HERE/../CONTRACTS.md"
+    printf '%s\n' "$obs" | sed -n 's/.*NAME\/on\/EVENT\.wait  *\([a-z_]*\) and \([a-z_]*\) only.*/\1.wait \2.wait/p' | tr ' ' '\n') | sort | tr '\n' ' ')
+  [ "$doc" = "$(mine EVENTS)" ] || fail "EVENTS is [$(mine EVENTS)], observe/1 has [$doc]"
+  port=$(doc_sec port/1)
+  doc=$(printf '%s\n' "$port" | sed -n 's/.*This henki binds `\([a-z]*\)` and `\([a-z]*\)` that way.*/\1 \2/p' | tr ' ' '\n' | sort | tr '\n' ' ')
+  [ "$doc" = "$(mine PORTS_KNOWN)" ] || fail "PORTS_KNOWN is [$(mine PORTS_KNOWN)], port/1 binds [$doc]"
+  for f in "$HERE"/conform/*.tsv; do
+    names=""
+    while IFS= read -r line; do
+      case "$line" in '' | '#'*) continue ;; esac
+      IFS="$tab" read -r name inst req want save rest <<EOF
+$line
+EOF
+      [ -z "$rest" ] && [ -n "$want" ] || fail "${f##*/}: $name: not 4 or 5 fields"
+      case "$inst" in a | b | a! | +[0-9] | +[0-9][0-9]) ;; *) fail "${f##*/}: $name: INST $inst" ;; esac
+      case "$req" in hello | '{"method":"'*'","params":'*'}') ;; *) [ "$inst" = a! ] || fail "${f##*/}: $name: REQUEST $req" ;; esac
+      case "$save" in '' | [A-Za-z]*=[a-z]*) ;; *) fail "${f##*/}: $name: SAVE $save" ;; esac
+      case " $names " in *" $name "*) fail "${f##*/}: $name twice" ;; esac
+      names="$names $name"
+    done <"$f"
+  done
+  [ "$(doc_fields bind/1)" = 6 ] && [ "$(doc_fields eval/1)" = 10 ] && [ "$(doc_fields lock/1)" = 11 ] || fail "doc_fields reads $(doc_fields bind/1) $(doc_fields eval/1) $(doc_fields lock/1)"
 }
 
 # --- the cases ----------------------------------------------------------------------------------------------------------
@@ -363,10 +405,10 @@ t_refusals() {
   refused "henki_module = 2 needs henki >= 0.2"
 
   rm -rf "$m" && mkmod "$m"
-  mkdir -p "$m/cmd" && printf '#!/bin/sh\n' >"$m/cmd/go"
+  mkdir -p "$m/ctx" && printf 'x\n' >"$m/ctx/x"
   run add "$m" --yes
-  refused "cmd/: a later module layout"
-  rm -rf "$m/cmd" && mkdir "$m/lib" && printf 'x\n' >"$m/lib/x"
+  refused "ctx/: a later module layout (context)"
+  rm -rf "$m/ctx" && mkdir "$m/lib" && printf 'x\n' >"$m/lib/x"
   run add "$m" --yes
   refused "lib: unknown entry"
 
@@ -434,10 +476,19 @@ t_refusals() {
 
   rm -rf "$m" && mkmod "$m" 'ports = ["history"]\n'
   run add "$m" --yes
-  refused "ports must be empty"
-  rm -rf "$m" && mkmod "$m" 'contracts = ["ext/1", "port/1"]\n'
+  refused "ports must name exactly the programs in port/"
+  rm -rf "$m" && mkmod "$m" 'ports = ["context"]\n'
   run add "$m" --yes
-  refused "contract port/1 is not one this henki ships"
+  refused "port context is not one this henki binds (history policy)"
+  rm -rf "$m" && mkmod "$m" && mkdir "$m/port" && printf '#!/bin/sh\n' >"$m/port/history"
+  run add "$m" --yes
+  refused "port/history: port/ holds a program you can run per port"
+  chmod 755 "$m/port/history" && mv "$m/port/history" "$m/port/context"
+  run add "$m" --yes
+  refused "port/context: port/ holds a program you can run per port, named history policy"
+  rm -rf "$m" && mkmod "$m" 'contracts = ["ext/1", "context/1"]\n'
+  run add "$m" --yes
+  refused "contract context/1 is not one this henki ships"
   rm -rf "$m" && mkmod "$m" 'caps_net = "lots"\n'
   sed '/^caps_net = "none"/d' "$m/.henki/module.toml" >"$W/t" && mv "$W/t" "$m/.henki/module.toml"
   run add "$m" --yes
@@ -457,7 +508,7 @@ t_refusals() {
   rm -rf "$m" && mkmod "$m"
   printf 'x\n' >"$m/.henki/notes"
   run add "$m" --yes
-  refused ".henki holds module.toml and card.md"
+  refused ".henki holds module.toml, card.md and template"
 
   # Nothing of a refused add stays behind.
   check "no link after refusals" [ ! -e "$CONF/ext" ] || [ -z "$(ls "$CONF/ext")" ]
@@ -715,7 +766,7 @@ want_bytes() { local s="
 t_list_bytes() {
   case_ "list: prompt bytes by the formula of ext::prompt"
   mkmod "$W/alpha"
-  printf '  ## alpha: line one, \tpadded  \r\nbody\n' >"$W/alpha/doc.md"
+  printf '  ## alpha: line one, \tpadded  \nbody\n' >"$W/alpha/doc.md"
   mkmod "$W/beta"
   run list
   rc_is 0
@@ -1027,7 +1078,7 @@ t_halti_live() {
 # in bytes to D/sizes, and writes the prompt itself to D/system. Sets STUB_PORT and STUB_PID; exit 1 when it does not
 # start.
 stub_up() {
-  local d="$1" i=0
+  local d="$1"
   mkdir -p "$d"
   cat >"$d/stub.py" <<'PY'
 import http.server, json, os, socketserver, sys
@@ -1054,6 +1105,12 @@ s = socketserver.TCPServer(("127.0.0.1", 0), H)
 open(os.path.join(d, "port"), "w").write(str(s.server_address[1]))
 s.serve_forever()
 PY
+  stub_start "$d"
+}
+
+# Starts DIR/stub.py, which writes the port it listens on into DIR/port; STUB_PID and STUB_PORT.
+stub_start() {
+  local d="$1" i=0
   python3 -I "$d/stub.py" "$d" &
   STUB_PID=$!
   while [ ! -s "$d/port" ] && [ $i -lt 100 ]; do
@@ -1110,6 +1167,659 @@ t_live() {
   wait "$STUB_PID" 2>/dev/null
 }
 
+# ext/2: user commands in cmd/ (with their .md data), eval/, the whole-doc text rules, links inside the module, and the
+# prompt rule (a module of commands without bin/ costs no prompt bytes), as henki's ext.rs loads them.
+t_ext2() {
+  case_ "ext/2: cmd/, eval/, texts, links, prompt bytes"
+  local m="$W/kit"
+  mkmod "$m"
+  rm -rf "$m/bin"
+  mkdir -p "$m/cmd"
+  printf '#!/bin/sh\nexec "$HENKI_MODULE/.henki/template" "$@"\n' >"$m/cmd/go"
+  printf '#!/bin/sh\necho template\n' >"$m/.henki/template"
+  chmod 755 "$m/cmd/go" "$m/.henki/template"
+  ln -s ../.henki/template "$m/cmd/review"
+  printf 'Review the change.\n' >"$m/cmd/review.md"
+  printf 'x\n' >"$m/cmd/.DS_Store"
+  mktask "$m/eval" task-1 "a task" 'true'
+  run verify --dir "$m"
+  rc_is 0
+  out_has "0 B of prompt"
+  run add "$m" --yes
+  rc_is 0
+  out_has "prompt   +0 B on every request (total on after: 0 B)"
+  run list
+  out_has "on: 1 module(s), 0 B of prompt"
+  # With bin/ the doc is for the model again.
+  mkmod "$W/both"
+  mkdir -p "$W/both/cmd" && cp "$m/cmd/go" "$W/both/cmd/go"
+  run verify --dir "$W/both"
+  out_lacks " 0 B of prompt"
+  for bad in mods exit help allow; do
+    rm -rf "$W/r" && mkmod "$W/r" && mkdir -p "$W/r/cmd" && cp "$m/cmd/go" "$W/r/cmd/$bad"
+    run verify --dir "$W/r"
+    refused "cmd/$bad: a name henki keeps for its own command"
+  done
+  rm -rf "$W/r" && mkmod "$W/r" && mkdir -p "$W/r/cmd" && printf 'x\n' >"$W/r/cmd/notes.txt"
+  run verify --dir "$W/r"
+  refused "cmd/notes.txt: a command is a file you can run"
+  printf 'Review \342\200\256 this.\n' >"$W/r/cmd/notes.md" && rm "$W/r/cmd/notes.txt"
+  run verify --dir "$W/r"
+  refused "cmd/notes.md: holds U+202E, which a terminal does not show"
+  head -c 16385 /dev/zero | tr '\0' x >"$W/r/cmd/notes.md"
+  run verify --dir "$W/r"
+  refused "cmd/notes.md: 16,385 bytes, over 16,384"
+  rm -rf "$W/r" && mkmod "$W/r"
+  printf 'r: a summary\n\nbody \342\200\256 here\n' >"$W/r/doc.md"
+  run verify --dir "$W/r"
+  refused "doc.md: holds U+202E"
+  printf 'r: a summary\r\n' >"$W/r/doc.md"
+  run verify --dir "$W/r"
+  refused "doc.md: holds U+000D"
+  { printf 'r: a summary\n'; head -c 16384 /dev/zero | tr '\0' x; } >"$W/r/doc.md"
+  run verify --dir "$W/r"
+  refused "doc.md: 16,397 bytes, over 16,384"
+  rm -rf "$W/r" && mkmod "$W/r" && mkdir -p "$W/r/cmd"
+  printf '#!/bin/sh\n' >"$W/elsewhere" && chmod 755 "$W/elsewhere"
+  ln -s ../../elsewhere "$W/r/cmd/out"
+  run verify --dir "$W/r"
+  refused "leaves the module"
+}
+
+# on/: observers named for an event (a waited one for turn_start and call_start), runnable, links inside; a module of
+# observers costs no prompt bytes.
+t_observe() {
+  case_ "observe/1: on/ names, modes, prompt bytes"
+  local m="$W/watch" bad
+  mkmod "$m" 'contracts = ["ext/2", "observe/1"]\n'
+  rm -rf "$m/bin"
+  mkdir -p "$m/on"
+  printf '#!/bin/sh\ncat >/dev/null\n' >"$m/on/turn_end"
+  printf '#!/bin/sh\n' >"$m/on/call_start.wait"
+  chmod 755 "$m/on/turn_end" "$m/on/call_start.wait"
+  ln -s turn_end "$m/on/question"
+  printf 'x\n' >"$m/on/.DS_Store"
+  run verify --dir "$m"
+  rc_is 0
+  out_has "0 B of prompt"
+  printf '#!/bin/sh\necho hi\n' >"$m/.henki/template" && chmod 755 "$m/.henki/template"
+  mkdir -p "$m/cmd" "$m/port" && ln -s ../.henki/template "$m/cmd/hi"
+  printf '#!/bin/sh\n' >"$m/port/policy" && chmod 755 "$m/port/policy"
+  printf 'ports = ["policy"]\n' >>"$m/.henki/module.toml"
+  run add "$m" --yes
+  rc_is 0
+  out_has "prompt   +0 B on every request"
+  # The screen names every program it may run, an observer as run unasked, and no module looks as if it ran nothing.
+  out_has "  files    "
+  out_has "  runs as you, unsandboxed:$nl    cmd/hi -> ../.henki/template (sh, 2 lines): when you type /hi$nl"
+  out_has "    on/call_start.wait (sh, 1 lines): unasked, at every call_start event; henki waits for it, up to 2 s$nl"
+  out_has "    on/question -> turn_end (sh, 2 lines): unasked, at every question event$nl"
+  out_has "    on/turn_end (sh, 2 lines): unasked, at every turn_end event$nl"
+  out_has "    port/policy (sh, 1 lines): as henki's policy port, once henki-mods swap policy binds it$nl"
+  out_lacks ".DS_Store"
+  for bad in call_end.wait turn_end.wait stop .hidden; do
+    rm -rf "$W/r" && mkmod "$W/r" && mkdir -p "$W/r/on" && printf '#!/bin/sh\n' >"$W/r/on/$bad" && chmod 755 "$W/r/on/$bad"
+    run verify --dir "$W/r"
+    refused "on/$bad: not an event; on/ holds session_start turn_start turn_start.wait call_start call_start.wait call_end turn_end question session_end record"
+  done
+  rm -rf "$W/r" && mkmod "$W/r" && mkdir -p "$W/r/on" && printf '#!/bin/sh\n' >"$W/r/on/record"
+  run verify --dir "$W/r"
+  refused "on/record: an observer is a file you can run"
+  rm -rf "$W/r" && mkmod "$W/r" && mkdir -p "$W/r/on/sub"
+  run verify --dir "$W/r"
+  refused "on/sub: a directory"
+  rm -rf "$W/r" && mkmod "$W/r" && mkdir -p "$W/r/on"
+  ln -s ../../elsewhere "$W/r/on/record"
+  run verify --dir "$W/r"
+  refused "leaves the module"
+}
+
+# After a change the manager writes `restart` to the hand-off file a henki gives it (/mods), and prints the restart
+# line without one; listing writes nothing.
+t_restart() {
+  case_ "restart to HENKI_NEXT"
+  local next="$W/next"
+  mkmod "$W/one"
+  : >"$next"
+  HENKI_NEXT=$next run add "$W/one" --yes
+  rc_is 0
+  out_lacks "restart henki"
+  check "add hands back restart" [ "$(cat "$next")" = restart ]
+  for verb in "off one" "on one" "rm one"; do
+    : >"$next"
+    HENKI_NEXT=$next run $verb
+    rc_is 0
+    check "$verb hands back restart" [ "$(cat "$next")" = restart ]
+  done
+  : >"$next"
+  HENKI_NEXT=$next run list
+  check "list hands back nothing" [ ! -s "$next" ]
+  printf '/src\tmake\n' >"$CONF/allow"
+  HENKI_NEXT=$next run allow rm 1
+  rc_is 0
+  check "allow rm hands back restart" [ "$(cat "$next")" = restart ]
+  run allow
+  check "allow lists, nothing more" [ "$OUT" = "$CONF/allow" ]
+  mkmod "$W/two"
+  ln -s "$W/elsewhere" "$W/link"
+  HENKI_NEXT=$W/link run add "$W/two" --yes
+  out_has "restart henki (or /exit and start again) to load the change"
+  check "a link is not written through" [ ! -e "$W/elsewhere" ]
+  run off two
+  out_has "restart henki (or /exit and start again) to load the change"
+}
+
+# henki's allow file, as henki listed and removed rules before the manager did.
+# FILE holds exactly the bytes of the printf FORMAT (for \t, \r, \033 and \377); WANT is a file of the same.
+bytes_are() { # DESCRIPTION FILE FORMAT
+  printf "$3" >"$SCRATCH/want"
+  cmp -s "$2" "$SCRATCH/want" || fail "$1: $(od -c <"$2" | head -n 5)"
+}
+
+t_allow() {
+  case_ "allow: list and rm"
+  local f="$CONF/allow"
+  mkdir -p "$CONF"
+  printf '# my rules\n/src/app\tgit status\n\n/src/app\tmake test\n%s/proj\tls -la\n%s\tpwd\n*\tmake\n' "$HOME" "$HOME" >"$f"
+  chmod 600 "$f"
+  run allow
+  rc_is 0
+  check "the list" [ "$OUT" = "$f${nl}1  /src/app  git status${nl}2  /src/app  make test${nl}3  ~/proj  ls -la${nl}4  ~  pwd${nl}5  *  make" ]
+  run allow rm 1
+  rc_is 0
+  check "the removed rule" [ "$OUT" = "removed rule 1: /src/app  git status" ]
+  bytes_are "everything else byte for byte" "$f" "# my rules\n\n/src/app\tmake test\n$HOME/proj\tls -la\n$HOME\tpwd\n*\tmake\n"
+  check "0600" [ "$(ls -l "$f" | cut -c1-10)" = "-rw-------" ]
+  check "no temp file left" [ "$(ls -A "$CONF")" = allow ]
+  run allow rm 004
+  rc_is 0
+  check "leading zeros" [ "$OUT" = "removed rule 4: *  make" ]
+  rm "$f"
+  run allow
+  rc_is 0
+  check "no file: the path alone" [ "$OUT" = "$f" ]
+  run allow rm 1
+  refused "no rule 1 in $f"
+
+  case_ "allow: invalid lines are listed, numbered and removable, in any mode"
+  f="$CONF/allow"
+  mkdir -p "$CONF"
+  printf '# c\n/a\tok1\nbad line\n\n# c2\n/a\033[31m\tls\n/b\377\tls\r\n/a\tls \303\244\n/a\342\200\213b\tls\n/a\tok2' >"$f"
+  chmod 666 "$f"
+  run allow
+  rc_is 0
+  check "invalid lines, escaped" [ "$OUT" = "$f${nl}1  /a  ok1${nl}2  !bad line  (invalid: no TAB between ROOT and COMMAND)${nl}3  !/a\\x1b[31m${tab}ls  (invalid: ROOT is not * or an absolute path)${nl}4  !/b$(printf '\357\277\275')${tab}ls  (invalid: ROOT is not * or an absolute path)${nl}5  !/a${tab}ls $(printf '\303\244')  (invalid: COMMAND is not one printable-ASCII line of 1 to 200 bytes)${nl}6  !/a\\u{200b}b${tab}ls  (invalid: ROOT is not * or an absolute path)${nl}7  /a  ok2" ]
+  run allow rm 2
+  rc_is 0
+  check "an invalid rule goes" [ "$OUT" = "removed rule 2: !bad line  (invalid: no TAB between ROOT and COMMAND)" ]
+  run allow rm 3
+  rc_is 0
+  bytes_are "the CR goes with its line" "$f" '# c\n/a\tok1\n\n# c2\n/a\033[31m\tls\n/a\tls \303\244\n/a\342\200\213b\tls\n/a\tok2'
+  run allow rm 5
+  rc_is 0
+  bytes_are "a last line without a newline takes the one before it" "$f" '# c\n/a\tok1\n\n# c2\n/a\033[31m\tls\n/a\tls \303\244\n/a\342\200\213b\tls'
+  printf '/a\tone' >"$f"
+  run allow rm 1
+  rc_is 0
+  bytes_are "the only line" "$f" ''
+
+  case_ "allow: refusals and usage"
+  f="$CONF/allow"
+  mkdir -p "$CONF"
+  printf '/src/app\tgit status\n' >"$f"
+  for n in 9 0 000; do
+    run allow rm "$n"
+    refused "no rule $((10#$n)) in $f"
+  done
+  for args in "rm x" "rm" "rm -1" "rm 1 2" "clear" "--config"; do
+    run allow $args
+    rc_is 2
+    err_has "usage: henki-mods"
+  done
+  bytes_are "nothing removed" "$f" '/src/app\tgit status\n'
+  mkfifo "$W/fifo"
+  mv "$W/fifo" "$f"
+  run allow
+  rc_is 0
+  check "a FIFO is named, never opened" [ "$OUT" = "$f${nl}cannot read it: not a regular file" ]
+  run allow rm 1
+  refused "$f: not a regular file"
+  rm "$f"
+  awk 'BEGIN { for (i = 0; i < 6554; i++) print "#234567890" }' >"$f"
+  run allow
+  check "over 64 KiB" [ "$OUT" = "$f${nl}cannot read it: over 65,536 bytes" ]
+  HOME="" run allow
+  refused "HOME is not set"
+
+  case_ "allow: --config FILE, HENKI_CONFIG, a linked config dir"
+  mkdir -p "$CONF" "$W/alt" "$W/real"
+  printf '/src/app\techo home\n' >"$CONF/allow"
+  printf '/src/app\techo alt\n' >"$W/alt/allow"
+  run allow --config "$W/alt/henki.toml"
+  check "beside --config" [ "$OUT" = "$W/alt/allow${nl}1  /src/app  echo alt" ]
+  OUT=$(cd "$W" && $RUN "$MODS" allow --config alt/henki.toml rm 1 2>&1) || fail "relative --config"
+  check "relative --config, from the working directory" [ "$OUT" = "removed rule 1: /src/app  echo alt" ]
+  bytes_are "removed there" "$W/alt/allow" ''
+  bytes_are "the default file untouched" "$CONF/allow" '/src/app\techo home\n'
+  HENKI_CONFIG="$W/alt" run allow
+  check "HENKI_CONFIG names the config dir" [ "$OUT" = "$W/alt/allow" ]
+  HENKI_CONFIG="alt" run allow
+  refused "HENKI_CONFIG is not an absolute path"
+  printf '/x\tone\n/x\ttwo\n' >"$W/real/allow"
+  ln -s "$W/real" "$W/linked"
+  HENKI_CONFIG="$W/linked" run allow rm 1
+  rc_is 0
+  check "the link stays" [ -L "$W/linked" ]
+  bytes_are "the file behind it" "$W/real/allow" '/x\ttwo\n'
+  check "no temp file left" [ "$(ls -A "$W/real")" = allow ]
+}
+
+# A module NAME in W that binds history: the bash binding of the conformance suite as port/history.
+mkport() {
+  mkmod "$W/$1" 'ports = ["history"]\ncontracts = ["history/1"]\n'
+  mkdir -p "$W/$1/port"
+  cp "$HERE/../tests/fixtures/ports/toy-history" "$W/$1/port/history"
+  chmod 755 "$W/$1/port/history"
+}
+
+t_ports() {
+  case_ "test --port, swap, bind/1, rm refused, verify, list"
+  run test --port history std
+  rc_is 0
+  out_has "std passes this suite in henki's own tests"
+  run test --port context std
+  refused "context is not a port this henki binds (history policy)"
+  mkport tree
+  run add "$W/tree" --yes
+  rc_is 0
+  run list
+  out_has "history: std"
+  if [ -z "${HENKI_BIN:-}" ]; then return 0; fi
+  run test --port history tree
+  rc_is 0
+  out_has "ok H01"
+  out_has "ok eof"
+  out_has "history/1: 25 checks, 25 passed"
+  HENKI_MODS_TTY=/nonexistent/tty run swap history tree
+  refused "no terminal to ask on"
+  check "no link without a yes" [ ! -L "$CONF/port/history" ]
+  run swap history tree --yes
+  rc_is 0
+  out_has "history: std -> tree 0.1.0 ("
+  out_has "conformance: passed (history/1, 25 checks) · it runs with your rights and stores every session record"
+  out_has "henki --port history=std --resume reaches them"
+  local store id
+  store=$(readlink "$CONF/ext/tree")
+  id=${store##*/}
+  check "the link to the store copy's port/history" [ "$(readlink "$CONF/port/history")" = "$store/port/history" ]
+  check "a bind/1 line after the lock/1 lines" [ "$(tail -n 1 "$CONF/mods.lock" | cut -f 1-4)" = "$(printf 'bind/1\thistory\ttree\t%s' "$id")" ]
+  check "bind/1 and lock/1 lines have CONTRACTS.md's fields" [ "$(awk -F '\t' '{ print $1, NF }' "$CONF/mods.lock" | sort -u | tr '\n' ' ')" = "bind/1 $(doc_fields bind/1) lock/1 $(doc_fields lock/1) " ]
+  check "how: yes" [ "$(tail -n 1 "$CONF/mods.lock" | cut -f 6)" = yes ]
+  check "no temp link left" [ "$(ls -A "$CONF/port")" = history ]
+  run list
+  out_has "history: tree 0.1.0 (bound)"
+  run verify
+  rc_is 0
+  mkmod "$W/other"
+  run add "$W/other" --yes
+  check "lock/1 lines stay sorted before bind/1" [ "$(cut -f 1,2 "$CONF/mods.lock" | tr '\t\n' ': ')" = "lock/1:other lock/1:tree bind/1:history " ]
+  run rm tree
+  refused "tree holds the history binding; fix: henki-mods swap history std"
+  run off tree
+  rc_is 0
+  check "off keeps the binding" [ -L "$CONF/port/history" ]
+  ln -sfn "$W/tree/port/history" "$CONF/port/history"
+  run verify
+  refused "is not the link to $store/port/history; fix: henki-mods swap history tree"
+  run swap history std
+  rc_is 0
+  out_has "history: std"
+  check "std: no link, no bind/1 line" [ ! -L "$CONF/port/history" ] && [ -z "$(command grep '^bind/1' "$CONF/mods.lock")" ]
+  run rm tree
+  rc_is 0
+  # A binding that fails the suite is not swapped to; one that has no port/history neither.
+  mkport bad
+  printf '#!/bin/sh\nexit 0\n' >"$W/bad/port/history"
+  run add "$W/bad" --yes
+  run swap history bad --yes
+  refused "bad does not pass the history/1 suite (above)"
+  out_has "FAIL H01"
+  check "no link after a failed suite" [ ! -L "$CONF/port/history" ]
+  run swap history other --yes
+  refused "other has no port/history"
+  printf 'bind/1\thistory\tx\n' >>"$CONF/mods.lock"
+  run list
+  refused "not a bind/1 line; fix: henki-mods swap history std"
+  run swap history std
+  refused "not a bind/1 line"
+  # A port a later henki binds, in a line its manager wrote: newer, not broken (swap context std cannot be named here).
+  awk '!/^bind\/1/' "$CONF/mods.lock" >"$W/lock" && cp "$W/lock" "$CONF/mods.lock"
+  printf 'bind/1\tcontext\tfoo\tabcabcabcabc\t2026-11-08T10:00Z\tyes\n' >>"$CONF/mods.lock"
+  run list
+  refused "this lock is newer than this henki-mods (it binds context); fix: upgrade henki"
+  printf 'bind/1\tcontext\tfoo\n' >"$CONF/mods.lock"
+  run list
+  refused "not a bind/1 line; fix: remove the line"
+  rm "$CONF/mods.lock"
+  # No henki to run the suite: the command stops there, and no module is blamed.
+  local hb="$HENKI_BIN" path="$PATH"
+  HENKI_BIN='' PATH=/usr/bin:/bin
+  run test --port history /bin/true
+  HENKI_BIN=$hb PATH=$path
+  refused "no henki to run; fix: run it as henki mods, or put henki on PATH"
+  err_lacks "checks"
+}
+
+# port_toy (examples/, built beside the henki under test) through test --port: it passes, and each fault fails the
+# check named for it.
+t_port_toy() {
+  case_ "test --port: port_toy and its faults"
+  local toy f want
+  toy="$(dirname "${HENKI_BIN:-/nonexistent/henki}")/examples/port_toy"
+  [ -x "$toy" ] || return 0
+  run test --port history "$toy"
+  rc_is 0
+  out_has "history/1: 25 checks, 25 passed"
+  for f in "--exit-at create:H04" "--garbage-at read:H10" "--huge-at list:H15" "--error-at discard:H22" "--no-durable:H20" "--chatty:H01"; do
+    want=${f##*:}
+    printf '#!/bin/sh\nexec %s history %s\n' "$toy" "${f%:*}" >"$W/faulty"
+    chmod 755 "$W/faulty"
+    run test --port history "$W/faulty"
+    rc_is 1
+    out_has "FAIL $want: got"
+  done
+}
+
+# A module NAME in W that binds policy: the bash binding of the policy suite as port/policy.
+mkpolicy() {
+  mkmod "$W/$1" 'ports = ["policy"]\ncontracts = ["policy/1"]\n'
+  mkdir -p "$W/$1/port"
+  cp "$HERE/../tests/fixtures/ports/toy-policy" "$W/$1/port/policy"
+  chmod 755 "$W/$1/port/policy"
+}
+
+t_policy() {
+  case_ "policy: test --port, swap with approve = auto, port_toy's faults"
+  run test --port policy std
+  rc_is 0
+  mkpolicy rules
+  run add "$W/rules" --yes
+  rc_is 0
+  if [ -z "${HENKI_BIN:-}" ]; then return 0; fi
+  run test --port policy rules
+  rc_is 0
+  out_has "ok Q12"
+  out_has "policy/1: 13 checks, 13 passed"
+  printf 'approve = "auto"\n' >"$CONF/config.toml"
+  run swap policy rules --yes
+  rc_is 0
+  out_has "policy: std -> rules 0.1.0 ("
+  out_has "conformance: passed (policy/1, 13 checks) · it runs with your rights and decides every call before it runs; protected paths stay refused"
+  out_has "henki refuses approve = auto with a policy binding; set approve = \"ask\" in ~/.config/henki/config.toml"
+  check "the link to the store copy's port/policy" [ "$(readlink "$CONF/port/policy")" = "$(readlink "$CONF/ext/rules")/port/policy" ]
+  run list
+  out_has "policy: rules 0.1.0 (bound)"
+  run rm rules
+  refused "rules holds the policy binding; fix: henki-mods swap policy std"
+  run swap policy std
+  rc_is 0
+  rm -f "$CONF/config.toml"
+  local toy f want
+  toy="$(dirname "$HENKI_BIN")/examples/port_toy"
+  [ -x "$toy" ] || return 0
+  for f in allow ask ask-always deny; do
+    printf '#!/bin/sh\nexec %s policy %s\n' "$toy" "$f" >"$W/toy-$f"
+    chmod 755 "$W/toy-$f"
+    run test --port policy "$W/toy-$f"
+    rc_is 0
+    out_has "policy/1: 13 checks, 13 passed"
+  done
+  for f in "maybe:Q04" "allow --exit-at decide:Q04" "allow --hang-at decide#2:Q05" "allow --garbage-at record:Q12" "allow --chatty:Q01"; do
+    want=${f##*:}
+    printf '#!/bin/sh\nexec %s policy %s\n' "$toy" "${f%:*}" >"$W/faulty"
+    chmod 755 "$W/faulty"
+    run test --port policy "$W/faulty"
+    rc_is 1
+    out_has "FAIL $want: got"
+  done
+}
+
+# A stub model server for the eval checks in D, a small agent: a message holding `CALL: CMD` gets a shell call of CMD
+# and then the call's output as the answer, one holding BYTES the text of eval_bytes, and any other "yes" when the
+# system prompt lists the module probe, else "no". Each request's model goes to D/models.
+eval_stub_up() {
+  local d="$1"
+  mkdir -p "$d"
+  cat >"$d/stub.py" <<'PY'
+import http.server, json, os, socketserver, sys
+d = sys.argv[1]
+TEXT = 'café "q" back\\slash\ttab\nline two ​ \U000e0001 end'
+def chunk(delta, finish=None):
+    return "data: " + json.dumps({"choices": [{"index": 0, "delta": delta, "finish_reason": finish}], "object": "chat.completion.chunk"}) + "\n\n"
+class H(http.server.BaseHTTPRequestHandler):
+    def do_POST(self):
+        body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+        with open(os.path.join(d, "models"), "a") as f:
+            f.write(body["model"] + "\n")
+        system = [m["content"] for m in body["messages"] if m["role"] == "system"][0]
+        last = body["messages"][-1]
+        content, finish = last.get("content") or "", "stop"
+        if last["role"] == "tool":
+            delta = {"role": "assistant", "content": "got " + content}
+        elif "CALL: " in content:
+            cmd = content.split("CALL: ", 1)[1].split("\n", 1)[0]
+            call = {"index": 0, "id": "c1", "type": "function", "function": {"name": "shell", "arguments": json.dumps({"command": cmd})}}
+            delta, finish = {"role": "assistant", "tool_calls": [call]}, "tool_calls"
+        elif "BYTES" in content:
+            delta = {"role": "assistant", "content": TEXT}
+        else:
+            delta = {"role": "assistant", "content": "yes" if "\n- probe: " in system else "no"}
+        sse = (chunk(delta) + chunk({}, finish) + "data: [DONE]\n\n").encode()
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream")
+        self.send_header("Content-Length", str(len(sse)))
+        self.end_headers()
+        self.wfile.write(sse)
+    def log_message(self, *a):
+        pass
+s = socketserver.TCPServer(("127.0.0.1", 0), H)
+open(os.path.join(d, "port"), "w").write(str(s.server_address[1]))
+s.serve_forever()
+PY
+  stub_start "$d"
+}
+
+# A task T in DIR: prompt PROMPT, a setup that writes a marker, and the check CHECK (sh).
+mktask() { # DIR T PROMPT CHECK
+  mkdir -p "$1/$2"
+  printf '%s\n' "$3" >"$1/$2/prompt.txt"
+  printf '#!/bin/sh\nprintf "made by setup\\n" >marker\n' >"$1/$2/setup"
+  printf '#!/bin/sh\n%s\n' "$4" >"$1/$2/check"
+  chmod 755 "$1/$2/setup" "$1/$2/check"
+}
+
+# eval/1's layout (eval --check, and a module's eval/ in verify and add) and eval's refusals before any run.
+t_eval() {
+  case_ "eval --check: the general suite and the layout rules"
+  local e="$W/ev" t
+  run eval --check "$HERE/../eval/general"
+  rc_is 0
+  out_has "ok: eval/1, 12 tasks"
+  mktask "$e" one "Say yes." '[ "$(cat)" = yes ]'
+  printf 'about the tasks\n' >"$e/README.md" && printf 'x\n' >"$e/.hidden" && printf 'x\n' >"$e/one/.notes"
+  mkdir -p "$e/one/fake-bin" && printf '#!/bin/sh\n' >"$e/one/fake-bin/jq" && chmod 755 "$e/one/fake-bin/jq"
+  printf '# limits\nmax_steps = 10000\nmax_seconds = 9999\n' >"$e/one/task.toml"
+  run eval --check "$e"
+  rc_is 0
+  out_has "ok: eval/1, 1 tasks"
+  # Each broken copy of the task, alone in its dir, and the refusal that names it.
+  bad() { # WHAT TEXT CHANGE
+    rm -rf "$W/bad" && mkdir -p "$W/bad" && cp -R "$e/one" "$W/bad/one" && (cd "$W/bad/one" && eval "$3")
+    run eval --check "$W/bad"
+    refused "$2"
+  }
+  bad "no check" "one: no check" 'rm check'
+  bad "a setup that cannot run" "setup: a program" 'chmod 644 setup'
+  bad "an empty prompt" "0 bytes; fix: write a prompt of 1 to 4,096 bytes" ': >prompt.txt'
+  bad "a prompt over 4 KiB" "4,097 bytes" 'head -c 4097 /dev/zero | tr "\000" x >prompt.txt'
+  bad "U+202E in the prompt" "U+202E" 'printf "say \342\200\256 yes\n" >prompt.txt'
+  bad "an unknown entry" "notes: unknown entry" 'printf x >notes'
+  bad "a fake-bin entry that cannot run" "fake-bin/ holds programs" 'chmod 644 fake-bin/jq'
+  bad "fake-bin a file" "fake-bin: not a directory" 'rm -r fake-bin && printf x >fake-bin'
+  bad "an unknown task.toml key" "x: task.toml takes" 'printf "x = 1\n" >task.toml'
+  bad "max_steps 0" "max_steps: task.toml takes" 'printf "max_steps = 0\n" >task.toml'
+  bad "max_seconds a string" "max_seconds: task.toml takes" 'printf "max_seconds = \"3\"\n" >task.toml'
+  bad "a task.toml line that is no assignment" "task.toml:1: expected key = value" 'printf "max_steps\n" >task.toml'
+  rm -rf "$W/bad" && mkdir -p "$W/bad/Bad" && cp -R "$e/one/." "$W/bad/Bad/"
+  run eval --check "$W/bad"
+  refused "a task is a directory, and its name as a module's"
+  rm -rf "$W/bad" && mkdir -p "$W/bad"
+  run eval --check "$W/bad"
+  refused "no task; fix:"
+
+  case_ "a module's eval/ is held to eval/1 when it is added"
+  mkmod "$W/probe"
+  mkdir -p "$W/probe/eval" && cp -R "$e/one" "$W/probe/eval/one"
+  run verify --dir "$W/probe"
+  rc_is 0
+  chmod 644 "$W/probe/eval/one/check"
+  run verify --dir "$W/probe"
+  refused "eval/one/check: a program"
+  run add "$W/probe" --yes
+  refused "eval/one/check: a program"
+  chmod 755 "$W/probe/eval/one/check"
+  run add "$W/probe" --yes
+  rc_is 0
+
+  case_ "eval: what it refuses before any run"
+  printf '#!/bin/sh\necho "henki 0.2.0 (x)"\n' >"$W/henki" && chmod 755 "$W/henki"
+  mkmod "$W/probe"
+  mkmod "$W/plain"
+  mkdir -p "$W/probe/eval" && cp -R "$e/one" "$W/probe/eval/one"
+  run add "$W/probe" --yes
+  run eval
+  rc_is 2
+  HENKI_BIN="$W/henki" run eval nope --yes
+  refused "nope is not added"
+  HENKI_BIN="$W/henki" run eval probe --repeats 0 --yes
+  refused "--repeats 0: not a number from 1 to 99"
+  HENKI_BIN="$W/henki" run eval probe --repeats 100 --yes
+  refused "--repeats 100"
+  HENKI_BIN="$W/henki" HENKI_DEPTH=1 run eval probe --yes
+  refused "this runs inside henki (HENKI_DEPTH=1)"
+  HENKI_BIN="$W/henki" run eval "$W/plain" --yes
+  refused "plain has no eval/ tasks; fix: henki-mods eval $W/plain --suite general"
+  HENKI_BIN="$W/henki" run eval probe --suite nope --yes
+  refused "nope is not added"
+  HENKI_BIN="$W/henki" HENKI_MODS_TTY="$W/no-tty" run eval probe
+  refused "no terminal to ask on"
+  out_has "eval: probe 0.1.0 (hd1:"
+  out_has "each task's setup and check run as you, and henki with approve = auto"
+  printf 'n\n' >"$W/answer"
+  HENKI_BIN="$W/henki" HENKI_MODS_TTY="$W/answer" run eval probe
+  refused "not run (the answer was no)"
+  [ ! -e "$XDG_STATE_HOME/henki/eval.tsv" ] || fail "a refused eval wrote eval.tsv"
+}
+
+# Live: eval against a real henki and the eval stub, the arms told apart by what the model sees.
+t_eval_live() {
+  case_ "eval: two arms through henki run, the result lines, the repeats rule"
+  live_ok || return
+  local d="$W/stub" m="$W/probe" s="$W/suite" lines
+  eval_stub_up "$d" || return
+  mkdir -p "$CONF"
+  printf 'model = "m"\nbase_url = "http://127.0.0.1:%s/v1"\next = ["~/elsewhere"]\n' "$STUB_PORT" >"$CONF/config.toml"
+  chmod 600 "$CONF/config.toml"
+  printf 'Be brief.\n' >"$CONF/AGENTS.md"
+  mkmod "$m"
+  printf '# probe: answers for tests\n' >"$m/doc.md"
+  # ask: only the on arm's prompt lists probe; it also sees setup's marker and EVAL_DIR.
+  mktask "$m/eval" ask "Is probe there?" '[ "$(cat)" = yes ] && [ -f marker ] && [ -f "$EVAL_DIR/prompt.txt" ]'
+  # fake: a call runs fake-bin/fakething first on PATH, within max_steps.
+  mktask "$m/eval" fake "CALL: fakething" 'command grep -q FAKE-OK'
+  mkdir -p "$m/eval/fake/fake-bin" && printf '#!/bin/sh\necho FAKE-OK\n' >"$m/eval/fake/fake-bin/fakething"
+  chmod 755 "$m/eval/fake/fake-bin/fakething" && printf 'max_steps = 3\n' >"$m/eval/fake/task.toml"
+  # bytes: the check gets the answer's exact bytes (escapes, a surrogate pair, a tab, no added newline).
+  mktask "$m/eval" bytes "BYTES" 'cmp - "$EVAL_DIR/.want"'
+  printf 'caf\303\251 "q" back\\slash\ttab\nline two \342\200\213 \363\240\200\201 end' >"$m/eval/bytes/.want"
+  run add "$m" --yes
+  rc_is 0
+  run eval probe --yes
+  rc_is 0
+  out_has "ask              on  pass  (ok, 1 steps,"
+  out_has "ask              off fail  (ok, 1 steps,"
+  out_has "fake             off pass  (ok, 2 steps,"
+  out_has "bytes            off pass"
+  out_lacks "10 more"
+  check "eval/1 lines have CONTRACTS.md's fields" [ "$(awk -F '\t' '{ print NF }' "$XDG_STATE_HOME/henki/eval.tsv" | sort -u)" = "$(doc_fields eval/1)" ]
+  lines=$(cat "$XDG_STATE_HOME/henki/eval.tsv")
+  case "$lines" in "eval/1${tab}probe${tab}0.1.0${tab}$(field probe 8)${tab}m${tab}probe${tab}on${tab}9${tab}9${tab}"*"${nl}eval/1${tab}probe${tab}0.1.0${tab}"*"${tab}off${tab}6${tab}9${tab}"*) ;; *)
+    fail "eval.tsv holds: $lines"
+    ;;
+  esac
+  out_has "probe: on 9 of 9 passed, off 6 of 9; added to $XDG_STATE_HOME/henki/eval.tsv"
+  # The arms within one pass of each other after 3 runs: 10 more, 13 each; --model names the model.
+  mkdir -p "$s" && cp -R "$m/eval/fake" "$s/fake"
+  : >"$d/models"
+  run eval probe --suite "$s" --model other --yes
+  rc_is 0
+  out_has "the arms are within one pass of each other after 3 repeats: 10 more"
+  [ "$(sort -u "$d/models")" = other ] || fail "the stub saw the models $(sort -u "$d/models" | tr '\n' ' ')"
+  case "$(tail -n 2 "$XDG_STATE_HOME/henki/eval.tsv")" in *"${tab}other${tab}$s${tab}on${tab}13${tab}13${tab}"*"${tab}off${tab}13${tab}13${tab}"*) ;; *)
+    fail "eval.tsv ends with: $(tail -n 2 "$XDG_STATE_HOME/henki/eval.tsv")"
+    ;;
+  esac
+  # The general suite: every setup runs (none fails), one run per task and arm.
+  run eval probe --suite general --repeats 1 --yes
+  rc_is 0
+  case "$(tail -n 1 "$XDG_STATE_HOME/henki/eval.tsv")" in *"${tab}general${tab}off${tab}"*"${tab}12${tab}"*) ;; *)
+    fail "eval.tsv ends with: $(tail -n 1 "$XDG_STATE_HOME/henki/eval.tsv")"
+    ;;
+  esac
+  kill "$STUB_PID" 2>/dev/null
+  wait "$STUB_PID" 2>/dev/null
+}
+
+# The general suite's checks are deterministic and right: after each task's setup, a right solution and answer pass,
+# and a near miss fails.
+t_general() {
+  case_ "the general suite: each check passes a right solution and fails a near miss"
+  local g="$HERE/../eval/general" t n=0
+  gen() { # TASK RIGHT_SOLUTION RIGHT_ANSWER WRONG_SOLUTION WRONG_ANSWER
+    local which w sol ans
+    n=$((n + 1))
+    for which in right wrong; do
+      w="$W/$1.$which"
+      mkdir -p "$w"
+      (cd "$w" && EVAL_DIR="$g/$1" "$g/$1/setup") </dev/null >"$W/setup.log" 2>&1 || {
+        fail "$1: setup failed: $(cat "$W/setup.log")"
+        return
+      }
+      if [ "$which" = right ]; then sol=$2 ans=$3; else sol=$4 ans=$5; fi
+      (cd "$w" && eval "$sol") || fail "$1: the $which solution failed"
+      if printf '%s\n' "$ans" | (cd "$w" && EVAL_DIR="$g/$1" "$g/$1/check") >/dev/null 2>&1; then
+        [ "$which" = right ] || fail "$1: the check passed a near miss"
+      else
+        [ "$which" = wrong ] || fail "$1: the check failed the right answer"
+      fi
+    done
+  }
+  gen count-lines ': ' 'There are 19 such lines (status 404).' ': ' '23'
+  gen rename 'cd photos && for f in *.JPG; do mv "$f" "${f%.JPG}.jpg"; done' done 'cd photos && for f in *JPG*; do mv "$f" "$(echo "$f" | tr A-Z a-z)"; done' done
+  gen fix-script "printf '#!/bin/sh\necho \$((\$1 + \$2))\n' >sum.sh" fixed "printf '#!/bin/sh\necho 5\n' >sum.sh" fixed
+  gen largest-file ': ' 'data/c/d/e/huge.bin' ': ' 'data/.cache'
+  gen json-field '[ "$("$g/json-field/fake-bin/jq" .server.port config.json 2>&1; echo $?)" = "jq: command not found${nl}127" ]' '8443' ': ' '8443 (and 9443 for TLS)'
+  gen git-log '[ "$(git log --diff-filter=A --format=%an -- parser.c)" = "Ada Lovelace" ]' 'Ada Lovelace' ': ' 'Alan Turing'
+  gen write-script "printf '#!/bin/sh\nwc -w <\"\$1\"\n' >count-words && chmod 755 count-words" done "printf '#!/bin/sh\nwc -w \"\$1\"\n' >count-words && chmod 755 count-words" done
+  gen config-value "sed 's/^timeout = 60\$/timeout = 30/' app.ini >x && mv x app.ini" done "sed 's/^timeout = .*/timeout = 30/' app.ini >x && mv x app.ini" done
+  gen find-todo '[ "$(command grep -rn TODO src | cut -d: -f1,2)" = src/lib/parse.sh:14 ]' 'src/lib/parse.sh:14' ': ' 'src/lib/parse.sh:13'
+  gen dir-tree 'mkdir -p site/css site/js site/img/icons && : >site/index.html' done 'mkdir -p site/css site/js site/img/icons && echo hi >site/index.html' done
+  gen compare-files '[ "$(diff old.txt new.txt | sed -n 1p)" = 7c7 ]' '7: color = navy' ': ' '7: color = teal'
+  gen explain-error '! ./run.sh >/dev/null 2>&1' 'settings.conf' 'touch settings.conf' 'settings.conf'
+  t=$(cd "$g" && ls | wc -l | tr -d ' ')
+  [ "$n" = "$t" ] || fail "the general suite has $t tasks, and this case covers $n"
+}
+
 all() {
   t_add_path
   t_ask
@@ -1129,14 +1839,25 @@ all() {
   t_shadow
   t_official
   t_halti
+  t_allow
+  t_ext2
+  t_observe
+  t_restart
+  t_ports
+  t_port_toy
+  t_policy
+  t_eval
 }
 
 static_bash32
 static_contracts
+static_formats
 RUN=bash
 all
 t_live
 t_halti_live
+t_eval_live
+t_general
 # POSIX mode turns off some bash behaviour a script may lean on without knowing; the manager must not.
 RUN="bash --posix"
 all

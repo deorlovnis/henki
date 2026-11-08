@@ -1,7 +1,7 @@
 //! Allow rules: the user's standing approvals for exact shell commands in one project root, kept in a plain text file
 //! the user can read, edit and empty.
-use crate::{sys, term};
-use std::{ffi::OsString, fs, fs::File, fs::TryLockError, io, io::Read, io::Write, os::unix::fs::MetadataExt, os::unix::fs::OpenOptionsExt, path::Path, path::PathBuf};
+use crate::{config::Config, port::Decision, port::Policy, sys, term, tools, tools::Target, types::Call};
+use std::{fs, fs::File, fs::TryLockError, io, io::Read, io::Write, os::unix::fs::MetadataExt, os::unix::fs::OpenOptionsExt, path::Path, path::PathBuf};
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct Rule {
@@ -19,7 +19,7 @@ pub struct Allow {
 
 const MAX: u64 = 64 << 10;
 const HEADER: &str = "# henki allow rules: ROOT<TAB>COMMAND, one per line; COMMAND then runs without asking in ROOT.
-# List and remove them with /allow in henki or henki allow [rm N]; or edit this file.\n";
+# List and remove them with henki mods allow [rm N] (/allow in henki); or edit this file.\n";
 
 /// The allow file for rule use, at start. `read` false (auto mode): nothing is read. Fails closed.
 pub fn load(file: &Path, read: bool) -> Result<Allow, String> {
@@ -29,7 +29,7 @@ pub fn load(file: &Path, read: bool) -> Result<Allow, String> {
         Some(libc::ELOOP) => format!("{f}: a symlink; fix: put the file itself in its place"),
         _ => format!("{f}: {e}; fix: keep the rules in a regular file of at most 64 KiB"),
     };
-    let Some(fd) = (if read { open(file, libc::O_NOFOLLOW).map_err(fix)? } else { None }) else { return Ok(none) };
+    let Some(fd) = (if read { open(file).map_err(fix)? } else { None }) else { return Ok(none) };
     let (b, m) = bytes(&fd).and_then(|b| Ok((b, fd.metadata()?))).map_err(fix)?;
     if others(m.mode(), m.uid(), sys::euid()) {
         return Err(format!("{f}: another user can change it; fix: chown $USER {f}; chmod 600 {f}"));
@@ -75,6 +75,30 @@ impl Allow {
     }
 }
 
+/// The std policy binding: `auto` allows every call; `ask` asks for shell, write and edit and for reads outside the
+/// project (`tools::needs_approval`), unless an allow rule for the root holds the exact command; `always` saves one.
+pub struct Std;
+
+impl Policy for Std {
+    fn decide(&mut self, c: &Call, t: Option<&Target>, cfg: &Config, session: &str) -> Decision {
+        let cmd = c.args["command"].as_str().filter(|_| c.name == "shell");
+        if !tools::needs_approval(&c.name, t, cfg, session) {
+            return Decision::Allow { verdict: "auto", rule: None, line: None };
+        }
+        let Some(r) = cmd.and_then(|cmd| cfg.allow.find(cmd, &cfg.root)) else { return Decision::Ask { always: cmd.is_some_and(|cmd| fits(cmd, &cfg.root)), note: None } };
+        let line = format!("$ {}  (allowed by rule {} for {}, {})", r.cmd, r.n, shown(Path::new(&r.root), &cfg.home), shown(&cfg.allow.file, &cfg.home));
+        Decision::Allow { verdict: "rule", rule: Some(r.n), line: Some(line) }
+    }
+
+    fn record(&mut self, c: &Call, cfg: &mut Config) -> Result<(String, Option<usize>), String> {
+        let (root, file) = (shown(&cfg.root, &cfg.home), shown(&cfg.allow.file, &cfg.home));
+        match cfg.allow.append(&cfg.root, c.args["command"].as_str().unwrap_or_default()) {
+            Ok(n) => Ok((format!("added to {file} as rule {n} for {root}; /allow lists and removes rules"), Some(n))),
+            Err(e) => Err(format!("could not write {file}: {e}")),
+        }
+    }
+}
+
 /// After the write: the file grew by exactly what was written, and its path still names the file written to.
 fn intact(old: u64, wrote: u64, fd: &fs::Metadata, path: &fs::Metadata) -> bool {
     fd.len() == old + wrote && (fd.dev(), fd.ino()) == (path.dev(), path.ino())
@@ -85,38 +109,15 @@ pub fn fits(cmd: &str, root: &Path) -> bool {
     !cmd.contains(&" ".repeat(33)) && root.to_str().is_some_and(|r| r.starts_with('/') && rule(0, format!("{r}\t{cmd}").as_bytes()).is_ok())
 }
 
-/// `/allow` and `henki allow`: the file's path, then one line per rule. Lenient: any mode, invalid lines listed as such.
-pub fn list(file: &Path, home: &Path) -> Vec<String> {
-    let b = open(file, 0).and_then(|f| f.map(|f| bytes(&f)).transpose()).map_err(|e| format!("cannot read it: {e}"));
-    let rules = b.map(|b| numbered(&b.unwrap_or_default()).enumerate().map(|(k, (_, l))| format!("{}  {}", k + 1, show(l, home))).collect());
-    [vec![file.display().to_string()], rules.unwrap_or_else(|e| vec![e])].concat()
-}
-
-/// Removes rule `n`, every other byte kept. Ok: `removed rule N: ROOT  COMMAND`; Err: `no rule N in FILE`, or the IO error.
-pub fn remove(file: &Path, n: usize, home: &Path) -> Result<String, String> {
-    let err = |e: io::Error| format!("{}: {e}", file.display());
-    let none = || format!("no rule {n} in {}", file.display());
-    let f = open(file, 0).map_err(err)?.ok_or_else(none)?;
-    let b = lock(&f).and_then(|()| bytes(&f)).map_err(err)?;
-    let (i, l) = n.checked_sub(1).and_then(|k| numbered(&b).nth(k)).ok_or_else(none)?;
-    let rest: Vec<&[u8]> = b.split(|&c| c == b'\n').enumerate().filter(|&(j, _)| j != i).map(|(_, l)| l).collect();
-    // The directory's realpath: a config directory that is a symlink (dotfiles) works as it does for load and append.
-    let dir = fs::canonicalize(file.parent().unwrap_or(Path::new("/"))).and_then(|d| sys::Dir::open(&d)).map_err(err)?;
-    let tmp = OsString::from(format!(".allow.henki-{}", std::process::id()));
-    let write = |mut t: File| t.write_all(&rest.join(&b'\n')).and_then(|()| t.sync_all());
-    let done = dir.create(&tmp, 0o600).and_then(write).and_then(|()| dir.rename(&tmp, file.file_name().unwrap_or_default()));
-    done.inspect_err(|_| dir.unlink(&tmp)).map_err(err)?;
-    Ok(format!("removed rule {n}: {}", show(l, home)))
-}
-
 /// A path with `$HOME` shown as `~`.
 pub fn shown(p: &Path, home: &Path) -> String {
     p.strip_prefix(home).map_or_else(|_| p.display().to_string(), |r| format!("~/{}", r.display()).trim_end_matches('/').into())
 }
 
-/// The file opened without blocking (`flags`: O_NOFOLLOW or 0), None when absent; anything but a regular file is an error.
-fn open(file: &Path, flags: i32) -> io::Result<Option<File>> {
-    match fs::OpenOptions::new().read(true).custom_flags(flags | libc::O_NONBLOCK | libc::O_NOCTTY).open(file) {
+/// The file opened without blocking and without following a symlink, None when absent; anything but a regular file is
+/// an error.
+fn open(file: &Path) -> io::Result<Option<File>> {
+    match fs::OpenOptions::new().read(true).custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_NOCTTY).open(file) {
         Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
         Ok(f) if !f.metadata()?.is_file() => Err(io::Error::other("not a regular file")),
         r => r.map(Some),
@@ -150,11 +151,6 @@ fn rule(n: usize, l: &[u8]) -> Result<Rule, &'static str> {
     }
     let printable = (1..=200).contains(&cmd.len()) && cmd.iter().all(|b| (0x20..=0x7e).contains(b)) && !matches!(cmd.first(), Some(b'#' | b' '));
     if printable { Ok(Rule { n, root: root.into(), cmd: String::from_utf8_lossy(cmd).into() }) } else { Err("COMMAND is not one printable-ASCII line of 1 to 200 bytes") }
-}
-
-/// `ROOT  COMMAND`, or `!LINE  (invalid: REASON)` with LINE escaped.
-fn show(l: &[u8], home: &Path) -> String {
-    rule(0, l).map_or_else(|why| format!("!{}  (invalid: {why})", term::escape(&String::from_utf8_lossy(l))), |r| format!("{}  {}", shown(Path::new(&r.root), home), r.cmd))
 }
 
 /// Someone else could change the file: an owner other than you or root, or group or world write.

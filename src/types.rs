@@ -7,6 +7,10 @@ pub fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
+/// Held by the release gates that time something, so no two of them run at once and skew each other.
+#[cfg(test)]
+pub static TIMED: Mutex<()> = Mutex::new(());
+
 /// A call's name as notes and errors show it: `unknown` when the model sent none.
 pub fn call_name(name: &str) -> &str {
     if name.is_empty() { "unknown" } else { name }
@@ -36,6 +40,8 @@ pub enum Ev {
     Tool { tag: u32, out: ToolOutput },
     /// The end of `!cmd` `tag`: its exit code, 128 + N when signal N ended it.
     BangDone { tag: u32, code: i32 },
+    /// An observer run ended and was reaped (`observe`): a `.wait` run of the event `tag`, or another one (tag 0).
+    Observed { tag: u32 },
     /// The output writer got EPIPE on stdout.
     OutputClosed,
 }

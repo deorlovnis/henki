@@ -1,0 +1,5 @@
+#!/bin/sh
+# Four files to rename, and three that must stay as they are (one ends in .JPG.bak).
+mkdir photos || exit 1
+for n in beach-01 beach-02 city.night dog; do printf '%s\n' "$n" >"photos/$n.JPG" || exit 1; done
+printf 'keep\n' >photos/notes.txt && printf 'keep\n' >photos/raw.JPG.bak && printf 'keep\n' >photos/already.jpg

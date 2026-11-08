@@ -1,0 +1,1 @@
+In app.ini, set timeout in the [server] section to 30. Leave every other line as it is.

@@ -1,0 +1,3 @@
+#!/bin/sh
+# Two sections hold timeout; only the server's changes.
+printf '; app settings\n[client]\ntimeout = 10\nretries = 3\n\n[server]\nhost = 0.0.0.0\ntimeout = 60\nworkers = 4\n' >app.ini

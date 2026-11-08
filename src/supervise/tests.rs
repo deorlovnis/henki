@@ -449,3 +449,82 @@ fn signal_groups_ended_background_gone() {
     assert!(!sys::procs().iter().any(|p| p.sid == pgid), "its zombie was not reaped");
     assert_eq!(reap(), 0);
 }
+
+/// A kernel child (a port binding) with a background child of its own: neither is in the count `reap` gives nor touched
+/// by a sweep, its zombie is left to its owner, and `kernel_end` kills its whole session and reaps it.
+#[cfg(target_os = "linux")]
+#[test]
+fn kernel_child_outside_the_floor_of_calls() {
+    if !alone("kernel_child_outside_the_floor_of_calls") {
+        return;
+    }
+    sys::harden().unwrap();
+    let t = Tmp::new();
+    let script = t.0.join("binding");
+    fs::write(&script, "#!/bin/bash\nsleep 3133.5 &\necho $! >bg\nread -r line\n").unwrap();
+    fs::set_permissions(&script, std::os::unix::fs::PermissionsExt::from_mode(0o700)).unwrap();
+    let io = [Stdio::piped(), Stdio::null(), Stdio::null()];
+    let c = kernel_child(&script, &t.0, &path_env(), io).unwrap();
+    let pid = c.id() as i32;
+    let bg = || fs::read_to_string(t.0.join("bg")).ok().and_then(|s| s.trim().parse::<i32>().ok());
+    until("the binding's background sleep", || bg().is_some_and(alive));
+    assert_eq!((reap(), sweep_pass(), signal_groups(0)), (0, 0, 0), "a kernel child counted or swept as a call's");
+    assert!(alive(pid) && alive(bg().unwrap()) && lock(&KERNEL).contains(&pid));
+    // Ended on its own (stdin closed), it stays a zombie for its owner: `pass` never reaps it. Its orphan is henki's
+    // child now, so it counts as background, as an orphan of a call's would.
+    let mut c = c;
+    drop(c.stdin.take());
+    until("the binding to end", || sys::procs().iter().any(|p| p.pid == pid && p.zombie));
+    assert_eq!(reap(), 1);
+    assert!(sys::procs().iter().any(|p| p.pid == pid && p.zombie), "pass reaped a kernel child");
+    // The kill still reaches the orphan: it is in the binding's session.
+    kernel_end(Some(c), true);
+    assert!(!lock(&KERNEL).contains(&pid) && !sys::procs().iter().any(|p| p.pid == pid));
+    until("the binding's background sleep to die", || !alive(bg().unwrap()));
+    assert_eq!(reap(), 0);
+    kernel_end(None, true);
+}
+
+/// An observer run: `sys::exited` sees its end and leaves it a zombie for its waiter, `kernel_end(.., false)` reaps it
+/// without touching what it left in its session, and `kernel_kill` kills only pids still in KERNEL, sweeping after.
+#[cfg(target_os = "linux")]
+#[test]
+fn kernel_observer_run_reaped_by_its_waiter() {
+    if !alone("kernel_observer_run_reaped_by_its_waiter") {
+        return;
+    }
+    sys::harden().unwrap();
+    let t = Tmp::new();
+    let script = t.0.join("on");
+    fs::write(&script, "#!/bin/bash\nsleep 3133.6 &\necho $! >bg\n").unwrap();
+    fs::set_permissions(&script, std::os::unix::fs::PermissionsExt::from_mode(0o700)).unwrap();
+    let c = kernel_child(&script, &t.0, &path_env(), [Stdio::null(), Stdio::null(), Stdio::null()]).unwrap();
+    let pid = c.id() as i32;
+    assert!(sys::exited(pid));
+    let bg = fs::read_to_string(t.0.join("bg")).unwrap().trim().parse::<i32>().unwrap();
+    assert!(sys::procs().iter().any(|p| p.pid == pid && p.zombie), "exited reaped the run");
+    // Its orphan is henki's child now: counted as background, as an orphan of a call's would be.
+    assert_eq!(reap(), 1);
+    assert!(sys::procs().iter().any(|p| p.pid == pid && p.zombie) && lock(&KERNEL).contains(&pid), "pass reaped the run");
+    kernel_end(Some(c), false);
+    assert!(!lock(&KERNEL).contains(&pid) && !sys::procs().iter().any(|p| p.pid == pid));
+    assert!(alive(bg), "the run's background process was killed with it");
+    // Forgotten: the pid is not signalled (a recycled one is safe), yet the sweep after it takes the orphan the ended
+    // run left, as at the session end.
+    kernel_kill(&[pid]);
+    until("the ended run's orphan to be swept", || !alive(bg));
+    // A live run is killed with its session; the sweep after it takes the orphan (henki's child once its parent died).
+    let script = t.0.join("slow");
+    fs::write(&script, "#!/bin/bash\nsleep 3133.7\n").unwrap();
+    fs::set_permissions(&script, std::os::unix::fs::PermissionsExt::from_mode(0o700)).unwrap();
+    let c = kernel_child(&script, &t.0, &path_env(), [Stdio::null(), Stdio::null(), Stdio::null()]).unwrap();
+    let slow = c.id() as i32;
+    until("the slow run's sleep", || sys::procs().iter().any(|p| p.sid == slow && p.pid != slow));
+    kernel_kill(&[slow]);
+    assert!(sys::exited(slow));
+    kernel_end(Some(c), false);
+    // Killed by now, but its orphan may die after kernel_kill's sweeps saw nothing left: a zombie until the next one.
+    until("the slow run's session to die", || !sys::procs().iter().any(|p| p.sid == slow && !p.zombie));
+    sweep_pass();
+    assert!(!sys::procs().iter().any(|p| p.sid == slow), "the sweep left the orphan's zombie");
+}

@@ -1,0 +1,49 @@
+#!/usr/bin/env bash
+# toy-policy: a policy/1 binding in bash, the "community binding in sh" henki's tests hold to the conformance suite.
+# Rules are grep -E patterns over the canonical request line (compact, keys sorted), one per line of STATE/rules as
+# VERDICT<TAB>PATTERN, VERDICT allow, ask or deny; the first that matches decides, and no match asks. Without the file
+# it reads inside the project, denies `rm -rf` and asks for the rest. `record` (cap record) keeps the shell command as
+# an allow rule. Each decide line goes into STATE/decide.log. STATE is the dir hello names.
+set -u
+state=.
+answer() { printf '{"id":%s,%s}\n' "$id" "$1"; }
+rules() {
+  if [ -f "$state/rules" ]; then cat "$state/rules"; else
+    printf 'allow\t%s\n' '"name":"read"},.*"target":\{"outside":false'
+    printf 'deny\t%s\n' '"command":"rm -rf '
+  fi
+}
+while IFS= read -r line; do
+  id=$(printf '%s' "$line" | sed -n 's/^{"id":\([0-9]*\),.*/\1/p')
+  method=$(printf '%s' "$line" | sed -n 's/^{"id":[0-9]*,"method":"\([^"]*\)".*/\1/p')
+  case "$method" in
+    hello)
+      v=$(printf '%s' "$line" | sed -n 's/.*"versions":\[\([0-9,]*\)\].*/\1/p')
+      case ",$v," in *,1,*) ;; *) answer '"error":{"code":"version","message":"toy-policy speaks policy/1 only"}' && continue ;; esac
+      state=$(printf '%s' "$line" | sed -n 's/.*"state":"\([^"\\]*\)".*/\1/p') && mkdir -p "$state"
+      answer '"result":{"caps":["record"],"impl":"0.1.0","name":"toy-policy","protocol":1,"version":1}'
+      ;;
+    decide)
+      printf '%s\n' "$line" >>"$state/decide.log"
+      verdict=ask n=0
+      while IFS="$(printf '\t')" read -r v p; do
+        n=$((n + 1))
+        printf '%s' "$line" | grep -Eq -- "$p" && verdict=$v && break
+      done <<<"$(rules)"
+      case "$verdict" in
+        allow) answer "\"result\":{\"decision\":\"allow\",\"reason\":\"toy-policy rule $n\"}" ;;
+        deny) answer "\"result\":{\"decision\":\"deny\",\"reason\":\"toy-policy rule $n\"}" ;;
+        *) answer '"result":{"always":true,"decision":"ask"}' ;;
+      esac
+      ;;
+    record)
+      cmd=$(printf '%s' "$line" | sed -n 's/.*"args":{"command":"\(\([^"\\]\|\\.\)*\)".*/\1/p')
+      [ -n "$cmd" ] || { answer '"error":{"code":"invalid","message":"only a shell command is kept"}' && continue; }
+      [ -f "$state/rules" ] || rules >"$state/rules"
+      printf 'allow\t"command":"%s"\n' "$(printf '%s' "$cmd" | sed 's/[][\.*^$+?(){}|/]/\\&/g')" >>"$state/rules"
+      answer '"result":{"shown":"kept in toy-policy rules"}'
+      ;;
+    bye) answer '"result":null' && exit 0 ;;
+    *) answer "\"error\":{\"code\":\"unsupported\",\"message\":\"no method $method\"}" ;;
+  esac
+done

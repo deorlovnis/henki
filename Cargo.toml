@@ -1,6 +1,6 @@
 [package]
 name = "henki"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 rust-version = "1.92"
 description = "A small terminal agent (early development)"
@@ -38,7 +38,7 @@ print_stderr = "deny"
 # The list and the helper to use instead are in clippy.toml.
 disallowed_methods = "deny"
 
-# Small and static: check.sh holds the release binary to 1,000,000 bytes.
+# Small and static: check.sh holds the release binary to 1,065,536 bytes.
 [profile.release]
 opt-level = "z"
 lto = true

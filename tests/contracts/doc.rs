@@ -103,10 +103,26 @@ fn contracts_index() {
     let doc = text();
     let rows = table(&section(&doc, "Index"), "");
     let names: Vec<&str> = rows.iter().map(|(k, _)| k.as_str()).collect();
-    assert_eq!(names, ["journal/1", "json/1", "wire/1", "ext/1", "module/1", "lock/1", "hd1"]);
-    for (name, owner) in
-        [("journal/1", "henki"), ("json/1", "henki"), ("wire/1", "henki"), ("ext/1", "henki"), ("module/1", "henki-mods"), ("lock/1", "henki-mods"), ("hd1", "henki-mods")]
-    {
+    let owners = [
+        ("journal/1", "henki"),
+        ("json/1", "henki"),
+        ("wire/1", "henki"),
+        ("ext/1", "henki"),
+        ("ext/2", "henki"),
+        ("handoff/1", "henki"),
+        ("observe/1", "henki"),
+        ("port/1", "henki"),
+        ("history/1", "henki"),
+        ("policy/1", "henki"),
+        ("conform/1", "henki"),
+        ("module/1", "henki-mods"),
+        ("lock/1", "henki-mods"),
+        ("bind/1", "henki-mods"),
+        ("hd1", "henki-mods"),
+        ("eval/1", "henki-mods"),
+    ];
+    assert_eq!(names, owners.map(|o| o.0));
+    for (name, owner) in owners {
         assert!(doc.contains(&format!("| `{name}` | {owner} |")), "{name} is not owned by {owner}");
         let sec = section(&doc, name);
         assert!(owner == "henki" || sec.starts_with("\nOwned by henki-mods"), "{name}: the section does not say it is owned by henki-mods");

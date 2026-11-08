@@ -390,6 +390,19 @@ fn config_key_non_loopback() {
     assert_eq!(t.load("model = \"m\"\nbase_url = \"http://10.1.2.3/v1\"\napi_key = \"\"\n").unwrap().url.host, "10.1.2.3");
 }
 
+/// A host that is not a loopback literal gets a notice at every start: the session's text goes over the network.
+#[test]
+fn config_remote_base_url_notice() {
+    let t = T::new();
+    for host in ["10.1.2.3", "model.example", "127.1"] {
+        let c = t.load(&format!("model = \"m\"\nbase_url = \"http://{host}:8080/v1\"\ncontext_window = 8192\n")).unwrap();
+        assert_eq!(c.notices, [format!("requests leave this machine: prompts, files and command output go to {host}, unencrypted")]);
+    }
+    for host in ["localhost", "127.9.8.7", "[::1]"] {
+        assert!(t.load(&format!("model = \"m\"\nbase_url = \"http://{host}:8080/v1\"\ncontext_window = 8192\n")).unwrap().notices.is_empty(), "{host}");
+    }
+}
+
 #[test]
 fn config_henki_base_url_non_loopback() {
     let t = T::new();
@@ -475,7 +488,7 @@ fn config_env_only_start() {
     assert_eq!((c.model.as_str(), c.url.port, c.url_from), ("qwen", 8080, "HENKI_BASE_URL"));
     assert_eq!((c.file, c.hash, c.explicit, c.auto), (None, None, false, false));
     assert_eq!(c.dir, t.cfg_dir());
-    assert_eq!(c.protected, [t.cfg_dir(), t.cfg_dir().join("AGENTS.md"), t.home.join(".local/state/henki"), t.cfg_dir().join("ext")]);
+    assert_eq!(c.protected, [t.cfg_dir(), t.cfg_dir().join("AGENTS.md"), t.home.join(".local/state/henki"), t.home.join(".local/share/henki"), t.cfg_dir().join("ext")]);
 }
 
 #[test]
@@ -487,7 +500,7 @@ fn config_precedence() {
     let env = t.env(&[("HENKI_MODEL", "from-env")]);
     let c = load(&flags(), &env, &t.cwd).unwrap();
     assert_eq!(c.model, "from-env");
-    let f = Flags { model: Some("from-flag".into()), max_steps: Some(9), max_seconds: Some(0), approve: Some(false), config: None };
+    let f = Flags { model: Some("from-flag".into()), max_steps: Some(9), max_seconds: Some(0), approve: Some(false), config: None, ports: Vec::new() };
     let c = load(&f, &env, &t.cwd).unwrap();
     assert_eq!((c.model.as_str(), c.max_steps, c.max_seconds, c.auto, c.approve_from.as_str()), ("from-flag", 9, 0, false, "--approve"));
     assert_eq!((c.cwd, c.root, c.home), (t.cwd.clone(), t.cwd.clone(), t.home.clone()));
@@ -510,9 +523,10 @@ fn config_ignores_xdg_config_home() {
 #[test]
 fn config_unknown_henki_env_notice() {
     let t = T::new();
-    let silent = [("HENKI_DEPTH", "1"), ("HENKI_SESSION", "x"), ("HENKI_USER_PATH", "/bin"), ("HENKI_VERSION", "0.1.0")];
-    let c = t.load_env(&format!("{BASE}context_window = 8192\n"), &[&silent[..], &[("HENKI_FOO", "1"), ("HENKI_CONFIG", "/x")]].concat()).unwrap();
-    assert_eq!(c.notices, ["ignoring HENKI_FOO: henki does not read it", "ignoring HENKI_CONFIG: henki does not read it"]);
+    let silent = [("HENKI_DEPTH", "1"), ("HENKI_SESSION", "x"), ("HENKI_USER_PATH", "/bin"), ("HENKI_VERSION", "0.1.0"), ("HENKI_CONFIG", "/x"), ("HENKI_BIN", "/y")];
+    let silent = [&silent[..], &[("HENKI_STATE", "/s"), ("HENKI_MODULE", "/m"), ("HENKI_NEXT", "/n")]].concat();
+    let c = t.load_env(&format!("{BASE}context_window = 8192\n"), &[&silent[..], &[("HENKI_FOO", "1"), ("HENKI_JOURNAL", "/x")]].concat()).unwrap();
+    assert_eq!(c.notices, ["ignoring HENKI_FOO: henki does not read it", "ignoring HENKI_JOURNAL: henki does not read it"]);
     assert!(t.load_env(&format!("{BASE}context_window = 8192\n"), &silent).unwrap().notices.is_empty());
 }
 
@@ -686,7 +700,7 @@ fn config_ext_empty_list() {
     assert!(c.exts.is_empty());
     assert!(!c.protected.contains(&ext), "{:?}", c.protected);
     let d = t.cfg_dir();
-    assert_eq!(c.trust, [t.cfg(), d.join("allow"), d.join("AGENTS.md"), t.bin.join("bash")]);
+    assert_eq!(c.trust, [t.cfg(), d.join("allow"), d.join("AGENTS.md"), t.bin.join("bash"), d.join("port"), d.join("port/history"), d.join("port/policy")]);
 }
 
 #[test]
@@ -830,6 +844,16 @@ fn config_state_protected() {
     }
 }
 
+/// The data dir holds the module store that the ext links point into: protected like the state dir.
+#[test]
+fn config_data_protected() {
+    let t = T::new();
+    let xdg = t.dir.join("xdg-data");
+    assert!(t.load_env(BASE, &[("XDG_DATA_HOME", xdg.to_str().unwrap())]).unwrap().protected.contains(&xdg.join("henki")), "absent, by its path");
+    let c = t.load_env(BASE, &[("XDG_DATA_HOME", "relative/data")]).unwrap();
+    assert!(c.protected.contains(&t.home.join(".local/share/henki")), "only an absolute XDG_DATA_HOME counts: {:?}", c.protected);
+}
+
 #[test]
 fn config_ext_paths_protected() {
     let t = T::new();
@@ -848,15 +872,16 @@ fn config_ext_symlink_target_protected() {
     let t = T::new();
     let ext = t.cfg_dir().join("ext");
     fs::create_dir_all(&ext).unwrap();
-    // The extension dir is a link to a checkout, and one of its commands a link to a file elsewhere.
+    // The extension dir is a link to a checkout, and one of its commands a relative link to a file elsewhere in it.
     let src = t.dir.join("src");
     add_ext(&src, "halti-checkout", &["halti"]);
-    put(&t.dir.join("tool-real"), "#!/bin/sh\n", 0o755);
-    symlink(t.dir.join("tool-real"), src.join("halti-checkout/bin/tool")).unwrap();
+    fs::create_dir_all(src.join("halti-checkout/.henki")).unwrap();
+    put(&src.join("halti-checkout/.henki/tool-real"), "#!/bin/sh\n", 0o755);
+    symlink("../.henki/tool-real", src.join("halti-checkout/bin/tool")).unwrap();
     symlink(src.join("halti-checkout"), ext.join("halti")).unwrap();
     let c = t.load(BASE).unwrap();
     assert_eq!(c.exts[0].name, "halti");
-    for p in [src.join("halti-checkout"), t.dir.join("tool-real")] {
+    for p in [src.join("halti-checkout"), src.join("halti-checkout/.henki/tool-real")] {
         assert!(c.exts[0].targets.contains(&p) && c.protected.contains(&p), "{p:?} not in {:?}", c.protected);
     }
 }
@@ -993,18 +1018,35 @@ fn config_trust_paths() {
     add_ext(&ext, "halti", &["halti"]);
     let c = t.load(BASE).unwrap();
     assert!(c.exts[0].paths.contains(&ext.join("halti/doc.md")) && c.exts[0].paths.contains(&ext.join("halti/bin/halti")));
-    let want: Vec<_> = [t.cfg(), d.join("allow"), d.join("AGENTS.md"), t.bin.join("bash"), ext.clone()].into_iter().chain(c.exts[0].paths.clone()).collect();
+    let want: Vec<_> = [t.cfg(), d.join("allow"), d.join("AGENTS.md"), t.bin.join("bash"), ext.clone()].into_iter().chain(c.exts[0].paths.clone()).chain(ports(&d)).collect();
     assert_eq!(c.trust, want);
     assert!(!d.join("allow").exists() && !d.join("AGENTS.md").exists(), "absent files are watched too");
     // Without a config file its default path is watched; with --config, the file named and the ext paths listed.
     fs::remove_dir_all(&ext).unwrap();
     fs::remove_file(t.cfg()).unwrap();
     let c = load(&flags(), &t.env(&[("HENKI_MODEL", "m"), ("HENKI_BASE_URL", "http://127.0.0.1:1/v1")]), &t.cwd).unwrap();
-    assert_eq!(c.trust, [t.cfg(), d.join("allow"), d.join("AGENTS.md"), t.bin.join("bash"), ext.clone()]);
+    assert_eq!(c.trust, [t.cfg(), d.join("allow"), d.join("AGENTS.md"), t.bin.join("bash"), ext.clone(), d.join("port"), d.join("port/history"), d.join("port/policy")]);
     fs::create_dir_all(t.home.join("exts")).unwrap();
     let c = t.explicit(&format!("{BASE}ext = [\"~/exts\"]\n")).unwrap();
     let cfg = t.dir.join("cfg");
-    assert_eq!(c.trust, [cfg.join("config.toml"), cfg.join("allow"), cfg.join("AGENTS.md"), t.bin.join("bash"), t.home.join("exts")]);
+    assert_eq!(
+        c.trust,
+        [
+            cfg.join("config.toml"),
+            cfg.join("allow"),
+            cfg.join("AGENTS.md"),
+            t.bin.join("bash"),
+            t.home.join("exts"),
+            cfg.join("port"),
+            cfg.join("port/history"),
+            cfg.join("port/policy")
+        ]
+    );
+}
+
+/// The port links the tripwire stamps (absent ones too): `CONFIG/port/` and each port a link can bind.
+fn ports(d: &Path) -> [PathBuf; 3] {
+    [d.join("port"), d.join("port/history"), d.join("port/policy")]
 }
 
 #[test]
@@ -1012,12 +1054,13 @@ fn config_trust_paths_symlinked_ext() {
     let t = T::new();
     let ext = t.cfg_dir().join("ext");
     fs::create_dir_all(&ext).unwrap();
-    // The NAME dir is a link to a checkout, and its one command a link to a file elsewhere.
-    let (src, tool) = (t.dir.join("src/checkout"), t.dir.join("tool-real"));
+    // The NAME dir is a link to a checkout, and its one command a relative link to a file elsewhere in it.
+    let (src, tool) = (t.dir.join("src/checkout"), t.dir.join("src/checkout/.henki/tool-real"));
     add_ext(&t.dir.join("src"), "checkout", &[]);
     fs::create_dir_all(src.join("bin")).unwrap();
+    fs::create_dir_all(src.join(".henki")).unwrap();
     put(&tool, "#!/bin/sh\n", 0o755);
-    symlink(&tool, src.join("bin/tool")).unwrap();
+    symlink("../.henki/tool-real", src.join("bin/tool")).unwrap();
     symlink(&src, ext.join("halti")).unwrap();
     let c = t.load(BASE).unwrap();
     // The tripwire stamps the names discovery used, through the links; write and edit refuse what the links reach.
@@ -1025,7 +1068,7 @@ fn config_trust_paths_symlinked_ext() {
     let through = [dir.clone(), dir.join("doc.md"), dir.join("bin"), dir.join("bin/tool")];
     assert_eq!(c.exts[0].paths, through);
     let d = t.cfg_dir();
-    let want: Vec<_> = [t.cfg(), d.join("allow"), d.join("AGENTS.md"), t.bin.join("bash"), ext.clone()].into_iter().chain(through).collect();
+    let want: Vec<_> = [t.cfg(), d.join("allow"), d.join("AGENTS.md"), t.bin.join("bash"), ext.clone()].into_iter().chain(through).chain(ports(&d)).collect();
     assert_eq!(c.trust, want);
     for p in [src, tool] {
         assert!(c.protected.contains(&p) && !c.trust.contains(&p), "{p:?}: {:?}", c.protected);
@@ -1135,7 +1178,16 @@ fn config_protected_realpaths() {
     symlink(&real, t.cfg_dir()).unwrap();
     let c = t.load(BASE).unwrap();
     let real = fs::canonicalize(&real).unwrap();
-    let want = [t.cfg(), real.join("config.toml"), t.cfg_dir(), real.clone(), t.cfg_dir().join("AGENTS.md"), t.home.join(".local/state/henki"), t.cfg_dir().join("ext")];
+    let want = [
+        t.cfg(),
+        real.join("config.toml"),
+        t.cfg_dir(),
+        real.clone(),
+        t.cfg_dir().join("AGENTS.md"),
+        t.home.join(".local/state/henki"),
+        t.home.join(".local/share/henki"),
+        t.cfg_dir().join("ext"),
+    ];
     assert_eq!(c.protected, want);
     assert_eq!((c.file, c.dir), (Some(t.cfg()), t.cfg_dir()));
 }

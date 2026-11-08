@@ -1,0 +1,9 @@
+#!/bin/sh
+# Sets the clipboard to stdin with the first clipboard tool found on PATH.
+has() { command -v "$1" >/dev/null 2>&1; }
+if has pbcopy; then exec pbcopy; fi
+if [ -n "${WAYLAND_DISPLAY:-}" ] && has wl-copy; then exec wl-copy; fi
+if [ -n "${DISPLAY:-}" ] && has xclip; then exec xclip -selection clipboard -i; fi
+if [ -n "${DISPLAY:-}" ] && has xsel; then exec xsel --clipboard --input; fi
+echo "clip-put: no clipboard here; fix: on Linux install wl-clipboard, xclip or xsel, and add pass_env = [\"WAYLAND_DISPLAY\", \"DISPLAY\"] to henki's config" >&2
+exit 1

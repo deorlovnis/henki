@@ -1,27 +1,31 @@
 //! The line REPL: a banner, a prompt, `/` commands, `!cmd`, and one turn per message, on the terminal henki was
 //! started from.
-use crate::{allow, http, supervise, sys, term, turn::Session, turn::outcome_line, types::Outcome, types::Stop};
+use crate::{allow, config, handoff, handoff::Next, http, supervise, sys, term, turn::Session, turn::outcome_line, types::Outcome, types::Stop};
+use std::ffi::OsString;
 
 const HELP: &str = "/exit  quit (also Ctrl-D)
-/allow  list the allow rules; /allow rm N removes rule N
+/mods [ARGS]  the module manager on this terminal (henki mods ARGS)
+/allow [rm N]  list the allow rules, or remove rule N (henki mods allow)
 /help  this list
 !CMD  run CMD yourself on this terminal; the model is told you ran it
 Enter sends the message; a paste goes into it whole (up to 1 MiB, newlines kept) and is never a command.";
 /// The answer to every message once a trust file changed: the session goes on only after a restart reads it again.
 const TRIPPED: &str = "a trust file changed; restart henki to go on (henki --resume continues this session)";
 
-/// From the banner to the exit code; closes the session on every path.
-pub fn run(s: &mut Session) -> u8 {
+/// From the banner to the exit code, and the argv of the henki a command handed back (`handoff`); closes the session on
+/// every path.
+pub fn run(s: &mut Session) -> (u8, Option<Vec<OsString>>) {
     // What henki inherited is not its own: from here on every process below it counts, a `!cmd &` job included.
     supervise::reap();
     banner(s);
-    let code = lines(s);
+    let (code, next) = lines(s);
     sys::raw(false); // the modes it started with, also after a `!cmd` that changed them was stopped by TERM or HUP
     // However the REPL found stdout gone (in a turn, at the prompt, during a `!cmd`), it says so once, as a turn would.
     (code == 141).then(|| s.out().line(&outcome_line(&Outcome::OutputClosed)));
     let failed = s.close(None).err();
     failed.iter().for_each(|o| s.out().line(&outcome_line(o)));
-    if failed.is_some() && code == 0 { 2 } else { code }
+    // A session that did not close cleanly is the end: no new henki starts on it.
+    if failed.is_some() { (if code == 0 { 2 } else { code }, None) } else { (code, next) }
 }
 
 /// What henki talks to, how it approves, where its config is, the extensions, the notices and this root's rules.
@@ -31,8 +35,10 @@ fn banner(s: &Session) {
     out.line(&format!("henki {} · {} · {url} ({}) · ctx {}", env!("CARGO_PKG_VERSION"), c.model, c.dialect, term::num(c.window)));
     out.line(&if c.auto { format!("approval: AUTO (from {})", c.approve_from) } else { "approval: ask".into() });
     out.line(&c.file.as_ref().map_or_else(|| "config: none (HENKI_MODEL and HENKI_BASE_URL)".into(), |f| format!("config: {}", allow::shown(f, &c.home))));
+    (c.exts.is_empty()).then(|| out.line("no modules on; /mods (or henki mods) lists the official mods"));
     for e in &c.exts {
-        let cmds = if e.cmds.is_empty() { "doc only".into() } else { e.cmds.join(", ") };
+        let none = if e.prompt { "doc only" } else { "no tools" };
+        let cmds = if e.cmds.is_empty() { none.into() } else { e.cmds.join(", ") };
         let shadows = e.shadows.iter().map(|p| allow::shown(p, &c.home)).collect::<Vec<_>>().join(", ");
         out.line(&format!("ext {}: {cmds}{}{shadows}", e.name, if shadows.is_empty() { "" } else { "; shadows " }));
     }
@@ -46,76 +52,98 @@ fn banner(s: &Session) {
 }
 
 /// IDLE and TRIPPED: one line at a time, until the exit code. TRIPPED (a trust file changed) refuses messages.
-fn lines(s: &mut Session) -> u8 {
+fn lines(s: &mut Session) -> (u8, Option<Vec<OsString>>) {
     let (mut notes, mut tripped) = (String::new(), false);
     loop {
         let (line, typed) = match s.line("> ") {
             Ok(Some(l)) => l,
             // A terminal that went away ends the input too, maybe before its SIGHUP arrives: a hangup all the same.
-            Ok(None) => return if sys::isatty(0) { 0 } else { 130 },
+            Ok(None) => return (if sys::isatty(0) { 0 } else { 130 }, None),
             Err(Stop::Signal(libc::SIGINT | libc::SIGQUIT)) => {
                 s.out().line("\n(Ctrl-C does not quit; /exit or Ctrl-D quits)");
                 continue;
             }
-            Err(e) => return Outcome::from(e).exit() as u8, // a closed stdout, or TERM or HUP
+            Err(e) => return (Outcome::from(e).exit() as u8, None), // a closed stdout, or TERM or HUP
         };
         // Only a line typed alone is a command; a paste, or a line that came with more input pending, is a message.
         let t = line.trim();
         let cmd = if typed { t } else { "" };
-        let rm = cmd.strip_prefix("/allow rm ").and_then(|n| n.trim().parse().ok());
-        match (cmd, rm, cmd.strip_prefix('!')) {
-            _ if t.is_empty() || cmd == "!" => {}
-            ("/exit", ..) => return 0,
-            ("/help", ..) => s.out().line(HELP),
-            ("/allow", ..) => allow::list(&s.cfg.allow.file, &s.cfg.home).iter().for_each(|l| s.out().line(l)),
-            (_, Some(n), _) => tripped |= remove(s, n),
-            _ if cmd.starts_with('/') => s.out().note(&format!("unknown command {t}; /help lists the commands")),
-            (_, _, Some(cmd)) => {
-                let before = s.changed();
-                match s.bang(cmd) {
-                    Ok(code) => code.iter().for_each(|n| notes += &format!("[the user ran in their terminal: {cmd} (exit {n})]\n")),
-                    Err(e) => return Outcome::from(e).exit() as u8, // a closed stdout, or TERM or HUP
-                }
-                // Nothing is read again: what the command changed applies only after a restart. A file that differed
-                // before it changed outside it: named once, as `/allow rm` names it, and never blamed on the command.
-                let (old, new): (Vec<_>, Vec<_>) = s.changed().into_iter().partition(|p| before.contains(p));
-                old.iter().filter(|_| !tripped).for_each(|p| s.out().note(&format!("trust file changed: {}", p.display())));
-                new.iter().for_each(|p| s.out().note(&format!("{} changed by !cmd; restart henki to apply it (henki --resume continues this session)", p.display())));
-                tripped |= !old.is_empty() || !new.is_empty();
+        let (verb, rest) = cmd.split_once(' ').unwrap_or((cmd, ""));
+        let name = verb.strip_prefix('/').unwrap_or_default();
+        // `/mods ARGS` and `/allow ARGS` (`/mods allow ARGS`): the shipped manager, never a module's, its words split at spaces.
+        let mods =
+            matches!(name, "mods" | "allow").then(|| (name == "allow").then_some("allow").into_iter().chain(rest.split_whitespace()).map(OsString::from).collect::<Vec<_>>());
+        // `/NAME REST`: a module's cmd/NAME, REST as one argument.
+        let module = s.cfg.exts.iter().find(|x| x.user.iter().any(|u| u == name)).map(|x| x.dir.clone());
+        let one: Vec<OsString> = Some(rest.trim()).filter(|r| !r.is_empty()).map(OsString::from).into_iter().collect();
+        let note = |s: &Session, m: &str| Ok((s.out().note(m), Next::Stay).1);
+        let next = match (cmd, mods, module, cmd.strip_prefix('!')) {
+            _ if t.is_empty() || cmd == "!" => continue,
+            ("/exit", ..) => return (0, None),
+            ("/help", ..) => {
+                Ok((s.out().line(&(HELP.to_string() + &s.cfg.exts.iter().flat_map(|x| x.user.iter().map(|u| format!("\n/{u}  ({})", x.name))).collect::<String>())), Next::Stay).1)
             }
-            _ if tripped => s.out().note(TRIPPED),
-            _ => {
-                let o = s.turn(Some(std::mem::take(&mut notes) + &line));
-                if !matches!(o, Outcome::Ok | Outcome::OutputClosed) {
-                    s.out().line(&outcome_line(&o));
-                }
-                match o {
-                    Outcome::Interrupted if matches!(s.sig, Some(libc::SIGTERM | libc::SIGHUP)) => return 130,
-                    // stdout went away (only a turn writes to it), also when the turn did not end on it: a finishing turn
-                    // drops that event.
-                    _ if s.out().closed() => return 141,
-                    Outcome::Error { kind: "journal" | "tampered", .. } => return 2,
-                    Outcome::Error { kind: "changed", .. } => {
-                        s.out().note(TRIPPED);
-                        tripped = true;
-                    }
-                    _ => {}
-                }
+            (_, Some(args), ..) => match config::which("henki-mods", Some(s.cfg.user_path.as_ref()), true) {
+                Some(m) => handoff::run(s, name, &m, None, &args, tripped),
+                None => note(s, "/mods needs henki-mods next to henki or on PATH; fix: reinstall henki"),
+            },
+            (_, _, Some(d), _) => handoff::run(s, name, &d.join("cmd").join(name), Some(&d), &one, tripped),
+            _ if cmd.starts_with('/') => note(s, &format!("unknown command {t}; /help lists the commands")),
+            (.., Some(cmd)) => terminal(s, cmd, &mut tripped, &mut notes),
+            _ if tripped => note(s, TRIPPED),
+            _ => Ok(Next::Send(line.clone())),
+        };
+        let text = match after(s, name, next, &mut tripped) {
+            Ok(Some(text)) => text,
+            Ok(None) => continue,
+            Err(end) => return end,
+        };
+        let o = s.turn(Some(std::mem::take(&mut notes) + &text));
+        if !matches!(o, Outcome::Ok | Outcome::OutputClosed) {
+            s.out().line(&outcome_line(&o));
+        }
+        match o {
+            Outcome::Interrupted if matches!(s.sig, Some(libc::SIGTERM | libc::SIGHUP)) => return (130, None),
+            // stdout went away (only a turn writes to it), also when the turn did not end on it: a finishing turn drops
+            // that event.
+            _ if s.out().closed() => return (141, None),
+            Outcome::Error { kind: "journal" | "tampered", .. } => return (2, None),
+            Outcome::Error { kind: "changed", .. } => {
+                s.out().note(TRIPPED);
+                tripped = true;
             }
+            _ => {}
         }
     }
 }
 
-/// `/allow rm N`; true when it leaves the REPL TRIPPED. henki's own writes re-arm the tripwire, so a change it finds is
-/// an outside one: nothing is removed, and a restart shows the rules as they are.
-fn remove(s: &mut Session, n: usize) -> bool {
-    let changed = s.changed();
-    changed.iter().for_each(|p| s.out().note(&format!("trust file changed: {}", p.display())));
-    if !changed.is_empty() {
-        return true;
+/// What a command handed back, as the REPL's next step: Ok(Some(TEXT)) a message to send, Ok(None) the next prompt,
+/// Err the REPL's end (a new henki's argv for Exec). A typed message is a `Send` too, sent without a question.
+fn after(s: &mut Session, name: &str, next: Result<Next, Stop>, tripped: &mut bool) -> Result<Option<String>, (u8, Option<Vec<OsString>>)> {
+    let end = |e: Stop| (Outcome::from(e).exit() as u8, None);
+    match next.map_err(end)? {
+        Next::Stay => Ok(None),
+        Next::Tripped => Ok(None).inspect(|_| *tripped = true),
+        Next::Exec(argv) => Err((0, Some(argv))),
+        Next::Send(text) if name.is_empty() => Ok(Some(text)),
+        Next::Send(text) => {
+            s.out().line(&format!("[from /{name}]\n{text}"));
+            Ok(s.reply("send? [Y/n] ").map_err(end)?.filter(|a| matches!(a.as_str(), "" | "y" | "yes")).map(|_| text))
+        }
     }
-    allow::remove(&s.cfg.allow.file, n, &s.cfg.home).map_or_else(|e| s.out().note(&e), |line| s.out().line(&line));
-    let loaded = allow::load(&s.cfg.allow.file, !s.cfg.auto);
-    s.rearm();
-    loaded.map(|a| s.cfg.allow = a).map_err(|e| s.out().note(&e)).is_err()
+}
+
+/// `!CMD` on the terminal, and the note the model gets with the next message; Err when the REPL ends there. Nothing is
+/// read again: what it changed applies only after a restart. A trust file that differed before it changed outside it:
+/// named once, and never blamed on it.
+fn terminal(s: &mut Session, cmd: &str, tripped: &mut bool, notes: &mut String) -> Result<Next, Stop> {
+    let (bash, env, args) = (s.cfg.bash.clone(), supervise::bang_env(&s.cfg.env), ["--noprofile", "--norc", "-c", cmd].map(OsString::from));
+    let before = s.changed();
+    let code = s.bang(&bash, &args, &env)?; // a closed stdout, or TERM or HUP
+    let (old, new): (Vec<_>, Vec<_>) = s.changed().into_iter().partition(|p| before.contains(p));
+    old.iter().filter(|_| !*tripped).for_each(|p| s.out().note(&format!("trust file changed: {}", p.display())));
+    new.iter().for_each(|p| s.out().note(&format!("{} changed by !cmd; restart henki to apply it (henki --resume continues this session)", p.display())));
+    *tripped |= !old.is_empty() || !new.is_empty();
+    code.iter().for_each(|n| *notes += &format!("[the user ran in their terminal: {cmd} (exit {n})]\n"));
+    Ok(Next::Stay)
 }

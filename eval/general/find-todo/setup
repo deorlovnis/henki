@@ -1,0 +1,7 @@
+#!/bin/sh
+# Three scripts; the TODO is on line 14 of src/lib/parse.sh. docs/ mentions a todo list, which is no TODO comment.
+mkdir -p src/lib docs || exit 1
+awk 'BEGIN { for (i = 1; i <= 20; i++) print (i == 14 ? "  # TODO: handle empty input" : "echo step " i) }' >src/lib/parse.sh
+awk 'BEGIN { for (i = 1; i <= 9; i++) print "echo util " i }' >src/lib/util.sh
+printf '#!/bin/sh\n. ./lib/util.sh\n. ./lib/parse.sh\n' >src/main.sh
+printf 'Keep a todo list in the tracker, not in the code.\n' >docs/notes.md

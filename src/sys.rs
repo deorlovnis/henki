@@ -3,7 +3,8 @@
 use crate::types::Ev;
 use std::os::unix::fs::{DirBuilderExt, FileTypeExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::os::{fd::AsRawFd, fd::FromRawFd, unix::ffi::OsStrExt, unix::process::CommandExt};
-use std::{ffi::CStr, ffi::CString, ffi::OsStr, fs, fs::File, io, io::Read, path::Path, sync::OnceLock, sync::mpsc::Sender, time::SystemTime, time::UNIX_EPOCH};
+use std::sync::{OnceLock, atomic::AtomicU64, atomic::Ordering::SeqCst, mpsc::Sender};
+use std::{ffi::CStr, ffi::CString, ffi::OsStr, fs, fs::File, io, io::Read, path::Path, time::SystemTime, time::UNIX_EPOCH};
 
 /// The signals that end a run; blocked in every thread and taken by `sigwait`.
 const SIGNALS: [i32; 4] = [libc::SIGINT, libc::SIGQUIT, libc::SIGTERM, libc::SIGHUP];
@@ -24,6 +25,14 @@ fn check(rc: libc::c_int) -> io::Result<()> {
     if rc < 0 { Err(io::Error::last_os_error()) } else { Ok(()) }
 }
 
+/// How many signals the signal thread has taken; bumped before each `Ev::Signal` is sent, so a wait outside
+/// `Session::wait` (a port binding's answer) ends at once and leaves the event queued for MAIN.
+static SEEN: AtomicU64 = AtomicU64::new(0);
+
+pub fn seen() -> u64 {
+    SEEN.load(SeqCst)
+}
+
 /// Blocks INT, QUIT, TERM and HUP in the calling thread (so in every thread started later) and starts the thread that
 /// `sigwait`s for them and sends `Ev::Signal`. One that henki started with ignored (`nohup`, a background job of a
 /// script) stays ignored: it is neither blocked nor waited for. Must be the first call in `main`, before any other
@@ -38,7 +47,8 @@ pub fn signals(tx: Sender<Ev>) -> io::Result<()> {
     std::thread::Builder::new().name("signals".into()).spawn(move || {
         let mut sig = 0;
         // SAFETY: `set` lives in this closure and `sig` is a live out pointer; sigwait reads the one and writes the other.
-        while unsafe { libc::sigwait(&set, &mut sig) } == 0 && tx.send(Ev::Signal(sig)).is_ok() {}
+        // The count is bumped first (and is never u64::MAX: that many signals do not come).
+        while unsafe { libc::sigwait(&set, &mut sig) } == 0 && SEEN.fetch_add(1, SeqCst) < u64::MAX && tx.send(Ev::Signal(sig)).is_ok() {}
     })?;
     Ok(())
 }
@@ -256,6 +266,24 @@ pub fn tree(ps: &[Proc], root: impl Fn(&Proc) -> bool) -> Vec<i32> {
     out
 }
 
+/// Blocks until child `pid` has ended (or is no child of henki's), and leaves it unreaped (waitid WEXITED | WNOWAIT):
+/// its owner reaps it under supervise's lock. false: waitid failed otherwise, and the child may still run (a reap
+/// would block under that lock).
+pub fn exited(pid: i32) -> bool {
+    // SAFETY: an all-zero siginfo_t is a valid out value; waitid writes only into it.
+    let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+    pid > 0
+        && loop {
+            // SAFETY: P_PID with a positive pid names one child; the pointer is to the live local above.
+            let done = unsafe { libc::waitid(libc::P_PID, pid as libc::id_t, &mut info, libc::WEXITED | libc::WNOWAIT) } == 0;
+            // ECHILD: reaped already, so a reap returns at once. EINTR: again.
+            let e = io::Error::last_os_error().raw_os_error();
+            if done || e != Some(libc::EINTR) {
+                break done || e == Some(libc::ECHILD);
+            }
+        }
+}
+
 /// O_RDONLY|O_NONBLOCK|O_NOCTTY|O_CLOEXEC, then fstat. Never blocks on a FIFO or a device.
 pub fn open_read(path: &Path) -> io::Result<(File, fs::Metadata)> {
     let f = fs::OpenOptions::new().read(true).custom_flags(libc::O_NONBLOCK | libc::O_NOCTTY).open(path)?;
@@ -274,10 +302,11 @@ pub fn not_regular(path: impl std::fmt::Display, t: fs::FileType) -> String {
     format!("not a regular file: {path} ({})", kinds.iter().find(|k| k.0).map_or("unknown kind", |k| k.1))
 }
 
-/// O_WRONLY|O_CREAT|O_EXCL|O_NOFOLLOW|O_CLOEXEC (| O_APPEND when `append`) with an explicit mode: the only way henki
-/// creates a file by path. The journal passes `append = true`, spill files `false`.
+/// O_WRONLY|O_CREAT|O_EXCL|O_NOFOLLOW|O_CLOEXEC (O_RDWR|O_APPEND when `append`) with an explicit mode: the only way
+/// henki creates a file by path. The journal passes `append = true` (and reads a session it created back through the
+/// same fd), spill files `false`.
 pub fn create_excl(path: &Path, mode: u32, append: bool) -> io::Result<File> {
-    fs::OpenOptions::new().write(true).append(append).create_new(true).mode(mode).custom_flags(libc::O_NOFOLLOW).open(path)
+    fs::OpenOptions::new().write(true).read(append).append(append).create_new(true).mode(mode).custom_flags(libc::O_NOFOLLOW).open(path)
 }
 
 /// O_RDWR|O_APPEND|O_NOFOLLOW|O_CLOEXEC|O_NONBLOCK, then fstat; a non-regular file is an error. The resumed journal:

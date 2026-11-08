@@ -1,0 +1,5 @@
+#!/bin/sh
+# sum.sh subtracts; test.sh expects a sum.
+printf '#!/bin/sh\necho $(($1 - $2))\n' >sum.sh
+printf '#!/bin/sh\ngot=$(./sum.sh 2 3)\n[ "$got" = 5 ] || { echo "FAIL: ./sum.sh 2 3 gave $got, wanted 5"; exit 1; }\necho ok\n' >test.sh
+chmod 755 sum.sh test.sh

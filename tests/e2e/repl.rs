@@ -24,6 +24,12 @@ fn asking(m: &Mock) -> Run {
     r
 }
 
+/// `r` with the repo's `manager/` first on PATH, so `/mods` and `henki mods` find the manager.
+fn managed(mut r: Run) -> Run {
+    r.env("PATH", &format!("{}/manager:/usr/local/bin:/usr/bin:/bin", env!("CARGO_MANIFEST_DIR")));
+    r
+}
+
 /// The REPL with `args` on a 24 x 80 terminal, at its first prompt.
 fn start<'a>(r: &'a Run, args: &[&str]) -> Pty<'a> {
     let p = Pty::spawn(r, args, 24, 80);
@@ -73,7 +79,19 @@ fn pty_banner_and_prompt() {
     let p = Pty::spawn(&r, &[], 24, 80);
     p.expect(&format!("henki {VERSION} · mock-model · {} (openai) · ctx 32,768\r\n", m.url()), W);
     p.expect("approval: ask\r\n", W);
-    p.expect("config: ~/.config/henki/config.toml\r\n", W);
+    p.expect("config: ~/.config/henki/config.toml\r\nno modules on; /mods (or henki mods) lists the official mods\r\n", W);
+    p.prompt(W);
+    exit(p);
+}
+
+/// A base_url that is not a loopback literal is named in the banner: the session's text leaves the machine.
+#[test]
+fn pty_remote_base_url_notice() {
+    let m = Mock::start(vec![]);
+    let mut r = asking(&m);
+    r.at("http://192.0.2.1:9/v1");
+    let p = Pty::spawn(&r, &[], 24, 80);
+    p.expect("henki: requests leave this machine: prompts, files and command output go to 192.0.2.1, unencrypted\r\n", W);
     p.prompt(W);
     exit(p);
 }
@@ -230,7 +248,7 @@ fn pty_always_saves_rule() {
     let d = exit(p);
     assert_eq!(verdicts(&d), [json!(["always", 1])]);
     let header = "# henki allow rules: ROOT<TAB>COMMAND, one per line; COMMAND then runs without asking in ROOT.\n\
-        # List and remove them with /allow in henki or henki allow [rm N]; or edit this file.\n";
+        # List and remove them with henki mods allow [rm N] (/allow in henki); or edit this file.\n";
     assert_eq!(fs::read_to_string(r.allow()).unwrap(), format!("{header}{root}\techo saved-rule\n"));
     assert_eq!(fs::metadata(r.allow()).unwrap().permissions().mode() & 0o777, 0o600);
     let m2 = Mock::start(vec![shell("echo saved-rule"), say("ran by the rule")]);
@@ -304,44 +322,131 @@ fn pty_always_refused_shapes() {
     assert!(!r.allow().exists());
 }
 
+/// `/allow` and `/allow rm N` run the manager on the terminal; the removal is a change to a trust file, which the manager
+/// hands back as `restart`: henki names the file and asks, and n leaves the session stopped until a restart reads the
+/// rules again.
 #[test]
 fn pty_allow_list_and_rm() {
-    let m = Mock::start(vec![]);
-    let r = asking(&m);
+    let m = Mock::start(vec![say("never")]);
+    let r = managed(asking(&m));
     let root = r.root();
     r.write_allow(&format!("# mine\n{root}\techo one\n{root}\techo two\n"));
     let p = start(&r, &[]);
     p.line("/allow");
     p.expect(&format!("{}\r\n1  {root}  echo one\r\n2  {root}  echo two\r\n", r.allow().display()), W);
+    p.prompt(W);
     p.line("/allow rm 1");
     p.expect(&format!("removed rule 1: {root}  echo one\r\n"), W);
+    p.expect("henki: changed while /allow ran: ~/.config/henki/allow\r\nrestart on these changes? [y/N] ", W);
+    p.line("n");
+    p.prompt(W);
     p.line("/allow");
     p.expect(&format!("{}\r\n1  {root}  echo two\r\n", r.allow().display()), W);
+    p.prompt(W);
+    p.line("hello");
+    p.expect(REFUSED, W);
     p.prompt(W);
     exit(p);
     assert_eq!(fs::read_to_string(r.allow()).unwrap(), format!("# mine\n{root}\techo two\n"));
     assert!(m.log().is_empty(), "commands never reach the model");
 }
 
-/// The allow file changed outside henki since it was loaded: `/allow rm` removes nothing and the session stops.
+/// y to the restart question: henki closes the session and starts again with its arguments, the rules read anew.
+#[test]
+fn pty_allow_rm_restart() {
+    let m = Mock::start(vec![say("after the restart")]);
+    let r = managed(asking(&m));
+    let root = r.root();
+    r.write_allow(&format!("{root}\techo one\n{root}\techo two\n"));
+    let p = start(&r, &["--model", "mock-model"]);
+    p.line("/allow rm 1");
+    p.expect("restart on these changes? [y/N] ", W);
+    p.line("y");
+    p.expect("allow:   1  echo two\r\n", W);
+    p.prompt(W);
+    message(&p, "hello", "after the restart");
+    let d = exit(p);
+    assert_eq!(r.journals().len(), 1, "the first session had no message: it was discarded\n{}", d.diag());
+    assert_eq!(m.log().len(), 1);
+}
+
+/// The allow file changed outside henki since it was loaded, then `/allow rm` removed a rule: the change from before
+/// is named as such, never blamed on the command, and no one-key restart is offered.
 #[test]
 fn pty_allow_rm_after_outside_change_trips() {
     let m = Mock::start(vec![say("never")]);
-    let r = asking(&m);
+    let r = managed(asking(&m));
     let text = format!("{}\techo one\n", r.root());
     r.write_allow(&text);
     let p = start(&r, &[]);
-    let more = format!("{text}*\techo two\n");
-    fs::write(r.allow(), &more).unwrap();
+    fs::write(r.allow(), format!("{text}*\techo two\n")).unwrap();
     p.line("/allow rm 1");
-    p.expect(&format!("henki: trust file changed: {}\r\n", r.allow().display()), W);
+    p.expect(&format!("henki: trust file changed: {}\r\nremoved rule 1: {}  echo one\r\n", r.allow().display(), r.root()), W);
+    p.expect("henki: a trust file changed before; restart henki yourself (henki --resume continues this session)\r\n", W);
     p.prompt(W);
-    assert_eq!(fs::read_to_string(r.allow()).unwrap(), more, "nothing removed");
+    assert_eq!(fs::read_to_string(r.allow()).unwrap(), "*\techo two\n");
     p.line("hello");
     p.expect(REFUSED, W);
     p.prompt(W);
-    exit(p);
+    let d = exit(p);
     assert!(m.log().is_empty());
+    assert!(!d.out().contains("changed while /allow") && !d.out().contains("[y/N]"), "{}", d.out());
+}
+
+/// `/allow` and `/mods` with arguments the manager refuses: its usage on the terminal, nothing removed, no trip.
+#[test]
+fn pty_allow_usage_removes_nothing() {
+    let m = Mock::start(vec![say("still here")]);
+    let r = managed(asking(&m));
+    let rules = format!("{}\techo kept\n", r.root());
+    r.write_allow(&rules);
+    let p = start(&r, &[]);
+    for cmd in ["/allow x", "/allow rm", "/allow rm 1 2", "/allow rm -1", "/mods allow clear"] {
+        p.line(cmd);
+        p.expect("usage: henki-mods [list]", W);
+        p.prompt(W);
+    }
+    message(&p, "hello", "still here");
+    exit(p);
+    assert_eq!(fs::read_to_string(r.allow()).unwrap(), rules);
+}
+
+/// `/mods ARGS`: the shipped manager with the tool environment plus HENKI_CONFIG and HENKI_BIN, its words split at
+/// spaces, in the session's working directory; never a module's command of that name.
+#[test]
+fn pty_mods_environment() {
+    let m = Mock::start(vec![]);
+    let mut r = asking(&m);
+    let dir = r.dir.join("bin");
+    fs::create_dir_all(&dir).unwrap();
+    fs::write(dir.join("henki-mods"), "#!/bin/sh\nfor a in \"$@\"; do echo \"arg $a\"; done\npwd\nenv | grep -E '^(HENKI_|SECRET)' | sort\n").unwrap();
+    fs::set_permissions(dir.join("henki-mods"), fs::Permissions::from_mode(0o755)).unwrap();
+    r.env("PATH", &format!("{}:/usr/local/bin:/usr/bin:/bin", dir.display())).env("SECRET_TOKEN", "t");
+    let p = start(&r, &[]);
+    p.line("/mods  add   ./x  --yes");
+    p.expect(&format!("arg add\r\narg ./x\r\narg --yes\r\n{}\r\n", r.cwd.display()), W);
+    p.expect(&format!("HENKI_BIN={}\r\nHENKI_CONFIG={}\r\nHENKI_DEPTH=1\r\n", Path::new(&bin()).display(), r.config_dir().display()), W);
+    p.prompt(W);
+    let d = exit(p);
+    assert!(!d.out().contains("SECRET_TOKEN"), "the tool environment only: {}", d.out());
+}
+
+/// A module's `bin/henki-mods` is never the manager: without the shipped one, `/mods` says so and runs nothing.
+#[test]
+fn pty_mods_never_a_module() {
+    let m = Mock::start(vec![]);
+    let r = asking(&m);
+    let x = r.config_dir().join("ext/fake");
+    fs::create_dir_all(x.join("bin")).unwrap();
+    fs::write(x.join("doc.md"), "fake: a fake manager\n").unwrap();
+    fs::write(x.join("bin/henki-mods"), "#!/bin/sh\necho module ran\n").unwrap();
+    fs::set_permissions(x.join("bin/henki-mods"), fs::Permissions::from_mode(0o755)).unwrap();
+    let p = start(&r, &[]);
+    p.line("/mods");
+    p.expect("henki: /mods needs henki-mods next to henki or on PATH; fix: reinstall henki\r\n", W);
+    p.prompt(W);
+    let d = exit(p);
+    assert!(!d.out().contains("module ran") && !d.out().contains("no modules on"), "{}", d.out());
 }
 
 #[test]
@@ -567,7 +672,7 @@ fn pty_bang_trust_change_trips() {
 #[test]
 fn pty_bang_revoke_applies() {
     let m = Mock::start(vec![shell("echo rule-call"), say("first done")]);
-    let mut r = asking(&m);
+    let mut r = managed(asking(&m));
     r.write_allow(&format!("{}\techo rule-call\n", r.root()));
     let p = start(&r, &[]);
     p.line("use the rule");
@@ -797,7 +902,8 @@ fn pty_help_text() {
     let p = start(&r, &[]);
     p.line("/help");
     p.expect(
-        "/help\r\n/exit  quit (also Ctrl-D)\r\n/allow  list the allow rules; /allow rm N removes rule N\r\n/help  this list\r\n\
+        "/help\r\n/exit  quit (also Ctrl-D)\r\n/mods [ARGS]  the module manager on this terminal (henki mods ARGS)\r\n\
+        /allow [rm N]  list the allow rules, or remove rule N (henki mods allow)\r\n/help  this list\r\n\
         !CMD  run CMD yourself on this terminal; the model is told you ran it\r\n\
         Enter sends the message; a paste goes into it whole (up to 1 MiB, newlines kept) and is never a command.\r\n> ",
         W,
@@ -806,8 +912,7 @@ fn pty_help_text() {
     assert!(m.log().is_empty() && d.journal.is_none(), "{}", d.diag());
 }
 
-/// A line that starts with `/` is a command; one henki does not know is noted and never reaches the model, and an
-/// `/allow` that is not `rm N` removes nothing.
+/// A line that starts with `/` is a command; one henki does not know is noted and never reaches the model.
 #[test]
 fn pty_unknown_command_not_sent() {
     let m = Mock::start(vec![]);
@@ -815,7 +920,7 @@ fn pty_unknown_command_not_sent() {
     let rules = format!("{}\techo kept\n", r.root());
     r.write_allow(&rules);
     let p = start(&r, &[]);
-    for cmd in ["/x", "/exit now", "/allow x", "/allow rm", "/allow rm 1 2", "/allow rm 99999999999999999999999"] {
+    for cmd in ["/x", "/exit now", "/allowx", "/modsx"] {
         p.line(cmd);
         p.expect(&format!("{cmd}\r\nhenki: unknown command {cmd}; /help lists the commands\r\n"), W);
         p.prompt(W);

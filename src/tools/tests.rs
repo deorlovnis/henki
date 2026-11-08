@@ -439,7 +439,7 @@ fn ext(dir: &Path, name: &str) -> Ext {
     fs::create_dir_all(dir.join(name).join("bin")).unwrap();
     fs::write(&doc, format!("# {name}: a tool\n")).unwrap();
     let (line, bin, cmds, shadows, paths, targets) = (format!("{name}: a tool"), Some(dir.join(name).join("bin")), Vec::new(), Vec::new(), Vec::new(), Vec::new());
-    Ext { name: name.into(), line, doc, bin, cmds, shadows, paths, targets }
+    Ext { name: name.into(), line, dir: dir.join(name), doc, bin, cmds, user: Vec::new(), on: Vec::new(), prompt: true, shadows, paths, targets }
 }
 
 #[test]

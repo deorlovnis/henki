@@ -1,0 +1,20 @@
+#!/bin/sh
+# on/turn_end, and on/question through a link to this file (observe/1): a desktop notification when a turn ends or
+# henki asks before a call, through osascript (macOS) or notify-send (Linux) when there is one. No terminal bell: an
+# observer has no terminal.
+LC_ALL=C
+export LC_ALL
+ev=$(cat)
+case "${HENKI_EVENT:-}" in
+  question) what="asks before a $(printf '%s\n' "$ev" | sed -n 's/.*"name":"\([^"]*\)","t":"ask".*/\1/p') call" ;;
+  *) what="turn ended: $(printf '%s\n' "$ev" | sed -n 's/.*"status":"\([a-z_]*\)".*/\1/p')" ;;
+esac
+title="henki: ${PWD##*/}"
+if command -v osascript >/dev/null 2>&1; then
+  # The text goes in as arguments, never into the script.
+  exec osascript -e 'on run argv' -e 'display notification (item 2 of argv) with title (item 1 of argv)' -e 'end run' "$title" "$what"
+fi
+if command -v notify-send >/dev/null 2>&1; then
+  exec notify-send -- "$title" "$what"
+fi
+echo "notify: no osascript or notify-send on PATH" >&2

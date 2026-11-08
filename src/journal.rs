@@ -1,28 +1,27 @@
-//! The session journal: one JSON record per line, appended by the main thread alone, byte-counted and synced before the
-//! effect it explains; resume reads it back, repairs dangling calls by appending, and checks the call/result pairing.
-use crate::{allow, config::Config, supervise::Spill, sys, term, tools, types::Outcome};
+//! The session journal: one JSON record per line. Its std binding (`Journal`) keeps a session in one file, appended by
+//! the main thread alone, byte-counted and synced before the effect it explains. The kernel half (`start`, `put`)
+//! reads it back through any history binding, replays it, repairs dangling calls by appending, and checks the
+//! call/result pairing.
+use crate::{allow, config::Config, port, port::History, port::PortError, port::Record, port::Taken, supervise::Spill, sys, term, tools, types::Outcome};
 use serde_json::Value;
 use std::path::{Path, PathBuf};
-use std::{collections::HashSet, fmt::Display, fs, fs::File, io::Read, io::Write, os::unix::ffi::OsStrExt, time::Duration, time::SystemTime};
+use std::{collections::HashSet, fmt::Display, fs, fs::File, io::Read, io::Seek, io::Write, os::unix::ffi::OsStrExt, os::unix::fs::MetadataExt, time::Duration, time::SystemTime};
 
+/// The std history binding: `STATE/sessions/<fnv(realpath(scope))>/<id>.jsonl`, at most one of them held.
 pub struct Journal {
-    file: File,
-    path: PathBuf,
-    bytes: u64,
-    id: String,
-    spill: PathBuf,
-    n: usize,
-    fresh: bool, // created by this process, so `discard` may remove it
-    gone: bool,  // discarded: nothing more is written
+    state: PathBuf,
+    held: Option<Held>,
 }
 
-pub struct Resumed {
-    pub journal: Journal,
-    pub hist: Vec<Value>,
-    pub from_bytes: u64,
-    pub notices: Vec<String>,
-    /// The repair records as written, also at the end of `hist`; `--json` stdout shows them before `session`.
-    pub repairs: Vec<Value>,
+/// The held session: its file, opened O_APPEND and locked, and the bytes written to it.
+struct Held {
+    file: File,
+    path: PathBuf,
+    id: String,
+    bytes: u64,
+    from: u64,   // its length after the last `read` (a torn tail cut): a resumed `session` record's `from_bytes`
+    fresh: bool, // created by this process, so `discard` may remove it
+    gone: bool,  // discarded: nothing more is written
 }
 
 const ELIDED: &str = "[output elided: ";
@@ -38,82 +37,140 @@ pub fn state_dir(dir: &Path) -> Result<(), String> {
     Ok(())
 }
 
-fn jerr(path: &Path, e: impl Display) -> Outcome {
-    Outcome::error("journal", format!("{}: {e}", path.display()))
+fn io(path: &Path, e: impl Display) -> PortError {
+    port::err("io", format!("{}: {e}", path.display()))
 }
 
-fn tampered(path: &Path) -> Outcome {
-    Outcome::error("tampered", format!("journal modified outside henki: {}", path.display()))
+fn tampered(place: impl Display) -> PortError {
+    port::err("tampered", format!("journal modified outside henki: {place}"))
 }
 
 /// The sessions subdirectory of a cwd: FNV-1a of its realpath.
-fn scope(cwd: &Path) -> Result<String, Outcome> {
-    Ok(sys::fnv(fs::canonicalize(cwd).map_err(|e| jerr(cwd, e))?.as_os_str().as_bytes()))
+fn scope(cwd: &Path) -> Result<String, PortError> {
+    Ok(sys::fnv(fs::canonicalize(cwd).map_err(|e| io(cwd, e))?.as_os_str().as_bytes()))
+}
+
+/// The paths in a directory (none when it cannot be read).
+fn ls(d: PathBuf) -> impl Iterator<Item = PathBuf> {
+    fs::read_dir(d).into_iter().flatten().flatten().map(|e| e.path())
+}
+
+/// Session `id`'s file in every scope where one exists; none for an id holding `/`.
+fn named(state: &Path, id: &str) -> Vec<PathBuf> {
+    ls(state.join("sessions")).map(|d| d.join(format!("{id}.jsonl"))).filter(|p| !id.contains('/') && fs::symlink_metadata(p).is_ok()).collect()
+}
+
+/// The length of the whole lines at the start of `b`.
+fn whole(b: &[u8]) -> usize {
+    b.iter().rposition(|&c| c == b'\n').map_or(0, |i| i + 1)
 }
 
 impl Journal {
-    /// `sessions/<fnv(realpath(cwd))>/<id>.jsonl`: `sys::create_excl(path, 0o600, true)` (O_APPEND), `try_lock` held
-    /// for the session.
-    pub fn create(state: &Path, cwd: &Path) -> Result<Journal, Outcome> {
-        let dir = state.join("sessions").join(scope(cwd)?);
-        sys::private_dir(&dir).map_err(|e| jerr(&dir, e))?;
-        let id = format!("{}-{}", sys::utc().1, sys::random4().map_err(|e| jerr(Path::new("/dev/urandom"), e))?);
-        Journal::start(dir.join(format!("{id}.jsonl")), id, state)
+    pub fn new(state: &Path) -> Journal {
+        Journal { state: state.into(), held: None }
     }
 
-    fn start(path: PathBuf, id: String, state: &Path) -> Result<Journal, Outcome> {
-        let file = sys::create_excl(&path, 0o600, true).map_err(|e| jerr(&path, e))?;
-        file.try_lock().map_err(|e| jerr(&path, e))?;
-        Ok(Journal { file, path, bytes: 0, id, spill: state.join("spill"), n: 0, fresh: true, gone: false })
+    /// `path`, created as session `id` and held: `sys::create_excl(path, 0o600, true)` (O_APPEND), `try_lock` held until
+    /// the binding drops it.
+    fn start(&mut self, path: PathBuf, id: String) -> Result<String, PortError> {
+        let file = sys::create_excl(&path, 0o600, true).map_err(|e| io(&path, e))?;
+        file.try_lock().map_err(|e| io(&path, e))?;
+        self.held = Some(Held { file, path, id: id.clone(), bytes: 0, from: 0, fresh: true, gone: false });
+        Ok(id)
     }
 
-    /// Resume through one `sys::open_append` fd: pick, open, lock, read, truncate a torn tail (`set_len`), parse, check,
-    /// rebuild, repair (appended through the same O_APPEND fd, synced).
-    pub fn resume(state: &Path, cwd: &Path, id: Option<&str>, cfg: &Config) -> Result<Resumed, Outcome> {
-        let (path, file) = pick(state, cwd, id)?;
-        let mut buf = Vec::new();
-        (&file).read_to_end(&mut buf).map_err(|e| jerr(&path, e))?;
-        let mut notices = Vec::new();
-        let keep = buf.iter().rposition(|&b| b == b'\n').map_or(0, |i| i + 1);
-        if keep < buf.len() {
-            file.set_len(keep as u64).map_err(|e| jerr(&path, e))?;
-            notices.push(format!("dropped an incomplete last line ({} bytes) from {}", term::num((buf.len() - keep) as u64), path.display()));
-            buf.truncate(keep);
+    /// The held session `id`; `not_found` for any other.
+    fn held(&mut self, id: &str) -> Result<&mut Held, PortError> {
+        self.held.as_mut().filter(|h| h.id == id).ok_or_else(|| port::err("not_found", format!("session {id} is not held")))
+    }
+}
+
+impl History for Journal {
+    /// The id is UTC time and 4 random bytes, or a `hint` that `port::session_id` accepts and no scope has yet.
+    fn create(&mut self, cwd: &Path, hint: Option<&str>) -> Result<String, PortError> {
+        let dir = self.state.join("sessions").join(scope(cwd)?);
+        sys::private_dir(&dir).map_err(|e| io(&dir, e))?;
+        let id = match hint.filter(|h| port::session_id(h)) {
+            Some(h) if !named(&self.state, h).is_empty() => return Err(port::err("exists", format!("session {h} exists"))),
+            Some(h) => h.to_string(),
+            None => format!("{}-{}", sys::utc().1, sys::random4().map_err(|e| io(Path::new("/dev/urandom"), e))?),
+        };
+        self.start(dir.join(format!("{id}.jsonl")), id)
+    }
+
+    /// Through one `sys::open_append` fd, locked; `read` then reads through it (and cuts a torn tail).
+    fn open(&mut self, scope: &Path, session: Option<&str>) -> Result<String, PortError> {
+        self.held = None; // its lock would make it busy
+        let (path, file) = pick(&self.state, scope, session)?;
+        let (id, n) = (path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default(), file.metadata().map_err(|e| io(&path, e))?.len());
+        self.held = Some(Held { file, path, id: id.clone(), bytes: n, from: n, fresh: false, gone: false });
+        Ok(id)
+    }
+
+    /// Held: through its fd, a torn tail cut (`set_len`) with a notice, so the next record starts a line. Unheld: read
+    /// only, a torn tail skipped. Every line is an object (else `corrupt`), and every `close` gives its own offset, the
+    /// file's length when it was written (else `tampered`).
+    fn read(&mut self, session: &str) -> Result<Taken, PortError> {
+        let (mut buf, mut notices) = (Vec::new(), Vec::new());
+        let path = match self.held.as_mut().filter(|h| h.id == session && !h.gone) {
+            Some(h) => {
+                (&h.file).rewind().and_then(|()| (&h.file).read_to_end(&mut buf)).map_err(|e| io(&h.path, e))?;
+                let keep = whole(&buf);
+                if keep < buf.len() {
+                    h.file.set_len(keep as u64).map_err(|e| io(&h.path, e))?;
+                    notices.push(format!("dropped an incomplete last line ({} bytes) from {}", term::num((buf.len() - keep) as u64), h.path.display()));
+                }
+                (h.bytes, h.from) = (keep as u64, keep as u64);
+                h.path.clone()
+            }
+            None => {
+                let path = named(&self.state, session).into_iter().next().ok_or_else(|| port::err("not_found", format!("no session {session}")))?;
+                sys::open_read(&path).and_then(|(mut f, _)| f.read_to_end(&mut buf)).map_err(|e| io(&path, e))?;
+                path
+            }
+        };
+        buf.truncate(whole(&buf));
+        let (mut records, mut off) = (Vec::new(), 0);
+        for (i, line) in buf.split_inclusive(|&b| b == b'\n').enumerate() {
+            match serde_json::from_slice::<Value>(line) {
+                Ok(v) if v["t"] == "close" && v["bytes"].as_u64() != Some(off) => return Err(tampered(path.display())),
+                Ok(v) if v.is_object() => records.push(v),
+                _ => return Err(port::err("corrupt", format!("corrupt journal {}:{}", path.display(), i + 1))),
+            }
+            off += line.len() as u64;
         }
-        let mut hist = replay(&buf, &path, cfg, cwd, &mut notices)?;
-        let id = path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
-        let prefix = format!("{id}-");
-        let spill = state.join("spill");
-        let names = fs::read_dir(&spill).into_iter().flatten().flatten().map(|e| e.file_name());
-        // A name whose file the 24 h sweep removed may still be named in the history: each call took at most one name.
-        let n = names.filter_map(|f| f.to_str()?.strip_prefix(&prefix)?.strip_suffix(".log")?.parse().ok()).max().unwrap_or(0).max(calls(&hist).count());
-        let mut journal = Journal { file, path, bytes: keep as u64, id, spill, n, fresh: false, gone: false };
-        let repairs = dangling(&hist).into_iter().map(|(id, name)| journal.write(rec::tool_result(&id, &name, tools::REPAIR, true, 0, 0)));
-        let repairs = repairs.collect::<Result<Vec<_>, _>>()?;
-        hist.extend(repairs.iter().cloned());
-        Ok(Resumed { journal, hist, from_bytes: keep as u64, notices, repairs })
+        Ok(Taken { records, notices, place: path.display().to_string() })
     }
 
-    /// Adds `ts`; checks fstat size = bytes written (else `tampered`); appends `term::json_line` + "\n" on the O_APPEND
-    /// fd; fdatasync unless the kind is `ask`, `approval` or `notice`. Returns the record as written (after `discard`,
-    /// as it would have been).
-    pub fn write(&mut self, mut rec: Value) -> Result<Value, Outcome> {
-        rec.as_object_mut().map(|o| o.insert("ts".into(), sys::utc().0.into()));
-        if self.gone {
+    /// Fills `close.bytes` and a resumed `session`'s `from_bytes`; checks fstat size = bytes written and that the path
+    /// still names the file (else `tampered`); appends `term::json_line` + "\n" on the O_APPEND fd; fdatasync unless the
+    /// kind is `ask`, `approval` or `notice`. After `discard`, returns the record as it would have been.
+    fn append(&mut self, session: &str, mut rec: Record) -> Result<Record, PortError> {
+        let h = self.held(session)?;
+        rec.as_object().ok_or_else(|| port::err("invalid", "a record is a JSON object"))?;
+        if rec["t"] == "close" {
+            rec["bytes"] = h.bytes.into();
+        }
+        if rec["t"] == "session" && rec["resumed"].is_object() {
+            rec["resumed"]["from_bytes"] = h.from.into();
+        }
+        if h.gone {
             return Ok(rec);
         }
         let line = term::json_line(&rec) + "\n";
-        let fail = |e: std::io::Error| Outcome::error("journal", format!("cannot write {}: {e}", self.path.display()));
-        if self.file.metadata().map_err(fail)?.len() != self.bytes {
-            return Err(tampered(&self.path));
+        let fail = |e: std::io::Error| port::err("io", format!("cannot write {}: {e}", h.path.display()));
+        // The path must still name the file held open: an edit that writes a new file in its place (`sed -i`) keeps the size.
+        let m = h.file.metadata().map_err(fail)?;
+        if m.len() != h.bytes || fs::symlink_metadata(&h.path).map_or(true, |p| (p.dev(), p.ino()) != (m.dev(), m.ino())) {
+            return Err(tampered(h.path.display()));
         }
         // One write(2), and a second only after a short one (whose error then names the cause, e.g. a full disk). A
         // failure leaves `bytes` behind the file, so every later write fails the size check instead of appending.
-        (&self.file).write_all(line.as_bytes()).map_err(fail)?;
-        self.bytes += line.len() as u64;
+        (&h.file).write_all(line.as_bytes()).map_err(fail)?;
+        h.bytes += line.len() as u64;
         // `ask`, `approval` and `notice` explain no effect that a crash could leave behind.
         if !matches!(rec["t"].as_str(), Some("ask" | "approval" | "notice")) {
-            self.file.sync_data().map_err(fail)?;
+            h.file.sync_data().map_err(fail)?;
             #[cfg(test)]
             tests::SYNCS.with(|n| n.set(n.get() + 1));
         }
@@ -123,91 +180,107 @@ impl Journal {
     /// The REPL ended before its first message: removes the session file this process created (never a resumed one).
     /// True once the file is gone, also on a later call. One try: when the removal fails the file stays a complete
     /// session, and later writes go on in it.
-    pub fn discard(&mut self) -> bool {
-        self.gone |= std::mem::take(&mut self.fresh) && fs::remove_file(&self.path).is_ok();
-        self.gone
-    }
-
-    pub fn id(&self) -> &str {
-        &self.id
-    }
-
-    pub fn bytes(&self) -> u64 {
-        self.bytes
-    }
-
-    /// The next spill name, `<id>-<n>.log` (n from the counter, never from a model string). One per tool call at most:
-    /// resume continues the counter past both the names on disk and the number of calls in the history.
-    pub fn spill(&mut self, home: &Path) -> Spill {
-        self.n = self.n.saturating_add(1);
-        let path = self.spill.join(format!("{}-{}.log", self.id, self.n));
-        Spill { shown: allow::shown(&path, home), path }
+    fn discard(&mut self, session: &str) -> Result<bool, PortError> {
+        let h = self.held(session)?;
+        h.gone |= std::mem::take(&mut h.fresh) && fs::remove_file(&h.path).is_ok();
+        Ok(h.gone)
     }
 }
 
 /// The session to resume, opened and locked: `id` in any scope, or the newest unlocked one in this cwd's scope. Empty
 /// files (a run that died before its first record) are not sessions.
-fn pick(state: &Path, cwd: &Path, id: Option<&str>) -> Result<(PathBuf, File), Outcome> {
-    let ls = |d: PathBuf| fs::read_dir(d).into_iter().flatten().flatten().map(|e| e.path());
-    let sessions = state.join("sessions");
+fn pick(state: &Path, cwd: &Path, id: Option<&str>) -> Result<(PathBuf, File), PortError> {
     let paths: Vec<PathBuf> = match id {
-        Some(id) => ls(sessions).map(|d| d.join(format!("{id}.jsonl"))).filter(|_| !id.contains('/')).collect(),
-        None => ls(sessions.join(scope(cwd)?)).filter(|p| p.extension().is_some_and(|x| x == "jsonl")).collect(),
+        Some(id) => named(state, id),
+        None => ls(state.join("sessions").join(scope(cwd)?)).filter(|p| p.extension().is_some_and(|x| x == "jsonl")).collect(),
     };
     let mtime = |p: &Path| fs::symlink_metadata(p).ok().filter(|m| m.is_file() && m.len() > 0)?.modified().ok();
     let mut found: Vec<(SystemTime, PathBuf)> = paths.into_iter().filter_map(|p| Some((mtime(&p)?, p))).collect();
     found.sort();
     let mut busy = None;
     for (_, path) in found.into_iter().rev() {
-        let file = sys::open_append(&path).map_err(|e| jerr(&path, e))?;
+        let file = sys::open_append(&path).map_err(|e| io(&path, e))?;
         if file.try_lock().is_ok() {
             return Ok((path, file));
         }
         busy.get_or_insert(path);
     }
     Err(match busy.as_ref().and_then(|p| p.file_stem()) {
-        Some(id) => Outcome::error("journal", format!("session {} is in use", id.to_string_lossy())),
-        None => Outcome::error("journal", format!("no session to resume in {}", cwd.display())),
+        Some(id) => port::err("busy", format!("session {} is in use", id.to_string_lossy())),
+        None => port::err("not_found", format!("no session to resume in {}", cwd.display())),
     })
 }
 
-/// Over whole lines: parse each, check the segment after the last `session` record, the dialect and what changed since,
-/// and rebuild the history from the message kinds with every `elide` applied.
-fn replay(buf: &[u8], path: &Path, cfg: &Config, cwd: &Path, notices: &mut Vec<String>) -> Result<Vec<Value>, Outcome> {
-    let (mut recs, mut off) = (Vec::new(), 0);
-    for (i, line) in buf.split_inclusive(|&b| b == b'\n').enumerate() {
-        match serde_json::from_slice::<Value>(line) {
-            Ok(v) if v.is_object() => recs.push((off, v)),
-            _ => return Err(Outcome::error("journal", format!("corrupt journal {}:{}", path.display(), i + 1))),
-        }
-        off += line.len();
+/// What `start` found: the session id, the history, the repair records as kept (`--json` stdout shows them before
+/// `session`), and the notices: the binding's, then replay's.
+pub type Begun = (String, Vec<Value>, Vec<Value>, Vec<String>);
+
+/// A new session, or the resumed one: opened, read, replayed, its dangling calls repaired through the binding, and
+/// paired.
+pub fn start(h: &mut dyn History, resume: &Option<Option<String>>, cfg: &Config) -> Result<Begun, Outcome> {
+    let Some(id) = resume else { return Ok((h.create(&cfg.cwd, None).map_err(port::outcome)?, Vec::new(), Vec::new(), Vec::new())) };
+    let sid = h.open(&cfg.cwd, id.as_deref()).map_err(port::outcome)?;
+    let mut t = h.read(&sid).map_err(port::outcome)?;
+    let mut hist = replay(&mut t, cfg)?;
+    let repairs = dangling(&hist).into_iter().map(|(id, name)| put(h, &sid, rec::tool_result(&id, &name, tools::REPAIR, true, 0, 0)));
+    let repairs = repairs.collect::<Result<Vec<_>, _>>()?;
+    hist.extend(repairs.iter().cloned());
+    pairing(&hist).map_err(|e| Outcome::error("journal", format!("{}: {e}", t.place)))?;
+    Ok((sid, hist, repairs, t.notices))
+}
+
+/// `rec` with `ts`, appended through the binding: the record as kept.
+pub fn put(h: &mut dyn History, sid: &str, mut rec: Value) -> Result<Value, Outcome> {
+    rec.as_object_mut().map(|o| o.insert("ts".into(), sys::utc().0.into()));
+    h.append(sid, rec).map_err(port::outcome)
+}
+
+/// Over the records: the segment after the last `session` record ends with its `close` if it has one, the dialect is
+/// the config's, and what changed since is noticed (in `t.notices`); then the history is rebuilt from the message kinds with every
+/// `elide` applied.
+fn replay(t: &mut Taken, cfg: &Config) -> Result<Vec<Value>, Outcome> {
+    let Some(last) = t.records.iter().rposition(|r| r["t"] == "session") else { return Err(Outcome::error("journal", format!("{}: no session record", t.place))) };
+    let seg = &t.records[last..];
+    match seg.iter().position(|r| r["t"] == "close") {
+        None => t.notices.push("previous run did not close cleanly".into()),
+        Some(i) if i + 1 == seg.len() => {}
+        Some(_) => return Err(port::outcome(tampered(&t.place))),
     }
-    let Some(last) = recs.iter().rposition(|(_, r)| r["t"] == "session") else { return Err(jerr(path, "no session record")) };
-    let seg = &recs[last..];
-    match seg.iter().position(|(_, r)| r["t"] == "close") {
-        None => notices.push("previous run did not close cleanly".into()),
-        Some(i) if i + 1 == seg.len() && seg[i].1["bytes"].as_u64() == Some(seg[i].0 as u64) => {}
-        Some(_) => return Err(tampered(path)),
-    }
-    let s = &recs[last].1;
+    let s = &t.records[last];
     if s["dialect"] != cfg.dialect {
         let was = s["dialect"].as_str().unwrap_or("unknown");
-        return Err(Outcome::error("journal", format!("{}: the session's dialect is {was}, not {}", path.display(), cfg.dialect)));
+        return Err(Outcome::error("journal", format!("{}: the session's dialect is {was}, not {}", t.place, cfg.dialect)));
     }
-    for (k, now) in [("model", cfg.model.as_str().into()), ("tools", Value::from(cfg.tools.clone())), ("cwd", cwd.to_string_lossy().into())] {
+    for (k, now) in [("model", cfg.model.as_str().into()), ("tools", Value::from(cfg.tools.clone())), ("cwd", cfg.cwd.to_string_lossy().into())] {
         if s[k] != now {
-            notices.push(format!("{k} changed since the session started: {} -> {now}", s[k]));
+            t.notices.push(format!("{k} changed since the session started: {} -> {now}", s[k]));
         }
     }
     let mut hist: Vec<Value> = Vec::new();
-    for (_, r) in recs {
+    for r in &t.records {
         match r["t"].as_str() {
-            Some("user" | "assistant" | "tool_result") => hist.push(r),
+            Some("user" | "assistant" | "tool_result") => hist.push(r.clone()),
             Some("elide") => hist.iter_mut().filter(|h| h["t"] == "tool_result" && r["ids"].as_array().is_some_and(|ids| ids.contains(&h["id"]))).for_each(|h| _ = shrink(h)),
             _ => {}
         }
     }
     Ok(hist)
+}
+
+/// The number of session `sid`'s last spill file: the highest `<sid>-N.log` in the spill dir, or the number of calls in
+/// `hist` when that is more (the 24 h sweep may have removed a file whose name the history holds; each call took one at
+/// most).
+pub fn spill_n(state: &Path, sid: &str, hist: &[Value]) -> usize {
+    let (names, prefix) = (fs::read_dir(state.join("spill")).into_iter().flatten().flatten().map(|e| e.file_name()), format!("{sid}-"));
+    names.filter_map(|f| f.to_str()?.strip_prefix(&prefix)?.strip_suffix(".log")?.parse().ok()).max().unwrap_or(0).max(calls(hist).count())
+}
+
+/// The next spill name after `n`, `<sid>-<n>.log` (n from the counter, never from a model string): one per tool call
+/// at most.
+pub fn spill(state: &Path, sid: &str, n: &mut usize, home: &Path) -> Spill {
+    *n = n.saturating_add(1);
+    let path = state.join("spill").join(format!("{sid}-{n}.log"));
+    Spill { shown: allow::shown(&path, home), path }
 }
 
 /// Every call of every assistant record, in history order.
@@ -264,20 +337,23 @@ pub fn next_h(hist: &[Value]) -> u32 {
     calls(hist).filter_map(|c| c["id"].as_str()?.strip_prefix('h')?.parse::<u32>().ok()).max().map_or(1, |n| n.saturating_add(1))
 }
 
-/// One builder per record kind, so the module reads as the record table; each sets "t"; `write` adds "ts".
+/// One builder per record kind, so the module reads as the record table; each sets "t"; `put` adds "ts".
 pub mod rec {
     use crate::{config::Config, types::Call, types::Outcome, types::Usage};
     use serde_json::{Value, json};
     use std::path::Path;
 
-    pub fn session(cfg: &Config, id: &str, cwd: &Path, resumed: Option<u64>) -> Value {
+    /// `resumed`: an object the std binding fills with `from_bytes`; `ports`: (port, display name) of each one bound
+    /// outside std, only when there is one.
+    pub fn session(cfg: &Config, id: &str, cwd: &Path, resumed: bool, ports: &[(&str, String)]) -> Value {
         let u = &cfg.url;
-        json!({"t": "session", "v": 1, "henki": env!("CARGO_PKG_VERSION"), "id": id, "cwd": cwd.to_string_lossy(), "model": cfg.model,
+        let v = json!({"t": "session", "v": 1, "henki": env!("CARGO_PKG_VERSION"), "id": id, "cwd": cwd.to_string_lossy(), "model": cfg.model,
             "dialect": cfg.dialect, "base_url": format!("http://{}{}", crate::http::host_port(u), u.path), "base_url_from": cfg.url_from,
             "approve": if cfg.auto { "auto" } else { "ask" }, "approve_from": cfg.approve_from, "config": cfg.file.as_ref().map(|f| f.to_string_lossy()),
             "tools": cfg.tools, "shell": cfg.bash.to_string_lossy(), "exts": cfg.exts.iter().map(|e| &e.name).collect::<Vec<_>>(), "pass_env": cfg.pass_env, "ctx": cfg.window,
             "config_hash": cfg.hash, "allow_hash": cfg.allow.hash, "agents_hash": cfg.agents_hash, "project_agents_hash": null,
-            "resumed": resumed.map(|b| json!({"from_bytes": b}))})
+            "resumed": resumed.then(|| json!({}))});
+        with(v, "ports", (!ports.is_empty()).then(|| ports.iter().map(|(p, n)| (p.to_string(), Value::from(n.as_str()))).collect::<serde_json::Map<_, _>>()))
     }
     pub fn user(content: &str) -> Value {
         json!({"t": "user", "msg": {"content": content, "role": "user"}})
@@ -294,9 +370,11 @@ pub mod rec {
     pub fn ask(c: &Call, target: Option<&str>) -> Value {
         with(json!({"t": "ask", "id": c.id, "name": c.name, "args": c.args}), "target", target)
     }
-    /// `verdict`: yes, no, always, rule or auto; `rule`: the allow rule's number.
-    pub fn approval(id: &str, verdict: &str, rule: Option<usize>) -> Value {
-        with(json!({"t": "approval", "id": id, "verdict": verdict}), "rule", rule)
+    /// `verdict`: yes, no, always, rule, auto, policy or deny; `rule`: the allow rule's number; `extra`: `by` (the policy
+    /// binding that allowed it) or `reason` (a deny's text).
+    pub fn approval(id: &str, verdict: &str, rule: Option<usize>, extra: Option<(&str, &str)>) -> Value {
+        let (k, x) = extra.unzip();
+        with(with(json!({"t": "approval", "id": id, "verdict": verdict}), "rule", rule), k.unwrap_or("by"), x)
     }
     pub fn tool_result(id: &str, name: &str, content: &str, is_error: bool, ms: u64, bytes: u64) -> Value {
         json!({"t": "tool_result", "id": id, "name": name, "content": content, "is_error": is_error, "ms": ms, "bytes": bytes})
@@ -321,8 +399,9 @@ pub mod rec {
         }
         v
     }
-    pub fn close(bytes: u64) -> Value {
-        json!({"t": "close", "bytes": bytes})
+    /// The std binding fills `bytes`.
+    pub fn close() -> Value {
+        json!({"t": "close"})
     }
 
     fn usage(u: Usage) -> Value {
@@ -338,4 +417,4 @@ pub mod rec {
 }
 
 #[cfg(test)]
-mod tests;
+pub mod tests;

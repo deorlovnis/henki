@@ -1,0 +1,11 @@
+#!/bin/sh
+# A prompt template (handoff/1): hands back `send` with the text of cmd/NAME.md, NAME the command this runs as (a link
+# to this file), and the command's argument after a blank line when there is one.
+name=${0##*/}
+# Read before HENKI_NEXT is written: a missing NAME.md hands back nothing, never an empty `send`.
+text=$(cat "$HENKI_MODULE/cmd/$name.md") || exit 1
+{
+  echo send
+  printf '%s\n' "$text"
+  if [ -n "${1:-}" ]; then printf '\n%s\n' "$1"; fi
+} >"$HENKI_NEXT"
