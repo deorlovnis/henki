@@ -50,6 +50,8 @@ An answer is a line you type at the question. What you typed before it appeared 
 
 `henki run` never asks. In ask mode the first call that needs approval ends it with exit 3, naming the call (`(needs approval: $ CMD; ...)`); `henki --resume` (the latest session here) or `henki --resume=ID` continues that session in the REPL: tell the model to go on, and it asks before the call runs. `--approve auto` runs every call without asking.
 
+A module can bring a policy binding, a program that decides every call in place of the above (`henki mods swap policy NAME`; `henki mods swap policy std` goes back). It may allow a call, ask, or deny it (the model is told why); henki shows each allow as `$ CMD  (allowed by policy NAME ID: REASON)`. henki still refuses every write to its own files before the binding is asked, asks you about any call the binding allows that reads or names them (a `read` of `config.toml`, a command with `~/.config/henki/` in it), and asks about every call once the binding fails. With a binding, henki reads no allow rules and refuses `approve = "auto"`; `henki --port policy=std` runs one session without it. See CONTRACTS.md `policy/1`.
+
 ### Allow rules
 
 An allow rule lets one exact shell command run without asking in one project. The rules are in `allow` next to the config file (`~/.config/henki/allow`), a plain text file you can read, edit and empty:
