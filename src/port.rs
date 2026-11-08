@@ -83,3 +83,17 @@ pub struct Ports {
     pub history: Box<dyn History>,
     pub policy: Box<dyn Policy>,
 }
+
+// The other ports have one binding each, so they stay seams until a second one exists: a trait with one impl costs
+// lines and buys nothing (measured: the three shells below, with their std impls, cost 34 lines). Their shapes are
+// fixed, so opening one reshapes nothing:
+// - context: `trait Context { fn fit(&mut self, hist: &[Record], budget: &Budget) -> Result<Fit, PortError>; }` with
+//   `Budget { window, used, overflowed }` and `Fit { records, journal }`. The kernel keeps the history unmutated (today
+//   `journal::elide` mutates it), checks the pairing and the budget of what comes back, and falls back to the std
+//   elision with a notice. The one call site is `Session::elide`.
+// - exec: data, not a trait: the realpath of `CONFIG/port/exec`, put in front of `bash --noprofile --norc -c CMD` inside
+//   `supervise::spawn`, so the child stays in its own session, in the ledger, killed and swept. `spawn` takes eight
+//   arguments already: bundle bash, cwd, env and the prefix into one struct first.
+// - frontend: `enum Front { Repl, Headless(Option<String>), Serve }`; the frontends stay built in, and `Serve` reads a
+//   command stream and writes the `--json` records. Once a command can hand back a restart, `repl::run` returns the
+//   exit code and the argv to exec.
