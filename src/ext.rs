@@ -2,8 +2,8 @@
 //! first line goes into the prompt; an optional `NAME/bin/` goes first on the tool PATH; `NAME/cmd/X` is the user's
 //! `/X` (`handoff`); `NAME/on/EVENT` watches the session (`observe`); `NAME/port/PORT` is a binding that only a link
 //! in `CONFIG/port/` runs.
-use crate::{allow, config, observe, port, sys};
-use std::io;
+use crate::{allow, config, observe, port, sys, term};
+use std::io::{self, BufRead, Read};
 use std::path::{Path, PathBuf};
 use std::{collections::BTreeMap, collections::BTreeSet, ffi::OsStr, ffi::OsString, fmt::Display, fs, os::unix::ffi::OsStrExt, os::unix::fs::MetadataExt};
 
@@ -85,11 +85,13 @@ fn one(dir: &Path, name: &str) -> Result<Ext, String> {
     if let Some(n) = entries.iter().find(|n| !known(n)) {
         return Err(bad(dir, format!("unknown entry {}; ext/2 modules hold doc.md, bin/, cmd/, on/, port/ and eval/", dir.join(n).display()), "move it out of the extension"));
     }
-    // The whole doc steers the model as AGENTS.md does, so it is held to the same rules; line 1 is the summary.
-    let doc = dir.join("doc.md");
-    let text = config::text(&doc, 16 << 10).map_err(|e| format!("ext {e}"))?;
+    // The whole doc steers the model as AGENTS.md does, so it is held to the same rules; line 1 is the summary. A module
+    // ext/1 knows (none of cmd/, on/, port/ and eval/) keeps ext/1's rules for one release more: line 1 of doc.md is all
+    // that is read, and a link may leave it (the Stability rule of CONTRACTS.md).
+    let (doc, v1) = (dir.join("doc.md"), !["cmd", "on", "port", "eval"].iter().any(|d| entries.contains(OsStr::new(d))));
+    let text = if v1 { first(&doc) } else { config::text(&doc, 16 << 10) }.map_err(|e| format!("ext {e}"))?;
     let line = text.split('\n').next().unwrap_or_default().trim_start_matches(['#', ' ']).trim();
-    if line.is_empty() || line.len() > 160 {
+    if line.is_empty() || line.len() > 160 || line.contains(term::escaped) {
         return Err(bad(&doc, "line 1 must be a summary of 1 to 160 bytes", "write doc.md with a summary of the extension on line 1"));
     }
     let has = |d: &str| entries.contains(OsStr::new(d)).then(|| dir.join(d));
@@ -113,7 +115,7 @@ fn one(dir: &Path, name: &str) -> Result<Ext, String> {
     // The manager copies a module whole: a link out of it would name a file the lock does not pin.
     let real = fs::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf());
     let out = |p: &&PathBuf| !fs::read_link(p).is_ok_and(|t| t.is_relative()) || !fs::canonicalize(p).is_ok_and(|t| t.starts_with(&real));
-    if let Some(p) = paths.iter().skip(1).filter(|p| p.is_symlink()).find(out) {
+    if let Some(p) = paths.iter().skip(1).filter(|p| !v1 && p.is_symlink()).find(out) {
         return Err(bad(p, "a link that leaves the module", "copy the file in"));
     }
     // Observers run unasked on each event, as a port binding does, so on/ and its files are held to a binding's owner
@@ -147,6 +149,13 @@ fn scan(dir: &Path, sub: &str, paths: &mut Vec<PathBuf>) -> Result<Vec<String>, 
         paths.push(p);
     }
     Ok(found)
+}
+
+/// ext/1's doc.md: a regular file, its line 1 read through 4 KiB as UTF-8.
+fn first(doc: &Path) -> Result<String, String> {
+    let fail = |e: String| format!("{e}; fix: make {} a readable regular file", doc.display());
+    let (f, mut line) = (sys::open_regular(doc).map_err(fail)?.0, String::new());
+    io::BufReader::new(f.take(4 << 10)).read_line(&mut line).map(|_| line).map_err(|e| fail(format!("{}: {e}", doc.display())))
 }
 
 /// The names in `dir`, sorted bytewise.

@@ -114,7 +114,7 @@ cargo build --release
 ./check.sh install-hook  # check the commits of every git push
 ```
 
-`check.sh` holds henki to its budgets: at most 4,333 lines of non-test Rust (400 per file), at most 10 crates in the dependency tree, and a release binary of at most 1,065,536 bytes, including the static musl build on Linux when that target is installed. It also refuses a commit not yet pushed that has no `Signed-off-by:` line (`git commit -s`); [CONTRIBUTING.md](CONTRIBUTING.md) says why and lists the style rules.
+`check.sh` holds henki to its budgets: at most 4,358 lines of non-test Rust (400 per file), at most 10 crates in the dependency tree, and a release binary of at most 1,065,536 bytes, including the static musl build on Linux when that target is installed. It also refuses a commit not yet pushed that has no `Signed-off-by:` line (`git commit -s`); [CONTRIBUTING.md](CONTRIBUTING.md) says why and lists the style rules.
 
 `release/release.sh VERSION` builds, from a clean checkout, `dist/henki-VERSION-TARGET.tar.gz` for this host (static musl on Linux) and `dist/SHA256SUMS`. A tarball holds `bin/henki`, `bin/henki-mods`, the official modules in `share/henki/official` (off until added), the conformance suites in `share/henki/conform`, the general eval suite in `share/henki/eval/general`, the config profiles, LICENSE, README.md and CONTRACTS.md; unpack it anywhere and put its `bin/` on your PATH. `release/release.sh --formula VERSION TAP` writes the Homebrew formula from `SHA256SUMS`, and `release/release.sh --selftest` builds, unpacks and runs one tarball.
 

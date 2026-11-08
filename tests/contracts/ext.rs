@@ -56,6 +56,28 @@ fn contracts_ext_accepts() {
     assert!(out.starts_with(&want), "{out}");
 }
 
+/// An ext/2 module `demo` (it has cmd/) whose doc.md holds `text` at `mode`.
+fn v2(x: &Path, text: &str, mode: u32) {
+    file(&x.join("demo"), "doc.md", text, mode);
+    fs::create_dir_all(x.join("demo/cmd")).unwrap();
+}
+
+/// A module ext/1 knows (none of cmd/, on/, port/ and eval/) keeps ext/1's rules for a release more: only line 1 of
+/// doc.md is read, so the rest may be long or group-writable, and a link may leave it.
+#[test]
+fn contracts_ext1_rules_kept() {
+    let m = Mock::start(vec![shell("mytrue && echo ran"), say("ok")]);
+    let r = Run::new(&m.url());
+    let x = ext_dir(&r);
+    file(&x.join("old"), "doc.md", &format!("old: an ext/1 module\n\u{202e}\n{}", "y".repeat(20 << 10)), 0o664);
+    fs::create_dir_all(x.join("old/bin")).unwrap();
+    std::os::unix::fs::symlink("/bin/true", x.join("old/bin/mytrue")).unwrap();
+    let d = r.json("use it");
+    d.finish();
+    assert_eq!((d.code, &d.of("session")[0]["exts"]), (Some(0), &json!(["old"])), "{}", d.diag());
+    assert!(d.results()[0]["content"].as_str().unwrap().starts_with("ran\n"), "{}", d.diag());
+}
+
 /// Each layout ext/1 refuses stops henki at start with a config error naming the problem, before any request.
 #[test]
 fn contracts_ext_refuses() {
@@ -104,14 +126,17 @@ fn contracts_ext_refuses() {
         ("no doc.md", |x| file(&x.join("demo"), "README", "", 0o644), "doc.md: No such file or directory"),
         ("a 161-byte line 1", |x| file(&x.join("demo"), "doc.md", &"y".repeat(161), 0o644), "line 1 must be a summary of 1 to 160 bytes"),
         ("an empty line 1", |x| file(&x.join("demo"), "doc.md", "#\nthe summary is not here\n", 0o644), "line 1 must be a summary of 1 to 160 bytes"),
-        ("an invisible character", |x| file(&x.join("demo"), "doc.md", "a\u{200b}summary\n", 0o644), "doc.md:1: holds U+200B, which a terminal does not show"),
-        ("an invisible character below line 1", |x| file(&x.join("demo"), "doc.md", "a summary\n\n\u{202e}\n", 0o644), "doc.md:3: holds U+202E"),
-        ("a doc.md over 16 KiB", |x| file(&x.join("demo"), "doc.md", &format!("a summary\n{}", "y".repeat(16 << 10)), 0o644), "over 16,384 bytes"),
+        ("an invisible character in line 1", |x| file(&x.join("demo"), "doc.md", "a\u{200b}summary\n", 0o644), "line 1 must be a summary of 1 to 160 bytes"),
+        // ext/2's text and link rules, for a module with any of cmd/, on/, port/ and eval/ (cmd/ here).
+        ("an invisible character", |x| v2(x, "a\u{200b}summary\n", 0o644), "doc.md:1: holds U+200B, which a terminal does not show"),
+        ("an invisible character below line 1", |x| v2(x, "a summary\n\n\u{202e}\n", 0o644), "doc.md:3: holds U+202E"),
+        ("a doc.md over 16 KiB", |x| v2(x, &format!("a summary\n{}", "y".repeat(16 << 10)), 0o644), "over 16,384 bytes"),
+        ("a group-writable doc.md", |x| v2(x, "a summary\n", 0o664), "doc.md is group- or world-writable"),
         (
             "a link out of the module",
             |x| {
                 file(x.parent().unwrap(), "elsewhere.md", "a summary\n", 0o644);
-                fs::create_dir_all(x.join("demo")).unwrap();
+                fs::create_dir_all(x.join("demo/cmd")).unwrap();
                 std::os::unix::fs::symlink("../../elsewhere.md", x.join("demo/doc.md")).unwrap();
             },
             "a link that leaves the module",

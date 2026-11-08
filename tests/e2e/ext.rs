@@ -245,14 +245,16 @@ fn e2e_ext_bin_dot_file_made_runnable_trips() {
     assert_eq!(m.log().len(), 1, "the call that runs it was never asked for\n{}", d.diag());
 }
 
-/// henki checks who may write doc.md (it steers the model as AGENTS.md does) and on/ (it runs unasked), not the other
-/// extension files (a documented limit): an extension whose directories and commands anyone may write still loads and runs. Pinned, so
-/// that changing it is a decision and not an accident.
+/// henki checks who may write an ext/2 module's doc.md (it steers the model as AGENTS.md does) and on/ (it runs unasked),
+/// not the other extension files (a documented limit): an extension whose directories and commands anyone may write
+/// still loads and runs. Pinned, so that changing it is a decision and not an accident. (The empty cmd/ makes it an
+/// ext/2 module; an ext/1 one keeps ext/1's rules, which read only line 1 of doc.md.)
 #[test]
 fn e2e_ext_writable_by_others_loads() {
     let m = Mock::start(vec![shell("xopen"), say("ok")]);
     let r = Run::new(&m.url());
     let x = ext(&r, None, "open", "an open extension\n", &[("xopen", "open-ran")]);
+    fs::create_dir(x.join("cmd")).unwrap();
     fs::set_permissions(x.join("doc.md"), fs::Permissions::from_mode(0o666)).unwrap();
     let d = r.json("hi");
     d.finish();

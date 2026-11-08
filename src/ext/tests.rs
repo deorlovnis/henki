@@ -162,6 +162,7 @@ fn ext_doc_line_rules() {
 fn ext_doc_whole_rules() {
     let t = T::new();
     let doc = t.p("e/a/doc.md");
+    t.dir("e/a/cmd"); // an ext/2 module; an ext/1 one keeps ext/1's rules (below)
     for (text, line, u) in [("a\u{200b}b", 1, 0x200B), ("red \x1b[31m", 1, 0x1B), ("a\rb", 1, 0xD), ("summary\n\nbody \u{202e}", 3, 0x202E)] {
         t.ext("e/a", text);
         let want = format!("ext {}:{line}: holds U+{u:04X}, which a terminal does not show; fix: remove it", doc.display());
@@ -175,6 +176,14 @@ fn ext_doc_whole_rules() {
     assert_eq!(ok(&[t.p("e")]).exts[0].line, "a: summary", "exactly 16 KiB");
     fs::set_permissions(&doc, fs::Permissions::from_mode(0o664)).unwrap();
     assert_eq!(err(&[t.p("e")]), format!("ext {0} is group- or world-writable; fix: chmod go-w {0}", doc.display()));
+    // ext/1's rules for a module without cmd/, on/, port/ and eval/: line 1 is all that is read, through 4 KiB.
+    fs::remove_dir(t.p("e/a/cmd")).unwrap();
+    t.ext("e/a", &format!("a: summary\n\nbody \u{202e}\n{}", "x".repeat(20 << 10)));
+    assert_eq!(ok(&[t.p("e")]).exts[0].line, "a: summary", "group-writable, over 16 KiB, invisible past line 1");
+    t.ext("e/a", "a\u{200b}b\n");
+    assert_eq!(err(&[t.p("e")]), format!("ext {}: {LINE_RULE}; {DOC_FIX}", doc.display()));
+    t.ext("e/a", &format!("# {}", "x".repeat(5 << 10)));
+    assert_eq!(err(&[t.p("e")]), format!("ext {}: {LINE_RULE}; {DOC_FIX}", doc.display()), "line 1 is cut at 4 KiB");
 }
 
 #[test]
@@ -367,6 +376,7 @@ fn ext_symlink_targets() {
 fn ext_link_rule() {
     let t = T::new();
     t.ext("e/a", "# a");
+    t.dir("e/a/on"); // an ext/2 module; an ext/1 one keeps ext/1's rules (below)
     t.exe("e/a/.henki/tool");
     let outside = t.exe("elsewhere/tool");
     t.dir("e/a/bin");
@@ -384,6 +394,12 @@ fn ext_link_rule() {
     fs::remove_file(t.p("e/a/doc.md")).unwrap();
     symlink(t.file("doc.md", "# a"), t.p("e/a/doc.md")).unwrap();
     assert_eq!(err(&[t.p("e")]), format!("ext {}: a link that leaves the module; fix: copy the file in", t.p("e/a/doc.md").display()));
+    // Without cmd/, on/, port/ and eval/ the module is held to ext/1, whose links may leave it; their targets are protected.
+    fs::remove_dir(t.p("e/a/on")).unwrap();
+    fs::remove_file(&link).unwrap();
+    symlink(&outside, &link).unwrap();
+    let f = ok(&[t.p("e")]);
+    assert_eq!((&f.exts[0].cmds, &f.exts[0].targets), (&vec!["tool".to_string()], &vec![t.p("doc.md"), outside]));
 }
 
 /// cmd/: runnable entries are the user's commands, NAME.md files their data (held to doc.md's rules), names henki keeps

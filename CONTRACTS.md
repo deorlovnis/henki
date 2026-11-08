@@ -31,7 +31,7 @@ A program reads the contracts this henki ships from the rows of this table: each
 | `journal/1` | henki | the session journal: files, records, identity, resume, repair |
 | `json/1` | henki | the record stream of `henki run --json` |
 | `wire/1` | henki | what henki sends to and accepts from a model server, in both dialects |
-| `ext/1` | henki | the extension directory layout henki loaded first; valid under ext/2 |
+| `ext/1` | henki | the extension directory layout henki loaded first; a module without ext/2's entries keeps its rules |
 | `ext/2` | henki | the module directory layout henki loads: doc, tools, user commands, bindings |
 | `handoff/1` | henki | a user command's environment, and what it hands back to henki in `HENKI_NEXT` |
 | `observe/1` | henki | a module's observers: the session's events, how henki runs them, and what it waits for |
@@ -340,8 +340,10 @@ default config). henki runs nothing while it loads them; a violation of any rule
 
 ## ext/2
 
-ext/2 is ext/1 with user commands, observers and bindings, and stricter text and link rules. henki loads every module
-under it; an ext/1 module stays valid unless it holds a link out of itself or a doc.md that fails the text rules below.
+ext/2 is ext/1 with user commands, observers and bindings, and stricter text and link rules. A module with none of
+`cmd/`, `on/`, `port/` and `eval/` is an ext/1 module, and henki holds it to ext/1's rules for at least one release
+more, as the Stability section asks: only line 1 of its doc.md is read, and its links may leave it. Every other module
+is held to the rules below.
 
 ```
 NAME/doc.md              required: line 1 the summary; the whole file a text (below)
@@ -365,8 +367,8 @@ NAME/README* LICENSE* CHANGELOG* .*   ignored
   `on/`, the real file of each `on/` entry and every directory from it up to the module's real directory must be owned
   by the user or root and not group- or world-writable (`PATH is group- or world-writable; fix: chmod go-w PATH`);
   henki does not check the owner or mode of the module's other files and directories, nor of the ext path.
-- **Links.** Inside a module every link must be relative and lead to a path inside it (`a link that leaves the module;
-  fix: copy the file in`); the module directory itself may be a link (the manager's store copy).
+- **Links.** Inside an ext/2 module every link must be relative and lead to a path inside it (`a link that leaves the
+  module; fix: copy the file in`); the module directory itself may be a link (the manager's store copy).
 - **Names across modules.** A `bin/` or a `cmd/` name in two modules stops the start.
 - **Trust.** The module directory, doc.md, `bin/`, `cmd/`, `on/`, `port/` and every entry of them are trust files;
   the realpaths of the links among them are protected.
