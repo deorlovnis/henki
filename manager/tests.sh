@@ -1888,9 +1888,9 @@ t_exec() {
 }
 
 # context/1's suite (shapes only; henki checks the records in a session): port_toy's context modes pass, its faults
-# fail the first fit; swap shows the context screen and links it.
+# fail the first fit; compact (the official binding) passes it with no model; swap shows the context screen and links it.
 t_context() {
-  case_ "context: test --port, the suite's faults, swap"
+  case_ "context: test --port, the suite's faults, compact, swap"
   local toy f
   run test --port context std
   rc_is 0
@@ -1918,6 +1918,11 @@ t_context() {
   printf 'C04\ta\t{"method":"fit","params":{"records":@F:gone@}}\t*\n' >"$W/share/conform/context.tsv"
   HENKI_SHARE="$W/share" run test --port context "$W/fits"
   refused "no fixture $W/share/conform/fixtures/gone.json; fix: reinstall henki"
+  if command -v python3 >/dev/null 2>&1; then
+    run test --port context "$HERE/../mods/compact/port/context"
+    rc_is 0
+    out_has "context/1: 12 checks, 12 passed"
+  fi
   mkmod "$W/shaper" 'ports = ["context"]\ncontracts = ["port/1", "context/1"]\n'
   mkdir -p "$W/shaper/port"
   printf '#!/bin/sh\nexec %s context keep\n' "$toy" >"$W/shaper/port/context"

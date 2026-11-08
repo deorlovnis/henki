@@ -1,0 +1,12 @@
+# The compact mod: henki's official context binding. It shapes what the model sees of a long session by summarising
+# old turns with the local model; the history itself is never changed.
+henki_module = 1
+name = "compact"
+version = "0.1.0"
+license = "Apache-2.0"
+requires = ["henki >= 0.3"]
+contracts = ["port/1", "context/1"]
+os = ["macos", "linux"]
+needs = ["python3"]
+caps_net = "loopback"            # one completion per new summary, to the model server henki uses; never another host
+ports = ["context"]

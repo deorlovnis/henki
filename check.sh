@@ -466,7 +466,7 @@ cargo test --locked
 # built), then the official modules: their own tests, and the layout henki loads; then the general eval suite's layout.
 step "mods (manager/tests.sh, manager/mods-tests.sh, mods/*/, eval/general/)"
 MODS_TEST_HENKI="$target/debug/henki" manager/tests.sh
-manager/mods-tests.sh
+MODS_TEST_HENKI="$target/debug/henki" manager/mods-tests.sh
 gate_mods mods
 manager/henki-mods eval --check eval/general
 

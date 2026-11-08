@@ -4,6 +4,8 @@
 # HENKI_MODULE and HENKI_NEXT, and stand-ins for the programs it calls on PATH. Bash 3.2 compatible like the manager.
 #
 #   manager/mods-tests.sh               every case
+#   MODS_TEST_HENKI=PATH manager/mods-tests.sh
+#       also runs a henki session bound to compact (check.sh passes the henki it built)
 #
 # Exit 0 when every case passes; each failure prints the case, the check and the command's output.
 set -u
@@ -504,6 +506,161 @@ t_notify() {
   err_has "notify: no osascript or notify-send on PATH"
 }
 
+# compact, the context binding, with a stub model server on loopback (python3; compact needs it too): keep below its
+# threshold, a summary record then the history's own records past it, the cache, the model in the cache key, a dead,
+# remote or missing model leaves every request to henki; with MODS_TEST_HENKI, a henki session bound to it, whose
+# requests carry the summary henki accepted while the journal keeps everything.
+t_compact() {
+  case_ "compact: keep, summaries, the cache, a dead or remote model, through henki"
+  command -v python3 >/dev/null 2>&1 || { echo "skipped: compact (no python3)"; return 0; }
+  cat >"$D/compact_tests.py" <<'PY'
+import json, os, shutil, subprocess, sys, threading, time
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+MOD, FIX, D, HENKI = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
+PROG = os.path.join(MOD, "port", "context")
+PREFIX = "Summary of the earlier part of this session, written by the assistant"
+FAILS = []
+STUB = {"mode": "ok", "log": []}
+
+
+def check(what, ok, detail=""):
+    if not ok:
+        FAILS.append(what)
+        print("FAIL compact: %s%s" % (what, ": " + str(detail)[:400] if detail else ""))
+
+
+class Stub(BaseHTTPRequestHandler):
+    def log_message(self, *a):
+        pass
+
+    def do_POST(self):
+        body = json.loads(self.rfile.read(int(self.headers.get("Content-Length") or 0)))
+        STUB["log"].append((dict(self.headers), body))
+        if STUB["mode"] == "error":
+            data, code = b'{"error":{"message":"stub"}}', 500
+        else:
+            ask = str(body["messages"][-1].get("content", ""))
+            # henki's own requests carry tools: a long answer, so its history grows; compact's get a summary.
+            text = ("Answer %d. " % len(STUB["log"])) * 200 if "tools" in body else "<think>x</think>Asked: %s‮" % ask[:60]
+            data, code = json.dumps({"choices": [{"finish_reason": "stop", "index": 0, "message": {"content": text, "role": "assistant"}}],
+                                     "usage": {"completion_tokens": 5, "prompt_tokens": 50}}).encode(), 200
+        self.send_response(code)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
+
+
+srv = ThreadingHTTPServer(("127.0.0.1", 0), Stub)
+threading.Thread(target=srv.serve_forever, daemon=True).start()
+URL = "http://127.0.0.1:%d/v1" % srv.server_address[1]
+
+
+def home(compact=None, config=None):
+    h = os.path.join(D, "home%d" % len(os.listdir(D)))
+    os.makedirs(os.path.join(h, ".config", "henki"))
+    for name, text in (("compact.toml", compact), ("config.toml", config)):
+        if text is not None:
+            with open(os.path.join(h, ".config", "henki", name), "w") as f:
+                f.write(text)
+    return h
+
+
+def talk(h, reqs):
+    """compact run as henki runs it, with HOME h: hello, the requests, bye. The answers after hello, and stderr."""
+    lines = [{"id": 0, "method": "hello", "params": {"port": "context", "protocol": [1], "versions": [1], "state": os.path.join(h, "state")}}]
+    lines += [{"id": i + 1, "method": m, "params": p} for i, (m, p) in enumerate(reqs)] + [{"id": len(reqs) + 1, "method": "bye", "params": {}}]
+    env = {"HOME": h, "PATH": os.environ["PATH"], "http_proxy": "http://127.0.0.1:9"}
+    t = time.time()
+    r = subprocess.run([PROG], input="".join(json.dumps(x) + "\n" for x in lines), capture_output=True, text=True, env=env, timeout=60)
+    got = [json.loads(x) for x in r.stdout.splitlines()]
+    check("one answer per request", len(got) == len(lines), r.stdout + r.stderr)
+    return got[1:-1], r.stderr, got[0], time.time() - t
+
+
+def fixture(name):
+    with open(os.path.join(FIX, name + ".json")) as f:
+        return json.load(f)
+
+
+def size(recs, fixed):
+    return fixed + sum(len(json.dumps(r, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode()) + 1 for r in recs)
+
+
+def fit(recs, window, fixed=2500, overflowed=False):
+    return ("fit", {"budget": {"fixed": fixed, "limit": window * 16 // 5, "max_tokens": 1024, "window": window}, "overflowed": overflowed, "records": recs, "session": "s"})
+
+
+long_ = fixture("long")
+cfg = 'base_url = "%s"\nmodel = "stub-model"\n' % URL
+h = home(cfg)
+got, err, hello, _ = talk(h, [("x-none", {}), fit(long_[:24], 7500)])
+check("hello", hello.get("result") == {"caps": [], "impl": "0.1.0", "name": "compact", "protocol": 1, "version": 1}, hello)
+check("an unknown method is unsupported", got[0].get("error", {}).get("code") == "unsupported", got[0])
+check("below start x limit: keep, no completion", got[1].get("result") == {"keep": True} and not STUB["log"], (got[1], len(STUB["log"])))
+got, err, _, _ = talk(h, [("x-none", {}), ("x-none", {}), fit(long_, 7500), fit(long_, 7500, overflowed=True)])
+recs = got[2].get("result", {}).get("records") or [{}]
+head = recs[0].get("msg", {}).get("content", "")
+check("over it: a summary record, then the history's own last records", recs[0].get("t") == "user" and head.startswith(PREFIX) and recs[1:] == long_[-(len(recs) - 1):], recs[:2])
+check("the summary is cleaned (no think block, no U+202E)", "<think>" not in head and "‮" not in head and "Asked: " in head, head[-120:])
+check("within the limit", size(recs, 2500) <= 24000, size(recs, 2500))
+headers, asked = STUB["log"][0]
+check("one completion of the model compact was given, no key, not streamed", len(STUB["log"]) == 2 and asked["model"] == "stub-model" and asked["stream"] is False
+      and not any(k.lower() == "authorization" for k in headers), (len(STUB["log"]), asked.get("model")))
+users = [r for r in got[3].get("result", {}).get("records", []) if r.get("t") == "user"]
+check("overflowed: the summary and one turn, within start x limit", len(users) == 2 and size(got[3]["result"]["records"], 2500) <= 0.6 * 24000, len(users))
+n = len(STUB["log"])
+again, _, _, _ = talk(h, [fit(long_, 7500)])
+check("a new instance reuses the cached summary", again[0].get("result") == got[2].get("result") and len(STUB["log"]) == n, len(STUB["log"]) - n)
+with open(os.path.join(h, ".config", "henki", "compact.toml"), "w") as f:
+    f.write('base_url = "%s"\nmodel = "other-model"\n' % URL)
+talk(h, [fit(long_, 7500)])
+check("another model's summary is not reused", len(STUB["log"]) == n + 1 and STUB["log"][-1][1]["model"] == "other-model", len(STUB["log"]) - n)
+got, _, _, _ = talk(h, [fit(fixture("one_turn"), 625)])
+check("one turn over the limit alone: keep", got[0].get("result") == {"keep": True}, got[0])
+for text, why in (('base_url = "http://127.0.0.1:9/v1"\nmodel = "m"\n', ""), ('base_url = "http://192.0.2.1:8080/v1"\nmodel = "m"\n', "not loopback"),
+                  ('base_url = "https://127.0.0.1:1/v1"\nmodel = "m"\n', "not loopback"), (None, "no base_url and model")):
+    n = len(STUB["log"])
+    got, err, _, took = talk(home(text), [fit(long_, 7500), fit(long_, 7500)])
+    check("a dead, remote or missing model (%s): keep, quickly, said once" % (text or "none").split("\n")[0], all(g.get("result") == {"keep": True} for g in got)
+          and took < 5 and err.count(why) == (1 if why else err.count(why)) and len(STUB["log"]) == n, (got, err, took))
+STUB["mode"] = "error"
+got, err, _, _ = talk(home(cfg), [fit(long_, 7500)])
+check("a model error: keep, and a log line", got[0].get("result") == {"keep": True} and "failed" in err, err)
+STUB["mode"] = "ok"
+check("henki's config.toml gives base_url and model", talk(home(None, cfg), [fit(long_, 7500)])[0][0].get("result", {}).get("records"), "no records")
+
+if HENKI:
+    # A henki session bound to compact: three turns of long answers in a small window. The last request starts with the
+    # summary henki took (no refusal notice), and the journal keeps every turn.
+    h = home(None, cfg + 'approve = "auto"\ncontext_window = 4096\n')
+    os.makedirs(os.path.join(h, ".config", "henki", "port"))
+    os.symlink(PROG, os.path.join(h, ".config", "henki", "port", "context"))
+    work = os.path.join(h, "work")
+    os.makedirs(work)
+    env = {"HOME": h, "PATH": os.environ["PATH"], "XDG_STATE_HOME": os.path.join(h, "state")}
+    STUB["log"] = []
+    out = ""
+    for i, args in enumerate([["first"], ["--resume", "second"], ["--resume", "third"], ["--resume", "fourth"]]):
+        r = subprocess.run([HENKI, "run", "--json"] + args, capture_output=True, text=True, env=env, cwd=work, timeout=60)
+        out += r.stdout
+        check("henki run %d ends ok" % i, r.returncode == 0, r.stdout[-600:] + r.stderr)
+    recs = [json.loads(x) for x in out.splitlines()]
+    check("no answer of compact refused", not [x for x in recs if x.get("t") == "notice" and "std elide" in x.get("text", "")], [x.get("text") for x in recs if x.get("t") == "notice"])
+    mine = [b for _, b in STUB["log"] if "tools" in b]
+    first = [str(m.get("content")) for m in mine[-1]["messages"] if m["role"] == "user"]
+    check("the last request starts with the summary, then the last turns", first[0].startswith(PREFIX) and len(first) == 3, [f[:40] for f in first])
+    journal = [json.loads(x) for d, _, fs in os.walk(os.path.join(h, "state", "henki", "sessions")) for f in fs for x in open(os.path.join(d, f))]
+    check("the journal keeps every turn", len([x for x in journal if x.get("t") == "user"]) == 4, len(journal))
+srv.shutdown()
+sys.exit(1 if FAILS else 0)
+PY
+  RC=0
+  mkdir -p "$D/homes"
+  OUT=$(python3 -I "$D/compact_tests.py" "$MODS_DIR/compact" "$MODS_DIR/../manager/conform/fixtures" "$D/homes" "${MODS_TEST_HENKI:-}" 2>&1 </dev/null) || RC=$?
+  [ "$RC" = 0 ] || { FAILS=$((FAILS + 1)) && printf '%s\n' "$OUT" >&2; }
+}
+
 t_sessions
 t_prompts
 t_project
@@ -512,6 +669,7 @@ t_checkpoints
 t_checkpoints_missed
 t_checkpoints_kept
 t_notify
+t_compact
 if [ "$FAILS" != 0 ]; then
   echo "mods-tests.sh: $FAILS checks failed in $CASES cases" >&2
   exit 1

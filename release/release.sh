@@ -291,7 +291,7 @@ EOF
     <<~TEXT
       henki reads ~/.config/henki/config.toml; start from a profile, then set model and base_url:
         mkdir -p ~/.config/henki && cp #{HOMEBREW_PREFIX}/share/henki/config.mac.toml ~/.config/henki/config.toml
-      The official modules (checkpoints, clip, halti, itse, notify, project, prompts, sessions) ship off. henki-mods
+      The official modules (checkpoints, clip, compact, halti, itse, notify, project, prompts, sessions) ship off. henki-mods
       (also henki mods) manages modules:
         henki-mods list        what is added, on, and what each adds to the prompt
         henki-mods add halti   shows what it installs, then asks
@@ -386,7 +386,7 @@ selftest() {
   [ "$got" = "henki-mods $version" ] || { say "selftest: bin/henki-mods --version said \"$got\""; bad=1; }
   # The official modules are found in the tarball's share/ (no HENKI_SHARE, no repo checkout next to it).
   got=$(env -i HOME="$t/home" PATH=/usr/bin:/bin "$x/bin/henki-mods" list 2>&1) || got="(exit $?) $got"
-  case "$got" in *"official, not added: checkpoints clip halti itse notify project prompts sessions "*) ;; *)
+  case "$got" in *"official, not added: checkpoints clip compact halti itse notify project prompts sessions "*) ;; *)
     say "selftest: bin/henki-mods list said: $got"
     bad=1
     ;;
@@ -398,6 +398,11 @@ selftest() {
   [ -L "$t/home/.config/henki/ext/itse" ] && [ -L "$t/home/.config/henki/ext/sessions" ] || { say "selftest: add --yes made no link"; bad=1; }
   # The conformance suites are found in the tarball's share/ too, and so is the general eval suite, whole.
   got=$(env -i HOME="$t/home" PATH=/usr/bin:/bin "$x/bin/henki-mods" test --port history std 2>&1) || { say "selftest: test --port history std: $got"; bad=1; }
+  # compact, the official context binding, passes context.tsv with the fixtures from share/ (where python3 runs it).
+  if PATH=/usr/bin:/bin command -v python3 >/dev/null 2>&1; then
+    got=$(env -i HOME="$t/home" PATH=/usr/bin:/bin "$x/bin/henki-mods" test --port context "$x/share/henki/official/compact/port/context" 2>&1) ||
+      { say "selftest: test --port context compact: $got"; bad=1; }
+  fi
   got=$(env -i HOME="$t/home" PATH=/usr/bin:/bin "$x/bin/henki-mods" eval --check "$x/share/henki/eval/general" 2>&1) || { say "selftest: eval --check: $got"; bad=1; }
   [ "$(cd "$x/share/henki/eval/general" && ls)" = "$(cd eval/general && ls)" ] || { say "selftest: share/henki/eval/general holds other tasks than eval/general"; bad=1; }
   # eval finds that suite: it gets as far as the screen (no terminal to ask on, so nothing runs).
