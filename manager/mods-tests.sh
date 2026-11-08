@@ -110,6 +110,12 @@ t_prompts() {
     rc_is 0
     next_is "send$nl$(cat "$HENKI_MODULE/cmd/$n.md")$nl${nl}the parser, and its tests"
   done
+  # A link to the template without its NAME.md (a prompt of your own, half made): it fails, and hands back nothing.
+  mkdir -p "$D/mine/cmd" && ln -s "$HENKI_MODULE/.henki/template" "$D/mine/cmd/hi" && : >"$HENKI_NEXT"
+  HENKI_MODULE="$D/mine" run "$D/mine/cmd/hi" "an argument"
+  rc_is 1
+  err_has "hi.md"
+  next_is ""
 }
 
 t_clip() {

@@ -8,5 +8,11 @@ sends it as your next message. Text after the command goes at the end, after a b
 - `/commit-msg [HINT]`: write a commit message for the staged changes.
 - `/fix-test [TEST]`: run the failing test, find the cause and fix it.
 
-Each prompt is the file `cmd/NAME.md`. Your own: copy this module, add `cmd/NAME.md` and a link
-`cmd/NAME -> ../.henki/template`, and add the copy with `henki mods add ./DIR`.
+Each prompt is the file `cmd/NAME.md`. Your own, in a module of your own named MINE:
+
+1. `cp -R ~/.config/henki/ext/prompts MINE` and `chmod -R u+w MINE` (the store copy is read-only).
+2. Set `name = "MINE"` in `MINE/.henki/module.toml`.
+3. Remove the four official commands, `cmd/review`, `cmd/explain`, `cmd/commit-msg`, `cmd/fix-test` and their `.md`
+   files: a command name in two modules stops henki at start (or keep only your copy on).
+4. Add `cmd/NAME.md` and a link: `ln -s ../.henki/template MINE/cmd/NAME`.
+5. `henki mods add ./MINE`.
