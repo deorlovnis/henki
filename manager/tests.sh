@@ -1730,8 +1730,11 @@ t_eval() {
   refused 'a tab, a newline, " or \ in --model'
   HENKI_BIN="$W/henki" run eval probe --model-file "$W/nope.gguf" --yes
   refused "--model-file $W/nope.gguf: no such file"
-  # No sandbox program here (this henki ships no sandbox module): only --unsandboxed runs.
+  # No sandbox program: only --unsandboxed runs. A copy of the manager alone, since a checkout's mods/ has the sandbox.
+  local mods=$MODS
+  mkdir -p "$W/lone" && cp "$MODS" "$W/lone/henki-mods" && MODS="$W/lone/henki-mods"
   HENKI_BIN="$W/henki" run eval probe --yes
+  MODS=$mods
   refused "this henki ships no sandbox module (official sandbox, port/exec); eval runs every arm inside it"
   err_has "or run eval --unsandboxed"
   HENKI_BIN="$W/henki" HENKI_MODS_TTY="$W/no-tty" run eval probe --unsandboxed
