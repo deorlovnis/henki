@@ -2837,6 +2837,83 @@ t.close()
   export HOME="$keep_home" XDG_DATA_HOME="$keep_data"
 }
 
+# Pack SRC again as DST with its PACK put through the awk program PROG (tab-separated fields), and store copy
+# store/NAME/FROM renamed to TO when given.
+repack() { # SRC DST PROG [NAME FROM TO]
+  local d="$W/repack"
+  chmod -R u+w "$d" 2>/dev/null
+  rm -rf "$d" && mkdir -p "$d" && (cd "$d" && tar -xzf "$1") || fail "repack: cannot extract $1"
+  awk -F '\t' 'BEGIN { OFS = "\t" } '"$3" "$d/PACK" >"$d/PACK.new" && mv -f "$d/PACK.new" "$d/PACK"
+  [ -z "${4:-}" ] || mv "$d/store/$4/$5" "$d/store/$4/$6"
+  (cd "$d" && tar -czf "$2" PACK store) || fail "repack: cannot write $2"
+}
+
+t_pack_lines() {
+  case_ "unpack and init check what a line claims: its kind, its commit, its characters; removed packages refuse"
+  ix_two
+  run add hello --version 0.1.0 --yes
+  rc_is 0
+  mkmod "$W/o/clip"
+  run add "$W/o/clip" --yes
+  rc_is 0
+  run pack hello -o "$W/h.tgz"
+  rc_is 0
+  run pack clip -o "$W/c.tgz"
+  rc_is 0
+  run profile save "$W/p.lock"
+  rc_is 0
+  local id k
+  id=$(field hello 7 | cut -c 1-12)
+  setkey "$IX/mods/hello/0.1.0.toml" yanked '"malicious: steals keys (2026-11-08)"'
+  ixc "$IX" yank
+  export HOME="$W/home2" XDG_DATA_HOME="$W/data2"
+  CONF="$HOME/.config/henki"
+  mkdir -p "$HOME"
+  run sync
+  rc_is 0
+  # A yanked package relabelled: as henki's own, as an index this machine does not use, as a directory.
+  repack "$W/h.tgz" "$W/h-official.tgz" '$1 == "lock/1" { $5 = "official" } { print }'
+  run unpack "$W/h-official.tgz" --yes
+  refused "hello: the pack says it is henki's official hello, and this henki ships no hello"
+  repack "$W/h.tgz" "$W/h-other.tgz" '$1 == "lock/1" { $5 = "index:other" } { print }'
+  run unpack "$W/h-other.tgz" --yes
+  refused "hello: the pack says it comes from index other, which you do not use"
+  repack "$W/h.tgz" "$W/h-path.tgz" '$1 == "lock/1" { $5 = "path" } { print }'
+  run unpack "$W/h-path.tgz" --yes
+  refused "hello 0.1.0 was yanked as malicious"
+  # The same package under the index's name, but another version than its files are.
+  repack "$W/h.tgz" "$W/h-ver.tgz" '$1 == "lock/1" { $4 = "0.2.0" } { print }'
+  run unpack "$W/h-ver.tgz" --yes
+  refused "hello: index deorlovnis here does not list hello 0.2.0 with these files"
+  check "nothing installed" [ ! -f "$CONF/mods.lock" ] && [ ! -d "$XDG_DATA_HOME/henki/mods/hello" ]
+  # Other code named as henki's official module of that name, which is installed: never replaced.
+  run add clip --yes
+  rc_is 0
+  repack "$W/c.tgz" "$W/c-official.tgz" '$1 == "lock/1" { $5 = "official"; $6 = "clip" } { print }'
+  run unpack "$W/c-official.tgz" --yes
+  refused "clip: the pack says it is henki's official clip, and this henki's clip is other files"
+  check "the official clip stays" [ "$(field clip 5)" = official ]
+  # A commit that walks out of the store, a control character, an hd1 that is not one.
+  repack "$W/h.tgz" "$W/h-dots.tgz" '$1 == "lock/1" { $7 = "../../index/" } { print }' hello "$id" index
+  run unpack "$W/h-dots.tgz" --yes
+  refused "its PACK is not lock/1 lines this henki-mods reads"
+  check "no index dir made" [ ! -e "$XDG_DATA_HOME/henki/index/.henki" ]
+  for k in '$6 = $6 "\033[2J"' '$8 = "hd1:../x"' '$9 = $9 "\r"'; do
+    repack "$W/h.tgz" "$W/h-bad.tgz" '$1 == "lock/1" { '"$k"' } { print }'
+    run unpack "$W/h-bad.tgz" --yes
+    refused "its PACK is not lock/1 lines this henki-mods reads"
+  done
+  # A profile naming a package the index removed as malicious: refused as add refuses it.
+  unkey "$IX/mods/hello/0.1.0.toml" yanked
+  printf 'hello = "malicious: steals keys"\n' >>"$IX/removed.toml"
+  ixc "$IX" removed
+  run sync
+  rc_is 0
+  run init "$W/p.lock" --yes
+  refused "hello 0.1.0 was yanked as malicious (steals keys) by index deorlovnis; not installed"
+  check "nothing added" [ -z "$(lockline hello)" ]
+}
+
 # Shipped profiles in W/share/mod-profiles (HENKI_SHARE): official modules sessions (no prompt bytes) and tooly.
 mkprofiles() {
   mkdir -p "$W/share/mod-profiles" "$W/share/official/sessions/cmd" "$W/share/index"
@@ -2994,6 +3071,7 @@ all() {
   t_masks
   t_assets
   t_pack
+  t_pack_lines
   t_init
   t_index_verbs
 }

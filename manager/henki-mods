@@ -2401,10 +2401,15 @@ install_copy() { # DIR WHY
   lock_put "$L_name" "$(lock_line "$L_state")"
 }
 
-# FILE's lock/1 lines checked as the lock is (lock_check), in a subshell: a pack's or a profile's. Exit 1 with the
-# reason said.
+# FILE's lock/1 lines checked as the lock is (lock_check), in a subshell: a pack's or a profile's. They come from
+# someone else, so more is checked: no control character in any field, COMMIT a full commit (the store copy's name is
+# made from it), HD1 an hd1. Exit 1 with the reason said.
 lines_check() { # FILE
   (LOCK=$1 && lock_check) || return 1
+  HM_F="$1" awk -F '\t' '{ for (i = 1; i <= NF; i++) if ($i ~ /[[:cntrl:]]/) b = 1 }
+    $7 != "-" && ($7 !~ /^[0-9a-f]+$/ || (length($7) != 40 && length($7) != 64)) { b = 1 }
+    $8 != "-" && ($8 !~ /^hd1:[0-9a-f]+$/ || length($8) != 68) { b = 1 }
+    b { printf "henki-mods: %s:%d: not a lock/1 line (a control character, or a COMMIT or HD1 that is not one)\n", ENVIRON["HM_F"], NR; exit 1 }' "$1" >&2 || return 1
   ! command grep -q "^bind/1$tab" "$1" || {
     printf 'henki-mods: %s: holds a port binding (bind/1), which is not moved this way; fix: remove the line\n' "$1" >&2
     return 1
@@ -2551,6 +2556,26 @@ pack_members() { # FILE
   }
 }
 
+# The KIND of the pack line in L_*, checked rather than believed (it decides which yanks apply): `official` only for
+# the files of this henki's module of that name; `index:I` only for an index in use here and, once it is here, one that
+# lists these files as that version (until then it is unreviewed, and its yanks apply at the next sync).
+pack_kind() {
+  local i
+  case "$L_kind" in
+    official)
+      i=$(official_dir "$L_name") || die "$L_name: the pack says it is henki's official $L_name, and this henki ships no $L_name; fix: do not unpack it"
+      inspect "$i" "$L_name" 0 && [ "$I_hd1" = "$L_hd1" ] ||
+        die "$L_name: the pack says it is henki's official $L_name, and this henki's $L_name is other files; fix: do not unpack it (henki-mods add $L_name installs this henki's)"
+      ;;
+    index:*)
+      i=${L_kind#index:}
+      index_names | command grep -qx "$i" || die "$L_name: the pack says it comes from index $i, which you do not use; fix: do not unpack it, or henki-mods index add $i first"
+      [ ! -f "$STAGE/ix/$i/vers" ] || hd1_hits "$L_hd1" | command grep -qxF "$i$tab$L_source$tab$L_version" ||
+        die "$L_name: index $i here does not list $L_source $L_version with these files; fix: henki-mods sync, then unpack again (if it says so again, do not unpack it)"
+      ;;
+  esac
+}
+
 # unpack FILE [--yes]: installs a pack's modules with no network: the members are checked before anything is
 # extracted; each copy must hold its lock line's hd1 and asset sha256s; the review line comes from the indexes verified
 # here (or the pack's bundle, under bundle_load's rules); a malicious yank refuses. One screen, one question; a module of
@@ -2598,6 +2623,7 @@ EOF
     n=$L_name
     x="$u/store/$n/$(basename "$(store_of)")"
     [ -d "$x" ] && [ ! -L "$x" ] || die "$f has no store copy for $n ($x); fix: pack it again"
+    pack_kind "$x"
     inspect "$x" "$n" 3 || die "$n: $(printf '%s' "$ERR" | sed "s|$u/||g")"
     [ "$I_hd1" = "$L_hd1" ] && [ "$I_name" = "$n" ] || die "$n: the copy in $f is not the one its lock line names ($I_hd1); fix: do not unpack it"
     hd=$(HM_N="$n" awk -F '\t' '$2 == ENVIRON["HM_N"] { print $3 "\t" $4 }' "$STAGE/pack.assets")
@@ -2616,6 +2642,8 @@ EOF
     x=-
     case "$L_kind" in index:*) x=$L_source ;; esac
     yank_guard "$n" "$L_version" "$L_kind" "$x" "$L_hd1"
+    # Whatever index a line names, the default index's yank of the same files applies too.
+    case "$L_kind" in "index:$INDEX_DEFAULT") ;; index:*) yank_guard "$n" "$L_version" path - "$L_hd1" ;; esac
     say "  $n $L_version ($L_kind $L_source)$([ -z "$old" ] || printf ', replaces the one here'): $L_state, +$(num "$(prompt_bytes "$n" "$u/store/$n/$(basename "$(store_of)")")") B of prompt"
     x=$(hd1_hits "$L_hd1" | head -n 1)
     if [ -n "$x" ]; then
@@ -2760,6 +2788,8 @@ EOF
     bytes=$((bytes + x))
     say "  $n ${M_version:--} ($kind): +$(num "$x") B of prompt"
     case "$kind" in index:*) tier_of "$F_index" "$E_rec" && say "    review   $(tier_paint)" ;; esac
+    # pick_version passes over yanked versions; a removal of the package refuses here, as it does at add.
+    [ -z "$pkg" ] || yank_guard "$n" "$E_ver" "$kind" "$pkg" "$I_hd1"
     printf '%s' "$I_runs" | while IFS="$tab" read -r s x; do [ -z "$s" ] || say "    runs     $s: $x"; done
     L_name=$n L_state=$(printf '%s' "$line" | cut -f 3) L_version=${M_version:--} L_kind=$kind L_source=$source L_commit=$COMMIT L_hd1=$I_hd1 L_added=- L_how=- L_flags=""
     [ -z "$pkg" ] || L_version=$E_ver

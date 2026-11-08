@@ -533,7 +533,8 @@ lock/1 NAME STATE VERSION SOURCE_KIND SOURCE COMMIT HD1 ADDED HOW FLAGS
   HD1, ADDED and HOW `-`: the copy this henki ships) and of kind `index:INDEX` (a package pinned by VERSION and HD1).
   henki ships some in `share/henki/mod-profiles/NAME.lock`, an index may hold more in `profiles/NAME.lock`, and
   `henki-mods profile save FILE` writes the modules on as one. A module the lock has already is left as it is: an off
-  line is never turned on by a profile.
+  line is never turned on by a profile. Each module is staged and checked as `add` does: a package yanked or removed
+  as malicious refuses.
 
 ## bind/1
 
@@ -644,7 +645,10 @@ under a link, a link outside a store copy, and anything but files, directories a
 line's hd1 and its asset's SHA-256, and fit this machine (module/1's `os`, `requires`, assets). A bundle counts only
 for an index in use here, checked from the anchor and checkpoint here (never a key or anchor in the pack), and only when
 its head has the commit verified here on its first-parent line (or nothing is verified here); it never moves
-`refs/henki/verified`, and the yanks and removals of the commit verified here apply after its own. A malicious yank
+`refs/henki/verified`, and the yanks and removals of the commit verified here apply after its own. A line's fields are
+checked, not believed: no control character, COMMIT a full commit or `-`, HD1 an hd1; KIND `official` only when this
+henki's module of that name has that hd1, `index:INDEX` only for an index in use here that, once it is here, lists that
+hd1 as the line's package and version (the default index's yanks of the same hd1 apply to it too). A malicious yank
 refuses the install. A module the lock holds with the same hd1 is left as it is; another one is replaced, its line
 going to the history (hist/1, `unpack`).
 
