@@ -177,6 +177,22 @@ fn contracts_record_fields() {
     std::fs::write(&src, "#!/bin/sh\necho notes\n").unwrap();
     std::fs::set_permissions(&src, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
     runs.push(("sources", r.json("hello")));
+    // exec and context bound (toy-exec; port_toy keeping every request to std): `session.ports` names both.
+    let m = Mock::start(vec![shell("echo through"), say("bound")]);
+    let r = Run::new(&m.url());
+    let (port, w) = (r.config_dir().join("port"), r.dir.join("bindings/context"));
+    std::fs::create_dir_all(&port).unwrap();
+    std::fs::create_dir_all(w.parent().unwrap()).unwrap();
+    std::fs::set_permissions(w.parent().unwrap(), std::os::unix::fs::PermissionsExt::from_mode(0o700)).unwrap();
+    let toy = std::path::Path::new(env!("CARGO_BIN_EXE_henki")).parent().unwrap().join("examples/port_toy");
+    std::fs::write(&w, format!("#!/bin/sh\nexec {} context keep\n", toy.display())).unwrap();
+    std::fs::set_permissions(&w, std::os::unix::fs::PermissionsExt::from_mode(0o700)).unwrap();
+    std::os::unix::fs::symlink(&w, port.join("context")).unwrap();
+    std::os::unix::fs::symlink(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/exec/toy-exec"), port.join("exec")).unwrap();
+    let d = r.json("through both");
+    let ports = d.of("session")[0]["ports"].as_object().map(|o| o.keys().cloned().collect::<Vec<_>>());
+    assert_eq!(ports, Some(vec!["context".to_string(), "exec".to_string()]), "{}", d.diag());
+    runs.push(("exec and context", d));
     // An end before a session: the result alone, `session` null, no `ts`.
     let r = Run::new("http://127.0.0.1:9/v1");
     let d = r.cmd(&["--json", "--max-steps", "0", "x"]).go();

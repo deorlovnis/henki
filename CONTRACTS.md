@@ -83,7 +83,7 @@ values of `args` and `blocks` are opaque JSON.
 
 | Kind | Fields |
 |---|---|
-| `session` | `t` `ts` `v` `henki` `id` `cwd` `model` `dialect` `base_url` `base_url_from` `approve` `approve_from` `config` `tools` `shell` `exts` `pass_env` `ctx` `config_hash` `allow_hash` `agents_hash` `project_agents_hash` `resumed` `resumed.from_bytes?` `ports?` `ports.history?` `ports.policy?` `sources?` `sources[].name?` `sources[].bytes?` `sources[].hash?` `parent?` `parent.id?` `parent.line?` |
+| `session` | `t` `ts` `v` `henki` `id` `cwd` `model` `dialect` `base_url` `base_url_from` `approve` `approve_from` `config` `tools` `shell` `exts` `pass_env` `ctx` `config_hash` `allow_hash` `agents_hash` `project_agents_hash` `resumed` `resumed.from_bytes?` `ports?` `ports.history?` `ports.policy?` `ports.context?` `ports.exec?` `sources?` `sources[].name?` `sources[].bytes?` `sources[].hash?` `parent?` `parent.id?` `parent.line?` |
 | `user` | `t` `ts` `msg` `msg.content` `msg.role` |
 | `assistant` | `t` `ts` `msg` `msg.content` `msg.role` `msg.tool_calls` `msg.tool_calls[].args` `msg.tool_calls[].id` `msg.tool_calls[].name` `msg.tool_calls[].raw?` `finish` `usage` `usage.cached` `usage.in` `usage.out` `blocks?` |
 | `ask` | `t` `ts` `id` `name` `args` `target?` `always?` `root?` |
@@ -105,6 +105,7 @@ values of `args` and `blocks` are opaque JSON.
   as read, or `null` when absent or not read; `project_agents_hash` is always `null` in this version. `resumed` is
   `null` for a new session, else `{"from_bytes": N}`: the file's length when this segment began (`{}` in a session a
   history binding keeps: history/1).
+  `ports` (only when a port is bound to a program, port/1) names each bound port's binding as its notice does.
   `sources` (only when a context source counted, ext/2) lists each one that did, in the order they ran: `name`
   (`MODULE/SOURCE`), `bytes` (its text's length) and `hash` (FNV-1a 64 of the text). The texts themselves are not
   journaled: a resume runs the sources again.
@@ -401,7 +402,7 @@ NAME/README* LICENSE* CHANGELOG* .*   ignored
 
 `NAME/ctx/SOURCE` is a context source (henki 0.3; henki 0.2 refuses a module with `ctx/`).
 
-- henki runs every source of every module that is on, once each time it starts (a new session, `--resume`, a
+- henki runs every source of every module that is on, once each time it starts (a new session, `--resume`, a fork, a
   restart), before the `session` record: in ext path order, then module name, then source name (bytewise), one after
   another. It runs as a tool call does: no arguments, stdin `/dev/null`, the session's working directory, the tool
   environment (`HENKI_SESSION` empty) plus `HENKI_CONFIG` (the config dir), stdout and stderr as one stream, in a
@@ -432,9 +433,9 @@ or else on the user's PATH (never a module's), with ARGS split at spaces. A past
   QUIT reach it (henki waits on), TERM, HUP and a closed stdout kill it and end henki. The model is not told.
 - **The environment.** The tool environment (ext/1: every module's `bin/` first on `PATH`), plus `HENKI_CONFIG` (the
   config dir), `HENKI_STATE` (the state dir), `HENKI_BIN` (henki's path), `HENKI_MODULE` (the module dir; not for the
-  manager) and `HENKI_NEXT`. A std session's journal is `$HENKI_STATE/sessions/*/$HENKI_SESSION.jsonl` (journal/1);
-  none is found when history is bound to another store; `henki mods history list` and `show` read either. Tools, bindings, observers and context sources never get
-  `HENKI_NEXT`.
+  manager) and `HENKI_NEXT`. A std session's journal is `$HENKI_STATE/sessions/*/$HENKI_SESSION.jsonl` (journal/1); none
+  is found when history is bound to another store; `henki mods history list` and `show` read either. Tools, bindings,
+  observers and context sources never get `HENKI_NEXT`.
 - **`HENKI_NEXT`** names an empty file henki made (0600, `STATE/spill/.next-PID-RAND`). Afterwards henki reads it only
   if it is still that regular file, at most 64 KiB of UTF-8; anything else is a notice and ignored. It is removed
   then. Line 1 is `VERB [ARG]`; the rest of the file is the text of `send`.
@@ -615,11 +616,12 @@ links say. `exec` speaks no protocol (exec/1): of this section only the link rul
   (or a second answer to one) is dropped as henki reads it, while it waits and between calls; a line without `id` (or
   with `"id":null`) is a notification, which this version reads and skips. More than 256 MiB of such lines between two
   answers is a broken line (the dead rule).
-- **hello**, the first request: params `henki` (its version), `port`, `protocol` (`[1]`), `versions` (the port's
-  method set majors henki offers, `[1]`), `scope` (the session's working directory) and `state`
-  (`STATE/port/PORT/`, 0700, the binding's own dir). The answer: `{"caps":[...],"impl":V,"name":N,"protocol":1,
-  "version":1}`, `name` and `impl` 1 to 64 bytes without spaces or invisible characters, at most 16 `caps`; or error
-  `version`. `NAME IMPL` is shown in parentheses in the binding notice.
+- **hello**, the first request: params `henki` (its version), `port`, `protocol` (`[1]`), `versions` (the port's method
+  set majors henki offers, `[1]`), `scope` (the session's working directory) and `state` (`STATE/port/PORT/`, 0700, the
+  binding's own dir; a binding should keep its files in a subdirectory named after its package, so a later binding of
+  the same port never reads another's). The answer: `{"caps":[...],"impl":V,"name":N,"protocol":1,"version":1}`, `name`
+  and `impl` 1 to 64 bytes without spaces or invisible characters, at most 16 `caps`; or error `version`. `NAME IMPL` is
+  shown in parentheses in the binding notice.
 - **Codes** a binding may send: `invalid`, `unsupported` (a method it does not know), `io`, `not_found`, `busy`,
   `exists`, `tampered`, `corrupt`, `version`; anything else arrives as `other`. henki adds `timeout`, `crashed`,
   `protocol`, `interrupted` (a signal) and `budget` (the session's time ran out).
@@ -779,17 +781,18 @@ While a program is bound, henki offers the model the `shell` tool only: `read`, 
 `session` record's `tools` shows it, and the system prompt drops its line on reading a file before editing it), so no
 tool runs on the host outside the program. A config whose `tools` lacks `shell` cannot start with exec bound (`error
 config`, with the fix). Not run through it: the person's `!cmd`, module commands, observers, context sources and port
-bindings: they run on the host with the person's rights. Files the model writes inside the program's view of the project (AGENTS.md, git hooks, scripts) are
-read or run later by code on the host (git, the person). A sandbox confines the model's calls, not what later reads
-their results.
+bindings: they run on the host with the person's rights. Files the model writes inside the program's view of the
+project (AGENTS.md, git hooks, scripts) are read or run later by code on the host (context sources, git, the person). A
+sandbox confines the model's calls, not what later reads their results.
 
-A `CONFIG_DIR/port/exec` link that names nothing runnable stops the start with its fix, as port/1's link rules say. The
-binding is a notice at start (`exec: NAME ID (exec/1) runs every shell call (read, write and edit are off); henki
---port exec=std runs a session without it`), the `session` record names it in `ports` (`{"exec":"NAME ID"}`), and `henki --port exec=std` runs a
+A `CONFIG_DIR/port/exec` link that names nothing runnable stops the start with its fix, as port/1's link rules say; so
+does a binding the module manager marked as yanked (a link to the missing `yanked`). The binding is a notice at start
+(`exec: NAME ID (exec/1) runs every shell call (read, write and edit are off); henki --port exec=std runs a session
+without it`), the `session` record names it in `ports` (`{"exec":"NAME ID"}`), and `henki --port exec=std` runs a
 session without it. `henki port` does not take `exec`. `henki-mods test --port exec NAME` runs the checks R01 to R07
 against a program, each as `PROGRAM BASH --noprofile --norc -c COMMAND`: R01 `echo ok` prints `ok` and exits 0; R02
-`exit 7` exits 7; R03 the arguments after COMMAND arrive intact; R04 stdin is at EOF at once; R05 stdout and stderr
-both arrive; R06 a SIGTERM to the group ends `sleep 30` within 1 s, and after a SIGKILL to the group (Linux: also its
+`exit 7` exits 7; R03 the arguments after COMMAND arrive intact; R04 stdin is at EOF at once; R05 stdout and stderr both
+arrive; R06 a SIGTERM to the group ends `sleep 30` within 1 s, and after a SIGKILL to the group (Linux: also its
 session) no process of the run is left within 1 s; R07 the environment arrives (a warning only).
 
 ## front/1
