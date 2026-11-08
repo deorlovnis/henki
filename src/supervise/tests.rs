@@ -44,9 +44,14 @@ fn path_env() -> Vec<(OsString, OsString)> {
     vec![("PATH".into(), "/usr/bin:/bin".into())]
 }
 
+/// A shell call's argv, as turn/call.rs builds it.
+fn shell<'a>(bash: &'a str, cmd: &'a str) -> [&'a OsStr; 5] {
+    [bash.as_ref(), "--noprofile".as_ref(), "--norc".as_ref(), "-c".as_ref(), cmd.as_ref()]
+}
+
 /// Starts `cmd` with `tag` in `dir`.
 fn start(dir: &Path, cmd: &str, vars: &[(OsString, OsString)], cap: usize, spill: Spill, tag: u32, tx: &Sender<Ev>) -> i32 {
-    spawn(Path::new(BASH), cmd, dir, vars, cap, spill, tag, tx).unwrap()
+    spawn(&shell(BASH, cmd), dir, vars, cap, spill, tag, tx).unwrap()
 }
 
 /// The one `Ev::Tool` of `tag`, within `within`.
@@ -394,10 +399,11 @@ fn cap_boundary_exact() {
 fn spawn_failure_leaves_nothing() {
     let t = Tmp::new();
     let (tx, rx) = mpsc::channel();
-    let fail = |bash: &str, cmd: &str, cwd: &Path| spawn(Path::new(bash), cmd, cwd, &path_env(), 1024, t.spill("s-19.log"), 9, &tx).unwrap_err().kind();
+    let fail = |bash: &str, cmd: &str, cwd: &Path| spawn(&shell(bash, cmd), cwd, &path_env(), 1024, t.spill("s-19.log"), 9, &tx).unwrap_err().kind();
     assert_eq!(fail("/nonexistent/bash", "echo x", &t.0), io::ErrorKind::NotFound);
     assert_eq!(fail(BASH, "echo x", &t.0.join("gone")), io::ErrorKind::NotFound);
     assert_eq!(fail(BASH, "echo \0x", &t.0), io::ErrorKind::InvalidInput);
+    assert_eq!(spawn(&[], &t.0, &path_env(), 1024, t.spill("s-19.log"), 9, &tx).unwrap_err().kind(), io::ErrorKind::InvalidInput);
     drop(tx);
     // Each failed spawn's waiter held a sender: the channel closes only when all of them ended without a report.
     match rx.recv_timeout(Duration::from_secs(10)) {

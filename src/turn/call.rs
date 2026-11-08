@@ -120,7 +120,8 @@ impl Session {
             files::start(c.clone(), t, cap, tag, &self.tx);
         } else {
             let spill = journal::spill(&self.cfg.state, &self.sid, &mut self.spill_n, &self.cfg.home);
-            match supervise::spawn(&self.cfg.bash, cmd, &self.cfg.cwd, &self.env, cap, spill, tag, &self.tx) {
+            let argv = [self.cfg.bash.as_os_str(), "--noprofile".as_ref(), "--norc".as_ref(), "-c".as_ref(), cmd.as_ref()];
+            match supervise::spawn(&argv, &self.cfg.cwd, &self.env, cap, spill, tag, &self.tx) {
                 Ok(p) => pgid = Some(p),
                 Err(e) => return self.answer(c, &tools::not_started(&e), true, None, None),
             }
