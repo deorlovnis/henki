@@ -34,6 +34,12 @@
 # sign-off checks on the commits it pushes; it refuses to install without the pattern file.
 set -euo pipefail
 cd "$(dirname "$0")"
+# A git hook runs with GIT_DIR set to the repository being pushed (`git push` from a linked work tree), and `git -c`
+# config too: every git run under the check would use that repository, a test's `git init` in its scratch dir
+# included. So none of git's repository variables reach the check: each git finds its repository from its own
+# directory, and this one finds this checkout's.
+# shellcheck disable=SC2046 # one variable name per word.
+unset $(git rev-parse --local-env-vars 2>/dev/null)
 
 max_lines=4358      # non-test lines in src/
 max_file_lines=400  # per file; a module is one file
@@ -332,10 +338,9 @@ selftest() {
   expect "mods: an unknown entry lib/" "does not pass henki-mods verify --dir" gate_mods "$t/mods-bad" || bad=1
   expect "mods: no modules" pass gate_mods "$t/mods-none" || bad=1
 
-  # A scratch repository with its own pattern file; a hook runs with GIT_DIR set, which must not lead back here.
+  # A scratch repository with its own pattern file (no GIT_DIR from a hook leads back here: see the top).
   # Commits there use a fixed identity and no signing or hooks, whatever the user's git config says.
   (
-    unset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE GIT_COMMON_DIR GIT_OBJECT_DIRECTORY
     commit() { git -c user.name=fixture -c user.email=fixture@example.invalid -c commit.gpgsign=false -c core.hooksPath=/dev/null commit -q --no-verify "$@"; }
     cd "$t" && git init -q repo && cd repo && mkdir -p .git/info || exit 1
     echo 'fixture-[0-9]+-marker' >.git/info/private-patterns

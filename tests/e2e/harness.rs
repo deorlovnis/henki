@@ -66,7 +66,6 @@ impl Run {
         for d in [&home, &cwd, &dir.join("xdg/state"), &dir.join("xdg/config"), &dir.join("xdg/data"), &dir.join("xdg/cache")] {
             fs::create_dir_all(d).unwrap();
         }
-        git_init(&cwd);
         let config_path = home.join(".config/henki/config.toml");
         let mut env = BTreeMap::new();
         for (k, v) in [("HOME", home.clone()), ("PATH", "/usr/local/bin:/usr/bin:/bin".into()), ("XDG_STATE_HOME", dir.join("xdg/state"))] {
@@ -78,7 +77,20 @@ impl Run {
         let keys = [("model", "\"mock-model\"".into()), ("base_url", format!("\"{url}\"")), ("approve", "\"auto\"".into()), ("context_window", "32768".into())];
         let keys = keys.into_iter().map(|(k, v)| (k.to_string(), v)).collect();
         let marker = format!("3133.{:07}{n:04}", std::process::id());
-        Run { dir, home, cwd, marker, config_path, keys, raw: None, env }
+        let r = Run { dir, home, cwd, marker, config_path, keys, raw: None, env };
+        if !r.git(&["init", "-q"]).is_ok_and(|o| o.status.success()) {
+            fs::create_dir_all(r.cwd.join(".git")).unwrap();
+        }
+        r
+    }
+
+    /// git in this run's working directory with exactly this run's environment, as henki's children get it: never the
+    /// test process's own, which a git hook gives GIT_DIR (the repository being pushed), so a test's git would init
+    /// and read that one instead.
+    pub fn git(&self, args: &[&str]) -> std::io::Result<std::process::Output> {
+        let mut c = Command::new("git");
+        c.args(args).current_dir(&self.cwd).env_clear().envs(self.env.iter().filter_map(|(k, v)| Some((k, v.as_ref()?))));
+        c.stdin(Stdio::null()).output()
     }
 
     /// Points `base_url` at `url`.
@@ -226,13 +238,6 @@ impl Drop for Run {
     fn drop(&mut self) {
         kill_marked(&self.marker);
         let _ = fs::remove_dir_all(&self.dir);
-    }
-}
-
-fn git_init(cwd: &Path) {
-    let ok = Command::new("git").args(["init", "-q"]).current_dir(cwd).stdout(Stdio::null()).stderr(Stdio::null()).status().is_ok_and(|s| s.success());
-    if !ok {
-        fs::create_dir_all(cwd.join(".git")).unwrap();
     }
 }
 

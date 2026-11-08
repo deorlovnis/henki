@@ -294,7 +294,7 @@ fn observe_checkpoints_snapshot_before_each_edit() {
     assert_eq!(d.code, Some(0), "{}", d.diag());
     assert!(d.results().iter().all(|r| r["is_error"] == false), "{}", d.diag());
     assert!(d.notices().is_empty(), "{:?}", d.notices());
-    let git = |args: &[&str]| std::process::Command::new("git").args(args).current_dir(&r.cwd).output().unwrap();
+    let git = |args: &[&str]| r.git(args).unwrap();
     for (i, files) in before.iter().enumerate() {
         for (k, want) in files.iter().enumerate() {
             let o = git(&["show", &format!("refs/henki/checkpoints/{}/{}:f{k}.txt", d.id(), i + 1)]);
@@ -304,6 +304,23 @@ fn observe_checkpoints_snapshot_before_each_edit() {
     }
     assert!(!git(&["rev-parse", "-q", "--verify", "HEAD"]).status.success(), "HEAD moved");
     assert!(String::from_utf8(git(&["ls-files"]).stdout).unwrap().is_empty(), "the index changed");
+}
+
+/// The test above as a git hook runs it: `git push` from a linked work tree gives the hook GIT_DIR, the repository
+/// being pushed. The test still reads its own run's repository, and the pushed one is left as it was (a `git init`
+/// with that GIT_DIR once rewrote its config to bare).
+#[test]
+fn observe_checkpoints_under_a_git_hook() {
+    let r = Run::new("");
+    let pushed = r.dir.join("pushed");
+    assert!(r.git(&["init", "-q", pushed.to_str().unwrap()]).unwrap().status.success());
+    let name = "observe::observe_checkpoints_snapshot_before_each_edit";
+    let mut c = std::process::Command::new(std::env::current_exe().unwrap());
+    let o = c.args(["--exact", name]).env("GIT_DIR", pushed.join(".git")).output().unwrap();
+    let out = String::from_utf8_lossy(&o.stdout);
+    assert!(o.status.success() && out.contains("1 passed"), "{out}{}", String::from_utf8_lossy(&o.stderr));
+    let bare = r.git(&["-C", pushed.to_str().unwrap(), "config", "core.bare"]).unwrap();
+    assert_eq!(String::from_utf8_lossy(&bare.stdout), "false\n", "the pushed repository's config changed");
 }
 
 /// `src` copied to `dst` as it is: files with their modes, links as links.
