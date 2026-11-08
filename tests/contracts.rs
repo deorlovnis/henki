@@ -20,5 +20,7 @@ mod ext;
 mod journal;
 #[path = "contracts/json.rs"]
 mod json;
+#[path = "contracts/ports.rs"]
+mod ports;
 #[path = "contracts/wire.rs"]
 mod wire;

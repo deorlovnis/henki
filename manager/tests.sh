@@ -136,6 +136,46 @@ static_contracts() {
   [ "$doc" = "$known" ] || fail "henki-mods knows [$(echo $known)], CONTRACTS.md's index lists [$(echo $doc)]"
 }
 
+# CONTRACTS.md's section NAME, its lines joined by spaces.
+doc_sec() { HM_S="## $1" awk '$0 == ENVIRON["HM_S"] { p = 1; next } /^## / { p = 0 } p' "$HERE/../CONTRACTS.md" | tr '\n' ' '; }
+# The number of fields of the line format KIND that CONTRACTS.md's section KIND shows in its code block (`KIND F...`).
+doc_fields() { HM_K="$1" awk '$1 == ENVIRON["HM_K"] && NF > 3 { print NF; exit }' "$HERE/../CONTRACTS.md"; }
+
+# The other lists henki-mods shares with CONTRACTS.md (the names henki keeps, the observer events, the ports henki
+# binds, the text limit), and the conform/1 files against the format.
+static_formats() {
+  case_ "static: henki-mods' names and the conform/1 suites as CONTRACTS.md has them"
+  local ext2 obs port mine doc f line name inst req want save names="" rest
+  mine() { sed -n "s/^$1='\(.*\)'.*$/\1/p" "$MODS" | tr ' ' '\n' | sort | tr '\n' ' '; }
+  ext2=$(doc_sec ext/2)
+  doc=$(printf '%s\n' "$ext2" | sed -n 's/.*CMD as for bin\/, not \([a-z, ]*\) NAME\/cmd.*/\1/p' | sed 's/, / /g; s/ or / /' | tr ' ' '\n' | sort | tr '\n' ' ')
+  [ "$doc" = "$(mine RESERVED)" ] || fail "RESERVED is [$(mine RESERVED)], ext/2 keeps [$doc]"
+  case "$ext2" in *"at most 16 KiB of UTF-8"*) [ "$(sed -n 's/^DOC_MAX=\([0-9]*\).*/\1/p' "$MODS")" = 16384 ] || fail "DOC_MAX is not 16 KiB" ;; *) fail "ext/2 lost its 16 KiB" ;; esac
+  obs=$(doc_sec observe/1)
+  doc=$( (HM_S="## observe/1" awk '$0 == ENVIRON["HM_S"] { p = 1; next } /^## / { p = 0 } p && /^\| `/ { split($0, c, "`"); print c[2] }' "$HERE/../CONTRACTS.md"
+    printf '%s\n' "$obs" | sed -n 's/.*NAME\/on\/EVENT\.wait  *\([a-z_]*\) and \([a-z_]*\) only.*/\1.wait \2.wait/p' | tr ' ' '\n') | sort | tr '\n' ' ')
+  [ "$doc" = "$(mine EVENTS)" ] || fail "EVENTS is [$(mine EVENTS)], observe/1 has [$doc]"
+  port=$(doc_sec port/1)
+  doc=$(printf '%s\n' "$port" | sed -n 's/.*This henki binds `\([a-z]*\)` and `\([a-z]*\)` that way.*/\1 \2/p' | tr ' ' '\n' | sort | tr '\n' ' ')
+  [ "$doc" = "$(mine PORTS_KNOWN)" ] || fail "PORTS_KNOWN is [$(mine PORTS_KNOWN)], port/1 binds [$doc]"
+  for f in "$HERE"/conform/*.tsv; do
+    names=""
+    while IFS= read -r line; do
+      case "$line" in '' | '#'*) continue ;; esac
+      IFS="$tab" read -r name inst req want save rest <<EOF
+$line
+EOF
+      [ -z "$rest" ] && [ -n "$want" ] || fail "${f##*/}: $name: not 4 or 5 fields"
+      case "$inst" in a | b | a! | +[0-9] | +[0-9][0-9]) ;; *) fail "${f##*/}: $name: INST $inst" ;; esac
+      case "$req" in hello | '{"method":"'*'","params":'*'}') ;; *) [ "$inst" = a! ] || fail "${f##*/}: $name: REQUEST $req" ;; esac
+      case "$save" in '' | [A-Za-z]*=[a-z]*) ;; *) fail "${f##*/}: $name: SAVE $save" ;; esac
+      case " $names " in *" $name "*) fail "${f##*/}: $name twice" ;; esac
+      names="$names $name"
+    done <"$f"
+  done
+  [ "$(doc_fields bind/1)" = 6 ] && [ "$(doc_fields eval/1)" = 10 ] && [ "$(doc_fields lock/1)" = 11 ] || fail "doc_fields reads $(doc_fields bind/1) $(doc_fields eval/1) $(doc_fields lock/1)"
+}
+
 # --- the cases ----------------------------------------------------------------------------------------------------------
 
 t_add_path() {
@@ -1401,6 +1441,7 @@ t_ports() {
   id=${store##*/}
   check "the link to the store copy's port/history" [ "$(readlink "$CONF/port/history")" = "$store/port/history" ]
   check "a bind/1 line after the lock/1 lines" [ "$(tail -n 1 "$CONF/mods.lock" | cut -f 1-4)" = "$(printf 'bind/1\thistory\ttree\t%s' "$id")" ]
+  check "bind/1 and lock/1 lines have CONTRACTS.md's fields" [ "$(awk -F '\t' '{ print $1, NF }' "$CONF/mods.lock" | sort -u | tr '\n' ' ')" = "bind/1 $(doc_fields bind/1) lock/1 $(doc_fields lock/1) " ]
   check "how: yes" [ "$(tail -n 1 "$CONF/mods.lock" | cut -f 6)" = yes ]
   check "no temp link left" [ "$(ls -A "$CONF/port")" = history ]
   run list
@@ -1682,6 +1723,7 @@ t_eval_live() {
   out_has "fake             off pass  (ok, 2 steps,"
   out_has "bytes            off pass"
   out_lacks "10 more"
+  check "eval/1 lines have CONTRACTS.md's fields" [ "$(awk -F '\t' '{ print NF }' "$XDG_STATE_HOME/henki/eval.tsv" | sort -u)" = "$(doc_fields eval/1)" ]
   lines=$(cat "$XDG_STATE_HOME/henki/eval.tsv")
   case "$lines" in "eval/1${tab}probe${tab}0.1.0${tab}$(field probe 8)${tab}m${tab}probe${tab}on${tab}9${tab}9${tab}"*"${nl}eval/1${tab}probe${tab}0.1.0${tab}"*"${tab}off${tab}6${tab}9${tab}"*) ;; *)
     fail "eval.tsv holds: $lines"
@@ -1781,6 +1823,7 @@ all() {
 
 static_bash32
 static_contracts
+static_formats
 RUN=bash
 all
 t_live

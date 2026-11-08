@@ -217,3 +217,82 @@ fn remote_decide_cost() {
     eprintln!("decide ms through Remote to port_toy: p50 {p50:.3}, p95 {p95:.3}");
     assert!(p95 < 50.0, "p95 {p95:.3} ms");
 }
+
+/// CONTRACTS.md's `## NAME` section, and the backticked words of its first line that starts with `start`.
+fn doc(name: &str) -> String {
+    let all = include_str!("../../CONTRACTS.md");
+    let at = all.find(&format!("\n## {name}\n")).unwrap_or_else(|| panic!("CONTRACTS.md has no {name}"));
+    let rest = &all[at + name.len() + 5..];
+    rest[..rest.find("\n## ").unwrap_or(rest.len())].to_string()
+}
+
+/// The text of the bullet in `sec` that starts with `start`, joined into one line.
+fn bullet(sec: &str, start: &str) -> String {
+    let at = sec.find(&format!("\n- {start}")).unwrap_or_else(|| panic!("no bullet {start:?}"));
+    let rest = &sec[at + 3..];
+    rest[..rest.find("\n- ").or_else(|| rest.find("\n\n")).unwrap_or(rest.len())].split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+fn ticked(s: &str) -> Vec<&str> {
+    s.split('`').skip(1).step_by(2).collect()
+}
+
+/// port/1's codes: each one a binding may send arrives as itself, any other (henki's own included) as `other`.
+#[test]
+fn contracts_port_codes() {
+    let b = bullet(&doc("port/1"), "**Codes**");
+    let (sent, added) = b.split_once("henki adds").unwrap();
+    let sent = ticked(sent);
+    assert!(sent.len() == 10 && sent.contains(&"other"), "{sent:?}");
+    for c in sent {
+        assert_eq!(crate::port::code(c), c);
+    }
+    for c in ticked(added).into_iter().chain(["x-new", ""]) {
+        assert_eq!(crate::port::code(c), "other", "{c}");
+    }
+}
+
+/// port/1's timeout table and which waits a signal or the deadline ends are METHODS's, method for method, and the
+/// methods are hello, bye and the history/1 and policy/1 tables'.
+#[test]
+fn contracts_port_timeouts_and_methods() {
+    let b = bullet(&doc("port/1"), "**Timeouts.**");
+    let (table, cut) = b.split_once(". A signal").unwrap();
+    let mut doc_ms: Vec<(String, u64, bool)> = table
+        .trim_start_matches("**Timeouts.** ")
+        .split(", ")
+        .map(|t| {
+            let (m, rest) = (ticked(t)[0], t.rsplit_once('`').unwrap().1.trim());
+            let n: u64 = rest.split(' ').next().unwrap().parse().unwrap();
+            let ms = if rest.split(' ').nth(1) == Some("ms") { n } else { n * 1_000 };
+            (m.to_string(), ms, ticked(cut.split_once(", never").unwrap().0).contains(&m))
+        })
+        .collect();
+    let mut code: Vec<(String, u64, bool)> = METHODS.iter().map(|&(m, ms, c)| (m.to_string(), ms, c)).collect();
+    doc_ms.sort();
+    code.sort();
+    assert_eq!(doc_ms, code);
+    let rows = |s: &str| doc(s).lines().filter_map(|l| Some(l.strip_prefix("| `")?.split('`').next()?.to_string())).collect::<Vec<_>>();
+    let mut names: Vec<String> = ["hello".to_string()].into_iter().chain(rows("history/1")).chain(rows("policy/1")).collect();
+    names.sort();
+    names.dedup();
+    let mut methods: Vec<String> = METHODS.iter().map(|m| m.0.to_string()).collect();
+    methods.sort();
+    assert_eq!(names, methods);
+}
+
+/// The line cap both ways and a session's cap over all `read` pages.
+#[test]
+fn contracts_port_caps() {
+    assert!(bullet(&doc("port/1"), "**Lines.**").contains("at most 16 MiB each way") && LINE_MAX == 16 << 20);
+    assert!(doc("history/1").contains("at most 256 MiB over all pages") && READ_MAX == 256 << 20);
+}
+
+/// The six ports `--port NAME=std` takes, and the ones a link binds, as port/1 names them.
+#[test]
+fn contracts_port_names() {
+    let d = doc("port/1").split_whitespace().collect::<Vec<_>>().join(" ");
+    assert_eq!(ticked(d.split(". Each").next().unwrap()), crate::port::PORTS);
+    let binds = d.split("This henki binds ").nth(1).unwrap().split(" that way").next().unwrap();
+    assert_eq!(ticked(binds), crate::port::LINKED);
+}

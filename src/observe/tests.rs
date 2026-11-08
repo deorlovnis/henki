@@ -162,3 +162,25 @@ fn observe_spawn_cost() {
     let _ = fs::remove_dir_all(&d);
     assert!(!cfg!(target_os = "linux") || p95 < 5.0, "spawn p95 {p95:.3} ms");
 }
+
+/// observe/1's event table and `.wait` rule, its 2 s and 4 runs, and ext/2's 16 observer files, as the code has them.
+#[test]
+fn contracts_observe_events() {
+    let all = include_str!("../../CONTRACTS.md");
+    let sec = &all[all.find("\n## observe/1\n").unwrap()..];
+    let sec = &sec[..sec[1..].find("\n## ").unwrap()];
+    let mut rows: Vec<&str> = sec.lines().filter_map(|l| l.strip_prefix("| `")?.split('`').next()).collect();
+    let mut events = EVENTS.to_vec();
+    rows.sort();
+    events.sort();
+    assert_eq!(rows, events);
+    assert!(sec.contains("NAME/on/EVENT.wait       turn_start and call_start only"));
+    for e in EVENTS {
+        assert_eq!(parse(e), Some((e, false)));
+        assert_eq!(parse(&format!("{e}.wait")).is_some(), ["turn_start", "call_start"].contains(&e), "{e}.wait");
+    }
+    let flat = sec.split_whitespace().collect::<Vec<_>>().join(" ");
+    assert!(flat.contains("for at most 2 s") && WAIT == Duration::from_secs(2));
+    assert!(flat.contains("An observer with 4 runs still going misses events") && LIVE == 4);
+    assert!(all.contains("At most 16 `on/` files over all modules") && MAX == 16);
+}

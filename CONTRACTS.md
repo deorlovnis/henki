@@ -560,7 +560,7 @@ has one binding: the std one built into henki, or a program that `CONFIG_DIR/por
   `version`. `NAME IMPL` is shown in parentheses in the binding notice.
 - **Codes** a binding may send: `invalid`, `unsupported` (a method it does not know), `io`, `not_found`, `busy`,
   `exists`, `tampered`, `corrupt`, `version`; anything else arrives as `other`. henki adds `timeout`, `crashed`,
-  `protocol` and `interrupted`.
+  `protocol`, `interrupted` (a signal) and `budget` (the session's time ran out).
 - **Timeouts.** `hello` 5 s, `create` 2 s, `open` 5 s, `read` 10 s per page, `list` 5 s, `append` 2 s, `discard` 2 s,
   `decide` 5 s, `record` 2 s, `bye` 300 ms. A signal or the session deadline ends a wait for `hello`, `create`, `open`,
   `read`, `list` or `decide` within 50 ms, never one for a method that changes state.
