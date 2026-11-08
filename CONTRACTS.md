@@ -522,7 +522,8 @@ bind/1 PORT NAME ID ADDED HOW
   `henki-mods swap PORT NAME` writes (after the conformance suite passes and the user says yes) and `swap PORT std`
   removes. henki reads the link only, never this line.
 - `henki-mods rm NAME` is refused while a link in `CONFIG_DIR/port/` leads into NAME's store copies. A henki-mods that
-  does not know `bind/1` refuses the lock, so it never drops a binding it cannot see.
+  does not know `bind/1` refuses the lock, so it never drops a binding it cannot see; one that knows it refuses a line
+  for a port it does not bind the same way (`this lock is newer than this henki-mods`).
 
 ## hd1
 

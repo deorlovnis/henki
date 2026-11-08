@@ -952,8 +952,13 @@ lock_check() {
   [ -f "$LOCK" ] || return 0
   HM_F="$LOCK" HM_P=" $PORTS_KNOWN " awk -F '\t' '
     BEGIN { f = ENVIRON["HM_F"] }
-    $1 == "bind/1" && (NF != 6 || index(ENVIRON["HM_P"], " " $2 " ") == 0 || $3 !~ /^[a-z0-9][a-z0-9_-]*$/ || $4 !~ /^[0-9a-f]+$/ || ($6 != "yes" && $6 != "tty")) {
-      printf "henki-mods: %s:%d: not a bind/1 line; fix: henki-mods swap %s std\n", f, NR, $2; exit 1 }
+    $1 == "bind/1" && (NF != 6 || $3 !~ /^[a-z0-9][a-z0-9_-]*$/ || $4 !~ /^[0-9a-f]+$/ || ($6 != "yes" && $6 != "tty")) {
+      known = index(ENVIRON["HM_P"], " " $2 " ") > 0
+      printf "henki-mods: %s:%d: not a bind/1 line; fix: %s\n", f, NR, known ? "henki-mods swap " $2 " std" : "remove the line"; exit 1 }
+    # A port a later henki binds (its manager wrote the line): swap PORT std cannot name it here.
+    $1 == "bind/1" && index(ENVIRON["HM_P"], " " $2 " ") == 0 {
+      p = $2; gsub(/[^a-z0-9_-]/, "?", p)
+      printf "henki-mods: %s:%d: this lock is newer than this henki-mods (it binds %s); fix: upgrade henki\n", f, NR, p; exit 1 }
     $1 == "bind/1" { next }
     $1 != "lock/1" { printf "henki-mods: %s:%d: this lock is newer than this henki-mods; fix: upgrade henki\n", f, NR; exit 1 }
     NF != 11 || $2 !~ /^[a-z0-9][a-z0-9_-]*$/ || ($3 != "on" && $3 != "off") || $5 !~ /^(official|path|url)$/ {
@@ -1760,7 +1765,7 @@ EOF
 # test --port PORT NAME|std|/PROGRAM: the suite of PORT against module NAME's port/PORT (its store copy), a program
 # by path (while writing one), or std.
 cmd_test() {
-  local port="${2:-}" what="${3:-}" exe
+  local port="${2:-}" what="${3:-}" exe h
   [ "${1:-}" = --port ] && [ $# = 3 ] || usage
   case " $PORTS_KNOWN " in *" $port "*) ;; *) die "$port is not a port this henki binds ($PORTS_KNOWN); fix: name one of them" ;; esac
   C_suite="$(conform_dir)/$port.tsv" || die "no conformance suites found; fix: reinstall henki"
@@ -1774,13 +1779,14 @@ cmd_test() {
       ;;
   esac
   [ -f "$exe" ] && [ -x "$exe" ] || die "$exe is not a program; fix: name a module with port/$port"
-  conform_run "$port" "$exe" "$(henki_bin)" || exit 1
+  h=$(henki_bin) || exit 1 # its die ends only the command substitution
+  conform_run "$port" "$exe" "$h" || exit 1
 }
 
 # swap PORT NAME|std [--yes]: binds henki's PORT to module NAME's port/PORT (its store copy, after the suite passes and
 # the person says yes), or back to std, which always works: the link CONFIG/port/PORT and the bind/1 line.
 cmd_swap() {
-  local port="${1:-}" n="${2:-}" yes=0 a store exe was tty answer how id
+  local port="${1:-}" n="${2:-}" yes=0 a store exe was tty answer how id h
   [ $# -ge 2 ] || usage
   for a in "${3:-}" "${4:-}"; do case "$a" in '') ;; --yes | -y) yes=1 ;; *) usage ;; esac; done
   case " $PORTS_KNOWN " in *" $port "*) ;; *) die "$port is not a port this henki binds ($PORTS_KNOWN); fix: name one of them" ;; esac
@@ -1803,7 +1809,8 @@ cmd_swap() {
   [ "$I_hd1" = "$L_hd1" ] || die "the store copy $store does not match the lock (it changed); fix: henki-mods rm $n and add it again"
   printf '%s\n' "$M_ports" | command grep -qx "$port" || die "$n's manifest does not list $port in ports; fix: swap to a module that declares it"
   C_suite="$(conform_dir)/$port.tsv" || die "no conformance suites found; fix: reinstall henki"
-  conform_run "$port" "$exe" "$(henki_bin)" >"$STAGE/conform" || {
+  h=$(henki_bin) || exit 1
+  conform_run "$port" "$exe" "$h" >"$STAGE/conform" || {
     cat "$STAGE/conform"
     die "$n does not pass the $port/1 suite (above); fix: ask its author, or keep std"
   }
@@ -2098,7 +2105,7 @@ cmd_eval() {
   case "${HENKI_DEPTH:-0}" in 0) ;; *) die "eval starts henki, and this runs inside henki (HENKI_DEPTH=$HENKI_DEPTH); fix: run henki mods eval in a terminal outside henki" ;; esac
   STAGE=$(mktemp -d "${TMPDIR:-/tmp}/henki-mods.XXXXXX") || die "cannot make a scratch dir; fix: check TMPDIR"
   STAGE_LIST="$STAGE/list"
-  E_henki=$(henki_bin)
+  E_henki=$(henki_bin) || exit 1
   case "$pkg" in
     /* | ./* | ../*)
       [ -d "$pkg" ] || die "$pkg is not a directory; fix: name a module directory"

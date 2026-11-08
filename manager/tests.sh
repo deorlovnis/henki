@@ -1480,6 +1480,22 @@ t_ports() {
   refused "not a bind/1 line; fix: henki-mods swap history std"
   run swap history std
   refused "not a bind/1 line"
+  # A port a later henki binds, in a line its manager wrote: newer, not broken (swap context std cannot be named here).
+  awk '!/^bind\/1/' "$CONF/mods.lock" >"$W/lock" && cp "$W/lock" "$CONF/mods.lock"
+  printf 'bind/1\tcontext\tfoo\tabcabcabcabc\t2026-11-08T10:00Z\tyes\n' >>"$CONF/mods.lock"
+  run list
+  refused "this lock is newer than this henki-mods (it binds context); fix: upgrade henki"
+  printf 'bind/1\tcontext\tfoo\n' >"$CONF/mods.lock"
+  run list
+  refused "not a bind/1 line; fix: remove the line"
+  rm "$CONF/mods.lock"
+  # No henki to run the suite: the command stops there, and no module is blamed.
+  local hb="$HENKI_BIN" path="$PATH"
+  HENKI_BIN='' PATH=/usr/bin:/bin
+  run test --port history /bin/true
+  HENKI_BIN=$hb PATH=$path
+  refused "no henki to run; fix: run it as henki mods, or put henki on PATH"
+  err_lacks "checks"
 }
 
 # port_toy (examples/, built beside the henki under test) through test --port: it passes, and each fault fails the
