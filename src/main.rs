@@ -9,6 +9,7 @@ mod files;
 mod http;
 mod journal;
 mod openai;
+mod port;
 mod repl;
 mod supervise;
 mod sys;
@@ -18,7 +19,7 @@ mod turn;
 mod types;
 
 use crate::types::{Ev, Outcome, Usage};
-use crate::{config::Config, config::Env, config::Flags, journal::Journal, journal::rec, term::Mode, term::Out, term::Reader, turn::Session, turn::outcome_line};
+use crate::{config::Config, config::Env, config::Flags, journal::Journal, journal::rec, port::Ports, term::Mode, term::Out, term::Reader, turn::Session, turn::outcome_line};
 use serde_json::Value;
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::{ffi::OsString, io, io::Read, process::ExitCode, time::Duration, time::Instant};
@@ -130,7 +131,7 @@ fn mods(args: Vec<OsString>, out: Out) -> u8 {
 /// `henki run` (startup, one turn, the `result`, the session end) and the REPL (startup, then `repl::run`).
 fn run(a: Args, out: Out, tx: Sender<Ev>, rx: Receiver<Ev>, t0: Instant, early: io::Result<()>) -> u8 {
     let (mut deadline, repl) = (None, a.mode == Mode::Repl);
-    let (cfg, j, hist, task, head, reader) = match start(a, &tx, &rx, t0, early, &mut deadline) {
+    let (cfg, ports, sid, hist, task, head, reader) = match start(a, &tx, &rx, t0, early, &mut deadline) {
         Ok(r) => r,
         Err(o) => {
             refuse(&out, &o, t0);
@@ -138,7 +139,7 @@ fn run(a: Args, out: Out, tx: Sender<Ev>, rx: Receiver<Ev>, t0: Instant, early: 
         }
     };
     head.iter().for_each(|r| out.record(r));
-    let mut s = Session::new(cfg, j, hist, out, tx, rx, deadline, reader);
+    let mut s = Session::new(cfg, ports, sid, hist, out, (tx, rx), deadline, reader);
     if repl {
         let code = repl::run(&mut s);
         s.into_out().flush(Instant::now() + Duration::from_secs(5));
@@ -157,9 +158,9 @@ fn run(a: Args, out: Out, tx: Sender<Ev>, rx: Receiver<Ev>, t0: Instant, early: 
     code(s.into_out(), &failed.unwrap_or(o), deadline)
 }
 
-/// What startup hands to the session: the config, the journal, the history, the task, the records it journaled (a
-/// resume's repairs, then `session`), and the REPL's terminal reader.
-type Started = (Config, Journal, Vec<Value>, Option<String>, Vec<Value>, Option<Reader>);
+/// What startup hands to the session: the config, the bindings, the session id, the history, the task, the records it
+/// journaled (a resume's repairs, then `session`), and the REPL's terminal reader.
+type Started = (Config, Ports, String, Vec<Value>, Option<String>, Vec<Value>, Option<Reader>);
 
 /// Startup up to the `session` record. An error ends the run before a session exists.
 fn start(a: Args, tx: &Sender<Ev>, rx: &Receiver<Ev>, t0: Instant, early: io::Result<()>, deadline: &mut Option<Instant>) -> Result<Started, Outcome> {
@@ -193,16 +194,11 @@ fn start(a: Args, tx: &Sender<Ev>, rx: &Receiver<Ev>, t0: Instant, early: io::Re
     if deadline.is_some_and(|d| Instant::now() >= d) {
         return Err(Outcome::Budget);
     }
-    let (mut j, hist, from, mut head) = match &a.resume {
-        None => (Journal::create(&cfg.state, &cfg.cwd)?, Vec::new(), None, Vec::new()),
-        Some(id) => {
-            let r = Journal::resume(&cfg.state, &cfg.cwd, id.as_deref(), &cfg)?;
-            cfg.notices.extend(r.notices);
-            (r.journal, r.hist, Some(r.from_bytes), r.repairs)
-        }
-    };
-    head.push(j.write(rec::session(&cfg, j.id(), &cfg.cwd, from))?);
-    Ok((cfg, j, hist, task, head, reader))
+    let mut ports = Ports { history: Box::new(Journal::new(&cfg.state)) };
+    let (sid, hist, mut head, notices) = journal::start(ports.history.as_mut(), &a.resume, &cfg)?;
+    cfg.notices.extend(notices);
+    head.push(journal::put(ports.history.as_mut(), &sid, rec::session(&cfg, &sid, &cfg.cwd, a.resume.is_some()))?);
+    Ok((cfg, ports, sid, hist, task, head, reader))
 }
 
 /// `run -`: stdin to EOF on its own thread, so that a signal or the deadline still ends the wait.

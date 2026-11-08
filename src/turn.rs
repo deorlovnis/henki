@@ -1,5 +1,5 @@
 //! One session: the step loop of a turn, the only place the main thread waits, and the single way a turn and a session end.
-use crate::{anthropic, config::Config, ext, http, journal, journal::Journal, journal::rec, supervise, sys, term, term::Out, term::Reader};
+use crate::{anthropic, config::Config, ext, http, journal, journal::rec, port::Ports, supervise, sys, term, term::Out, term::Reader};
 use crate::{tools, tools::Killed, types::*};
 use call::Stuck;
 use serde_json::Value;
@@ -23,7 +23,11 @@ pub struct Session {
     /// The signal that ended the last wait: INT and QUIT cancel a REPL turn, TERM and HUP end the REPL (and stay while
     /// the turn finishes).
     pub(crate) sig: Option<i32>,
-    j: Journal,
+    /// The history and policy bindings; the session `sid` is held in the history binding.
+    ports: Ports,
+    sid: String,
+    /// The last spill file's number (`journal::spill`).
+    spill_n: usize,
     out: Out,
     /// Exactly the `user`, `assistant` and `tool_result` records, in journal order: what the next request renders.
     hist: Vec<Value>,
@@ -70,22 +74,25 @@ struct Turn {
 }
 
 impl Session {
-    /// The child environment from `cfg.env`, `cfg.pass_env`, the extensions' `bin/` dirs, `cfg.user_path` and `j.id()`;
-    /// the cwd is `cfg.cwd`. `reader`: Some in the REPL (approvals are asked on the terminal), None in `run`.
-    pub fn new(cfg: Config, j: Journal, hist: Vec<Value>, out: Out, tx: Sender<Ev>, rx: Receiver<Ev>, deadline: Option<Instant>, reader: Option<Reader>) -> Session {
-        let env = supervise::child_env(&cfg.env, &cfg.pass_env, &ext::child_path(&cfg.exts, &cfg.user_path), &cfg.user_path, j.id());
+    /// Session `sid`, held in `ports.history`, with its replayed `hist`. The child environment from `cfg.env`,
+    /// `cfg.pass_env`, the extensions' `bin/` dirs, `cfg.user_path` and `sid`; the cwd is `cfg.cwd`. `reader`: Some in
+    /// the REPL (approvals are asked on the terminal), None in `run`.
+    pub fn new(cfg: Config, ports: Ports, sid: String, hist: Vec<Value>, out: Out, ch: (Sender<Ev>, Receiver<Ev>), deadline: Option<Instant>, reader: Option<Reader>) -> Session {
+        let env = supervise::child_env(&cfg.env, &cfg.pass_env, &ext::child_path(&cfg.exts, &cfg.user_path), &cfg.user_path, &sid);
         let system = tools::system(cfg.agents.as_deref(), &ext::prompt(&cfg.exts, &cfg.home));
         // The Anthropic API can be silent for minutes while it buffers a large tool input.
         let lim = http::Limits { stall: if cfg.dialect == "anthropic" { anthropic::STALL } else { http::LIMITS.stall }, ..http::LIMITS };
-        let (tools, next_h) = (tools::schema(&cfg.tools), journal::next_h(&hist));
+        let (tools, next_h, spill_n) = (tools::schema(&cfg.tools), journal::next_h(&hist), journal::spill_n(&cfg.state, &sid, &hist));
         Session {
             cfg,
             sig: None,
-            j,
+            ports,
+            sid,
+            spill_n,
             out,
             hist,
-            tx,
-            rx,
+            tx: ch.0,
+            rx: ch.1,
             deadline,
             lim,
             env,
@@ -127,14 +134,14 @@ impl Session {
     /// kill notice goes to the terminal only.
     fn end(&mut self, killed: usize, result: Option<Value>) -> Result<(), Outcome> {
         let stopped = (killed > 0).then(|| format!("stopped {} background processes at exit", term::num(killed as u64)));
-        if self.reader.is_some() && !self.hist.iter().any(|r| r["t"] == "user") && self.j.discard() {
+        if self.reader.is_some() && !self.hist.iter().any(|r| r["t"] == "user") && self.ports.history.discard(&self.sid).unwrap_or(false) {
             stopped.iter().for_each(|m| self.out.note(m)); // no journal to write it to
             return Ok(());
         }
         let written = (|| {
             stopped.iter().try_for_each(|m| self.notice(m))?;
-            let r = result.clone().map(|r| self.j.write(r)).transpose()?;
-            self.j.write(rec::close(self.j.bytes())).map(|_| r)
+            let r = result.clone().map(|r| journal::put(self.ports.history.as_mut(), &self.sid, r)).transpose()?;
+            journal::put(self.ports.history.as_mut(), &self.sid, rec::close()).map(|_| r)
         })();
         let (r, end) = match written {
             Ok(r) => (r, Ok(())),
@@ -159,7 +166,7 @@ impl Session {
 
     /// The run's `result` record: the last assistant text (or ""), this turn's successful replies, this process's usage.
     pub fn result(&self, o: &Outcome, duration_ms: u64) -> Value {
-        rec::result(o, &self.t.text, self.usage_proc, Some(self.j.id()), self.t.steps, duration_ms)
+        rec::result(o, &self.t.text, self.usage_proc, Some(&self.sid), self.t.steps, duration_ms)
     }
 
     /// For the bounded flush before exit.
@@ -360,7 +367,7 @@ impl Session {
 
     /// The journal first, then the `--json` line; only `user`, `assistant` and `tool_result` enter the history.
     fn record(&mut self, rec: Value) -> Result<(), Outcome> {
-        let rec = self.j.write(rec)?;
+        let rec = journal::put(self.ports.history.as_mut(), &self.sid, rec)?;
         self.out.record(&rec);
         if matches!(rec["t"].as_str(), Some("user" | "assistant" | "tool_result")) {
             self.hist.push(rec);

@@ -13,6 +13,58 @@ thread_local! {
     pub static SYNCS: Cell<usize> = const { Cell::new(0) };
 }
 
+/// A held session of the std binding, written as the kernel writes (`put` adds `ts`), with the kernel's spill counter.
+struct J {
+    h: Journal,
+    id: String,
+    n: usize,
+}
+
+impl J {
+    fn create(state: &Path, cwd: &Path) -> Result<J, Outcome> {
+        let mut h = Journal::new(state);
+        let id = h.create(cwd, None).map_err(port::outcome)?;
+        Ok(J { h, id, n: 0 })
+    }
+    fn id(&self) -> &str {
+        &self.id
+    }
+    fn bytes(&self) -> u64 {
+        self.h.held.as_ref().unwrap().bytes
+    }
+    fn path(&self) -> PathBuf {
+        self.h.held.as_ref().unwrap().path.clone()
+    }
+    fn write(&mut self, r: Value) -> Result<Value, Outcome> {
+        put(&mut self.h, &self.id, r)
+    }
+    fn discard(&mut self) -> bool {
+        self.h.discard(&self.id).unwrap()
+    }
+    fn spill(&mut self, home: &Path) -> Spill {
+        spill(&self.h.state, &self.id, &mut self.n, home)
+    }
+}
+
+/// What `start` gave a resume, the session still held.
+struct Resumed {
+    journal: J,
+    hist: Vec<Value>,
+    from_bytes: u64,
+    notices: Vec<String>,
+}
+
+/// `start` resuming `id` (or the newest session) of the scope `cwd`, with the dialect, model and tools of `cfg`; the
+/// spill counter as a session starts it.
+fn resume(state: &Path, cwd: &Path, id: Option<&str>, cfg: &Config) -> Result<Resumed, Outcome> {
+    let mut c = Config::test(Path::new("/"));
+    (c.cwd, c.dialect, c.model, c.tools) = (cwd.into(), cfg.dialect, cfg.model.clone(), cfg.tools.clone());
+    let mut h = Journal::new(state);
+    let (id, hist, _, notices) = start(&mut h, &Some(id.map(String::from)), &c)?;
+    let (from_bytes, n) = (h.held.as_ref().unwrap().from, spill_n(state, &id, &hist));
+    Ok(Resumed { journal: J { h, id, n }, hist, from_bytes, notices })
+}
+
 /// A fresh, empty directory under the temp dir, removed when dropped.
 struct Tmp(PathBuf);
 
@@ -55,21 +107,20 @@ fn fx() -> Fx {
 impl Fx {
     /// A new journal holding its `session` record, then `recs`; unlocked again on return.
     fn session(&self, recs: &[Value]) -> (String, PathBuf) {
-        let mut j = Journal::create(&self.state, &self.cwd).unwrap();
+        let mut j = J::create(&self.state, &self.cwd).unwrap();
         let id = j.id().to_string();
-        j.write(rec::session(&self.cfg, &id, &self.cwd, None)).unwrap();
+        j.write(rec::session(&self.cfg, &id, &self.cwd, false)).unwrap();
         for r in recs {
             j.write(r.clone()).unwrap();
         }
-        (id, j.path.clone())
+        (id, j.path())
     }
 
     /// The same, ended by `close` at the right offset.
     fn closed(&self, recs: &[Value]) -> (String, PathBuf) {
         let (id, path) = self.session(recs);
         let mut r = self.resume(Some(&id)).unwrap();
-        let b = r.journal.bytes();
-        r.journal.write(rec::close(b)).unwrap();
+        r.journal.write(rec::close()).unwrap();
         (id, path)
     }
 
@@ -79,7 +130,7 @@ impl Fx {
 
     /// One attempt, for the checks that expect a lock this test holds.
     fn busy(&self, id: Option<&str>) -> String {
-        journal_err("journal", Journal::resume(&self.state, &self.cwd, id, &self.cfg))
+        journal_err("journal", resume(&self.state, &self.cwd, id, &self.cfg))
     }
 
     /// Writes `lines` (records as compact JSON, one per line) as the session file `id` of this cwd.
@@ -92,12 +143,12 @@ impl Fx {
     }
 }
 
-/// `Journal::resume`, waiting out a lock that only a forked child of another test still holds: until the child execs, it
+/// `resume`, waiting out a lock that only a forked child of another test still holds: until the child execs, it
 /// shares the open file of a journal this test has already dropped, and with it the lock.
 fn resume_at(state: &Path, cwd: &Path, id: Option<&str>, cfg: &Config) -> Result<Resumed, Outcome> {
     let until = Instant::now() + Duration::from_secs(5);
     loop {
-        match Journal::resume(state, cwd, id, cfg) {
+        match resume(state, cwd, id, cfg) {
             Err(Outcome::Error { message, .. }) if message.ends_with(" is in use") && Instant::now() < until => std::thread::sleep(Duration::from_millis(1)),
             r => return r,
         }
@@ -168,11 +219,11 @@ fn journal_layout_modes() {
     fs::create_dir(&cwd).unwrap();
     let link = tmp.0.join("link");
     symlink(&cwd, &link).unwrap();
-    let j = Journal::create(&state, &link).unwrap();
+    let j = J::create(&state, &link).unwrap();
     let dir = state.join("sessions").join(sys::fnv(cwd.as_os_str().as_bytes()));
-    assert_eq!(j.path, dir.join(format!("{}.jsonl", j.id())));
+    assert_eq!(j.path(), dir.join(format!("{}.jsonl", j.id())));
     assert_eq!(mode(&dir), 0o700);
-    assert_eq!(mode(&j.path), 0o600);
+    assert_eq!(mode(&j.path()), 0o600);
     let id = j.id().as_bytes();
     assert_eq!(id.len(), 21, "{}", j.id());
     assert!(id[..8].iter().chain(&id[9..15]).all(u8::is_ascii_digit), "{}", j.id());
@@ -214,8 +265,8 @@ fn journal_excl_nofollow() {
     symlink(&target, dir.join("a.jsonl")).unwrap();
     fs::write(dir.join("b.jsonl"), "old").unwrap();
     for name in ["a", "b"] {
-        let r = Journal::start(dir.join(format!("{name}.jsonl")), name.into(), &f.state);
-        assert!(matches!(r, Err(Outcome::Error { kind: "journal", .. })), "{name}");
+        let r = Journal::new(&f.state).start(dir.join(format!("{name}.jsonl")), name.into());
+        assert!(matches!(r, Err(PortError { code: "io", .. })), "{name}");
     }
     assert_eq!(fs::read(&target).unwrap(), b"keep");
     assert_eq!(fs::read(dir.join("b.jsonl")).unwrap(), b"old");
@@ -223,16 +274,16 @@ fn journal_excl_nofollow() {
     let elsewhere = f.tmp.0.join("elsewhere");
     fs::create_dir(&elsewhere).unwrap();
     symlink(&elsewhere, f.state.join("sessions").join(scope(&f.cwd).unwrap())).unwrap();
-    assert!(matches!(Journal::create(&f.state, &f.cwd), Err(Outcome::Error { kind: "journal", .. })));
+    assert!(matches!(J::create(&f.state, &f.cwd), Err(Outcome::Error { kind: "journal", .. })));
     assert!(fs::read_dir(&elsewhere).unwrap().next().is_none());
 }
 
 #[test]
 fn journal_lock_in_use() {
     let f = fx();
-    let mut j = Journal::create(&f.state, &f.cwd).unwrap();
+    let mut j = J::create(&f.state, &f.cwd).unwrap();
     let id = j.id().to_string();
-    j.write(rec::session(&f.cfg, &id, &f.cwd, None)).unwrap();
+    j.write(rec::session(&f.cfg, &id, &f.cwd, false)).unwrap();
     let busy = format!("session {id} is in use");
     assert_eq!(f.busy(Some(&id)), busy);
     assert_eq!(f.busy(None), busy);
@@ -250,7 +301,7 @@ fn journal_record_shapes() {
     let cfg = Config::test(Path::new("/d"));
     let v = env!("CARGO_PKG_VERSION");
     assert_eq!(
-        s(rec::session(&cfg, "20261105T171203Z-3f9a", Path::new("/p"), None)),
+        s(rec::session(&cfg, "20261105T171203Z-3f9a", Path::new("/p"), false)),
         format!(
             r#"{{"agents_hash":null,"allow_hash":null,"approve":"ask","approve_from":"default","base_url":"http://127.0.0.1:9/v1","base_url_from":"config","config":null,"config_hash":null,"ctx":32768,"cwd":"/p","dialect":"openai","exts":[],"henki":"{v}","id":"20261105T171203Z-3f9a","model":"m","pass_env":[],"project_agents_hash":null,"resumed":null,"shell":"/bin/bash","t":"session","tools":["shell","read","write","edit"],"v":1}}"#
         )
@@ -261,9 +312,9 @@ fn journal_record_shapes() {
     (cfg.file, cfg.hash, cfg.agents_hash) = (Some("/c/config.toml".into()), Some("9c1d0e2a77f0b431".into()), Some("1a2b3c4d5e6f7081".into()));
     (cfg.pass_env, cfg.tools, cfg.window) = (vec!["FOO".into()], vec!["shell", "read"], 8192);
     assert_eq!(
-        s(rec::session(&cfg, "x", Path::new("/p"), Some(402))),
+        s(rec::session(&cfg, "x", Path::new("/p"), true)),
         format!(
-            r#"{{"agents_hash":"1a2b3c4d5e6f7081","allow_hash":null,"approve":"auto","approve_from":"--approve","base_url":"http://[::1]:8080","base_url_from":"HENKI_BASE_URL","config":"/c/config.toml","config_hash":"9c1d0e2a77f0b431","ctx":8192,"cwd":"/p","dialect":"openai","exts":[],"henki":"{v}","id":"x","model":"m","pass_env":["FOO"],"project_agents_hash":null,"resumed":{{"from_bytes":402}},"shell":"/bin/bash","t":"session","tools":["shell","read"],"v":1}}"#
+            r#"{{"agents_hash":"1a2b3c4d5e6f7081","allow_hash":null,"approve":"auto","approve_from":"--approve","base_url":"http://[::1]:8080","base_url_from":"HENKI_BASE_URL","config":"/c/config.toml","config_hash":"9c1d0e2a77f0b431","ctx":8192,"cwd":"/p","dialect":"openai","exts":[],"henki":"{v}","id":"x","model":"m","pass_env":["FOO"],"project_agents_hash":null,"resumed":{{}},"shell":"/bin/bash","t":"session","tools":["shell","read"],"v":1}}"#
         )
     );
     assert_eq!(s(rec::user("hi")), r#"{"msg":{"content":"hi","role":"user"},"t":"user"}"#);
@@ -311,7 +362,7 @@ fn journal_record_shapes() {
         s(rec::result(&Outcome::GaveUp("max_steps"), "t", Usage::default(), Some("x"), 12, 140)),
         r#"{"duration_s":0.1,"exit":1,"reason":"max_steps","session":"x","status":"gave_up","steps":12,"t":"result","text":"t","usage":{"cached":0,"in":0,"out":0}}"#
     );
-    assert_eq!(s(rec::close(402)), r#"{"bytes":402,"t":"close"}"#);
+    assert_eq!(s(rec::close()), r#"{"t":"close"}"#);
 }
 
 #[test]
@@ -328,11 +379,11 @@ fn journal_session_record_fields() {
         targets: vec![],
     };
     (cfg.dialect, cfg.exts, cfg.allow.hash) = ("anthropic", vec![ext("halti"), ext("itse")], Some("5d0c9e1f2a3b4c6d".into()));
-    let r = rec::session(&cfg, "x", Path::new("/p"), None);
+    let r = rec::session(&cfg, "x", Path::new("/p"), false);
     assert_eq!((&r["dialect"], &r["exts"], &r["allow_hash"]), (&json!("anthropic"), &json!(["halti", "itse"]), &json!("5d0c9e1f2a3b4c6d")));
     assert_eq!(r["project_agents_hash"], Value::Null);
     // No rules read (an absent file, or auto mode): null, as in journal_record_shapes.
-    assert_eq!(rec::session(&Config::test(Path::new("/d")), "x", Path::new("/p"), None)["allow_hash"], Value::Null);
+    assert_eq!(rec::session(&Config::test(Path::new("/d")), "x", Path::new("/p"), false)["allow_hash"], Value::Null);
 }
 
 #[test]
@@ -360,10 +411,10 @@ fn journal_approval_rule() {
 #[test]
 fn journal_sync_table() {
     let f = fx();
-    let mut j = Journal::create(&f.state, &f.cwd).unwrap();
+    let mut j = J::create(&f.state, &f.cwd).unwrap();
     let c = call("h1");
     let recs = [
-        (rec::session(&f.cfg, j.id(), &f.cwd, None), true),
+        (rec::session(&f.cfg, j.id(), &f.cwd, false), true),
         (rec::user("u"), true),
         (asst(&["h1"]), true),
         (rec::ask(&c, None), false),
@@ -373,7 +424,7 @@ fn journal_sync_table() {
         (rec::elide(&["h1".into()]), true),
         (rec::turn_end(&Outcome::Ok, 1, Usage::default()), true),
         (rec::result(&Outcome::Ok, "", Usage::default(), Some("x"), 1, 0), true),
-        (rec::close(0), true),
+        (rec::close(), true),
     ];
     for (r, synced) in recs {
         let before = SYNCS.with(Cell::get);
@@ -385,43 +436,43 @@ fn journal_sync_table() {
 #[test]
 fn journal_write_adds_ts_and_counts() {
     let f = fx();
-    let mut j = Journal::create(&f.state, &f.cwd).unwrap();
+    let mut j = J::create(&f.state, &f.cwd).unwrap();
     let w = j.write(rec::notice("a")).unwrap();
     let ts = w["ts"].as_str().unwrap();
     assert_eq!((ts.len(), &ts[10..11], &ts[19..]), (20, "T", "Z"));
     assert_eq!(without_ts(&w), rec::notice("a"));
     let line = format!("{}\n", term::json_line(&w));
-    assert_eq!(fs::read_to_string(&j.path).unwrap(), line);
+    assert_eq!(fs::read_to_string(j.path()).unwrap(), line);
     assert_eq!(j.bytes(), line.len() as u64);
 }
 
 #[test]
 fn journal_tamper_live_append() {
     let f = fx();
-    let mut j = Journal::create(&f.state, &f.cwd).unwrap();
+    let mut j = J::create(&f.state, &f.cwd).unwrap();
     j.write(rec::notice("a")).unwrap();
-    fs::File::options().append(true).open(&j.path).unwrap().write_all(b"{}\n").unwrap();
-    let tampered = Outcome::error("tampered", format!("journal modified outside henki: {}", j.path.display()));
+    fs::File::options().append(true).open(j.path()).unwrap().write_all(b"{}\n").unwrap();
+    let tampered = Outcome::error("tampered", format!("journal modified outside henki: {}", j.path().display()));
     assert_eq!(j.write(rec::user("b")).unwrap_err(), tampered);
-    assert!(fs::read(&j.path).unwrap().ends_with(b"\n{}\n"));
+    assert!(fs::read(j.path()).unwrap().ends_with(b"\n{}\n"));
     // A cut is caught as well.
-    fs::File::options().write(true).open(&j.path).unwrap().set_len(3).unwrap();
+    fs::File::options().write(true).open(j.path()).unwrap().set_len(3).unwrap();
     assert_eq!(j.write(rec::user("b")).unwrap_err(), tampered);
-    assert_eq!(fs::metadata(&j.path).unwrap().len(), 3);
+    assert_eq!(fs::metadata(j.path()).unwrap().len(), 3);
 }
 
 /// Another file in the journal's place, with the same bytes (as `sed -i` leaves it): the size alone matches.
 #[test]
 fn journal_tamper_replaced() {
     let f = fx();
-    let mut j = Journal::create(&f.state, &f.cwd).unwrap();
+    let mut j = J::create(&f.state, &f.cwd).unwrap();
     j.write(rec::notice("a")).unwrap();
-    let copy = j.path.with_extension("tmp");
-    fs::copy(&j.path, &copy).unwrap();
-    fs::rename(&copy, &j.path).unwrap();
-    let tampered = Outcome::error("tampered", format!("journal modified outside henki: {}", j.path.display()));
+    let copy = j.path().with_extension("tmp");
+    fs::copy(j.path(), &copy).unwrap();
+    fs::rename(&copy, j.path()).unwrap();
+    let tampered = Outcome::error("tampered", format!("journal modified outside henki: {}", j.path().display()));
     assert_eq!(j.write(rec::user("b")).unwrap_err(), tampered);
-    assert_eq!(fs::metadata(&j.path).unwrap().len(), j.bytes(), "nothing written to either file");
+    assert_eq!(fs::metadata(j.path()).unwrap().len(), j.bytes(), "nothing written to either file");
 }
 
 #[test]
@@ -429,7 +480,8 @@ fn journal_write_fail() {
     let f = fx();
     let path = f.tmp.0.join("read-only.jsonl");
     fs::write(&path, "").unwrap();
-    let mut j = Journal { file: File::open(&path).unwrap(), path: path.clone(), bytes: 0, id: "x".into(), spill: f.state.join("spill"), n: 0, fresh: false, gone: false };
+    let held = Held { file: File::open(&path).unwrap(), path: path.clone(), id: "x".into(), bytes: 0, from: 0, fresh: false, gone: false };
+    let mut j = J { h: Journal { state: f.state.clone(), held: Some(held) }, id: "x".into(), n: 0 };
     match j.write(rec::user("a")) {
         Err(Outcome::Error { kind: "journal", message }) => assert!(message.starts_with(&format!("cannot write {}: ", path.display())), "{message}"),
         other => panic!("{other:?}"),
@@ -457,7 +509,7 @@ fn journal_torn_every_offset() {
         assert_eq!(r.notices.iter().any(|n| n.starts_with("dropped an incomplete last line (")), keep < cut, "cut {cut}");
         let repaired = fs::read(&path).unwrap();
         assert!(repaired.starts_with(&full[..keep]), "cut {cut}");
-        r.journal.write(rec::session(&f.cfg, &id, &f.cwd, Some(r.from_bytes))).unwrap();
+        r.journal.write(rec::session(&f.cfg, &id, &f.cwd, true)).unwrap();
         r.journal.write(rec::user("again")).unwrap();
         drop(r);
         let r = f.resume(Some(&id)).unwrap();
@@ -479,7 +531,7 @@ fn journal_torn_every_offset() {
 #[test]
 fn journal_corrupt_line() {
     let f = fx();
-    let ok = [rec::session(&f.cfg, "c", &f.cwd, None), rec::user("a")];
+    let ok = [rec::session(&f.cfg, "c", &f.cwd, false), rec::user("a")];
     let path = f.plant("c", &ok);
     for bad in [b"not json\n".as_slice(), b"5\n", b"\n", b"{\"t\":\"user\"} {}\n", b"{\"t\":\"us\xffer\"}\n"] {
         let mut bytes = fs::read(&path).unwrap();
@@ -513,12 +565,12 @@ fn journal_tamper_after_close() {
     assert_eq!(journal_err("tampered", f.resume(Some(&id))), tampered);
     // Two closes.
     let mut two = full.clone();
-    two.extend(format!("{}\n", rec::close(full.len() as u64)).bytes());
+    two.extend(format!("{}\n", json!({"bytes": full.len(), "t": "close"})).bytes());
     fs::write(&path, &two).unwrap();
     assert_eq!(journal_err("tampered", f.resume(Some(&id))), tampered);
     // An earlier segment's close is not checked again once a later session record starts a new segment.
     let mut next = full.clone();
-    next.extend(format!("{}\n", rec::session(&f.cfg, &id, &f.cwd, Some(full.len() as u64))).bytes());
+    next.extend(format!("{}\n", rec::session(&f.cfg, &id, &f.cwd, true)).bytes());
     fs::write(&path, &next).unwrap();
     assert_eq!(f.resume(Some(&id)).unwrap().notices, ["previous run did not close cleanly"]);
 }
@@ -538,7 +590,7 @@ fn journal_resume_dialect_mismatch_both_ways() {
     let f = fx();
     let mut anthropic = Config::test(&f.tmp.0);
     (anthropic.cwd, anthropic.dialect) = (f.cwd.clone(), "anthropic");
-    let (open, other) = (rec::session(&f.cfg, "d", &f.cwd, None), rec::session(&anthropic, "d", &f.cwd, None));
+    let (open, other) = (rec::session(&f.cfg, "d", &f.cwd, false), rec::session(&anthropic, "d", &f.cwd, false));
     assert_eq!((&open["dialect"], &other["dialect"]), (&json!("openai"), &json!("anthropic")));
     let path = f.plant("d", &[other.clone(), rec::user("a")]);
     assert_eq!(journal_err("journal", f.resume(None)), format!("{}: the session's dialect is anthropic, not openai", path.display()));
@@ -571,9 +623,9 @@ fn journal_resume_keeps_blocks() {
     let blocks = json!([{"signature": "EqQBCkYI", "thinking": "", "type": "thinking"}, {"data": "ZGF0YQ==", "type": "redacted_thinking"},
         {"text": "\u{e9} \u{2713} \u{1b}[0m \u{202e}", "type": "text"}, {"id": "toolu_1", "input": {"command": "ls", "n": 1.5, "z": [true, null]}, "name": "shell", "type": "tool_use"}]);
     let c = Call { id: "toolu_1".into(), args: blocks[3]["input"].clone(), ..call("x") };
-    let mut j = Journal::create(&f.state, &f.cwd).unwrap();
+    let mut j = J::create(&f.state, &f.cwd).unwrap();
     let id = j.id().to_string();
-    j.write(rec::session(&f.cfg, &id, &f.cwd, None)).unwrap();
+    j.write(rec::session(&f.cfg, &id, &f.cwd, false)).unwrap();
     let text = blocks[2]["text"].as_str().unwrap();
     let recs = [rec::user("go"), rec::assistant(text, &[c], "tool_calls", Usage::default(), Some(&blocks)), rec::tool_result("toolu_1", "shell", "ok", false, 1, 2)];
     let live: Vec<Value> = recs.into_iter().map(|r| j.write(r).unwrap()).collect();
@@ -589,13 +641,13 @@ fn journal_resume_keeps_blocks() {
 #[test]
 fn journal_discard_fresh_only() {
     let f = fx();
-    let mut j = Journal::create(&f.state, &f.cwd).unwrap();
+    let mut j = J::create(&f.state, &f.cwd).unwrap();
     let id = j.id().to_string();
-    j.write(rec::session(&f.cfg, &id, &f.cwd, None)).unwrap();
-    let (path, bytes) = (j.path.clone(), j.bytes());
+    j.write(rec::session(&f.cfg, &id, &f.cwd, false)).unwrap();
+    let (path, bytes) = (j.path(), j.bytes());
     assert!(j.discard());
     assert!(!path.exists());
-    assert_eq!(without_ts(&j.write(rec::close(bytes)).unwrap()), rec::close(bytes));
+    assert_eq!(without_ts(&j.write(rec::close()).unwrap()), json!({"bytes": bytes, "t": "close"}));
     assert_eq!((path.exists(), j.bytes()), (false, bytes));
     assert_eq!(journal_err("journal", f.resume(None)), format!("no session to resume in {}", f.cwd.display()));
     let (id, path) = f.session(&[rec::user("a")]);
@@ -611,26 +663,26 @@ fn journal_discard_fresh_only() {
 #[test]
 fn journal_discard_twice() {
     let f = fx();
-    let mut j = Journal::create(&f.state, &f.cwd).unwrap();
-    j.write(rec::session(&f.cfg, j.id(), &f.cwd, None)).unwrap();
-    let path = j.path.clone();
+    let mut j = J::create(&f.state, &f.cwd).unwrap();
+    j.write(rec::session(&f.cfg, j.id(), &f.cwd, false)).unwrap();
+    let path = j.path();
     assert!(j.discard());
     fs::write(&path, "not henki's\n").unwrap();
     assert!(j.discard());
     assert_eq!(fs::read_to_string(&path).unwrap(), "not henki's\n");
     fs::remove_file(&path).unwrap();
     // Removed by someone else first: the unlink fails, so the journal is not gone and its writes still count.
-    let mut j = Journal::create(&f.state, &f.cwd).unwrap();
-    j.write(rec::session(&f.cfg, j.id(), &f.cwd, None)).unwrap();
+    let mut j = J::create(&f.state, &f.cwd).unwrap();
+    j.write(rec::session(&f.cfg, j.id(), &f.cwd, false)).unwrap();
     let bytes = j.bytes();
-    fs::remove_file(&j.path).unwrap();
+    fs::remove_file(j.path()).unwrap();
     assert!(!j.discard());
     // Its path no longer names the file written to, so the writes are `tampered` (nothing goes into an unlinked file).
-    assert!(matches!(j.write(rec::close(bytes)), Err(Outcome::Error { kind: "tampered", .. })));
+    assert!(matches!(j.write(rec::close()), Err(Outcome::Error { kind: "tampered", .. })));
     assert_eq!(j.bytes(), bytes);
-    fs::write(&j.path, "").unwrap();
+    fs::write(j.path(), "").unwrap();
     assert!(!j.discard());
-    assert!(j.path.exists(), "one try only");
+    assert!(j.path().exists(), "one try only");
 }
 
 #[test]
@@ -729,9 +781,9 @@ fn journal_resume_scoped_cwd() {
     let other = f.tmp.0.join("other");
     fs::create_dir(&other).unwrap();
     let (a, path_a) = f.session(&[rec::user("a")]);
-    let mut j = Journal::create(&f.state, &other).unwrap();
+    let mut j = J::create(&f.state, &other).unwrap();
     let b = j.id().to_string();
-    j.write(rec::session(&f.cfg, &b, &other, None)).unwrap();
+    j.write(rec::session(&f.cfg, &b, &other, false)).unwrap();
     drop(j);
     set_mtime(&path_a, 3600);
     assert_eq!(f.resume(None).unwrap().journal.id(), a);
@@ -752,7 +804,7 @@ fn journal_resume_none() {
     let f = fx();
     let none = format!("no session to resume in {}", f.cwd.display());
     assert_eq!(journal_err("journal", f.resume(None)), none);
-    let path = f.plant("real", &[rec::session(&f.cfg, "real", &f.cwd, None)]);
+    let path = f.plant("real", &[rec::session(&f.cfg, "real", &f.cwd, false)]);
     for id in ["nope", "../real", "", "/real"] {
         assert_eq!(journal_err("journal", f.resume(Some(id))), none, "{id:?}");
     }
@@ -767,8 +819,8 @@ fn journal_resume_none() {
 fn journal_resume_newest_unlocked() {
     let f = fx();
     let (old, new) = ("20260101T000000Z-aaaa", "20260102T000000Z-bbbb");
-    let path_old = f.plant(old, &[rec::session(&f.cfg, old, &f.cwd, None)]);
-    let path_new = f.plant(new, &[rec::session(&f.cfg, new, &f.cwd, None)]);
+    let path_old = f.plant(old, &[rec::session(&f.cfg, old, &f.cwd, false)]);
+    let path_new = f.plant(new, &[rec::session(&f.cfg, new, &f.cwd, false)]);
     set_mtime(&path_old, 7200);
     set_mtime(&path_new, 3600);
     assert_eq!(f.resume(None).unwrap().journal.id(), new);
@@ -813,15 +865,15 @@ fn journal_short_write() {
         return;
     }
     let f = fx();
-    let mut j = Journal::create(&f.state, &f.cwd).unwrap();
+    let mut j = J::create(&f.state, &f.cwd).unwrap();
     j.write(rec::notice(&"a".repeat(600))).unwrap();
     let written = j.bytes();
-    let e = Outcome::error("journal", format!("cannot write {}: File too large (os error 27)", j.path.display()));
+    let e = Outcome::error("journal", format!("cannot write {}: File too large (os error 27)", j.path().display()));
     assert_eq!(j.write(rec::notice(&"b".repeat(600))).unwrap_err(), e);
-    assert_eq!((j.bytes(), fs::metadata(&j.path).unwrap().len()), (written, 1024));
-    let tampered = Outcome::error("tampered", format!("journal modified outside henki: {}", j.path.display()));
+    assert_eq!((j.bytes(), fs::metadata(j.path()).unwrap().len()), (written, 1024));
+    let tampered = Outcome::error("tampered", format!("journal modified outside henki: {}", j.path().display()));
     assert_eq!(j.write(rec::notice("c")).unwrap_err(), tampered);
-    assert_eq!(fs::metadata(&j.path).unwrap().len(), 1024);
+    assert_eq!(fs::metadata(j.path()).unwrap().len(), 1024);
 }
 
 #[test]
@@ -957,7 +1009,7 @@ fn next_h_max_plus_one() {
 #[test]
 fn spill_name_counter() {
     let f = fx();
-    let mut j = Journal::create(&f.state, &f.cwd).unwrap();
+    let mut j = J::create(&f.state, &f.cwd).unwrap();
     let id = j.id().to_string();
     let s = j.spill(&f.tmp.0);
     assert_eq!(s.path, f.state.join(format!("spill/{id}-1.log")));
@@ -971,9 +1023,9 @@ fn spill_name_counter() {
 #[test]
 fn spill_counter_after_sweep() {
     let f = fx();
-    let mut j = Journal::create(&f.state, &f.cwd).unwrap();
+    let mut j = J::create(&f.state, &f.cwd).unwrap();
     let id = j.id().to_string();
-    j.write(rec::session(&f.cfg, &id, &f.cwd, None)).unwrap();
+    j.write(rec::session(&f.cfg, &id, &f.cwd, false)).unwrap();
     j.write(asst(&["h1", "h2"])).unwrap();
     let first = j.spill(&f.tmp.0);
     fs::write(&first.path, "full output").unwrap();
@@ -1042,18 +1094,17 @@ fn journal_line_never_panics() {
         deep.as_str(),
     ];
     let f = fx();
-    let path = f.tmp.0.join("fuzz.jsonl");
     let session = f.plant("fuzz", &[]);
     let (mut read, mut repaired, mut elided, mut resumed, mut refused) = (0, 0, 0, 0, 0);
     for _ in 0..10_000 {
         let mut buf = Vec::new();
         if next(4) != 0 {
-            buf.extend(format!("{}\n", rec::session(&f.cfg, "x", &f.cwd, None)).bytes());
+            buf.extend(format!("{}\n", rec::session(&f.cfg, "x", &f.cwd, false)).bytes());
         }
         for _ in 0..next(12) {
             match next(25) {
                 0 => buf.extend((0..next(40)).map(|_| [b'{', b'}', b'"', b'\\', 0xff, 0xc3, b'a', b':', b','][next(9)])),
-                1 => buf.extend(format!("{}", rec::close(next(4000) as u64)).bytes()),
+                1 => buf.extend(format!("{}", json!({"bytes": next(4000), "t": "close"})).bytes()),
                 2..=13 => {
                     let ids = ["h1", "h2", "h7", ""];
                     let r = match next(4) {
@@ -1072,8 +1123,8 @@ fn journal_line_never_panics() {
             }
             buf.push(b'\n');
         }
-        let mut notices = Vec::new();
-        if let Ok(mut hist) = replay(&buf, &path, &f.cfg, &f.cwd, &mut notices) {
+        fs::write(&session, &buf).unwrap();
+        if let Ok(mut hist) = Journal::new(&f.state).read("fuzz").map_err(port::outcome).and_then(|mut t| replay(&mut t, &f.cfg)) {
             read += 1;
             repaired += usize::from(!dangling(&hist).is_empty());
             let _ = (pairing(&hist), next_h(&hist));
@@ -1093,4 +1144,51 @@ fn journal_line_never_panics() {
     }
     assert!(read > 1000 && repaired > 100 && elided > 20, "read {read}, repaired {repaired}, elided {elided}");
     assert!(resumed > 100 && refused > 100, "resumed {resumed}, refused {refused}");
+}
+
+/// `create` with a hint: the id when `port::session_id` accepts it and no scope has it (`exists` when one does); a
+/// hint it refuses gets a new id as without one.
+#[test]
+fn journal_create_hint() {
+    let f = fx();
+    let mut h = Journal::new(&f.state);
+    assert_eq!(h.create(&f.cwd, Some("imported.1")).unwrap(), "imported.1");
+    assert!(f.state.join("sessions").join(scope(&f.cwd).unwrap()).join("imported.1.jsonl").is_file());
+    let other = f.tmp.0.join("other");
+    fs::create_dir(&other).unwrap();
+    let e = Journal::new(&f.state).create(&other, Some("imported.1")).unwrap_err();
+    assert_eq!((e.code, e.message.as_str()), ("exists", "session imported.1 exists"));
+    for bad in ["", ".x", "-x", "a/b", "a b", &"x".repeat(65)] {
+        let id = Journal::new(&f.state).create(&f.cwd, Some(bad)).unwrap();
+        assert_eq!(id.len(), 21, "{bad:?}: {id}");
+    }
+    assert!(port::session_id(&"x".repeat(64)) && port::session_id("a.b_c-Dz9"));
+}
+
+/// Every `close` gives its own offset, in an earlier segment too.
+#[test]
+fn journal_every_close_checked() {
+    let f = fx();
+    let (id, path) = f.closed(&[rec::user("a")]);
+    let full = fs::read(&path).unwrap();
+    let lines: Vec<&[u8]> = full.split_inclusive(|&b| b == b'\n').collect();
+    let next = format!("{}\n", rec::session(&f.cfg, &id, &f.cwd, true));
+    // A line removed before the first close, and a new segment after it: today's last segment is fine.
+    fs::write(&path, [lines[0], lines[2], next.as_bytes()].concat()).unwrap();
+    assert_eq!(journal_err("tampered", f.resume(Some(&id))), format!("journal modified outside henki: {}", path.display()));
+}
+
+/// An unheld read takes no lock and changes nothing: a torn tail is skipped, not cut; a held one is cut.
+#[test]
+fn journal_read_unheld() {
+    let f = fx();
+    let (id, path) = f.session(&[rec::user("a")]);
+    fs::OpenOptions::new().append(true).open(&path).unwrap().write_all(b"{\"t\":\"us").unwrap();
+    let before = fs::read(&path).unwrap();
+    let _held = hold(&path);
+    let t = Journal::new(&f.state).read(&id).unwrap();
+    assert_eq!(t.records.iter().map(|r| r["t"].as_str().unwrap()).collect::<Vec<_>>(), ["session", "user"]);
+    assert_eq!((t.notices.len(), t.place), (0, path.display().to_string()));
+    assert_eq!(fs::read(&path).unwrap(), before);
+    assert!(matches!(Journal::new(&f.state).read("none"), Err(PortError { code: "not_found", .. })));
 }

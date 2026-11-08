@@ -1,7 +1,7 @@
 //! The calls of a step: ids and validation, who approves each (auto, an allow rule, the user), one call with its timeout
 //! and escalation, its result, the stuck rule and the kill path.
 use super::{CALL_MAX_S, LATE, SLICE, Session, approve::DENIED};
-use crate::{allow, files, journal::rec, supervise, supervise::GRACE, sys, term, tools, tools::Killed, tools::Target, types::*};
+use crate::{allow, files, journal, journal::rec, supervise, supervise::GRACE, sys, term, tools, tools::Killed, tools::Target, types::*};
 use std::{path::Path, time::Duration, time::Instant};
 
 /// A call extends the run when it repeats the previous call (name and arguments) and both failed; another failure
@@ -49,7 +49,7 @@ impl Session {
         };
         self.tripwire()?;
         let rule = c.args["command"].as_str().filter(|_| c.name == "shell").and_then(|cmd| self.cfg.allow.find(cmd, &self.cfg.root)).cloned();
-        if !tools::needs_approval(&c.name, t.as_ref(), &self.cfg, self.j.id()) {
+        if !tools::needs_approval(&c.name, t.as_ref(), &self.cfg, &self.sid) {
             self.record(rec::approval(&c.id, "auto", None))?;
         } else if let Some(r) = &rule {
             let (home, file) = (&self.cfg.home, &self.cfg.allow.file);
@@ -86,7 +86,8 @@ impl Session {
         if let Some(t) = t {
             files::start(c.clone(), t, cap, tag, &self.tx);
         } else {
-            match supervise::spawn(&self.cfg.bash, cmd, &self.cfg.cwd, &self.env, cap, self.j.spill(&self.cfg.home), tag, &self.tx) {
+            let spill = journal::spill(&self.cfg.state, &self.sid, &mut self.spill_n, &self.cfg.home);
+            match supervise::spawn(&self.cfg.bash, cmd, &self.cfg.cwd, &self.env, cap, spill, tag, &self.tx) {
                 Ok(p) => pgid = Some(p),
                 Err(e) => return self.answer(c, &tools::not_started(&e), true, None, None),
             }
