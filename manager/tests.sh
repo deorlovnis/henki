@@ -1242,9 +1242,21 @@ t_observe() {
   run verify --dir "$m"
   rc_is 0
   out_has "0 B of prompt"
+  printf '#!/bin/sh\necho hi\n' >"$m/.henki/template" && chmod 755 "$m/.henki/template"
+  mkdir -p "$m/cmd" "$m/port" && ln -s ../.henki/template "$m/cmd/hi"
+  printf '#!/bin/sh\n' >"$m/port/policy" && chmod 755 "$m/port/policy"
+  printf 'ports = ["policy"]\n' >>"$m/.henki/module.toml"
   run add "$m" --yes
   rc_is 0
   out_has "prompt   +0 B on every request"
+  # The screen names every program it may run, an observer as run unasked, and no module looks as if it ran nothing.
+  out_has "  files    "
+  out_has "  runs as you, unsandboxed:$nl    cmd/hi -> ../.henki/template (sh, 2 lines): when you type /hi$nl"
+  out_has "    on/call_start.wait (sh, 1 lines): unasked, at every call_start event; henki waits for it, up to 2 s$nl"
+  out_has "    on/question -> turn_end (sh, 2 lines): unasked, at every question event$nl"
+  out_has "    on/turn_end (sh, 2 lines): unasked, at every turn_end event$nl"
+  out_has "    port/policy (sh, 1 lines): as henki's policy port, once henki-mods swap policy binds it$nl"
+  out_lacks ".DS_Store"
   for bad in call_end.wait turn_end.wait stop .hidden; do
     rm -rf "$W/r" && mkmod "$W/r" && mkdir -p "$W/r/on" && printf '#!/bin/sh\n' >"$W/r/on/$bad" && chmod 755 "$W/r/on/$bad"
     run verify --dir "$W/r"

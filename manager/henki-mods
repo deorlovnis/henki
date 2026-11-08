@@ -566,11 +566,12 @@ top_ok() {
   esac
 }
 
-# Everything about module DIR into I_* and M_*: hd1, doc line, commands, links, card, manifest; NAME the default
-# name (the source dir's), HOST 1 to check this machine too. Exit 1 with ERR at the first problem.
+# Everything about module DIR into I_* and M_*: hd1, doc line, commands, links, card, manifest, and I_runs: what runs
+# (PATH<TAB>WHEN, one per line: bin/, cmd/, on/ and port/ entries); NAME the default name (the source dir's), HOST 1
+# to check this machine too. Exit 1 with ERR at the first problem.
 inspect() {
   local dir="$1" fallback="$2" host="$3" p kind top rest x why
-  I_hd1="" I_line="" I_cmds="" I_links=0 I_files=0 I_card=0 I_name="" I_ports=""
+  I_hd1="" I_line="" I_cmds="" I_links=0 I_files=0 I_card=0 I_name="" I_ports="" I_runs=""
   listing "$dir" || return 1
   [ -s "$STAGE_LIST" ] || {
     ERR="$dir: empty; fix: a module holds doc.md"
@@ -635,6 +636,7 @@ EOF
             [ -n "$(find -L "$dir/$p" -prune -type f -perm -100 -print 2>/dev/null)" ] && x=1
             if [ "$x" = 1 ] && is_cmd "$rest"; then
               I_cmds="$I_cmds$rest$nl"
+              I_runs="${I_runs}bin/$rest${tab}when the model runs $rest$nl"
             elif [ "$x" = 1 ] || [ "${rest#.}" = "$rest" ]; then
               ERR="$dir/$p: a command is a file you can run, named with A-Z, a-z, 0-9, ., _ and -; fix: rename it or chmod u+x it, or move it out of bin/"
               return 1
@@ -664,6 +666,7 @@ EOF
                 return 1
                 ;;
               esac
+              I_runs="${I_runs}cmd/$rest${tab}when you type /$rest$nl"
             elif [ "$x" = 0 ] && [ "${rest%.md}" != "$rest" ]; then
               text_ok "$dir/$p" || return 1
             elif [ "$x" = 1 ] || [ "${rest#.}" = "$rest" ]; then
@@ -695,6 +698,9 @@ EOF
                 return 1
                 ;;
               esac
+              x=""
+              [ "${rest%.wait}" = "$rest" ] || x="; henki waits for it, up to 2 s"
+              I_runs="${I_runs}on/$rest${tab}unasked, at every ${rest%.wait} event$x$nl"
             elif [ "${rest#.}" = "$rest" ]; then
               ERR="$dir/$p: an observer is a file you can run; fix: chmod u+x it, or move it out of on/"
               return 1
@@ -707,7 +713,7 @@ EOF
         x=0
         [ -n "$(find -L "$dir/$p" -prune -type f -perm -100 -print 2>/dev/null)" ] && x=1
         case " $PORTS_KNOWN :$x" in
-          *" ${rest:-/} "*:1) I_ports="$I_ports$rest$nl" ;;
+          *" ${rest:-/} "*:1) I_ports="$I_ports$rest$nl" I_runs="${I_runs}port/$rest${tab}as henki's $rest port, once henki-mods swap $rest binds it$nl" ;;
           *)
             ERR="$dir/$p: port/ holds a program you can run per port, named $PORTS_KNOWN; fix: rename it or chmod u+x it, or move it out"
             return 1
@@ -1325,14 +1331,17 @@ cmd_add() {
   say "  summary  ${M_summary:-$I_line}"
   say "  prompt   +$(num "$bytes") B on every request$x (total on after: $(num $((total + bytes))) B)"
   [ "$I_card" = 0 ] || say "  card     +$(num "$I_card") B into $(shown "$AGENTS") (henki's limit: $(num $AGENTS_MAX) B for the file)"
-  x=""
-  while IFS= read -r a; do
+  say "  files    $I_files ($I_links links)"
+  # Every program henki may run from it, a link with its target: on/ runs without anyone asking, so it is named too.
+  [ -z "$I_runs" ] || say "  runs as you, unsandboxed:"
+  while IFS="$tab" read -r a x; do
     [ -n "$a" ] || continue
-    x="$x${x:+; }bin/$a ($(file_kind "$STAGE/m/bin/$a"))"
+    d=""
+    [ ! -L "$STAGE/m/$a" ] || d=" -> $(target "$STAGE/m/$a" | sed 's/[[:cntrl:]]/?/g')"
+    say "    $a$d ($(file_kind "$STAGE/m/$a")): $x"
   done <<EOF
-$I_cmds
+$I_runs
 EOF
-  say "  files    $I_files ($I_links links)${x:+; runs as you, unsandboxed: $x}"
   while IFS= read -r a; do
     [ -n "$a" ] || continue
     if command -v "$a" >/dev/null 2>&1; then say "  needs    $a (found)"; else say "  needs    $a: NOT on PATH; install it yourself (henki-mods installs nothing)"; fi
