@@ -357,7 +357,9 @@ NAME/README* LICENSE* CHANGELOG* .*   ignored
   the name is an event (observe/1), in `port/` a port (`model`, `history`, `context`, `exec`, `policy`, `frontend`). A
   dot file that cannot run is ignored but watched; in `cmd/` a `NAME.md` that cannot run is data. Anything else there
   is refused. `ctx/` and any other name are refused (`unknown entry PATH; ext/2 modules hold doc.md, bin/, cmd/, on/,
-  port/ and eval/`). At most 16 `on/` files over all modules.
+  port/ and eval/`). At most 16 `on/` files over all modules. Since these run with the user's rights, the ext path
+  directory, the module and everything in it named above must be owned by the user or root and not group- or
+  world-writable (`PATH is group- or world-writable; fix: chmod go-w PATH`).
 - **Links.** Inside a module every link must be relative and lead to a path inside it (`a link that leaves the module;
   fix: copy the file in`); the module directory itself may be a link (the manager's store copy).
 - **Names across modules.** A `bin/` or a `cmd/` name in two modules stops the start.
@@ -442,7 +444,8 @@ null, `target` the resolved path of a file tool's target or null. No event comes
   as any other change does, `call_start`'s included, since henki checks after it. Observer notices are journaled as
   `notice` records and are never events.
 - **The session end.** After `close`, the runs still going get 300 ms; then henki kills each one's process group and
-  session. An observer must not leave processes behind.
+  session. An observer must not leave processes behind: one it leaves counts among the background processes of
+  earlier calls in notices, and on Linux goes in the next stop's sweep or the session end's.
 
 ## module/1
 
