@@ -57,7 +57,9 @@ pub fn json_line(v: &Value) -> String {
 
 /// `s` with each escaped code point written by `form`; None when there is none.
 fn subst(s: &str, form: impl Fn(&mut String, char) -> std::fmt::Result) -> Option<String> {
-    let (head, tail) = s.split_at(s.find(escaped)?);
+    // Tab, newline and printable ASCII are never escaped: a byte scan skips to the first other byte, a char boundary.
+    let at = s.bytes().position(|b| !matches!(b, b'\t' | b'\n' | 0x20..0x7f))?;
+    let (head, tail) = s.split_at(at + s.get(at..)?.find(escaped)?);
     let mut o = String::with_capacity(s.len() + 16);
     o.push_str(head);
     for c in tail.chars() {
