@@ -1,0 +1,4 @@
+#!/bin/sh
+# run.sh sources a settings file that is not there.
+printf '#!/bin/sh\n. ./settings.conf\necho "starting on port $PORT"\n' >run.sh
+chmod 755 run.sh

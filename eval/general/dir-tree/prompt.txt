@@ -1,0 +1,1 @@
+Create this tree under site/: the directories site/css, site/js and site/img/icons, and an empty file site/index.html. Nothing else.

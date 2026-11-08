@@ -40,7 +40,7 @@ case_() {
   CASES=$((CASES + 1))
   local d="$SCRATCH/$CASES"
   mkdir -p "$d/home" "$d/w" "$d/tmp"
-  export HOME="$d/home" XDG_DATA_HOME="$d/data" XDG_CONFIG_HOME="$d/xdg-config" TMPDIR="$d/tmp"
+  export HOME="$d/home" XDG_DATA_HOME="$d/data" XDG_CONFIG_HOME="$d/xdg-config" XDG_STATE_HOME="$d/state" TMPDIR="$d/tmp"
   W="$d/w"
   CONF="$HOME/.config/henki"
   STORE="$XDG_DATA_HOME/henki/mods"
@@ -1038,7 +1038,7 @@ t_halti_live() {
 # in bytes to D/sizes, and writes the prompt itself to D/system. Sets STUB_PORT and STUB_PID; exit 1 when it does not
 # start.
 stub_up() {
-  local d="$1" i=0
+  local d="$1"
   mkdir -p "$d"
   cat >"$d/stub.py" <<'PY'
 import http.server, json, os, socketserver, sys
@@ -1065,6 +1065,12 @@ s = socketserver.TCPServer(("127.0.0.1", 0), H)
 open(os.path.join(d, "port"), "w").write(str(s.server_address[1]))
 s.serve_forever()
 PY
+  stub_start "$d"
+}
+
+# Starts DIR/stub.py, which writes the port it listens on into DIR/port; STUB_PID and STUB_PORT.
+stub_start() {
+  local d="$1" i=0
   python3 -I "$d/stub.py" "$d" &
   STUB_PID=$!
   while [ ! -s "$d/port" ] && [ $i -lt 100 ]; do
@@ -1128,14 +1134,14 @@ t_ext2() {
   local m="$W/kit"
   mkmod "$m"
   rm -rf "$m/bin"
-  mkdir -p "$m/cmd" "$m/eval/task-1"
+  mkdir -p "$m/cmd"
   printf '#!/bin/sh\nexec "$HENKI_MODULE/.henki/template" "$@"\n' >"$m/cmd/go"
   printf '#!/bin/sh\necho template\n' >"$m/.henki/template"
   chmod 755 "$m/cmd/go" "$m/.henki/template"
   ln -s ../.henki/template "$m/cmd/review"
   printf 'Review the change.\n' >"$m/cmd/review.md"
   printf 'x\n' >"$m/cmd/.DS_Store"
-  printf 'a task\n' >"$m/eval/task-1/task.md"
+  mktask "$m/eval" task-1 "a task" 'true'
   run verify --dir "$m"
   rc_is 0
   out_has "0 B of prompt"
@@ -1509,6 +1515,241 @@ t_policy() {
   done
 }
 
+# A stub model server for the eval checks in D, a small agent: a message holding `CALL: CMD` gets a shell call of CMD
+# and then the call's output as the answer, one holding BYTES the text of eval_bytes, and any other "yes" when the
+# system prompt lists the module probe, else "no". Each request's model goes to D/models.
+eval_stub_up() {
+  local d="$1"
+  mkdir -p "$d"
+  cat >"$d/stub.py" <<'PY'
+import http.server, json, os, socketserver, sys
+d = sys.argv[1]
+TEXT = 'café "q" back\\slash\ttab\nline two ​ \U000e0001 end'
+def chunk(delta, finish=None):
+    return "data: " + json.dumps({"choices": [{"index": 0, "delta": delta, "finish_reason": finish}], "object": "chat.completion.chunk"}) + "\n\n"
+class H(http.server.BaseHTTPRequestHandler):
+    def do_POST(self):
+        body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+        with open(os.path.join(d, "models"), "a") as f:
+            f.write(body["model"] + "\n")
+        system = [m["content"] for m in body["messages"] if m["role"] == "system"][0]
+        last = body["messages"][-1]
+        content, finish = last.get("content") or "", "stop"
+        if last["role"] == "tool":
+            delta = {"role": "assistant", "content": "got " + content}
+        elif "CALL: " in content:
+            cmd = content.split("CALL: ", 1)[1].split("\n", 1)[0]
+            call = {"index": 0, "id": "c1", "type": "function", "function": {"name": "shell", "arguments": json.dumps({"command": cmd})}}
+            delta, finish = {"role": "assistant", "tool_calls": [call]}, "tool_calls"
+        elif "BYTES" in content:
+            delta = {"role": "assistant", "content": TEXT}
+        else:
+            delta = {"role": "assistant", "content": "yes" if "\n- probe: " in system else "no"}
+        sse = (chunk(delta) + chunk({}, finish) + "data: [DONE]\n\n").encode()
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream")
+        self.send_header("Content-Length", str(len(sse)))
+        self.end_headers()
+        self.wfile.write(sse)
+    def log_message(self, *a):
+        pass
+s = socketserver.TCPServer(("127.0.0.1", 0), H)
+open(os.path.join(d, "port"), "w").write(str(s.server_address[1]))
+s.serve_forever()
+PY
+  stub_start "$d"
+}
+
+# A task T in DIR: prompt PROMPT, a setup that writes a marker, and the check CHECK (sh).
+mktask() { # DIR T PROMPT CHECK
+  mkdir -p "$1/$2"
+  printf '%s\n' "$3" >"$1/$2/prompt.txt"
+  printf '#!/bin/sh\nprintf "made by setup\\n" >marker\n' >"$1/$2/setup"
+  printf '#!/bin/sh\n%s\n' "$4" >"$1/$2/check"
+  chmod 755 "$1/$2/setup" "$1/$2/check"
+}
+
+# eval/1's layout (eval --check, and a module's eval/ in verify and add) and eval's refusals before any run.
+t_eval() {
+  case_ "eval --check: the general suite and the layout rules"
+  local e="$W/ev" t
+  run eval --check "$HERE/../eval/general"
+  rc_is 0
+  out_has "ok: eval/1, 12 tasks"
+  mktask "$e" one "Say yes." '[ "$(cat)" = yes ]'
+  printf 'about the tasks\n' >"$e/README.md" && printf 'x\n' >"$e/.hidden" && printf 'x\n' >"$e/one/.notes"
+  mkdir -p "$e/one/fake-bin" && printf '#!/bin/sh\n' >"$e/one/fake-bin/jq" && chmod 755 "$e/one/fake-bin/jq"
+  printf '# limits\nmax_steps = 10000\nmax_seconds = 9999\n' >"$e/one/task.toml"
+  run eval --check "$e"
+  rc_is 0
+  out_has "ok: eval/1, 1 tasks"
+  # Each broken copy of the task, alone in its dir, and the refusal that names it.
+  bad() { # WHAT TEXT CHANGE
+    rm -rf "$W/bad" && mkdir -p "$W/bad" && cp -R "$e/one" "$W/bad/one" && (cd "$W/bad/one" && eval "$3")
+    run eval --check "$W/bad"
+    refused "$2"
+  }
+  bad "no check" "one: no check" 'rm check'
+  bad "a setup that cannot run" "setup: a program" 'chmod 644 setup'
+  bad "an empty prompt" "0 bytes; fix: write a prompt of 1 to 4,096 bytes" ': >prompt.txt'
+  bad "a prompt over 4 KiB" "4,097 bytes" 'head -c 4097 /dev/zero | tr "\000" x >prompt.txt'
+  bad "U+202E in the prompt" "U+202E" 'printf "say \342\200\256 yes\n" >prompt.txt'
+  bad "an unknown entry" "notes: unknown entry" 'printf x >notes'
+  bad "a fake-bin entry that cannot run" "fake-bin/ holds programs" 'chmod 644 fake-bin/jq'
+  bad "fake-bin a file" "fake-bin: not a directory" 'rm -r fake-bin && printf x >fake-bin'
+  bad "an unknown task.toml key" "x: task.toml takes" 'printf "x = 1\n" >task.toml'
+  bad "max_steps 0" "max_steps: task.toml takes" 'printf "max_steps = 0\n" >task.toml'
+  bad "max_seconds a string" "max_seconds: task.toml takes" 'printf "max_seconds = \"3\"\n" >task.toml'
+  bad "a task.toml line that is no assignment" "task.toml:1: expected key = value" 'printf "max_steps\n" >task.toml'
+  rm -rf "$W/bad" && mkdir -p "$W/bad/Bad" && cp -R "$e/one/." "$W/bad/Bad/"
+  run eval --check "$W/bad"
+  refused "a task is a directory, and its name as a module's"
+  rm -rf "$W/bad" && mkdir -p "$W/bad"
+  run eval --check "$W/bad"
+  refused "no task; fix:"
+
+  case_ "a module's eval/ is held to eval/1 when it is added"
+  mkmod "$W/probe"
+  mkdir -p "$W/probe/eval" && cp -R "$e/one" "$W/probe/eval/one"
+  run verify --dir "$W/probe"
+  rc_is 0
+  chmod 644 "$W/probe/eval/one/check"
+  run verify --dir "$W/probe"
+  refused "eval/one/check: a program"
+  run add "$W/probe" --yes
+  refused "eval/one/check: a program"
+  chmod 755 "$W/probe/eval/one/check"
+  run add "$W/probe" --yes
+  rc_is 0
+
+  case_ "eval: what it refuses before any run"
+  printf '#!/bin/sh\necho "henki 0.2.0 (x)"\n' >"$W/henki" && chmod 755 "$W/henki"
+  mkmod "$W/probe"
+  mkmod "$W/plain"
+  mkdir -p "$W/probe/eval" && cp -R "$e/one" "$W/probe/eval/one"
+  run add "$W/probe" --yes
+  run eval
+  rc_is 2
+  HENKI_BIN="$W/henki" run eval nope --yes
+  refused "nope is not added"
+  HENKI_BIN="$W/henki" run eval probe --repeats 0 --yes
+  refused "--repeats 0: not a number from 1 to 99"
+  HENKI_BIN="$W/henki" run eval probe --repeats 100 --yes
+  refused "--repeats 100"
+  HENKI_BIN="$W/henki" HENKI_DEPTH=1 run eval probe --yes
+  refused "this runs inside henki (HENKI_DEPTH=1)"
+  HENKI_BIN="$W/henki" run eval "$W/plain" --yes
+  refused "plain has no eval/ tasks; fix: henki-mods eval $W/plain --suite general"
+  HENKI_BIN="$W/henki" run eval probe --suite nope --yes
+  refused "nope is not added"
+  HENKI_BIN="$W/henki" HENKI_MODS_TTY="$W/no-tty" run eval probe
+  refused "no terminal to ask on"
+  out_has "eval: probe 0.1.0 (hd1:"
+  out_has "each task's setup and check run as you, and henki with approve = auto"
+  printf 'n\n' >"$W/answer"
+  HENKI_BIN="$W/henki" HENKI_MODS_TTY="$W/answer" run eval probe
+  refused "not run (the answer was no)"
+  [ ! -e "$XDG_STATE_HOME/henki/eval.tsv" ] || fail "a refused eval wrote eval.tsv"
+}
+
+# Live: eval against a real henki and the eval stub, the arms told apart by what the model sees.
+t_eval_live() {
+  case_ "eval: two arms through henki run, the result lines, the repeats rule"
+  live_ok || return
+  local d="$W/stub" m="$W/probe" s="$W/suite" lines
+  eval_stub_up "$d" || return
+  mkdir -p "$CONF"
+  printf 'model = "m"\nbase_url = "http://127.0.0.1:%s/v1"\next = ["~/elsewhere"]\n' "$STUB_PORT" >"$CONF/config.toml"
+  chmod 600 "$CONF/config.toml"
+  printf 'Be brief.\n' >"$CONF/AGENTS.md"
+  mkmod "$m"
+  printf '# probe: answers for tests\n' >"$m/doc.md"
+  # ask: only the on arm's prompt lists probe; it also sees setup's marker and EVAL_DIR.
+  mktask "$m/eval" ask "Is probe there?" '[ "$(cat)" = yes ] && [ -f marker ] && [ -f "$EVAL_DIR/prompt.txt" ]'
+  # fake: a call runs fake-bin/fakething first on PATH, within max_steps.
+  mktask "$m/eval" fake "CALL: fakething" 'command grep -q FAKE-OK'
+  mkdir -p "$m/eval/fake/fake-bin" && printf '#!/bin/sh\necho FAKE-OK\n' >"$m/eval/fake/fake-bin/fakething"
+  chmod 755 "$m/eval/fake/fake-bin/fakething" && printf 'max_steps = 3\n' >"$m/eval/fake/task.toml"
+  # bytes: the check gets the answer's exact bytes (escapes, a surrogate pair, a tab, no added newline).
+  mktask "$m/eval" bytes "BYTES" 'cmp - "$EVAL_DIR/.want"'
+  printf 'caf\303\251 "q" back\\slash\ttab\nline two \342\200\213 \363\240\200\201 end' >"$m/eval/bytes/.want"
+  run add "$m" --yes
+  rc_is 0
+  run eval probe --yes
+  rc_is 0
+  out_has "ask              on  pass  (ok, 1 steps,"
+  out_has "ask              off fail  (ok, 1 steps,"
+  out_has "fake             off pass  (ok, 2 steps,"
+  out_has "bytes            off pass"
+  out_lacks "10 more"
+  lines=$(cat "$XDG_STATE_HOME/henki/eval.tsv")
+  case "$lines" in "eval/1${tab}probe${tab}0.1.0${tab}$(field probe 8)${tab}m${tab}probe${tab}on${tab}9${tab}9${tab}"*"${nl}eval/1${tab}probe${tab}0.1.0${tab}"*"${tab}off${tab}6${tab}9${tab}"*) ;; *)
+    fail "eval.tsv holds: $lines"
+    ;;
+  esac
+  out_has "probe: on 9 of 9 passed, off 6 of 9; added to $XDG_STATE_HOME/henki/eval.tsv"
+  # The arms within one pass of each other after 3 runs: 10 more, 13 each; --model names the model.
+  mkdir -p "$s" && cp -R "$m/eval/fake" "$s/fake"
+  : >"$d/models"
+  run eval probe --suite "$s" --model other --yes
+  rc_is 0
+  out_has "the arms are within one pass of each other after 3 repeats: 10 more"
+  [ "$(sort -u "$d/models")" = other ] || fail "the stub saw the models $(sort -u "$d/models" | tr '\n' ' ')"
+  case "$(tail -n 2 "$XDG_STATE_HOME/henki/eval.tsv")" in *"${tab}other${tab}$s${tab}on${tab}13${tab}13${tab}"*"${tab}off${tab}13${tab}13${tab}"*) ;; *)
+    fail "eval.tsv ends with: $(tail -n 2 "$XDG_STATE_HOME/henki/eval.tsv")"
+    ;;
+  esac
+  # The general suite: every setup runs (none fails), one run per task and arm.
+  run eval probe --suite general --repeats 1 --yes
+  rc_is 0
+  case "$(tail -n 1 "$XDG_STATE_HOME/henki/eval.tsv")" in *"${tab}general${tab}off${tab}"*"${tab}12${tab}"*) ;; *)
+    fail "eval.tsv ends with: $(tail -n 1 "$XDG_STATE_HOME/henki/eval.tsv")"
+    ;;
+  esac
+  kill "$STUB_PID" 2>/dev/null
+  wait "$STUB_PID" 2>/dev/null
+}
+
+# The general suite's checks are deterministic and right: after each task's setup, a right solution and answer pass,
+# and a near miss fails.
+t_general() {
+  case_ "the general suite: each check passes a right solution and fails a near miss"
+  local g="$HERE/../eval/general" t n=0
+  gen() { # TASK RIGHT_SOLUTION RIGHT_ANSWER WRONG_SOLUTION WRONG_ANSWER
+    local which w sol ans
+    n=$((n + 1))
+    for which in right wrong; do
+      w="$W/$1.$which"
+      mkdir -p "$w"
+      (cd "$w" && EVAL_DIR="$g/$1" "$g/$1/setup") </dev/null >"$W/setup.log" 2>&1 || {
+        fail "$1: setup failed: $(cat "$W/setup.log")"
+        return
+      }
+      if [ "$which" = right ]; then sol=$2 ans=$3; else sol=$4 ans=$5; fi
+      (cd "$w" && eval "$sol") || fail "$1: the $which solution failed"
+      if printf '%s\n' "$ans" | (cd "$w" && EVAL_DIR="$g/$1" "$g/$1/check") >/dev/null 2>&1; then
+        [ "$which" = right ] || fail "$1: the check passed a near miss"
+      else
+        [ "$which" = wrong ] || fail "$1: the check failed the right answer"
+      fi
+    done
+  }
+  gen count-lines ': ' 'There are 19 such lines (status 404).' ': ' '23'
+  gen rename 'cd photos && for f in *.JPG; do mv "$f" "${f%.JPG}.jpg"; done' done 'cd photos && for f in *JPG*; do mv "$f" "$(echo "$f" | tr A-Z a-z)"; done' done
+  gen fix-script "printf '#!/bin/sh\necho \$((\$1 + \$2))\n' >sum.sh" fixed "printf '#!/bin/sh\necho 5\n' >sum.sh" fixed
+  gen largest-file ': ' 'data/c/d/e/huge.bin' ': ' 'data/.cache'
+  gen json-field '[ "$("$g/json-field/fake-bin/jq" .server.port config.json 2>&1; echo $?)" = "jq: command not found${nl}127" ]' '8443' ': ' '8443 (and 9443 for TLS)'
+  gen git-log '[ "$(git log --diff-filter=A --format=%an -- parser.c)" = "Ada Lovelace" ]' 'Ada Lovelace' ': ' 'Alan Turing'
+  gen write-script "printf '#!/bin/sh\nwc -w <\"\$1\"\n' >count-words && chmod 755 count-words" done "printf '#!/bin/sh\nwc -w \"\$1\"\n' >count-words && chmod 755 count-words" done
+  gen config-value "sed 's/^timeout = 60\$/timeout = 30/' app.ini >x && mv x app.ini" done "sed 's/^timeout = .*/timeout = 30/' app.ini >x && mv x app.ini" done
+  gen find-todo '[ "$(command grep -rn TODO src | cut -d: -f1,2)" = src/lib/parse.sh:14 ]' 'src/lib/parse.sh:14' ': ' 'src/lib/parse.sh:13'
+  gen dir-tree 'mkdir -p site/css site/js site/img/icons && : >site/index.html' done 'mkdir -p site/css site/js site/img/icons && echo hi >site/index.html' done
+  gen compare-files '[ "$(diff old.txt new.txt | sed -n 1p)" = 7c7 ]' '7: color = navy' ': ' '7: color = teal'
+  gen explain-error '! ./run.sh >/dev/null 2>&1' 'settings.conf' 'touch settings.conf' 'settings.conf'
+  t=$(cd "$g" && ls | wc -l | tr -d ' ')
+  [ "$n" = "$t" ] || fail "the general suite has $t tasks, and this case covers $n"
+}
+
 all() {
   t_add_path
   t_ask
@@ -1535,6 +1776,7 @@ all() {
   t_ports
   t_port_toy
   t_policy
+  t_eval
 }
 
 static_bash32
@@ -1543,6 +1785,8 @@ RUN=bash
 all
 t_live
 t_halti_live
+t_eval_live
+t_general
 # POSIX mode turns off some bash behaviour a script may lean on without knowing; the manager must not.
 RUN="bash --posix"
 all

@@ -1,0 +1,1 @@
+Write an executable shell script named count-words in this directory. It prints the number of words in the file named by its first argument, as a bare number and nothing else. sample.txt is there to try it on.

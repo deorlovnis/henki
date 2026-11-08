@@ -1,0 +1,4 @@
+#!/bin/sh
+# Stands in for a machine without jq.
+echo "jq: command not found" >&2
+exit 127

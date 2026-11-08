@@ -2,7 +2,8 @@
 # henki-mods: henki's module manager. A module is an extension directory (NAME/doc.md, an optional NAME/bin/, an
 # optional NAME/.henki/module.toml and .henki/card.md); this program copies one into a read-only store, pins it by
 # commit and tree hash in a lock, and turns it on and off by a symlink in the ext dir henki reads. It never runs code
-# from a module: no checkout, no hooks, no build step, no install script.
+# from a module to add, change or remove one: no checkout, no hooks, no build step, no install script. Only `eval`,
+# once the person said yes to its screen, runs a module's eval/1 tasks (and henki with the module on).
 #
 #   ~/.config/henki/ext/NAME -> ${XDG_DATA_HOME:-~/.local/share}/henki/mods/NAME/ID/   on = the link exists
 #   ~/.config/henki/mods.lock                                                          lock/1, one line per module
@@ -16,8 +17,9 @@
 #
 # Environment: HOME (required), XDG_DATA_HOME, HENKI_SHARE (the dir holding official/NAME, the official modules),
 # HENKI_MODS_TTY (the terminal the question is asked on; default /dev/tty), HENKI_CONFIG (the config dir; henki sets
-# it for /mods), HENKI_BIN (the henki whose `henki port` runs the conformance suites; henki sets it), HENKI_NEXT (the
-# hand-off file of a henki that runs this as /mods: a change writes `restart` there, and henki asks to restart on it).
+# it for /mods), HENKI_BIN (the henki whose `henki port` runs the conformance suites and that eval runs; henki sets it),
+# HENKI_NEXT (the hand-off file of a henki that runs this as /mods: a change writes `restart` there, and henki asks to
+# restart on it), XDG_STATE_HOME (eval adds its lines to henki/eval.tsv there).
 set -u
 export LC_ALL=C
 umask 022
@@ -39,7 +41,7 @@ nl='
 # ext::prompt's header line; henki joins it to the rest of the system prompt with a blank line ("\n\n").
 HEADER='Extensions are commands on PATH; read the doc in brackets before first use.'
 # The named formats this henki ships (CONTRACTS.md); a module's `contracts` must all be here.
-CONTRACTS_KNOWN='journal/1 json/1 wire/1 ext/1 ext/2 handoff/1 observe/1 module/1 lock/1 hd1 port/1 history/1 policy/1 conform/1 bind/1'
+CONTRACTS_KNOWN='journal/1 json/1 wire/1 ext/1 ext/2 handoff/1 observe/1 module/1 lock/1 hd1 port/1 history/1 policy/1 conform/1 bind/1 eval/1'
 # The ports a package may bind (henki's port::LINKED), and what each one gets to see, for the swap screen.
 PORTS_KNOWN='history policy'
 PORT_SEES_history='stores every session record'
@@ -80,6 +82,9 @@ usage: henki-mods [list]              modules: state, version, source, prompt by
        henki-mods verify --dir DIR    one module directory: layout and manifest
        henki-mods swap PORT NAME|std [--yes]   bind henki's PORT to module NAME's port/PORT, or back to std
        henki-mods test --port PORT NAME|std|/PROGRAM   the conformance suite of PORT against a binding
+       henki-mods eval NAME|/DIR [--suite NAME|general|/DIR] [--repeats N] [--model M] [--yes]
+                                      eval/1 tasks with the module on and off
+       henki-mods eval --check DIR    the layout of a directory of eval/1 tasks
        henki-mods allow [--config FILE] [rm N]   henki's allow rules: list them, or remove rule N
        henki-mods help | --version
 EOF
@@ -668,7 +673,7 @@ EOF
             ;;
         esac
         ;;
-      eval) ;; # eval/1 tasks: henki ignores them
+      eval) ;; # eval/1 tasks, checked below: henki ignores them
       on)
         # on/EVENT: an observer henki runs once per event (observe/1); henki's test as for bin/, named for an event.
         case "$rest" in
@@ -737,6 +742,7 @@ EOF
     return 1
   fi
   text_ok "$dir/doc.md" || return 1
+  [ ! -e "$dir/eval" ] || eval_check "$dir/eval" || return 1
   I_line=$(docline "$dir/doc.md")
   printf '%s' "$I_line" >"$STAGE_LIST.line"
   why=$(invisible_check "$STAGE_LIST.line") || {
@@ -1626,7 +1632,7 @@ henki_bin() {
   for h in ${HENKI_BIN:-} "$SELF/henki" "$(command -v henki 2>/dev/null)"; do
     [ -n "$h" ] && [ -x "$h" ] && [ ! -d "$h" ] && printf '%s\n' "$h" && return 0
   done
-  die "no henki to run the conformance suite with; fix: run it as henki mods, or put henki on PATH"
+  die "no henki to run; fix: run it as henki mods, or put henki on PATH"
 }
 
 # An EXPECT of conform/1 as a bash pattern: `*` any text, `@(A|B)` A or B, every other character itself.
@@ -1836,6 +1842,341 @@ bound_to() {
   done
 }
 
+# --- eval/1: a module's tasks, run with the module on and off -------------------------------------------------------
+
+EVAL_PROMPT_MAX=4096 # prompt.txt
+EVAL_SECONDS=120     # a run's --max-seconds when task.toml sets none
+
+# The general suite: beside the official modules in a release, eval/general/ in the repository.
+eval_general() {
+  local d
+  for d in ${HENKI_SHARE:+"$HENKI_SHARE/eval/general"} "$SELF/../share/henki/eval/general" "$SELF/../eval/general"; do
+    [ ! -d "$d" ] || { (cd -P "$d" && pwd) && return 0; }
+  done
+  return 1
+}
+
+# eval/1's layout of DIR: every entry but dot files, README* and LICENSE* a task, a directory named as a module is,
+# holding prompt.txt (1 to 4 KiB of UTF-8 without a code point henki escapes), setup and check (programs), and maybe
+# fake-bin/ (programs) and task.toml (max_steps, max_seconds); nothing else but dot files. Sets E_tasks, the task dirs
+# one per line in name order; else 1 with ERR.
+eval_check() { # DIR
+  local d=$1 t e x n why rec
+  E_tasks=""
+  [ -d "$d" ] || {
+    ERR="$d: not a directory; fix: name a directory of eval/1 tasks"
+    return 1
+  }
+  for t in "$d"/*; do
+    [ -e "$t" ] || [ -L "$t" ] || continue
+    x=${t##*/}
+    case "$x" in README* | LICENSE*) continue ;; esac
+    if ! is_name "$x" || [ ! -d "$t" ]; then
+      ERR="$t: a task is a directory, and its name as a module's: $NAME_RULE; fix: rename it, or move it out of $d"
+      return 1
+    fi
+    for x in prompt.txt setup check; do
+      [ -f "$t/$x" ] || {
+        ERR="$t: no $x; fix: an eval/1 task holds prompt.txt, setup and check"
+        return 1
+      }
+    done
+    for e in "$t"/*; do
+      [ -e "$e" ] || [ -L "$e" ] || continue
+      x=${e##*/}
+      case "$x" in
+        prompt.txt)
+          n=$(wc -c <"$e") && n=$((n)) || n=0
+          if [ "$n" = 0 ] || [ "$n" -gt "$EVAL_PROMPT_MAX" ]; then
+            ERR="$e: $(num "$n") bytes; fix: write a prompt of 1 to $(num "$EVAL_PROMPT_MAX") bytes"
+            return 1
+          fi
+          why=$(invisible_check "$e") || {
+            ERR="$e: holds $why, which a terminal does not show; fix: remove it"
+            return 1
+          }
+          ;;
+        setup | check)
+          [ -x "$e" ] || {
+            ERR="$e: a program, which this is not; fix: chmod u+x it"
+            return 1
+          }
+          ;;
+        fake-bin)
+          [ -d "$e" ] || {
+            ERR="$e: not a directory; fix: make fake-bin a directory of programs"
+            return 1
+          }
+          for x in "$e"/*; do
+            [ -e "$x" ] || [ -L "$x" ] || continue
+            if [ ! -f "$x" ] || [ ! -x "$x" ] || ! is_cmd "${x##*/}"; then
+              ERR="$x: fake-bin/ holds programs named with A-Z, a-z, 0-9, ., _ and -; fix: rename it or chmod u+x it, or move it out"
+              return 1
+            fi
+          done
+          ;;
+        task.toml)
+          rec=$(toml <"$e") || {
+            ERR="$e:$rec"
+            return 1
+          }
+          while IFS="$tab" read -r x n why; do
+            case "$x:$n:$why" in
+              ::) ;;
+              max_steps:I:[1-9] | max_steps:I:[1-9][0-9] | max_steps:I:[1-9][0-9][0-9] | max_steps:I:[1-9][0-9][0-9][0-9] | max_steps:I:10000) ;;
+              max_seconds:I:[1-9] | max_seconds:I:[1-9][0-9] | max_seconds:I:[1-9][0-9][0-9] | max_seconds:I:[1-9][0-9][0-9][0-9]) ;;
+              *)
+                ERR="$e: $x: task.toml takes max_steps (1 to 10000) and max_seconds (1 to 9999), integers; fix: correct it"
+                return 1
+                ;;
+            esac
+          done <<TOML
+$rec
+TOML
+          ;;
+        *)
+          ERR="$e: unknown entry; an eval/1 task holds prompt.txt, setup, check, fake-bin/, task.toml and dot files only; fix: move it out"
+          return 1
+          ;;
+      esac
+    done
+    E_tasks="$E_tasks$t$nl"
+  done
+  [ -n "$E_tasks" ] || {
+    ERR="$d: no task; fix: add a task directory with prompt.txt, setup and check"
+    return 1
+  }
+}
+
+# The string of KEY in LINE, a canonical JSON object as henki writes one (compact, keys sorted, so `"KEY":"` after a
+# `{` or a `,` is the key and never text inside a string), as printf %b takes it: printable ASCII as it is, any other
+# byte as \0NNN, \uXXXX (a surrogate pair too) as its UTF-8 bytes. The bytes reach awk as hex, so no awk has to read
+# a byte outside ASCII. Exit 1 when LINE has no such key.
+json_str() { # KEY LINE
+  printf '%s' "$2" | od -An -v -tx1 | HM_K="$1" awk '
+    function out(c) { if (c >= 32 && c < 127 && c != 92) printf "%c", c; else printf "\\0%03o", c }
+    function utf8(c) {
+      if (c < 128) out(c)
+      else if (c < 2048) { out(192 + int(c / 64)); out(128 + c % 64) }
+      else if (c < 65536) { out(224 + int(c / 4096)); out(128 + int(c / 64) % 64); out(128 + c % 64) }
+      else { out(240 + int(c / 262144)); out(128 + int(c / 4096) % 64); out(128 + int(c / 64) % 64); out(128 + c % 64) }
+    }
+    function hex4(i,   v, j, x) {
+      v = 0
+      for (j = 0; j < 4; j++) { x = b[i + j]; v = v * 16 + (x >= 97 ? x - 87 : x >= 65 ? x - 55 : x - 48) }
+      return v
+    }
+    BEGIN {
+      for (i = 0; i < 16; i++) h[substr("0123456789abcdef", i + 1, 1)] = i
+      for (i = 32; i < 127; i++) ord[sprintf("%c", i)] = i
+      k = "\"" ENVIRON["HM_K"] "\":\""
+      for (i = 1; i <= length(k); i++) p[i - 1] = ord[substr(k, i, 1)]
+      m = length(k)
+    }
+    { for (i = 1; i <= NF; i++) b[n++] = h[substr($i, 1, 1)] * 16 + h[substr($i, 2, 1)] }
+    END {
+      for (i = 1; i + m <= n; i++) {
+        if (b[i - 1] != 44 && b[i - 1] != 123) continue
+        j = 0
+        while (j < m && b[i + j] == p[j]) j++
+        if (j == m) break
+      }
+      if (i + m > n) exit 1
+      for (j = i + m; j < n && b[j] != 34; ) {
+        if (b[j] != 92) { out(b[j]); j++; continue }
+        e = b[j + 1]
+        if (e == 117) {
+          v = hex4(j + 2); j += 6
+          if (v >= 55296 && v < 56320 && b[j] == 92 && b[j + 1] == 117 && (w = hex4(j + 2)) >= 56320 && w < 57344) { v = 65536 + (v - 55296) * 1024 + w - 56320; j += 6 }
+          utf8(v)
+          continue
+        }
+        out(e == 110 ? 10 : e == 116 ? 9 : e == 114 ? 13 : e == 98 ? 8 : e == 102 ? 12 : e)
+        j += 2
+      }
+    }'
+}
+
+# The number after `"KEY":` in LINE (as json_str finds the key), or nothing.
+json_num() { printf '%s\n' "$2" | sed -n "s/.*[{,]\"$1\":\([0-9.]*\).*/\1/p"; }
+
+# The config dir of arm ARM (on or off) in STAGE/ARM: config.toml without its ext key (the ext dir is the arm's own),
+# AGENTS.md with the mods cards block replaced by NAME's card in the on arm and by none in the off arm, and in the on
+# arm the one link ext/NAME -> DIR. No allow file and no port link: std history, std policy in auto mode.
+eval_arm() { # ARM NAME DIR
+  local a="$STAGE/$1"
+  mkdir -p "$a/ext" "$a/state" && chmod 700 "$a" || die "cannot make $a; fix: check TMPDIR"
+  : >"$a/block"
+  if [ -f "$CONF/config.toml" ]; then
+    awk '{ l = $0; sub(/^[ \t]+/, "", l) } l !~ /^ext[ \t]*=/' "$CONF/config.toml" >"$a/config.toml"
+  else
+    : >"$a/config.toml"
+  fi
+  chmod 600 "$a/config.toml"
+  if [ "$1" = on ]; then
+    ln -s -- "$3" "$a/ext/$2" || die "cannot link $a/ext/$2; fix: check TMPDIR"
+    if [ -f "$3/.henki/card.md" ]; then
+      {
+        say "$CARDS_BEGIN"
+        cat "$3/.henki/card.md"
+        [ -z "$(tail -c 1 "$3/.henki/card.md")" ] || echo
+        say "$CARDS_END"
+      } >"$a/block"
+    fi
+  fi
+  splice "$a/block" "$a/AGENTS.md" || die "$ERR"
+  [ -s "$a/AGENTS.md" ] || rm -f "$a/AGENTS.md"
+}
+
+# Run N of task T in arm ARM: setup in a fresh work dir, `henki run --json -` on prompt.txt with the arm's config dir
+# and state dir (fake-bin/ first on PATH), then check in that dir with the answer's text on stdin. Counts into the
+# arm's P_ARM (passes), N_ARM (runs) and S_ARM (henki's seconds), and prints a line.
+eval_run() { # T ARM
+  local t=$1 arm=$2 w line text status steps secs s pass=fail fb="" max_steps="" max_secs=$EVAL_SECONDS rc=0
+  RUN_N=$((RUN_N + 1))
+  w="$STAGE/run/$RUN_N"
+  mkdir -p "$w/work" || die "cannot make $w; fix: check TMPDIR"
+  (cd "$w/work" && EVAL_DIR=$t exec "$t/setup") </dev/null >"$w/setup" 2>&1 || rc=$?
+  if [ "$rc" != 0 ]; then
+    tail -n 20 "$w/setup" | sed 's/^/  | /' >&2
+    die "${t##*/}: setup exited $rc (its last lines above); fix: run $t/setup in an empty dir to see why"
+  fi
+  [ ! -d "$t/fake-bin" ] || fb="$t/fake-bin:"
+  if [ -f "$t/task.toml" ]; then
+    max_steps=$(toml max_steps <"$t/task.toml" | cut -f 3)
+    max_secs=$(toml max_seconds <"$t/task.toml" | cut -f 3)
+    max_secs=${max_secs:-$EVAL_SECONDS}
+  fi
+  (cd "$w/work" && PATH="$fb$PATH" XDG_STATE_HOME="$STAGE/$arm/state" exec "$E_henki" run --json --approve auto \
+    --config "$STAGE/$arm/config.toml" ${E_model:+--model "$E_model"} --max-seconds "$max_secs" ${max_steps:+--max-steps "$max_steps"} - \
+    <"$t/prompt.txt" >"$w/out" 2>"$w/err")
+  line=$(tail -n 1 "$w/out")
+  case "$line" in *',"t":"result",'*) ;; *) line="" ;; esac
+  status=$(json_str status "$line") || status="no result: $(head -c 200 "$w/err" | tr '\n' ' ')"
+  steps=$(json_num steps "$line")
+  secs=$(json_num duration_s "$line")
+  text=$(json_str text "$line") || text=""
+  printf '%b' "$text" >"$w/text"
+  (cd "$w/work" && EVAL_DIR=$t exec "$t/check") <"$w/text" >"$w/check" 2>&1 && pass=pass
+  [ "$pass" = fail ] || eval "P_$arm=\$((P_$arm + 1))"
+  eval "s=\$S_$arm"
+  s=$(HM_A="$s" HM_B="${secs:-0}" awk 'BEGIN { printf "%.1f", ENVIRON["HM_A"] + ENVIRON["HM_B"] }')
+  eval "S_$arm=\$s N_$arm=\$((N_$arm + 1))"
+  printf '%-16s %-3s %s  (%s, %s steps, %s s)\n' "${t##*/}" "$arm" "$pass" "$status" "${steps:-0}" "${secs:-0}"
+  chmod -R u+w "$w" 2>/dev/null
+  rm -rf "$w"
+}
+
+# eval NAME|/DIR [--suite NAME|general|/DIR] [--repeats N] [--model M] [--yes]: the tasks of the suite (the module's
+# own eval/ by default) with the module on and off, the arms taking turns; 3 repeats, 13 when the arms end within one
+# pass of each other, or N. One eval/1 line per arm, printed and added to STATE/henki/eval.tsv. `eval --check DIR`:
+# the layout only.
+cmd_eval() {
+  local pkg="" suite="" reps="" yes=0 dir name ver hd1 sdir label n model total r t a tty answer st line p c s
+  E_model=""
+  if [ "${1:-}" = --check ]; then
+    [ $# = 2 ] || usage
+    eval_check "$2" || die "$ERR"
+    say "$2: ok: eval/1, $(printf '%s' "$E_tasks" | awk 'NF' | wc -l | tr -d ' ') tasks"
+    return 0
+  fi
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --suite | --repeats | --model)
+        [ $# -ge 2 ] || usage
+        case "$1" in --suite) suite=$2 ;; --repeats) reps=$2 ;; *) E_model=$2 ;; esac
+        shift 2
+        ;;
+      --yes | -y) yes=1 && shift ;;
+      -*) usage ;;
+      *) [ -z "$pkg" ] && pkg=$1 && shift || usage ;;
+    esac
+  done
+  [ -n "$pkg" ] || usage
+  case "$reps" in '' | [1-9] | [1-9][0-9]) ;; *) die "--repeats $reps: not a number from 1 to 99; fix: name one" ;; esac
+  case "$E_model$suite" in *"$tab"* | *"$nl"*) die "a tab or a newline in --model or --suite; fix: name them without one" ;; esac
+  case "${HENKI_DEPTH:-0}" in 0) ;; *) die "eval starts henki, and this runs inside henki (HENKI_DEPTH=$HENKI_DEPTH); fix: run henki mods eval in a terminal outside henki" ;; esac
+  STAGE=$(mktemp -d "${TMPDIR:-/tmp}/henki-mods.XXXXXX") || die "cannot make a scratch dir; fix: check TMPDIR"
+  STAGE_LIST="$STAGE/list"
+  E_henki=$(henki_bin)
+  case "$pkg" in
+    /* | ./* | ../*)
+      [ -d "$pkg" ] || die "$pkg is not a directory; fix: name a module directory"
+      dir=$(cd -P "$pkg" && pwd)
+      inspect "$dir" "${dir##*/}" 0 || die "$ERR"
+      name=$I_name ver=${M_version:--} hd1=$I_hd1
+      ;;
+    *)
+      lock_check
+      lock_get "$pkg" || die "$pkg is not added; fix: henki-mods add SRC first, or name a module directory by its path"
+      dir=$(store_of)
+      inspect "$dir" "$pkg" 0 || die "$pkg: $ERR"
+      [ "$I_hd1" = "$L_hd1" ] || die "the store copy $dir does not match the lock (it changed); fix: henki-mods rm $pkg and add it again"
+      name=$pkg ver=$L_version hd1=$L_hd1
+      ;;
+  esac
+  case "$suite" in
+    '') sdir="$dir/eval" label=$name ;;
+    general)
+      sdir=$(eval_general) || die "no general suite found; fix: reinstall henki"
+      label=general
+      ;;
+    /*) sdir=$suite label=$suite ;;
+    *)
+      lock_check
+      lock_get "$suite" || die "$suite is not added; fix: name general, an added module or a directory of tasks"
+      sdir="$(store_of)/eval" label=$suite
+      ;;
+  esac
+  [ -d "$sdir" ] || die "$label has no eval/ tasks; fix: henki-mods eval $pkg --suite general"
+  eval_check "$sdir" || die "$ERR"
+  n=$(printf '%s' "$E_tasks" | awk 'NF' | wc -l | tr -d ' ')
+  model=${E_model:-${HENKI_MODEL:-$(toml model <"$CONF/config.toml" 2>/dev/null | cut -f 3)}}
+  model=${model:--}
+  say "eval: $name $ver ($hd1) on $label, $n tasks, model $model"
+  say "  arms: $name on, $name off; each a copy of $(shown "$CONF/config.toml") and AGENTS.md with no other module"
+  case "$reps" in
+    '') say "  3 runs of each task per arm, 13 when the arms end within one pass of each other" ;;
+    1) say "  1 run of each task per arm" ;;
+    *) say "  $reps runs of each task per arm" ;;
+  esac
+  say "  each task's setup and check run as you, and henki with approve = auto: the model's calls run without asking"
+  if [ "$yes" != 1 ]; then
+    tty=${HENKI_MODS_TTY:-/dev/tty}
+    (: <"$tty") 2>/dev/null || die "no terminal to ask on; fix: run it in a terminal, or add --yes once you have read the screen above"
+    if [ -c "$tty" ]; then printf 'eval? [y/N] ' >"$tty"; else printf 'eval? [y/N] \n' >&2; fi
+    read -r answer <"$tty" || answer=""
+    case "$answer" in y | Y | yes | YES) ;; *) die "not run (the answer was no); fix: run eval again and answer y" ;; esac
+  fi
+  eval_arm on "$name" "$dir"
+  eval_arm off "$name" "$dir"
+  P_on=0 P_off=0 N_on=0 N_off=0 S_on=0 S_off=0 RUN_N=0 total=${reps:-3} r=0
+  while [ "$r" -lt "$total" ]; do
+    r=$((r + 1))
+    while IFS= read -r t; do
+      [ -n "$t" ] || continue
+      # The arms take turns going first, so neither always meets a cold server.
+      for a in $([ $((r % 2)) = 1 ] && echo on off || echo off on); do eval_run "$t" "$a"; done
+    done <<TASKS
+$E_tasks
+TASKS
+    if [ -z "$reps" ] && [ "$total" = 3 ] && [ "$r" = 3 ] && [ $((P_on - P_off)) -le 1 ] && [ $((P_off - P_on)) -le 1 ]; then
+      total=13
+      say "the arms are within one pass of each other after 3 repeats: 10 more"
+    fi
+  done
+  st=${XDG_STATE_HOME:-}
+  case "$st" in /*) ;; *) st="$HOME/.local/state" ;; esac
+  mkdir -p "$st/henki" || die "cannot make $st/henki; fix: make it a directory you own"
+  for a in on off; do
+    eval "p=\$P_$a c=\$N_$a s=\$S_$a"
+    line=$(printf 'eval/1\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s' "$name" "$ver" "$hd1" "$model" "$label" "$a" "$p" "$c" "$s")
+    say "$line"
+    printf '%s\n' "$line" >>"$st/henki/eval.tsv" || die "cannot write $st/henki/eval.tsv; fix: make it writable"
+  done
+  say "$name: on $P_on of $N_on passed, off $P_off of $N_off; added to $(shown "$st/henki/eval.tsv")"
+}
+
 # --- allow rules -------------------------------------------------------------------------------------------------------
 
 # henki's allow file: ROOT<TAB>COMMAND per line, the user's standing approvals. henki reads it at start and appends to it
@@ -1983,6 +2324,7 @@ case "${1:-list}" in
   allow) shift && cmd_allow "$@" ;;
   swap) shift && cmd_swap "$@" ;;
   test) shift && cmd_test "$@" ;;
+  eval) shift && cmd_eval "$@" ;;
   help | -h | --help)
     usage 2>&1 | sed 's/^usage: //;s/^       //'
     exit 0

@@ -1,0 +1,5 @@
+#!/bin/sh
+# The answer names Ada Lovelace and not the author of the rewrite.
+a=$(cat)
+case "$a" in *'Ada Lovelace'*) ;; *) exit 1 ;; esac
+case "$a" in *'Alan Turing'*) exit 1 ;; esac

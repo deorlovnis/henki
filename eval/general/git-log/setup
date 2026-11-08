@@ -1,0 +1,12 @@
+#!/bin/sh
+# A repository of three commits by three authors; the second adds parser.c, the third rewrites it.
+set -e
+g() { git -c commit.gpgsign=false -c core.hooksPath=/dev/null "$@"; }
+c() { GIT_AUTHOR_NAME=$1 GIT_AUTHOR_EMAIL=$2 GIT_COMMITTER_NAME=$1 GIT_COMMITTER_EMAIL=$2 GIT_AUTHOR_DATE=$3 GIT_COMMITTER_DATE=$3 g commit -q -m "$4"; }
+g init -q .
+echo 'int main(void) { return 0; }' >main.c && g add main.c
+c 'Grace Hopper' grace@example.invalid 2026-01-05T10:00:00Z 'Add main'
+echo '/* parse */' >parser.c && g add parser.c
+c 'Ada Lovelace' ada@example.invalid 2026-01-06T10:00:00Z 'Add the parser'
+echo '/* parse, again */' >parser.c && g add parser.c
+c 'Alan Turing' alan@example.invalid 2026-01-07T10:00:00Z 'Rewrite the parser'

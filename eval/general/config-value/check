@@ -1,0 +1,5 @@
+#!/bin/sh
+# app.ini is the file setup wrote with the server's timeout 30, every other line as it was.
+cat >/dev/null
+want=$(printf '; app settings\n[client]\ntimeout = 10\nretries = 3\n\n[server]\nhost = 0.0.0.0\ntimeout = 30\nworkers = 4\n')
+[ "$(cat app.ini)" = "$want" ]

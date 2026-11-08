@@ -1,0 +1,6 @@
+#!/bin/sh
+# The answer holds 7 as a number of its own and new.txt's navy, not old.txt's teal.
+a=$(cat)
+case " $(printf '%s' "$a" | tr -c '0-9' ' ') " in *" 7 "*) ;; *) exit 1 ;; esac
+case "$a" in *navy*) ;; *) exit 1 ;; esac
+case "$a" in *teal*) exit 1 ;; esac

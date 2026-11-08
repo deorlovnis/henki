@@ -1,0 +1,1 @@
+old.txt and new.txt differ in one line. Which line number is it, and what does new.txt hold there? Answer as NUMBER: TEXT.

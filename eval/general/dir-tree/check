@@ -1,0 +1,5 @@
+#!/bin/sh
+# site/ holds exactly the tree asked for, and index.html is an empty file.
+cat >/dev/null
+[ "$(cd site && find . | LC_ALL=C sort | tr '\n' ' ')" = ". ./css ./img ./img/icons ./index.html ./js " ] || exit 1
+[ -d site/css ] && [ -d site/js ] && [ -d site/img/icons ] && [ -f site/index.html ] && [ ! -s site/index.html ]

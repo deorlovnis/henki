@@ -43,6 +43,7 @@ A program reads the contracts this henki ships from the rows of this table: each
 | `lock/1` | henki-mods | the module lock, `mods.lock` |
 | `bind/1` | henki-mods | the lock lines of bound ports, in `mods.lock` |
 | `hd1` | henki-mods | the tree hash that pins a module's files |
+| `eval/1` | henki-mods | a module's eval tasks, the two arms they run in, and the line that records them |
 
 ## journal/1
 
@@ -349,7 +350,7 @@ NAME/cmd/CMD             a user command /CMD (handoff/1); CMD as for bin/, not e
 NAME/cmd/CMD.md          data for a command: a text (below)
 NAME/on/EVENT            an observer of EVENT (observe/1); EVENT.wait for turn_start and call_start
 NAME/port/PORT           a binding program (port/1); run only through a link in CONFIG_DIR/port/
-NAME/eval/...            the manager's; henki ignores it
+NAME/eval/...            tasks for the manager (eval/1); henki ignores them
 NAME/README* LICENSE* CHANGELOG* .*   ignored
 ```
 
@@ -478,7 +479,7 @@ ports = ["history"]              # optional; exactly the programs in port/ (port
 
 A module without a manifest is unmanaged (allowed for path and URL installs, and listed as such). `port/PORT` is a
 program its owner can run (a file, or a link inside the module), PORT one that henki binds (`history`). `cmd/` and
-`eval/` are ext/2's, `on/` observe/1's; `.henki/template` may hold a program that `cmd/` links run. The directory
+`eval/` are ext/2's (`eval/` holds eval/1 tasks), `on/` observe/1's; `.henki/template` may hold a program that `cmd/` links run. The directory
 `ctx/` is reserved for a later layout: henki-mods refuses it.
 
 A git source (`URL[@REF][#SUBDIR]`) is cloned only over `https`, `http`, `ssh`, `git` or `file` URLs, or scp's
@@ -648,3 +649,45 @@ NAME INST REQUEST EXPECT [SAVE]
   `henki port` must end within 1 s of its stdin closing, and the program run alone must exit within 1 s of EOF on its
   stdin. The std binding passes the same file in henki's own tests.
 
+
+## eval/1
+
+Owned by henki-mods; henki never reads it. A module's `eval/` holds tasks that show what it does for a model, and the
+general suite (`share/henki/eval/general/` in a release, `eval/general/` in the repository) holds everyday shell tasks,
+run to show that a module costs a model nothing on tasks it is not for. Each task is a directory, named as a module is:
+
+```
+TASK/prompt.txt          required: the task, 1 to 4 KiB of UTF-8 without a code point henki escapes
+TASK/setup               required: a program that makes the task's files in an empty work dir
+TASK/check               required: a program; exit 0 is a pass
+TASK/fake-bin/CMD        optional: programs first on PATH in the run (a tool the task's machine lacks, or must not run)
+TASK/task.toml           optional, module/1's grammar: max_steps (1 to 10000), max_seconds (1 to 9999; default 120)
+```
+
+Dot files are ignored anywhere, and so are `README*` and `LICENSE*` next to the tasks; anything else is refused.
+`henki-mods eval --check DIR` checks this layout and runs nothing; `add` and `verify --dir` check a module's `eval/`.
+
+- **A run.** `setup` runs in a new empty work dir with `EVAL_DIR` (the task's directory) and stdin empty; a setup that
+  fails stops the eval. Then, in that dir, `henki run --json --approve auto --config ARM/config.toml [--model M]
+  --max-seconds S [--max-steps N] -` with prompt.txt on stdin, `fake-bin/` first on PATH and `XDG_STATE_HOME` the
+  arm's. Then `check` runs in the same dir with `EVAL_DIR`, and on stdin the `text` of henki's `result` record
+  (json/1), byte for byte, with no newline added. Its exit status is the result; what it prints is not kept.
+- **The arms.** The module on and the module off, each a config dir of its own: the user's `config.toml` without its
+  `ext` key, the user's `AGENTS.md` with the mods cards block holding only the module's card (on) or none (off), the
+  link `ext/NAME` to the module (on) or no module (off), no allow file and no port link. In each repeat every task
+  runs once per arm, the arms taking turns going first. 3 repeats; when the arms' passes then differ by at most one,
+  10 more; `--repeats N` runs exactly N.
+- **The record.** Per arm one line, printed and appended to `$XDG_STATE_HOME/henki/eval.tsv` (else
+  `~/.local/state/henki/eval.tsv`), fields separated by tabs:
+
+```
+eval/1 PKG VERSION HD1 MODEL SUITE ARM PASSES RUNS SECONDS
+```
+
+  PKG is the module's name, VERSION its manifest's (`-` without one), HD1 its tree hash, MODEL `--model`, else
+  `HENKI_MODEL`, else the config's `model` (`-` with none), SUITE the module's name (its own tasks), `general`, another
+  module's name or a suite's path, ARM `on` or `off`, PASSES and RUNS counts, SECONDS the sum of the runs'
+  `duration_s`.
+- **The general suite** uses POSIX tools and git only, no network, and every check is deterministic.
+- eval runs a module's `setup` and `check` as the user, and henki with `approve = "auto"`, so it shows what it will run
+  and asks first (`--yes` once the screen was read); it refuses to run inside henki (`HENKI_DEPTH` set).

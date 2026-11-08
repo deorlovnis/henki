@@ -1,0 +1,5 @@
+#!/bin/sh
+# The answer holds 8443 and none of the other two ports.
+a=" $(tr -c '0-9' ' ') "
+case "$a" in *" 8443 "*) ;; *) exit 1 ;; esac
+case "$a" in *" 5432 "* | *" 9443 "*) exit 1 ;; esac

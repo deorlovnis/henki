@@ -1,0 +1,5 @@
+#!/bin/sh
+# The answer holds 19 as a number of its own, and not 23 (the lines that merely contain 404).
+a=" $(tr -c '0-9' ' ') "
+case "$a" in *" 19 "*) ;; *) exit 1 ;; esac
+case "$a" in *" 23 "*) exit 1 ;; esac

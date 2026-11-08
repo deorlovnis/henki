@@ -1,0 +1,1 @@
+How many lines of access.log have the HTTP status 404? Answer with the number.

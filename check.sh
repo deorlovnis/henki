@@ -457,12 +457,13 @@ cargo clippy --locked --all-targets -- -D warnings
 step tests
 cargo test --locked
 
-# The module manager: its own suite (hermetic, with a live prompt check against the henki the tests just built),
-# then the official modules: their own tests, and the layout henki loads.
-step "mods (manager/tests.sh, manager/mods-tests.sh, mods/*/)"
+# The module manager: its own suite (hermetic, with live prompt and eval checks against the henki the tests just
+# built), then the official modules: their own tests, and the layout henki loads; then the general eval suite's layout.
+step "mods (manager/tests.sh, manager/mods-tests.sh, mods/*/, eval/general/)"
 MODS_TEST_HENKI="$target/debug/henki" manager/tests.sh
 manager/mods-tests.sh
 gate_mods mods
+manager/henki-mods eval --check eval/general
 
 step "lines of code (src/, non-test)"
 gate_lines src

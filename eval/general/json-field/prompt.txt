@@ -1,0 +1,1 @@
+What is the value of server.port in config.json (the port key directly under server)? Answer with the value only.

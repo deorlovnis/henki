@@ -1,0 +1,2 @@
+#!/bin/sh
+printf 'one two three\nfour\n' >sample.txt

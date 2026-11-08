@@ -1,0 +1,3 @@
+#!/bin/sh
+# The answer names data/c/d/e/huge.bin.
+command grep -q 'data/c/d/e/huge\.bin'

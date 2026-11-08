@@ -1,0 +1,6 @@
+#!/bin/sh
+# photos/ holds exactly the renamed files and the others, each with its own bytes.
+cat >/dev/null
+[ "$(cd photos && ls | LC_ALL=C sort | tr '\n' ' ')" = "already.jpg beach-01.jpg beach-02.jpg city.night.jpg dog.jpg notes.txt raw.JPG.bak " ] || exit 1
+for n in beach-01 beach-02 city.night dog; do [ "$(cat "photos/$n.jpg")" = "$n" ] || exit 1; done
+[ "$(cat photos/raw.JPG.bak)" = keep ]

@@ -1,0 +1,1 @@
+Which file under data/ is the largest? Answer with its path, relative to this directory.

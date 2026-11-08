@@ -1,0 +1,13 @@
+#!/bin/sh
+# access.log: 60 requests, 19 of them with the status 404; four more hold 404 elsewhere (a path, a size), so counting
+# the lines that merely contain 404 gives 23.
+awk 'BEGIN {
+  for (i = 1; i <= 60; i++) {
+    status = (i % 5 == 0 || i % 7 == 3) ? 404 : 200
+    path = "/page/" i
+    size = 512 + i
+    if (i == 8 || i == 22) path = "/404.html"
+    if (i == 41 || i == 53) size = 404
+    printf "10.0.0.%d - - [01/Mar/2026:10:%02d:00 +0000] \"GET %s HTTP/1.1\" %d %d\n", i, i - 1, path, status, size
+  }
+}' >access.log

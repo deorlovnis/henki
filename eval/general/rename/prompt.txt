@@ -1,0 +1,1 @@
+In photos/, rename every file whose name ends in .JPG so that it ends in .jpg instead. Change nothing else.
