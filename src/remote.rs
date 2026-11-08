@@ -21,8 +21,8 @@ pub const LINE_MAX: usize = 16 << 20;
 const READ_MAX: usize = 256 << 20;
 /// The contract timeout of each method in ms, and whether a signal or the deadline ends the wait (side-effect free only).
 #[rustfmt::skip]
-const METHODS: [(&str, u64, bool); 10] = [("hello", 5_000, true), ("create", 2_000, true), ("open", 5_000, true), ("read", 10_000, true), ("list", 5_000, true),
-    ("append", 2_000, false), ("discard", 2_000, false), ("decide", 5_000, true), ("record", 2_000, false), ("bye", 300, false)];
+const METHODS: [(&str, u64, bool); 11] = [("hello", 5_000, true), ("create", 2_000, true), ("open", 5_000, true), ("read", 10_000, true), ("list", 5_000, true),
+    ("append", 2_000, false), ("discard", 2_000, false), ("fork", 10_000, true), ("decide", 5_000, true), ("record", 2_000, false), ("bye", 300, false)];
 
 /// One line from the binding: the object and its length, or why the binding is broken.
 type Line = Result<(Value, usize), String>;
@@ -230,6 +230,15 @@ impl History for Remote {
 
     fn discard(&mut self, session: &str) -> Result<bool, PortError> {
         Ok(self.call("discard", json!({"session": session}))?["removed"] == true)
+    }
+
+    /// Only with cap `fork` (else `unsupported`, before anything is sent).
+    fn fork(&mut self, scope: &Path, session: &str, line: u64) -> Result<String, PortError> {
+        if !self.caps.iter().any(|c| c == "fork") {
+            let fix = format!("fix: henki --resume={session} goes on with the whole session, or bind a history that can fork (henki mods swap history PKG)");
+            return Err(err("unsupported", format!("history binding {} cannot fork (its hello lists no fork); {fix}", self.name)));
+        }
+        id(&self.call("fork", json!({"line": line, "scope": utf8(scope)?, "session": session}))?).map_err(|e| self.fail(e))
     }
 }
 

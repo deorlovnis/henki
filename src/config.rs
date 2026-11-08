@@ -75,6 +75,7 @@ pub struct Config {
     pub exec: Option<PathBuf>, // the exec/1 binding's program (`port::bind`), put in front of every shell call
     pub context: String,       // the context sources' texts (`ext::sources`), for the system prompt after AGENTS.md
     pub sources: Vec<Value>,   // the `session` record's `sources`: {name, bytes, hash} of each source that counted
+    pub parent: Option<Value>, // a fork's `session` record's `parent`: {id, line} (`journal::start`)
 }
 
 /// The HENKI_* variables henki reads or sets for its children; any other gives a notice.

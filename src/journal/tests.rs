@@ -61,7 +61,7 @@ fn resume(state: &Path, cwd: &Path, id: Option<&str>, cfg: &Config) -> Result<Re
     let mut c = Config::test(Path::new("/"));
     (c.cwd, c.dialect, c.model, c.tools) = (cwd.into(), cfg.dialect, cfg.model.clone(), cfg.tools.clone());
     let mut h = Journal::new(state);
-    let (id, hist, _, notices) = start(&mut h, &Some(id.map(String::from)), &c)?;
+    let (id, hist, _, notices) = start(&mut h, &Some(id.map(String::from)), &mut c)?;
     let (from_bytes, n) = (h.held.as_ref().unwrap().from, spill_n(state, &id, &hist));
     Ok(Resumed { journal: J { h, id, n }, hist, from_bytes, notices })
 }
@@ -1184,6 +1184,122 @@ fn journal_every_close_checked() {
     assert_eq!(journal_err("tampered", f.resume(Some(&id))), format!("journal modified outside henki: {}", path.display()));
 }
 
+/// `start` for `--resume=AT` (`ID@N`: a fork) in the scope `cwd` with the fixture's config there: the begun session,
+/// still held, and the config `start` left (`parent`, the notices).
+fn fork_at(f: &Fx, cwd: &Path, at: &str) -> Result<(Journal, Begun, Config), Outcome> {
+    let mut c = Config::test(&f.tmp.0);
+    c.cwd = cwd.into();
+    let mut h = Journal::new(&f.state);
+    let b = start(&mut h, &Some(Some(at.into())), &mut c)?;
+    Ok((h, b, c))
+}
+
+/// Every session file of the state dir, in any scope.
+fn sessions(state: &Path) -> Vec<PathBuf> {
+    let mut all: Vec<PathBuf> = ls(state.join("sessions")).flat_map(ls).collect();
+    all.sort();
+    all
+}
+
+/// A fork's lines 1 to N-1 are the parent's, byte for byte, then `close` at its offset; it lives in the cwd's scope with
+/// a new id, the parent is unchanged (a torn tail there stays and is not copied), `parent` names the point, and the
+/// history is the prefix's. A fork of a fork keeps the root's lines.
+#[test]
+fn journal_fork_copies_the_prefix() {
+    let f = fx();
+    let (id, path) = f.closed(&[rec::user("a"), asst(&["c1"]), res("c1"), asst(&[]), rec::user("b"), asst(&[])]);
+    fs::OpenOptions::new().append(true).open(&path).unwrap().write_all(b"{\"t\":\"us").unwrap();
+    let before = fs::read(&path).unwrap();
+    let other = f.tmp.0.join("other");
+    fs::create_dir_all(&other).unwrap();
+    let (mut h, (sid, hist, repairs, notices), c) = fork_at(&f, &other, &format!("{id}@6")).unwrap();
+    assert_ne!(sid, id);
+    let forked = h.held.as_ref().unwrap().path.clone();
+    assert_eq!(forked.parent().unwrap().file_name().unwrap().to_str().unwrap(), scope(&other).unwrap());
+    let (parent, child) = (fs::read(&path).unwrap(), fs::read(&forked).unwrap());
+    let head: usize = parent.split_inclusive(|&b| b == b'\n').take(5).map(<[u8]>::len).sum();
+    assert_eq!(child[..head], parent[..head]);
+    let close: Value = serde_json::from_slice(&child[head..]).unwrap();
+    assert_eq!((&close["t"], close["bytes"].as_u64()), (&json!("close"), Some(head as u64)));
+    assert_eq!(parent, before, "the parent changed");
+    assert_eq!(hist.iter().map(|r| r["t"].as_str().unwrap()).collect::<Vec<_>>(), ["user", "assistant", "tool_result", "assistant"]);
+    assert!(repairs.is_empty());
+    assert_eq!(notices, [format!("cwd changed since the session started: {:?} -> {:?}", f.cwd, other)], "only the replay of the copy");
+    assert_eq!(c.parent, Some(json!({"id": id, "line": 6})));
+    assert!(c.notices.contains(&format!("forked from session {id} at line 6")), "{:?}", c.notices);
+    // The kernel's next records go on as for a resume: `session` with `resumed` and `parent`.
+    let s = put(&mut h, &sid, rec::session(&c, &sid, &other, true, &[])).unwrap();
+    assert_eq!((&s["parent"], s["resumed"]["from_bytes"].as_u64()), (&json!({"id": id, "line": 6}), Some(child.len() as u64)));
+    put(&mut h, &sid, rec::user("c")).unwrap();
+    put(&mut h, &sid, rec::close()).unwrap();
+    drop(h);
+    // A fork of the fork, at its own user record (line 8): lines 1-5 are still the root's.
+    let (h2, (sid2, hist2, ..), c2) = fork_at(&f, &f.cwd, &format!("{sid}@8")).unwrap();
+    let grand = fs::read(&h2.held.as_ref().unwrap().path).unwrap();
+    assert_eq!((grand[..head] == parent[..head], hist2.len(), c2.parent), (true, 4, Some(json!({"id": sid, "line": 8}))));
+    assert_ne!(sid2, sid);
+    // The parent of a fork is not held: a plain --resume of it still works.
+    drop(h2);
+    assert!(f.resume(Some(&id)).is_ok());
+}
+
+/// A fork that fails a check creates nothing: not a user line, a line past the end, N not a number, a bad id, a missing
+/// parent, another dialect, a tampered parent, an unpaired prefix. A plain --resume then opens the previous session.
+#[test]
+fn journal_fork_refused_leaves_nothing() {
+    let f = fx();
+    let (id, path) = f.closed(&[rec::user("a"), asst(&["c1"]), res("c1"), rec::user("b")]);
+    let all = sessions(&f.state);
+    let cases = [
+        (format!("{id}@3"), "config", format!("--resume={id}@3: line 3 is not a user record")),
+        (format!("{id}@9"), "config", format!("--resume={id}@9: line 9 is not a user record")),
+        (format!("{id}@1"), "config", format!("--resume={id}@1: ID@N names a session and the line of a user record in it")),
+        (format!("{id}@x"), "config", format!("--resume={id}@x: ID@N names a session and the line of a user record in it")),
+        ("../x@2".into(), "config", "--resume=../x@2: ID@N names a session and the line of a user record in it".into()),
+        ("none@2".into(), "journal", "no session none".into()),
+    ];
+    for (at, kind, want) in cases {
+        match fork_at(&f, &f.cwd, &at) {
+            Err(Outcome::Error { kind: k, message }) => assert_eq!((k, message), (kind, want), "{at}"),
+            _ => panic!("{at}: not refused"),
+        }
+        assert_eq!(sessions(&f.state), all, "{at}");
+    }
+    let mut anthropic = Config::test(&f.tmp.0);
+    (anthropic.cwd, anthropic.dialect) = (f.cwd.clone(), "anthropic");
+    let other = f.plant("other", &[rec::session(&anthropic, "other", &f.cwd, false, &[]), rec::user("a"), rec::user("b")]);
+    let e = fork_at(&f, &f.cwd, "other@3").err().unwrap();
+    assert_eq!(e, Outcome::error("journal", format!("{}: the session's dialect is anthropic, not openai", other.display())));
+    f.plant("other", &[rec::session(&f.cfg, "other", &f.cwd, false, &[]), rec::close(), rec::user("b")]);
+    assert_eq!(fork_at(&f, &f.cwd, "other@3").err().unwrap(), Outcome::error("tampered", format!("journal modified outside henki: {}", other.display())));
+    f.plant("other", &[rec::session(&f.cfg, "other", &f.cwd, false, &[]), rec::user("a"), asst(&["c9"]), rec::user("b")]);
+    assert_eq!(fork_at(&f, &f.cwd, "other@4").err().unwrap(), Outcome::error("config", "--resume=other@4: call \"c9\" has no result".to_string()));
+    fs::remove_file(&other).unwrap();
+    assert_eq!(sessions(&f.state), all);
+    let r = f.resume(None).unwrap();
+    assert_eq!(r.journal.path(), path);
+}
+
+/// The std binding's `fork` alone: line `line` must be a user record of whole lines, and the parent may be held.
+#[test]
+fn journal_fork_binding() {
+    let f = fx();
+    let (id, path) = f.session(&[rec::user("a")]);
+    let _held = hold(&path);
+    let mut h = Journal::new(&f.state);
+    for line in [0, 1, 3, u64::MAX] {
+        assert!(matches!(h.fork(&f.cwd, &id, line), Err(PortError { code: "invalid", .. })), "{line}");
+    }
+    assert!(matches!(h.fork(&f.cwd, "none", 2), Err(PortError { code: "not_found", .. })));
+    assert_eq!(sessions(&f.state), std::slice::from_ref(&path));
+    let sid = h.fork(&f.cwd, &id, 2).unwrap();
+    let first = fs::read(&path).unwrap().split_inclusive(|&b| b == b'\n').next().unwrap().to_vec();
+    assert_eq!(
+        (fs::read(f.state.join("sessions").join(scope(&f.cwd).unwrap()).join(format!("{sid}.jsonl"))).unwrap(), h.held.as_ref().unwrap().bytes),
+        (first.clone(), first.len() as u64)
+    );
+}
+
 /// An unheld read takes no lock and changes nothing: a torn tail is skipped, not cut; a held one is cut.
 #[test]
 fn journal_read_unheld() {
@@ -1235,7 +1351,8 @@ fn conform_match_rules() {
 
 /// conform/1's history suite (manager/conform/history.tsv), the file every outside binding is held to, run against the
 /// std binding: one `Journal` per instance, the answers rendered as `henki port` renders them. Std speaks no protocol,
-/// so the hello and version steps are skipped; `list` reads the store as `pick` does.
+/// so the hello and version steps are skipped; `list` reads the store as `pick` does. Std forks, so the `#cap fork`
+/// steps run.
 #[test]
 fn conform_history_std() {
     let t = Tmp::new();
@@ -1269,6 +1386,7 @@ fn conform_history_std() {
             "read" => h.read(p["session"].as_str().unwrap()).map(|t| json!({"records": t.records[p["from"].as_u64().unwrap() as usize..]})),
             "append" => h.append(p["session"].as_str().unwrap(), p["record"].clone()).map(|_| Value::Null),
             "discard" => h.discard(p["session"].as_str().unwrap()).map(|r| json!({"removed": r})),
+            "fork" => h.fork(&path(p), p["session"].as_str().unwrap(), p["line"].as_u64().unwrap()).map(|s| json!({"session": s})),
             "list" => {
                 let dir = state.join("sessions").join(super::scope(&path(p)).unwrap());
                 let mut found: Vec<(SystemTime, String)> =
@@ -1289,5 +1407,5 @@ fn conform_history_std() {
         steps += 1;
         checks += usize::from(!name.ends_with(|c: char| c.is_ascii_lowercase()));
     }
-    assert_eq!((steps, checks), (27, 22), "the suite changed: say so here (std skips H01, H02 and the kill)");
+    assert_eq!((steps, checks), (32, 26), "the suite changed: say so here (std skips H01, H02 and the kill; it has cap fork)");
 }

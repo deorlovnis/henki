@@ -27,8 +27,8 @@ use serde_json::Value;
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::{ffi::OsString, io, io::Read, path::PathBuf, process::ExitCode, time::Duration, time::Instant};
 
-const USAGE: &str = "usage: henki [--config FILE] [--approve ask|auto] [--model NAME] [--resume[=ID]] [--port PORT=std] [--nested]
-       henki run [--json] [--max-steps N] [--max-seconds N] [--approve ask|auto] [--config FILE] [--model NAME] [--resume[=ID]] [--port PORT=std] [--nested] [TASK | -]
+const USAGE: &str = "usage: henki [--config FILE] [--approve ask|auto] [--model NAME] [--resume[=ID[@N]]] [--port PORT=std] [--nested]
+       henki run [--json] [--max-steps N] [--max-seconds N] [--approve ask|auto] [--config FILE] [--model NAME] [--resume[=ID[@N]]] [--port PORT=std] [--nested] [TASK | -]
        henki mods [ARGS] | henki allow [rm N]
        henki --version | --help";
 
@@ -237,7 +237,7 @@ fn start(a: Args, tx: &Sender<Ev>, rx: &Receiver<Ev>, t0: Instant, early: io::Re
         return Err(Outcome::Budget);
     }
     let mut ports = port::bind(&mut cfg, *deadline)?;
-    let (sid, hist, mut head, notices) = journal::start(ports.history.as_mut(), &a.resume, &cfg)?;
+    let (sid, hist, mut head, notices) = journal::start(ports.history.as_mut(), &a.resume, &mut cfg)?;
     cfg.notices.extend(notices);
     head.push(journal::put(ports.history.as_mut(), &sid, rec::session(&cfg, &sid, &cfg.cwd, a.resume.is_some(), &ports.bound))?);
     Ok((cfg, ports, sid, hist, task, head, reader))

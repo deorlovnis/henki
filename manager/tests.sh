@@ -1470,14 +1470,15 @@ t_ports() {
   rc_is 0
   out_has "ok H01"
   out_has "ok eof"
-  out_has "history/1: 25 checks, 25 passed"
+  out_has "ok H29"
+  out_has "history/1: 29 checks, 29 passed"
   HENKI_MODS_TTY=/nonexistent/tty run swap history tree
   refused "no terminal to ask on"
   check "no link without a yes" [ ! -L "$CONF/port/history" ]
   run swap history tree --yes
   rc_is 0
   out_has "history: std -> tree 0.1.0 ("
-  out_has "conformance: passed (history/1, 25 checks) · it runs with your rights and stores every session record"
+  out_has "conformance: passed (history/1, 29 checks) · it runs with your rights and stores every session record"
   out_has "henki --port history=std --resume reaches them"
   local store id
   store=$(readlink "$CONF/ext/tree")
@@ -1550,8 +1551,16 @@ t_port_toy() {
   [ -x "$toy" ] || return 0
   run test --port history "$toy"
   rc_is 0
+  out_has "skipped: the checks for cap fork (the binding's hello lists no fork)"
+  out_lacks "H26"
   out_has "history/1: 25 checks, 25 passed"
-  for f in "--exit-at create:H04" "--garbage-at read:H10" "--huge-at list:H15" "--error-at discard:H22" "--no-durable:H20" "--chatty:H01"; do
+  printf '#!/bin/sh\nexec %s history --fork\n' "$toy" >"$W/forks"
+  chmod 755 "$W/forks"
+  run test --port history "$W/forks"
+  rc_is 0
+  out_has "ok H26"
+  out_has "history/1: 29 checks, 29 passed"
+  for f in "--exit-at create:H04" "--garbage-at read:H10" "--huge-at list:H15" "--error-at discard:H22" "--no-durable:H20" "--chatty:H01" "--fork --error-at fork:H26a"; do
     want=${f##*:}
     printf '#!/bin/sh\nexec %s history %s\n' "$toy" "${f%:*}" >"$W/faulty"
     chmod 755 "$W/faulty"

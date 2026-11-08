@@ -76,6 +76,9 @@ pub trait History {
     fn append(&mut self, session: &str, rec: Record) -> Result<Record, PortError>;
     /// Removes the held session this binding created when it got no `user` record; Ok(false) when it is kept.
     fn discard(&mut self, session: &str) -> Result<bool, PortError>;
+    /// A new held session in `scope` holding records 1 to `line` - 1 of `session` as `read` returns them; record `line`
+    /// must be a `user` record (`invalid`). The kernel checks that prefix first, then appends `close` and the rest.
+    fn fork(&mut self, scope: &Path, session: &str, line: u64) -> Result<String, PortError>;
 }
 
 /// The policy port's answer for one call.

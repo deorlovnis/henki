@@ -81,7 +81,7 @@ values of `args` and `blocks` are opaque JSON.
 
 | Kind | Fields |
 |---|---|
-| `session` | `t` `ts` `v` `henki` `id` `cwd` `model` `dialect` `base_url` `base_url_from` `approve` `approve_from` `config` `tools` `shell` `exts` `pass_env` `ctx` `config_hash` `allow_hash` `agents_hash` `project_agents_hash` `resumed` `resumed.from_bytes?` `ports?` `ports.history?` `ports.policy?` `sources?` `sources[].name?` `sources[].bytes?` `sources[].hash?` |
+| `session` | `t` `ts` `v` `henki` `id` `cwd` `model` `dialect` `base_url` `base_url_from` `approve` `approve_from` `config` `tools` `shell` `exts` `pass_env` `ctx` `config_hash` `allow_hash` `agents_hash` `project_agents_hash` `resumed` `resumed.from_bytes?` `ports?` `ports.history?` `ports.policy?` `sources?` `sources[].name?` `sources[].bytes?` `sources[].hash?` `parent?` `parent.id?` `parent.line?` |
 | `user` | `t` `ts` `msg` `msg.content` `msg.role` |
 | `assistant` | `t` `ts` `msg` `msg.content` `msg.role` `msg.tool_calls` `msg.tool_calls[].args` `msg.tool_calls[].id` `msg.tool_calls[].name` `msg.tool_calls[].raw?` `finish` `usage` `usage.cached` `usage.in` `usage.out` `blocks?` |
 | `ask` | `t` `ts` `id` `name` `args` `target?` |
@@ -106,6 +106,8 @@ values of `args` and `blocks` are opaque JSON.
   `sources` (only when a context source counted, ext/2) lists each one that did, in the order they ran: `name`
   (`MODULE/SOURCE`), `bytes` (its text's length) and `hash` (FNV-1a 64 of the text). The texts themselves are not
   journaled: a resume runs the sources again.
+  `parent` (a fork's first segment only): `id`, the session it was forked from, and `line`, the line of the `user`
+  record it was forked at.
 - `user` is a message from the user; `msg.role` is `user`. A session's first task starts with
   `cwd: DIR\nos: OS ARCH\ndate: YYYY-MM-DD\n\n`; later ones do not.
 - `assistant` is one model reply; `msg.role` is `assistant`, `msg.content` its text. Each `msg.tool_calls` entry is a
@@ -137,6 +139,13 @@ values of `args` and `blocks` are opaque JSON.
 
 - A file holds one or more segments; each starts with a `session` record. `henki --resume` (the newest unlocked session
   of this working directory's scope) or `--resume=ID` (any scope) appends a new segment to the same file.
+- A fork: `henki --resume=ID@N`, where line N of session ID (any scope) is a `user` record, makes a new session in this
+  working directory's scope with a new id. henki first checks lines 1 to N-1 (the dialect, tampering, pairing) and
+  creates nothing if they fail (`error config` or `error journal`). The fork's lines 1 to N-1 are byte for byte the
+  parent's lines 1 to N-1; a `close` follows, then the new segment's `session` record with `parent` and `resumed`. A
+  session's parent is the `parent` of its last `session` record that has one. Lines 1 to N-1 of a fork equal its
+  parent's, so a point in a tree of forks is (root id, line). A fork is an ordinary session: `--resume=ID` opens it with
+  no module installed. A fork of a session in use copies the complete lines present at that moment.
 - Resume reads whole lines. An incomplete last line (no `\n`) is a torn write: it is cut off, with a notice. A complete
   line that is not a JSON object fails the resume (`error journal`, `corrupt journal PATH:LINE`), and so does a file
   without a `session` record.
@@ -604,8 +613,8 @@ links say. `exec` speaks no protocol (exec/1): of this section only the link rul
   `exists`, `tampered`, `corrupt`, `version`; anything else arrives as `other`. henki adds `timeout`, `crashed`,
   `protocol`, `interrupted` (a signal) and `budget` (the session's time ran out).
 - **Timeouts.** `hello` 5 s, `create` 2 s, `open` 5 s, `read` 10 s per page, `list` 5 s, `append` 2 s, `discard` 2 s,
-  `decide` 5 s, `record` 2 s, `bye` 300 ms. A signal or the session deadline ends a wait for `hello`, `create`, `open`,
-  `read`, `list` or `decide` within 50 ms, never one for a method that changes state.
+  `fork` 10 s, `decide` 5 s, `record` 2 s, `bye` 300 ms. A signal or the session deadline ends a wait for `hello`,
+  `create`, `open`, `read`, `list`, `fork` or `decide` within 50 ms, never one for a method that changes state.
 - **The dead rule.** A timeout, a closed stdout, a line over the cap or cut at EOF, a non-object line, or an answer
   with both or neither of `result` and `error`, or 256 MiB of lines no request asked for, kills the binding for the
   rest of the session: every later call fails at once. An error answer is one failed call; the binding lives on.
@@ -635,13 +644,21 @@ or `open` until another `create` or `open`, `bye`, or the process's end (a kill 
 | `append` | `session` (held), `record` | `null`, once the record is durable (it survives a kill of the binding and of henki) | `not_found`, `invalid`, `tampered`, `io` |
 | `discard` | `session` (held) | `{"removed":B}`: a session this process created that has no `user` record is removed | `not_found` |
 | `list` | `scope` | `{"sessions":[{"session":ID,"updated":SECONDS},...]}`, newest first | `io` |
+| `fork` (cap `fork`) | `scope`, `session`, `line` (a 1-based record position) | `{"session":ID}`, held, created in `scope`; record `line` of `session` (as `read` returns it) must be a `user` record; the new session holds records 1 to `line`-1 exactly as `read` returns them, and the parent is unchanged | `not_found`, `invalid`, `busy`, `io` |
 | `bye` | `{}` | `null`, then exit | |
 
 henki checks every answer as it checks its own journal: the id rule, `read` records are objects with a string `t`,
 `next` grows and equals the count so far, at most 256 MiB over all pages; then the replay, the repairs (appended) and
 the pairing of calls and results at start. A history failure in a session ends the turn `error journal` (exit 2) with
 the fix `henki --port history=std for this session, or henki mods swap history std`; henki never falls back to std in
-a session. `list` is for tools (henki-mods, an import); henki itself does not call it. The cap `fork` is reserved.
+a session. `list` is for tools (henki-mods, an import); henki itself does not call it.
+
+`henki --resume=ID@N` forks (journal/1): henki reads session ID, checks its records 1 to N-1 (the dialect, tampering,
+the pairing) and only then calls `fork`; it then appends `close` and the new segment's `session` record with
+`parent`, as for a resume. A binding whose `hello` lists no cap `fork` is never sent one, and henki refuses
+`--resume=ID@N` with it: `history binding NAME ID cannot fork (its hello lists no fork); fix: henki --resume=ID goes on
+with the whole session, or bind a history that can fork (henki mods swap history PKG)`. The history suite's checks
+H26 to H29 run only for a binding with the cap.
 
 ## policy/1
 
@@ -735,11 +752,13 @@ NAME INST REQUEST EXPECT [SAVE]
   `@SCOPE2@` are two empty directories, `@BIG@` 1 MiB of text.
 - EXPECT is the canonical answer line, where `*` is any text and `@(A|B)` is A or B; every other character stands for
   itself. SAVE is `NAME=KEY`: the first string value of `"KEY"` in the answer.
+- A line `#cap NAME` makes the steps after it run only for a binding whose `hello` (instance a's) lists cap NAME;
+  otherwise they are skipped with a line saying so, and are not counted. Other `#` lines are comments.
 - A step named with a trailing lowercase letter prepares a check and counts only when it fails. After the steps, each
   `henki port` must end within 1 s of its stdin closing, and the program run alone must exit within 1 s of EOF on its
   stdin. henki's own tests run the history file against the std binding through its trait: std speaks no protocol,
   so the hello, version and kill steps are skipped, and the test itself answers `list`, `read`'s `from` (std reads
-  whole sessions) and an unknown method (`unsupported`).
+  whole sessions) and an unknown method (`unsupported`). Std has cap `fork`.
 
 
 ## eval/1

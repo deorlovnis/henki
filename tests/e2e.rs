@@ -13,6 +13,8 @@ mod ctx;
 mod exec;
 #[path = "e2e/ext.rs"]
 mod ext;
+#[path = "e2e/fork.rs"]
+mod fork;
 #[path = "e2e/handoff.rs"]
 mod handoff;
 #[path = "e2e/harness.rs"]

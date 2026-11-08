@@ -1721,9 +1721,10 @@ inst_end() { # X [kill]
 
 # Runs SUITE (a conform/1 file) for PORT against PROGRAM through HENKI: "ok NAME" or "FAIL NAME: got LINE" per check,
 # then "PORT/1: N checks, N passed"; exit 1 on any failure. A step whose name ends in a lowercase letter prepares a
-# check: it counts only when it fails. Last, PROGRAM run on its own must exit within 1 s of reading EOF on stdin.
+# check: it counts only when it fails. After a `#cap NAME` line, steps run only when instance a's hello lists cap NAME.
+# Last, PROGRAM run on its own must exit within 1 s of reading EOF on stdin.
 conform_run() { # PORT PROGRAM HENKI
-  local name inst req want save got n=0 ok=0 v w r pid big i x
+  local name inst req want save got n=0 ok=0 v w r pid big i x skip=""
   C_port=$1 C_exe=$2 C_henki=$3 C_fail="" U_a=0 U_b=0 U_v=0
   CT=$(mktemp -d "${TMPDIR:-/tmp}/henki-conform.XXXXXX") || die "cannot make a scratch dir; fix: check TMPDIR"
   mkdir -p "$CT/scope" "$CT/scope2" "$CT/home"
@@ -1733,7 +1734,16 @@ conform_run() { # PORT PROGRAM HENKI
   # An instance that ended (a failed hello) must not end the run when the next request goes to its FIFO.
   trap '' PIPE
   while IFS="$tab" read -r name inst req want save; do
-    case "$name" in '' | '#'*) continue ;; esac
+    case "$name" in
+      '#cap '*)
+        eval "[ \"\${U_a:-0}\" = 1 ]" || inst_start a
+        x=${H_a#*\"caps\":\[} skip=""
+        case ",${x%%]*}," in *,\"${name#\#cap }\",*) ;; *) skip=${name#\#cap } && say "skipped: the checks for cap $skip (the binding's hello lists no $skip)" ;; esac
+        continue
+        ;;
+      '' | '#'*) continue ;;
+    esac
+    [ -z "$skip" ] || continue
     case "$inst" in
       *!)
         inst_end "${inst%!}" kill

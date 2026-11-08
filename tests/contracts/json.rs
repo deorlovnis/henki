@@ -103,6 +103,14 @@ fn contracts_record_fields() {
     let m2 = Mock::start(vec![say("better")]);
     r.at(&m2.url());
     runs.push(("resume", r.cmd(&["--json", "--resume", "again"]).go()));
+    // A fork of that session at its first `user` record: `session.parent`.
+    let d = &runs.last().unwrap().1;
+    let (id, line) = (d.journal.as_ref().unwrap().file_stem().unwrap().to_string_lossy().into_owned(), d.journal_all().iter().position(|x| x["t"] == "user").unwrap() + 1);
+    let m3 = Mock::start(vec![say("forked")]);
+    r.at(&m3.url());
+    let d = r.cmd(&["--json", &format!("--resume={id}@{line}"), "instead"]).go();
+    assert_eq!(d.of("session").last().unwrap()["parent"], json!({"id": id, "line": line}), "{}", d.diag());
+    runs.push(("fork", d));
     // The anthropic dialect journals the reply's blocks.
     let m = Mock::start_api(Api::Anthropic, vec![say("blocks")]);
     let mut r = Run::new(&m.url());

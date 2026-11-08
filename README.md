@@ -101,7 +101,7 @@ A module is an extension with an optional manifest, `.henki/module.toml`, that `
 ### Output, sessions and exit codes
 
 - `henki run` prints the answer on stdout and one line per call and notice on stderr; a call line ends `, no output` when the command printed nothing. `--json` prints one JSON record per line instead, ending with a `result` record.
-- Every session is journaled under `~/.local/state/henki`; `--resume[=ID]` continues one. A REPL that quits before its first message leaves no session.
+- Every session is journaled under `~/.local/state/henki`; `--resume[=ID]` continues one, and `--resume=ID@N` forks session ID at its line N (a `user` record) into a new session. A REPL that quits before its first message leaves no session.
 - When a session ends, every process it started is stopped (on macOS, except a `!CMD &` job or a process that started a session of its own).
 - Exit codes: 0 answered (or the REPL quit), 1 gave up (step limit, stuck, empty answer), 2 error, 3 needs approval, 124 out of time, 130 interrupted (or TERM, HUP or the terminal closing), 141 stdout closed or not read in time.
 - The journal, the `--json` records, what henki sends to a model server and the extension layout are specified, with their versions and the stability rule, in [CONTRACTS.md](CONTRACTS.md).
@@ -116,7 +116,7 @@ cargo build --release
 ./check.sh install-hook  # check the commits of every git push
 ```
 
-`check.sh` holds henki to its budgets: at most 4,408 lines of non-test Rust (400 per file), at most 10 crates in the dependency tree, and a release binary of at most 1,065,536 bytes, including the static musl build on Linux when that target is installed. It also refuses a commit not yet pushed that has no `Signed-off-by:` line (`git commit -s`); [CONTRIBUTING.md](CONTRIBUTING.md) says why and lists the style rules.
+`check.sh` holds henki to its budgets: at most 4,445 lines of non-test Rust (400 per file), at most 10 crates in the dependency tree, and a release binary of at most 1,065,536 bytes, including the static musl build on Linux when that target is installed. It also refuses a commit not yet pushed that has no `Signed-off-by:` line (`git commit -s`); [CONTRIBUTING.md](CONTRIBUTING.md) says why and lists the style rules.
 
 `release/release.sh VERSION` builds, from a clean checkout, `dist/henki-VERSION-TARGET.tar.gz` for this host (static musl on Linux) and `dist/SHA256SUMS`. A tarball holds `bin/henki`, `bin/henki-mods`, the official modules in `share/henki/official` (off until added), the conformance suites in `share/henki/conform`, the general eval suite in `share/henki/eval/general`, the config profiles, LICENSE, README.md and CONTRACTS.md; unpack it anywhere and put its `bin/` on your PATH. `release/release.sh --formula VERSION TAP` writes the Homebrew formula from `SHA256SUMS`, and `release/release.sh --selftest` builds, unpacks and runs one tarball.
 
