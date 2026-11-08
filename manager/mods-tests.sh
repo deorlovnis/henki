@@ -141,9 +141,117 @@ t_clip() {
   rc_is 126
 }
 
+# A call_start event line for a NAME call with TARGET (JSON-escaped already; "" for none).
+event() { # NAME TARGET
+  local t=null
+  [ -z "$2" ] || t="\"$2\""
+  printf '{"data":{"call":{"args":{"name":"read","path":"x"},"id":"h1","name":"%s"},"rule":null,"target":%s,"verdict":"auto"},"event":"call_start","seq":3,"session":"%s","v":1}\n' "$1" "$t" "$HENKI_SESSION"
+}
+
+t_checkpoints() {
+  case_ "checkpoints: snapshots in git and outside, /checkpoints, /undo, /rewind"
+  local m="$MODS_DIR/checkpoints" repo="$D/repo" here n
+  here=$(pwd)
+  [ "$(readlink "$m/on/call_start.wait")" = ../cmd/checkpoints ] || fail "on/call_start.wait is not the link"
+  export GIT_CEILING_DIRECTORIES="$D" HENKI_MODULE="$m"
+  mkdir -p "$repo/sub" && cd "$repo" || return
+  git init -q . && printf 'one\n' >a.txt && printf '*.log\n' >.gitignore && printf 'log\n' >c.log
+  git add a.txt .gitignore && git -c user.name=t -c user.email=t@t -c commit.gpgsign=false commit -qm first
+  printf 'untracked\n' >b.txt
+  head=$(git rev-parse HEAD)
+  cd sub || return
+  event write "$repo/a.txt" >"$D/ev"
+  run "$m/on/call_start.wait" <"$D/ev"
+  rc_is 0
+  cd "$repo" || return
+  [ "$(git show "refs/henki/checkpoints/$HENKI_SESSION/1:a.txt")" = one ] || fail "the snapshot lacks a.txt"
+  [ "$(git show "refs/henki/checkpoints/$HENKI_SESSION/1:b.txt")" = untracked ] || fail "the snapshot lacks the untracked b.txt"
+  git cat-file -e "refs/henki/checkpoints/$HENKI_SESSION/1:c.log" 2>/dev/null && fail "the snapshot holds an ignored file"
+  [ "$(git rev-parse HEAD)" = "$head" ] && git diff --cached --quiet && [ "$(git status --porcelain)" = "?? b.txt" ] || fail "HEAD, the index or the work tree changed"
+  event read "$repo/a.txt" >"$D/ev"
+  run "$m/on/call_start.wait" <"$D/ev"
+  event shell "" >"$D/ev"
+  run "$m/on/call_start.wait" <"$D/ev"
+  [ "$(git for-each-ref "refs/henki/checkpoints/$HENKI_SESSION/" | wc -l | tr -d ' ')" = 2 ] || fail "not one snapshot per write and shell call"
+  run "$m/cmd/checkpoints"
+  out_has "  1  "
+  out_has "before write $repo/a.txt"
+  out_has "before shell"
+  # The edits after snapshot 1 and 2: a.txt changed, b.txt gone, d.txt new.
+  printf 'two\n' >a.txt && rm b.txt && printf 'new\n' >d.txt
+  run "$m/cmd/undo" <<<n
+  out_has "a.txt"
+  [ "$(cat a.txt)" = two ] && [ -f d.txt ] || fail "n changed the files"
+  run "$m/cmd/undo" <<<y
+  rc_is 0
+  [ "$(cat a.txt)" = one ] && [ "$(cat b.txt)" = untracked ] && [ ! -e d.txt ] && [ "$(cat c.log)" = log ] || fail "/undo did not put the files back"
+  out_has "back at checkpoint 2"
+  [ "$(git for-each-ref "refs/henki/checkpoints/$HENKI_SESSION/" | wc -l | tr -d ' ')" = 1 ] || fail "/undo did not drop the snapshot"
+  printf 'three\n' >a.txt
+  run "$m/cmd/rewind" x
+  err_has "usage: /rewind N"
+  run "$m/cmd/rewind" 9
+  err_has "no checkpoint 9"
+  run "$m/cmd/rewind" 1 <<<y
+  [ "$(cat a.txt)" = one ] || fail "/rewind 1 did not put a.txt back"
+  run "$m/cmd/checkpoints"
+  out_has "no checkpoints in this session"
+  run "$m/cmd/undo"
+  rc_is 1
+  err_has "no checkpoints in this session"
+  # Outside git: the write and edit targets, kept or noted absent.
+  mkdir -p "$D/plain" && cd "$D/plain" || return
+  printf 'old\n' >x.txt
+  event edit "$D/plain/x.txt" >"$D/ev"
+  run "$m/on/call_start.wait" <"$D/ev"
+  event write "$D/plain/y.txt" >"$D/ev"
+  run "$m/on/call_start.wait" <"$D/ev"
+  event shell "" >"$D/ev"
+  run "$m/on/call_start.wait" <"$D/ev"
+  n=$(ls "$HENKI_STATE/checkpoints/$HENKI_SESSION" | tr '\n' ' ')
+  [ "$n" = "1 2 " ] || fail "outside git: snapshots $n"
+  printf 'new\n' >x.txt && printf 'made\n' >y.txt
+  run "$m/cmd/checkpoints"
+  out_has "2  before write or edit $D/plain/y.txt (absent)"
+  run "$m/cmd/undo" <<<y
+  [ ! -e y.txt ] || fail "/undo did not remove the file made after the snapshot"
+  run "$m/cmd/undo" <<<y
+  [ "$(cat x.txt)" = old ] || fail "/undo did not put x.txt back"
+  event write 'a\\nb' >"$D/ev"
+  run "$m/on/call_start.wait" <"$D/ev"
+  rc_is 1
+  err_has "no plain path in the event"
+  HENKI_SESSION="" run env "$m/cmd/checkpoints"
+  rc_is 1
+  err_has "no session (HENKI_SESSION)"
+  cd "$here" || exit 1
+  unset GIT_CEILING_DIRECTORIES
+}
+
+t_notify() {
+  case_ "notify: turn_end and question through the first notifier on PATH"
+  local b="$D/bin"
+  [ "$(readlink "$MODS_DIR/notify/on/question")" = turn_end ] || fail "on/question is not the link"
+  printf '#!/bin/sh\nprintf "%%s|" "$@"\n' >"$b/notify-send" && chmod 755 "$b/notify-send"
+  printf '{"data":{"status":"ok","steps":2,"t":"turn_end","ts":"x","usage":{}},"event":"turn_end","seq":9,"session":"s","v":1}\n' >"$D/ev"
+  HENKI_EVENT=turn_end P="$b:/usr/bin:/bin" run "$MODS_DIR/notify/on/turn_end" <"$D/ev"
+  [ "$OUT" = "--|henki: ${PWD##*/}|turn ended: ok|" ] || fail "turn_end: $OUT"
+  printf '{"data":{"args":{"command":"ls"},"id":"h1","name":"shell","t":"ask","ts":"x"},"event":"question","seq":9,"session":"s","v":1}\n' >"$D/ev"
+  HENKI_EVENT=question P="$b:/usr/bin:/bin" run "$MODS_DIR/notify/on/question" <"$D/ev"
+  [ "$OUT" = "--|henki: ${PWD##*/}|asks before a shell call|" ] || fail "question: $OUT"
+  printf '#!/bin/sh\nprintf "%%s|" "$@"\n' >"$b/osascript" && chmod 755 "$b/osascript"
+  HENKI_EVENT=turn_end P="$b:/usr/bin:/bin" run "$MODS_DIR/notify/on/turn_end" <<<'{}'
+  out_has "display notification (item 2 of argv) with title (item 1 of argv)|-e|end run|henki: "
+  rm "$b/osascript" "$b/notify-send"
+  HENKI_EVENT=turn_end P="$b:/usr/bin:/bin" run "$MODS_DIR/notify/on/turn_end" <<<'{}'
+  err_has "notify: no osascript or notify-send on PATH"
+}
+
 t_sessions
 t_prompts
 t_clip
+t_checkpoints
+t_notify
 if [ "$FAILS" != 0 ]; then
   echo "mods-tests.sh: $FAILS checks failed in $CASES cases" >&2
   exit 1

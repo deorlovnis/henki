@@ -1,0 +1,10 @@
+# The notify mod: a desktop notification at the end of a turn and at a question (observe/1); no prompt bytes.
+henki_module = 1
+name = "notify"
+version = "0.1.0"
+license = "Apache-2.0"
+requires = ["henki >= 0.2"]
+contracts = ["ext/2", "observe/1", "module/1"]
+os = ["macos", "linux"]
+caps_net = "none"
+ports = []

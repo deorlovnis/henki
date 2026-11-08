@@ -1,0 +1,10 @@
+# The checkpoints mod: a snapshot before each edit (observe/1), and user commands to put one back; no prompt bytes.
+henki_module = 1
+name = "checkpoints"
+version = "0.1.0"
+license = "Apache-2.0"
+requires = ["henki >= 0.2"]
+contracts = ["ext/2", "observe/1", "handoff/1", "module/1"]
+os = ["macos", "linux"]
+caps_net = "none"
+ports = []

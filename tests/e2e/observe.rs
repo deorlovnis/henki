@@ -7,7 +7,7 @@ use crate::pty::Pty;
 use serde_json::{Value, json};
 use std::fs;
 use std::os::unix::fs::{PermissionsExt, symlink};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 const W: Duration = Duration::from_secs(15);
@@ -228,4 +228,65 @@ fn observe_repl_events() {
     assert_eq!(names, ["session_start", "turn_start", "turn_start", "session_end"]);
     let failed = d.notices().iter().filter(|n| n.starts_with("observer broken/on/turn_end did not start: ")).count();
     assert_eq!(failed, 2, "{}", d.diag());
+}
+
+/// O6: the official checkpoints mod; before each of 20 write and edit calls, the snapshot holds the files as
+/// they were, and the work tree, the index and HEAD are not touched by it.
+#[test]
+fn observe_checkpoints_snapshot_before_each_edit() {
+    let mut steps = Vec::new();
+    let mut state: Vec<Option<String>> = vec![None; 3];
+    let mut before = Vec::new();
+    for i in 0..20 {
+        let k = i % 3;
+        before.push(state.clone());
+        let path = format!("f{k}.txt");
+        match &state[k] {
+            Some(cur) if i % 2 == 1 => {
+                steps.push(call("edit", json!({"path": path, "old_text": cur.trim(), "new_text": format!("e{i}")})));
+                state[k] = Some(format!("e{i}\n"));
+            }
+            _ => {
+                steps.push(call("write", json!({"path": path, "content": format!("c{i}\n")})));
+                state[k] = Some(format!("c{i}\n"));
+            }
+        }
+    }
+    steps.push(say("done"));
+    let m = Mock::start(steps);
+    let r = Run::new(&m.url());
+    copy(&Path::new(env!("CARGO_MANIFEST_DIR")).join("mods/checkpoints"), &r.config_dir().join("ext/checkpoints"));
+    let d = r.json("edit");
+    d.finish();
+    assert_eq!(d.code, Some(0), "{}", d.diag());
+    assert!(d.results().iter().all(|r| r["is_error"] == false), "{}", d.diag());
+    assert!(d.notices().is_empty(), "{:?}", d.notices());
+    let git = |args: &[&str]| std::process::Command::new("git").args(args).current_dir(&r.cwd).output().unwrap();
+    for (i, files) in before.iter().enumerate() {
+        for (k, want) in files.iter().enumerate() {
+            let o = git(&["show", &format!("refs/henki/checkpoints/{}/{}:f{k}.txt", d.id(), i + 1)]);
+            let got = o.status.success().then(|| String::from_utf8(o.stdout).unwrap());
+            assert_eq!(&got, want, "snapshot {} of f{k}.txt", i + 1);
+        }
+    }
+    assert!(!git(&["rev-parse", "-q", "--verify", "HEAD"]).status.success(), "HEAD moved");
+    assert!(String::from_utf8(git(&["ls-files"]).stdout).unwrap().is_empty(), "the index changed");
+}
+
+/// `src` copied to `dst` as it is: files with their modes, links as links.
+fn copy(src: &Path, dst: &Path) {
+    fs::create_dir_all(dst).unwrap();
+    for e in fs::read_dir(src).unwrap().flatten() {
+        let (from, to) = (e.path(), dst.join(e.file_name()));
+        let t = e.file_type().unwrap();
+        if t.is_symlink() {
+            symlink(fs::read_link(&from).unwrap(), &to).unwrap();
+        } else if t.is_dir() {
+            copy(&from, &to);
+        } else {
+            fs::copy(&from, &to).unwrap();
+            let mode = fs::metadata(&from).unwrap().permissions().mode() & 0o755;
+            fs::set_permissions(&to, fs::Permissions::from_mode(mode)).unwrap();
+        }
+    }
 }
