@@ -255,3 +255,18 @@ fn e2e_run_stdin_untouched() {
     let mut f = d.stdin_file.as_ref().unwrap();
     assert_eq!(f.stream_position().unwrap(), 0, "henki read its stdin");
 }
+
+/// A tool that puts a new file with the same bytes in the journal's place (as `sed -i` does) ends the run `tampered`
+/// at the next record: the size matches, the file is another one.
+#[test]
+fn e2e_journal_replaced_tampered() {
+    let cmd = "j=$(ls \"$XDG_STATE_HOME\"/henki/sessions/*/\"$HENKI_SESSION\".jsonl) && cp \"$j\" \"$j.new\" && mv \"$j.new\" \"$j\"";
+    let m = Mock::start(vec![shell(cmd), say("never")]);
+    let r = Run::new(&m.url());
+    let d = r.json("rewrite it");
+    let (e, path) = (&d.result()["error"], d.journal.clone().expect("a journal"));
+    assert_eq!((d.code, e["kind"].as_str()), (Some(2), Some("tampered")), "{}", d.diag());
+    assert_eq!(e["message"].as_str(), Some(format!("journal modified outside henki: {}", path.display()).as_str()));
+    assert_eq!(m.log().len(), 1, "no request after it");
+    assert!(d.journal_all().iter().all(|x| x["t"] != "tool_result"), "nothing written after the change: {}", d.diag());
+}

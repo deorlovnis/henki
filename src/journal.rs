@@ -3,7 +3,7 @@
 use crate::{allow, config::Config, supervise::Spill, sys, term, tools, types::Outcome};
 use serde_json::Value;
 use std::path::{Path, PathBuf};
-use std::{collections::HashSet, fmt::Display, fs, fs::File, io::Read, io::Write, os::unix::ffi::OsStrExt, time::Duration, time::SystemTime};
+use std::{collections::HashSet, fmt::Display, fs, fs::File, io::Read, io::Write, os::unix::ffi::OsStrExt, os::unix::fs::MetadataExt, time::Duration, time::SystemTime};
 
 pub struct Journal {
     file: File,
@@ -94,7 +94,7 @@ impl Journal {
         Ok(Resumed { journal, hist, from_bytes: keep as u64, notices, repairs })
     }
 
-    /// Adds `ts`; checks fstat size = bytes written (else `tampered`); appends `term::json_line` + "\n" on the O_APPEND
+    /// Adds `ts`; checks fstat size = bytes written and that the path still names the file (else `tampered`); appends `term::json_line` + "\n" on the O_APPEND
     /// fd; fdatasync unless the kind is `ask`, `approval` or `notice`. Returns the record as written (after `discard`,
     /// as it would have been).
     pub fn write(&mut self, mut rec: Value) -> Result<Value, Outcome> {
@@ -104,7 +104,9 @@ impl Journal {
         }
         let line = term::json_line(&rec) + "\n";
         let fail = |e: std::io::Error| Outcome::error("journal", format!("cannot write {}: {e}", self.path.display()));
-        if self.file.metadata().map_err(fail)?.len() != self.bytes {
+        // The path must still name the file held open: an edit that writes a new file in its place (`sed -i`) keeps the size.
+        let m = self.file.metadata().map_err(fail)?;
+        if m.len() != self.bytes || fs::symlink_metadata(&self.path).map_or(true, |p| (p.dev(), p.ino()) != (m.dev(), m.ino())) {
             return Err(tampered(&self.path));
         }
         // One write(2), and a second only after a short one (whose error then names the cause, e.g. a full disk). A

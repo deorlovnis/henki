@@ -410,6 +410,20 @@ fn journal_tamper_live_append() {
     assert_eq!(fs::metadata(&j.path).unwrap().len(), 3);
 }
 
+/// Another file in the journal's place, with the same bytes (as `sed -i` leaves it): the size alone matches.
+#[test]
+fn journal_tamper_replaced() {
+    let f = fx();
+    let mut j = Journal::create(&f.state, &f.cwd).unwrap();
+    j.write(rec::notice("a")).unwrap();
+    let copy = j.path.with_extension("tmp");
+    fs::copy(&j.path, &copy).unwrap();
+    fs::rename(&copy, &j.path).unwrap();
+    let tampered = Outcome::error("tampered", format!("journal modified outside henki: {}", j.path.display()));
+    assert_eq!(j.write(rec::user("b")).unwrap_err(), tampered);
+    assert_eq!(fs::metadata(&j.path).unwrap().len(), j.bytes(), "nothing written to either file");
+}
+
 #[test]
 fn journal_write_fail() {
     let f = fx();
@@ -611,8 +625,9 @@ fn journal_discard_twice() {
     let bytes = j.bytes();
     fs::remove_file(&j.path).unwrap();
     assert!(!j.discard());
-    j.write(rec::close(bytes)).unwrap();
-    assert!(j.bytes() > bytes);
+    // Its path no longer names the file written to, so the writes are `tampered` (nothing goes into an unlinked file).
+    assert!(matches!(j.write(rec::close(bytes)), Err(Outcome::Error { kind: "tampered", .. })));
+    assert_eq!(j.bytes(), bytes);
     fs::write(&j.path, "").unwrap();
     assert!(!j.discard());
     assert!(j.path.exists(), "one try only");

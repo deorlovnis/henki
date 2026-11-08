@@ -60,7 +60,8 @@ it. Other programs read it, to list, show, search or replay sessions.
 - Every record has `t`, its kind, and `ts`, the UTC time it was written (`YYYY-MM-DDTHH:MM:SSZ`).
 - henki appends only, through one `O_APPEND` descriptor, and syncs the file (fdatasync) after every record but `ask`,
   `approval` and `notice`, before the effect the record explains. Before each write it checks that the file is exactly
-  as long as what it wrote; if not, the session ends `error tampered`.
+  as long as what it wrote and that its path still names that file (an edit that puts a new file in its place, as
+  `sed -i` does, keeps the size); if not, the session ends `error tampered`.
 
 ### Record kinds
 
