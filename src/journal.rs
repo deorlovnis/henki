@@ -65,6 +65,14 @@ fn whole(b: &[u8]) -> usize {
     b.iter().rposition(|&c| c == b'\n').map_or(0, |i| i + 1)
 }
 
+/// Session `id`'s file (any scope) and its whole lines, read only: a torn tail is left out, and the file stays as it is.
+fn unheld(state: &Path, id: &str) -> Result<(PathBuf, Vec<u8>), PortError> {
+    let (path, mut buf) = (named(state, id).into_iter().next().ok_or_else(|| port::err("not_found", format!("no session {id}")))?, Vec::new());
+    sys::open_read(&path).and_then(|(mut f, _)| f.read_to_end(&mut buf)).map_err(|e| io(&path, e))?;
+    buf.truncate(whole(&buf));
+    Ok((path, buf))
+}
+
 impl Journal {
     pub fn new(state: &Path) -> Journal {
         Journal { state: state.into(), held: None }
@@ -123,11 +131,7 @@ impl History for Journal {
                 (h.bytes, h.from) = (keep as u64, keep as u64);
                 h.path.clone()
             }
-            None => {
-                let path = named(&self.state, session).into_iter().next().ok_or_else(|| port::err("not_found", format!("no session {session}")))?;
-                sys::open_read(&path).and_then(|(mut f, _)| f.read_to_end(&mut buf)).map_err(|e| io(&path, e))?;
-                path
-            }
+            None => unheld(&self.state, session).map(|(path, b)| (buf = b, path).1)?,
         };
         buf.truncate(whole(&buf));
         let (mut records, mut off) = (Vec::new(), 0);
@@ -185,6 +189,20 @@ impl History for Journal {
         h.gone |= std::mem::take(&mut h.fresh) && fs::remove_file(&h.path).is_ok();
         Ok(h.gone)
     }
+
+    /// The parent's lines 1 to `line` - 1, byte for byte, in one write and one sync to a session `create` made; the
+    /// parent is only read. A failed write removes the new file, so no part of a fork is left as a session.
+    fn fork(&mut self, scope: &Path, session: &str, line: u64) -> Result<String, PortError> {
+        let (path, buf) = unheld(&self.state, session)?;
+        let lines: Vec<&[u8]> = buf.split_inclusive(|&b| b == b'\n').collect();
+        let user = |n: &usize| lines.get(n.wrapping_sub(1)).and_then(|l| serde_json::from_slice::<Value>(l).ok()).is_some_and(|r| r["t"] == "user");
+        let n = usize::try_from(line).ok().filter(user).ok_or_else(|| port::err("invalid", format!("{}:{line} is not a user record", path.display())))?;
+        let (id, head) = (self.create(scope, None)?, lines[..n - 1].concat());
+        let h = self.held(&id)?;
+        (&h.file).write_all(&head).and_then(|()| h.file.sync_data()).map_err(|e| (fs::remove_file(&h.path), io(&h.path, e)).1)?;
+        h.bytes = head.len() as u64;
+        Ok(id)
+    }
 }
 
 /// The session to resume, opened and locked: `id` in any scope, or the newest unlocked one in this cwd's scope. Empty
@@ -215,11 +233,14 @@ fn pick(state: &Path, cwd: &Path, id: Option<&str>) -> Result<(PathBuf, File), P
 /// `session`), and the notices: the binding's, then replay's.
 pub type Begun = (String, Vec<Value>, Vec<Value>, Vec<String>);
 
-/// A new session, or the resumed one: opened, read, replayed, its dangling calls repaired through the binding, and
-/// paired.
-pub fn start(h: &mut dyn History, resume: &Option<Option<String>>, cfg: &Config) -> Result<Begun, Outcome> {
+/// A new session, or the resumed one (`ID@N`: a fork of it, `fork`): opened, read, replayed, its dangling calls repaired
+/// through the binding, and paired.
+pub fn start(h: &mut dyn History, resume: &Option<Option<String>>, cfg: &mut Config) -> Result<Begun, Outcome> {
     let Some(id) = resume else { return Ok((h.create(&cfg.cwd, None).map_err(port::outcome)?, Vec::new(), Vec::new(), Vec::new())) };
-    let sid = h.open(&cfg.cwd, id.as_deref()).map_err(port::outcome)?;
+    let sid = match id.as_deref().and_then(|i| i.split_once('@')) {
+        Some((p, n)) => fork(h, p, n, cfg)?,
+        None => h.open(&cfg.cwd, id.as_deref()).map_err(port::outcome)?,
+    };
     let mut t = h.read(&sid).map_err(port::outcome)?;
     let mut hist = replay(&mut t, cfg)?;
     let repairs = dangling(&hist).into_iter().map(|(id, name)| put(h, &sid, rec::tool_result(&id, &name, tools::REPAIR, true, 0, 0)));
@@ -227,6 +248,22 @@ pub fn start(h: &mut dyn History, resume: &Option<Option<String>>, cfg: &Config)
     hist.extend(repairs.iter().cloned());
     pairing(&hist).map_err(|e| Outcome::error("journal", format!("{}: {e}", t.place)))?;
     Ok((sid, hist, repairs, t.notices))
+}
+
+/// `--resume=P@N`: a new session in the cwd's scope holding lines 1 to N-1 of session P, then `close`; `cfg.parent`
+/// names P and N for the `session` record. Lines 1 to N-1 pass replay's checks and the pairing before the binding's
+/// `fork` is called, so a refused fork creates nothing.
+fn fork(h: &mut dyn History, p: &str, n: &str, cfg: &mut Config) -> Result<String, Outcome> {
+    let bad = |why: String| Outcome::error("config", format!("--resume={p}@{n}: {why}"));
+    let line = n.parse::<usize>().ok().filter(|&l| l > 1 && port::session_id(p)).ok_or_else(|| bad("ID@N names a session and the line of a user record in it".into()))?;
+    let mut pre = h.read(p).map_err(port::outcome)?; // not held: the parent stays as it is
+    pre.records.get(line - 1).filter(|r| r["t"] == "user").ok_or_else(|| bad(format!("line {line} is not a user record")))?;
+    pre.records.truncate(line - 1);
+    replay(&mut pre, cfg).and_then(|_| pairing(&pre.records).map_err(bad))?; // the dialect, tampered closes, the pairing
+    let sid = h.fork(&cfg.cwd, p, line as u64).map_err(port::outcome)?;
+    put(h, &sid, rec::close())?;
+    (cfg.parent, _) = (Some(serde_json::json!({"id": p, "line": line})), cfg.notices.push(format!("forked from session {p} at line {line}")));
+    Ok(sid)
 }
 
 /// `rec` with `ts`, appended through the binding: the record as kept.
@@ -353,6 +390,7 @@ pub mod rec {
             "tools": cfg.tools, "shell": cfg.bash.to_string_lossy(), "exts": cfg.exts.iter().map(|e| &e.name).collect::<Vec<_>>(), "pass_env": cfg.pass_env, "ctx": cfg.window,
             "config_hash": cfg.hash, "allow_hash": cfg.allow.hash, "agents_hash": cfg.agents_hash, "project_agents_hash": null,
             "resumed": resumed.then(|| json!({}))});
+        let v = with(with(v, "sources", (!cfg.sources.is_empty()).then(|| cfg.sources.clone())), "parent", cfg.parent.clone());
         with(v, "ports", (!ports.is_empty()).then(|| ports.iter().map(|(p, n)| (p.to_string(), Value::from(n.as_str()))).collect::<serde_json::Map<_, _>>()))
     }
     pub fn user(content: &str) -> Value {
@@ -367,8 +405,9 @@ pub mod rec {
         let calls: Vec<Value> = calls.iter().map(|c| with(json!({"args": c.args, "id": c.id, "name": c.name}), "raw", c.raw.as_deref())).collect();
         with(json!({"t": "assistant", "msg": {"content": text, "role": "assistant", "tool_calls": calls}, "finish": finish, "usage": usage(u)}), "blocks", blocks.cloned())
     }
-    pub fn ask(c: &Call, target: Option<&str>) -> Value {
-        with(json!({"t": "ask", "id": c.id, "name": c.name, "args": c.args}), "target", target)
+    /// `root`: `always` is offered, for a rule in this project root.
+    pub fn ask(c: &Call, target: Option<&str>, root: Option<&str>) -> Value {
+        with(with(with(json!({"t": "ask", "id": c.id, "name": c.name, "args": c.args}), "target", target), "always", root.map(|_| true)), "root", root)
     }
     /// `verdict`: yes, no, always, rule, auto, policy or deny; `rule`: the allow rule's number; `extra`: `by` (the policy
     /// binding that allowed it) or `reason` (a deny's text).
@@ -385,17 +424,19 @@ pub mod rec {
     pub fn elide(ids: &[String]) -> Value {
         json!({"t": "elide", "ids": ids})
     }
+    /// An error's kind and message, in `turn_end` and `result`: what a frontend or a reader shows.
+    fn error(o: &Outcome) -> Option<Value> {
+        if let Outcome::Error { kind, message } = o { Some(json!({"kind": kind, "message": message})) } else { None }
+    }
     pub fn turn_end(o: &Outcome, steps: u32, u: Usage) -> Value {
-        with(json!({"t": "turn_end", "status": o.status(), "steps": steps, "usage": usage(u)}), "reason", o.reason())
+        with(with(json!({"t": "turn_end", "status": o.status(), "steps": steps, "usage": usage(u)}), "reason", o.reason()), "error", error(o))
     }
     pub fn result(o: &Outcome, text: &str, u: Usage, session: Option<&str>, steps: u32, duration_ms: u64) -> Value {
         let v = json!({"t": "result", "status": o.status(), "exit": o.exit(), "text": text, "usage": usage(u), "session": session, "steps": steps,
             "duration_s": (duration_ms.saturating_add(50) / 100) as f64 / 10.0});
-        let mut v = with(v, "reason", o.reason());
-        match o {
-            Outcome::Error { kind, message } => v["error"] = json!({"kind": kind, "message": message}),
-            Outcome::NeedsApproval(c) => v["call"] = json!({"args": c.args, "id": c.id, "name": c.name}),
-            _ => {}
+        let mut v = with(with(v, "reason", o.reason()), "error", error(o));
+        if let Outcome::NeedsApproval(c) = o {
+            v["call"] = json!({"args": c.args, "id": c.id, "name": c.name});
         }
         v
     }

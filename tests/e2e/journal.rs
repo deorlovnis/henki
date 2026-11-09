@@ -173,6 +173,9 @@ fn e2e_resume_spill_readable() {
     }
 }
 
+/// The profile henki's no-config message names; the test binary has no share/henki/ beside it, so Homebrew's path.
+const PROFILE: &str = if cfg!(target_os = "macos") { "config.mac.toml" } else { "config.local.toml" };
+
 #[test]
 fn e2e_fresh_home() {
     let m = Mock::start(vec![say("fresh")]);
@@ -184,7 +187,7 @@ fn e2e_fresh_home() {
     assert_eq!(d.code, Some(2));
     assert_eq!(
         (e["kind"].as_str(), e["message"].as_str()),
-        (Some("config"), Some("no config; copy one: mkdir -p ~/.config/henki && cp $(brew --prefix)/share/henki/config.mac.toml ~/.config/henki/config.toml"))
+        (Some("config"), Some(format!("no config; copy one: mkdir -p ~/.config/henki && cp $(brew --prefix)/share/henki/{} ~/.config/henki/config.toml", PROFILE).as_str()))
     );
     r.env("HENKI_BASE_URL", &m.url()).env("HENKI_MODEL", "env-model");
     let d = r.json("hello");

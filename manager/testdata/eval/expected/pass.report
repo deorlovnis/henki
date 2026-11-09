@@ -1,0 +1,27 @@
+run 20270111T220000Z-a1b2: halti 0.3.0 (hd1:5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e), model Qwen3.5-2B-Q8_0
+suite halti: 12 tasks x 3 repeats; on 26/36, off 1/36; effect +25 per 36 (95% CI +19 to +30); tasks 11 better, 0 worse, 1 equal; sign p 0.001; prompt bytes on 412, off 0
+  c01              on 3/3  off 0/3  +3
+  c02              on 3/3  off 0/3  +3
+  c03              on 3/3  off 0/3  +3
+  c04              on 3/3  off 0/3  +3
+  c05              on 2/3  off 0/3  +2
+  c06              on 2/3  off 0/3  +2
+  s07              on 2/3  off 0/3  +2
+  s08              on 2/3  off 0/3  +2
+  s09              on 2/3  off 0/3  +2
+  s10              on 2/3  off 0/3  +2
+  s11              on 2/3  off 1/3  +1
+  s12              on 0/3  off 0/3  0
+suite general: 12 tasks x 3 repeats; on 25/36, off 24/36; effect +1 per 36 (95% CI -2 to +4); tasks 2 better, 1 worse, 9 equal; sign p 1.000; prompt bytes on 412, off 0
+  g01              on 3/3  off 3/3  0
+  g02              on 2/3  off 2/3  0
+  g03              on 3/3  off 2/3  +1
+  g04              on 1/3  off 1/3  0
+  g05              on 2/3  off 3/3  -1
+  g06              on 3/3  off 3/3  0
+  g07              on 0/3  off 0/3  0
+  g08              on 3/3  off 2/3  +1
+  g09              on 2/3  off 2/3  0
+  g10              on 2/3  off 2/3  0
+  g11              on 1/3  off 1/3  0
+  g12              on 3/3  off 3/3  0

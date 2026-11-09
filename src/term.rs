@@ -57,7 +57,9 @@ pub fn json_line(v: &Value) -> String {
 
 /// `s` with each escaped code point written by `form`; None when there is none.
 fn subst(s: &str, form: impl Fn(&mut String, char) -> std::fmt::Result) -> Option<String> {
-    let (head, tail) = s.split_at(s.find(escaped)?);
+    // Tab, newline and printable ASCII are never escaped: a byte scan skips to the first other byte, a char boundary.
+    let at = s.bytes().position(|b| !matches!(b, b'\t' | b'\n' | 0x20..0x7f))?;
+    let (head, tail) = s.split_at(at + s.get(at..)?.find(escaped)?);
     let mut o = String::with_capacity(s.len() + 16);
     o.push_str(head);
     for c in tail.chars() {
@@ -233,7 +235,7 @@ fn width(s: &str) -> usize {
 /// The REPL's terminal reader. It reads only while MAIN waits for input, so what the user types into a `!cmd` reaches
 /// the command. Each read goes out as `Ev::Input { tag, bytes }` (None: EOF or an error) with the tag MAIN asked with
 /// when it returned: 0 when MAIN no longer waits, and MAIN drops it as stale. `.1` is the descriptor it reads.
-pub struct Reader(Arc<(Mutex<u32>, Condvar)>, pub i32);
+pub struct Reader(pub Arc<(Mutex<u32>, Condvar)>, pub i32);
 
 impl Reader {
     /// The thread over `input`: stdin, or a pipe in tests. Reads of 64 KiB go past std's buffer for stdin, which stays

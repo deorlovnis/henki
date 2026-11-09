@@ -2,22 +2,27 @@
 //! and context elision.
 use super::{ATTEMPTS, Session};
 use crate::{anthropic, http, journal, journal::rec, openai, term, types::*};
+use serde_json::{Value, json};
 use std::{sync::Arc, sync::Mutex, time::Instant};
 
 /// `attempt` for one wire format.
 type Attempt = fn(http::Resp, &[&'static str], &http::Limits, &mut dyn FnMut(Part)) -> Result<Reply, ProviderError>;
 
 impl Session {
-    /// One reply for the step. Pairing holds before every attempt (else nothing is sent); old tool results are elided
-    /// once when the window fills or the server says it overflowed; a retryable error waits, then tries again. Every
-    /// attempt that ends, the request timeout included, has its socket shut.
+    /// One reply for the step. Pairing holds before every attempt (else nothing is sent). A context binding shapes each
+    /// attempt while it answers records henki accepts (a server overflow asks it once more, `overflowed`); otherwise old
+    /// tool results are elided once when the window fills or the server says it overflowed. A retryable error waits,
+    /// then tries again. Every attempt that ends, the request timeout included, has its socket shut.
     pub(super) fn request(&mut self) -> Result<Reply, Outcome> {
-        let (mut attempt, mut elided) = (1, false);
+        // fit: Some(overflowed) while the context binding shapes this request; None: std elide.
+        let (mut attempt, mut elided, mut fit) = (1, false, self.ports.context.as_ref().map(|_| false));
         loop {
             journal::pairing(&self.hist).map_err(|e| Outcome::error("internal", e))?;
-            let mut body = self.body();
-            if !elided && ctx_use(self.ctx, body.len()) * 5 >= self.cfg.window * 4 && self.elide()? {
-                (elided, body) = (true, self.body());
+            let fitted = fit.map(|o| self.fitted(o)).transpose()?.flatten();
+            fit = fit.filter(|_| fitted.is_some());
+            let mut body = fitted.unwrap_or_else(|| self.body(&self.hist));
+            if fit.is_none() && !elided && ctx_use(self.ctx, body.len()) * 5 >= self.cfg.window * 4 && self.elide()? {
+                (elided, body) = (true, self.body(&self.hist));
             }
             let (tag, len) = (self.next_tag(), body.len());
             (self.t.partial, self.t.opened) = (String::new(), Vec::new());
@@ -43,6 +48,7 @@ impl Session {
                     self.wait(timer, Some(Instant::now() + d))?;
                     attempt += 1;
                 }
+                Err(e) if e.kind == "context_exceeded" && fit.is_some() => fit = fit.filter(|o| !o).map(|_| true),
                 Err(e) if e.kind == "context_exceeded" && !elided && self.elide()? => elided = true,
                 // What streamed before a refusal is dropped: replayed, it would ask the model to go on with it.
                 Err(e) if e.message == anthropic::REFUSAL => return Err(self.gave_up(e, attempt)),
@@ -113,9 +119,24 @@ impl Session {
         Ok(!ids.is_empty() && self.record(rec::elide(&ids)).map(|()| true)?)
     }
 
-    pub(super) fn body(&self) -> Vec<u8> {
+    /// The context binding's records for this attempt, rendered; None: std elide decides (`keep`, or an answer henki
+    /// did not take: a notice says why, and a binding that died is dropped for the rest of the session).
+    fn fitted(&mut self, overflowed: bool) -> Result<Option<Vec<u8>>, Outcome> {
+        let budget = json!({"fixed": self.body(&[]).len(), "limit": self.cfg.window * 16 / 5, "max_tokens": self.cfg.max_tokens, "window": self.cfg.window});
+        let Some(got) = self.ports.context.as_mut().map(|c| c.fit(&self.sid, &self.hist, &budget, overflowed)) else { return Ok(None) };
+        self.poll()?; // a signal or the deadline that came while the binding worked ends the turn here
+        match got {
+            Ok(r) => Ok(r.map(|r| self.body(&r))),
+            Err(e) => {
+                let dead = matches!(e.code, "timeout" | "crashed" | "protocol") && self.ports.context.take().is_some();
+                self.notice(&format!("{}; std elide shapes {}", e.message, if dead { "the rest of the session" } else { "this request" })).map(|()| None)
+            }
+        }
+    }
+
+    pub(super) fn body(&self, hist: &[Value]) -> Vec<u8> {
         let body = if self.cfg.dialect == "anthropic" { anthropic::body } else { openai::body };
-        body(&self.cfg.model, self.cfg.max_tokens, &self.system, &self.tools, &self.hist)
+        body(&self.cfg.model, self.cfg.max_tokens, &self.system, &self.tools, hist)
     }
 }
 

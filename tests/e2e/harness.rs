@@ -15,7 +15,7 @@ use std::os::fd::{AsRawFd, OwnedFd};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, Stdio};
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -198,6 +198,7 @@ impl Run {
             unread: false,
             ignore: Vec::new(),
             launch: None,
+            serve: false,
         }
     }
 
@@ -258,6 +259,7 @@ pub struct Cmd<'a> {
     unread: bool,
     ignore: Vec<i32>,
     launch: Option<String>,
+    serve: bool,
 }
 
 impl<'a> Cmd<'a> {
@@ -273,6 +275,12 @@ impl<'a> Cmd<'a> {
     #[cfg(target_os = "linux")]
     pub fn launch(mut self, prefix: &str) -> Cmd<'a> {
         self.launch = Some(prefix.into());
+        self
+    }
+
+    /// `henki serve ARGS` instead of `henki run ARGS`: its Done is held to a REPL session's postconditions.
+    pub fn serve(mut self) -> Cmd<'a> {
+        self.serve = true;
         self
     }
 
@@ -318,7 +326,7 @@ impl<'a> Cmd<'a> {
             }
             None => {
                 let mut c = Command::new(bin());
-                c.arg("run");
+                c.arg(if self.serve { "serve" } else { "run" });
                 c
             }
         };
@@ -365,8 +373,9 @@ impl<'a> Cmd<'a> {
             reader(OwnedFd::from(so), out.clone(), self.close_first);
         }
         reader(OwnedFd::from(child.stderr.take().unwrap()), err.clone(), false);
-        let json = self.args.iter().any(|a| a == "--json");
+        let json = self.serve || self.args.iter().any(|a| a == "--json");
         Live {
+            serve: self.serve,
             pid: child.id() as i32,
             child,
             stdin,
@@ -391,11 +400,14 @@ struct Pipe {
     close: AtomicBool,
     closed: AtomicBool,
     eof: AtomicBool,
+    /// The pipe's inode, which both of its ends share.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))] // read by close_stdout on Linux only
+    ino: AtomicU64,
 }
 
 impl Pipe {
     fn new() -> Arc<Pipe> {
-        Arc::new(Pipe { buf: Mutex::new(Vec::new()), close: AtomicBool::new(false), closed: AtomicBool::new(false), eof: AtomicBool::new(false) })
+        Arc::new(Pipe { buf: Mutex::new(Vec::new()), close: AtomicBool::new(false), closed: AtomicBool::new(false), eof: AtomicBool::new(false), ino: AtomicU64::new(0) })
     }
 }
 
@@ -410,6 +422,7 @@ fn nonblocking(fd: &OwnedFd) {
 /// Reads a pipe into `p` until EOF, polling so it can close the read end on request (or after the first line).
 fn reader(fd: OwnedFd, p: Arc<Pipe>, close_first: bool) {
     nonblocking(&fd);
+    p.ino.store(fs::File::from(fd.try_clone().expect("dup")).metadata().map_or(0, |m| std::os::unix::fs::MetadataExt::ino(&m)), Ordering::SeqCst);
     thread::spawn(move || {
         let mut f = fs::File::from(fd);
         let mut b = vec![0u8; 65536];
@@ -444,6 +457,20 @@ fn reader(fd: OwnedFd, p: Arc<Pipe>, close_first: bool) {
     });
 }
 
+/// Some process has a read end of the pipe `ino` open: an fd that links to `pipe:[ino]` and is open read-only.
+#[cfg(target_os = "linux")]
+fn read_end_held(ino: u64) -> bool {
+    let name = format!("pipe:[{ino}]");
+    let dirs = |p: &str| fs::read_dir(p).into_iter().flatten().flatten();
+    dirs("/proc").filter(|p| p.file_name().to_str().is_some_and(|n| n.bytes().all(|b| b.is_ascii_digit()))).any(|p| {
+        dirs(&format!("/proc/{}/fd", p.file_name().to_string_lossy())).any(|f| {
+            let info = || fs::read_to_string(format!("/proc/{}/fdinfo/{}", p.file_name().to_string_lossy(), f.file_name().to_string_lossy()));
+            let flags = |i: String| i.lines().find_map(|l| l.strip_prefix("flags:")).and_then(|v| u32::from_str_radix(v.trim(), 8).ok());
+            fs::read_link(f.path()).is_ok_and(|l| l.as_os_str() == name.as_str()) && info().ok().and_then(flags).is_some_and(|fl| fl & 3 == 0)
+        })
+    })
+}
+
 /// A henki process still running.
 pub struct Live {
     pub pid: i32,
@@ -462,6 +489,7 @@ pub struct Live {
     marker: String,
     state: PathBuf,
     stdin_file: Option<fs::File>,
+    serve: bool,
 }
 
 impl Live {
@@ -506,6 +534,16 @@ impl Live {
         while !self.out.closed.load(Ordering::SeqCst) && !self.out.eof.load(Ordering::SeqCst) && Instant::now() < end {
             thread::sleep(Duration::from_millis(1));
         }
+        // A process another test forked while this pipe was open holds a copy of its read end until it execs: henki's
+        // writes still land until then. Closed means no read end anywhere.
+        #[cfg(target_os = "linux")]
+        {
+            let end = Instant::now() + 5 * SEC;
+            while read_end_held(self.out.ino.load(Ordering::SeqCst)) {
+                assert!(Instant::now() < end, "stdout's read end still open somewhere after 5 s:\n{}", self.diag());
+                thread::sleep(Duration::from_millis(1));
+            }
+        }
     }
 
     pub fn write_stdin(&mut self, b: &[u8]) {
@@ -525,18 +563,27 @@ impl Live {
         lines(&self.stdout())
     }
 
-    fn diag(&self) -> String {
+    pub fn diag(&self) -> String {
         format!("stdout:\n{}\nstderr:\n{}", self.stdout(), String::from_utf8_lossy(&self.err.buf.lock().unwrap()))
     }
 
-    /// Polls `cond` while henki runs; panics if henki ends first or after `within`.
+    /// Polls `cond` while henki runs; panics after `within`, or if henki ends and its last output still fails `cond`.
     pub fn until(&mut self, what: &str, within: Duration, mut cond: impl FnMut(&mut Live) -> bool) {
         let end = Instant::now() + within;
         loop {
             if cond(self) {
                 return;
             }
-            assert!(!self.poll(), "henki ended while waiting for {what}:\n{}", self.diag());
+            if self.poll() {
+                // henki may write its last record and exit between the check above and the wait:
+                // let the reader drain stdout to EOF, then check once more.
+                let drain = Instant::now() + SEC;
+                while !self.out.eof.load(Ordering::SeqCst) && !self.out.closed.load(Ordering::SeqCst) && Instant::now() < drain {
+                    thread::sleep(Duration::from_millis(1));
+                }
+                assert!(cond(self), "henki ended while waiting for {what}:\n{}", self.diag());
+                return;
+            }
             assert!(Instant::now() < end, "no {what} within {within:?}:\n{}", self.diag());
             thread::sleep(Duration::from_millis(2));
         }
@@ -650,7 +697,7 @@ impl Live {
             stdout_complete,
             marker: self.marker.clone(),
             stdin_file: self.stdin_file.take(),
-            repl: false,
+            repl: self.serve,
         }
     }
 }

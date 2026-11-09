@@ -1,0 +1,11 @@
+# The project mod: the project's AGENTS.md (or CLAUDE.md) in the system prompt at each start (a context source).
+henki_module = 1
+name = "project"
+version = "0.1.0"
+license = "Apache-2.0"
+requires = ["henki >= 0.3"]
+contracts = ["ext/2", "module/1"]
+os = ["macos", "linux"]
+needs = ["git"]
+caps_net = "none"
+ports = []

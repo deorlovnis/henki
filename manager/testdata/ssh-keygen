@@ -1,0 +1,533 @@
+#!/bin/sh
+''''exec python3 -I "$0" "$@" #'''
+# A test stand-in for OpenSSH's ssh-keygen: exactly the Ed25519 subset git and the index tests call. Python 3 stdlib
+# plus the openssl CLI (1.1.1 or 3.x) for the Ed25519 arithmetic. Never shipped; the manager runs `ssh-keygen` from
+# PATH and a test puts this first only when no real ssh-keygen is found.
+#   -t ed25519 [-N ''] [-C COMMENT] -f FILE [-q]   writes FILE (openssh-key-v1, unencrypted) and FILE.pub
+#   -l -f FILE                                      prints "256 SHA256:... COMMENT (ED25519)"
+#   -y -f FILE                                      prints the public key line of a private key
+#   -Y sign -n NS -f KEY [FILE...]                  FILE.sig (or stdin to stdout), SSHSIG armour, sha512
+#   -Y verify -n NS -I PRINCIPAL -f ALLOWED -s SIG [-r REVOKED]  message on stdin; REVOKED: a list of public keys
+#   -Y find-principals -f ALLOWED -s SIG
+#   -Y check-novalidate -n NS -s SIG                message on stdin
+#   -O verify-time=T (and -O hashalg=sha256|sha512 for sign) as OpenSSH reads them
+# allowed_signers: principals (patterns, !negation), options namespaces=, valid-after=, valid-before=, cert-authority
+# (a line with cert-authority never matches: certificates are not supported). Output lines match OpenSSH's, which git
+# parses. Exit 0 on success, 255 on failure, as OpenSSH.
+import base64, calendar, fnmatch, hashlib, os, re, shutil, struct, subprocess, sys, tempfile, time
+
+MAGIC_KEY = b"openssh-key-v1\0"
+KT = b"ssh-ed25519"
+PKCS8 = bytes.fromhex("302e020100300506032b657004220420")
+SPKI = bytes.fromhex("302a300506032b6570032100")
+
+
+def die(msg):
+    sys.stderr.write(msg + "\n")
+    sys.exit(255)
+
+
+def s(b):
+    return struct.pack(">I", len(b)) + b
+
+
+class Reader:
+    def __init__(self, b):
+        self.b, self.i = b, 0
+
+    def u32(self):
+        if self.i + 4 > len(self.b):
+            raise ValueError("truncated")
+        v = struct.unpack(">I", self.b[self.i:self.i + 4])[0]
+        self.i += 4
+        return v
+
+    def str(self):
+        n = self.u32()
+        if self.i + n > len(self.b):
+            raise ValueError("truncated")
+        v = self.b[self.i:self.i + n]
+        self.i += n
+        return v
+
+    def raw(self, n):
+        if self.i + n > len(self.b):
+            raise ValueError("truncated")
+        v = self.b[self.i:self.i + n]
+        self.i += n
+        return v
+
+    def done(self):
+        return self.i == len(self.b)
+
+
+def armour(kind, b):
+    t = base64.b64encode(b).decode()
+    lines = [t[i:i + 70] for i in range(0, len(t), 70)]
+    return "-----BEGIN %s-----\n%s\n-----END %s-----\n" % (kind, "\n".join(lines), kind)
+
+
+def unarmour(kind, text):
+    m = re.search(r"-----BEGIN %s-----\s*(.*?)\s*-----END %s-----" % (kind, kind), text, re.S)
+    if not m:
+        raise ValueError("no %s armour" % kind)
+    return base64.b64decode("".join(m.group(1).split()), validate=True)
+
+
+def pub_blob(pub):
+    return s(KT) + s(pub)
+
+
+def fingerprint(blob):
+    return "SHA256:" + base64.b64encode(hashlib.sha256(blob).digest()).decode().rstrip("=")
+
+
+def parse_pub_blob(blob):
+    r = Reader(blob)
+    t = r.str()
+    if t != KT:
+        raise ValueError("not an ssh-ed25519 key")
+    pub = r.str()
+    if len(pub) != 32 or not r.done():
+        raise ValueError("bad ssh-ed25519 key")
+    return pub
+
+
+# --- openssl ---------------------------------------------------------------------------------------------------------
+
+def openssl(args, tmp):
+    exe = shutil.which("openssl")
+    if not exe:
+        die("ssh-keygen stand-in: openssl not found on PATH")
+    return subprocess.run([exe] + args, cwd=tmp, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                          stderr=subprocess.PIPE)
+
+
+def ed_public(seed):
+    with tempfile.TemporaryDirectory() as tmp:
+        k = os.path.join(tmp, "k")
+        with open(os.open(k, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600), "wb") as f:
+            f.write(PKCS8 + seed)
+        p = openssl(["pkey", "-inform", "DER", "-in", k, "-pubout", "-outform", "DER"], tmp)
+        if p.returncode != 0 or len(p.stdout) != 44 or not p.stdout.startswith(SPKI):
+            die("ssh-keygen stand-in: openssl cannot derive an Ed25519 public key: " + p.stderr.decode(errors="replace"))
+        return p.stdout[12:]
+
+
+def ed_sign(seed, data):
+    with tempfile.TemporaryDirectory() as tmp:
+        k, d, o = (os.path.join(tmp, n) for n in ("k", "d", "o"))
+        with open(os.open(k, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600), "wb") as f:
+            f.write(PKCS8 + seed)
+        with open(d, "wb") as f:
+            f.write(data)
+        p = openssl(["pkeyutl", "-sign", "-inkey", k, "-keyform", "DER", "-rawin", "-in", d, "-out", o], tmp)
+        if p.returncode != 0:
+            die("ssh-keygen stand-in: openssl cannot sign: " + p.stderr.decode(errors="replace"))
+        with open(o, "rb") as f:
+            sig = f.read()
+        if len(sig) != 64:
+            die("ssh-keygen stand-in: openssl gave a %d-byte Ed25519 signature" % len(sig))
+        return sig
+
+
+def ed_verify(pub, data, sig):
+    if len(sig) != 64:
+        return False
+    with tempfile.TemporaryDirectory() as tmp:
+        k, d, g = (os.path.join(tmp, n) for n in ("k", "d", "g"))
+        for path, b in ((k, SPKI + pub), (d, data), (g, sig)):
+            with open(path, "wb") as f:
+                f.write(b)
+        p = openssl(["pkeyutl", "-verify", "-pubin", "-inkey", k, "-keyform", "DER", "-rawin", "-in", d,
+                     "-sigfile", g], tmp)
+        return p.returncode == 0 and b"Signature Verified Successfully" in p.stdout
+
+
+# --- key files -------------------------------------------------------------------------------------------------------
+
+def private_bytes(seed, pub, comment, check):
+    sec = struct.pack(">II", check, check) + s(KT) + s(pub) + s(seed + pub) + s(comment.encode())
+    i = 1
+    while len(sec) % 8:
+        sec += bytes([i])
+        i += 1
+    return MAGIC_KEY + s(b"none") + s(b"none") + s(b"") + struct.pack(">I", 1) + s(pub_blob(pub)) + s(sec)
+
+
+def read_private(path):
+    """(seed, pub, comment) of an unencrypted openssh-key-v1 Ed25519 key."""
+    try:
+        with open(path) as f:
+            b = unarmour("OPENSSH PRIVATE KEY", f.read())
+        if not b.startswith(MAGIC_KEY):
+            raise ValueError("not openssh-key-v1")
+        r = Reader(b[len(MAGIC_KEY):])
+        cipher, kdf, _ = r.str(), r.str(), r.str()
+        if cipher != b"none" or kdf != b"none":
+            die("ssh-keygen stand-in: %s is passphrase-protected; the stand-in reads only unencrypted keys" % path)
+        if r.u32() != 1:
+            raise ValueError("not one key")
+        pub = parse_pub_blob(r.str())
+        sec = Reader(r.str())
+        if not r.done():
+            raise ValueError("trailing bytes")
+        if sec.u32() != sec.u32():
+            raise ValueError("check bytes differ")
+        if sec.str() != KT or sec.str() != pub:
+            raise ValueError("public part differs")
+        priv = sec.str()
+        if len(priv) != 64 or priv[32:] != pub:
+            raise ValueError("bad private part")
+        comment = sec.str().decode(errors="replace")
+        pad = sec.b[sec.i:]
+        if pad != bytes(range(1, len(pad) + 1)):
+            raise ValueError("bad padding")
+    except (ValueError, UnicodeDecodeError) as e:
+        die("Load key \"%s\": invalid format (%s)" % (path, e))
+    except OSError as e:
+        die("Load key \"%s\": %s" % (path, e.strerror))
+    return priv[:32], pub, comment
+
+
+def read_public_line(line):
+    f = line.split(None, 2)
+    if len(f) < 2 or f[0] != KT.decode():
+        raise ValueError("not an ssh-ed25519 public key")
+    blob = base64.b64decode(f[1], validate=True)
+    parse_pub_blob(blob)
+    return blob, (f[2].strip() if len(f) > 2 else "")
+
+
+def keygen(o):
+    if o.get("t", "ed25519") != "ed25519":
+        die("ssh-keygen stand-in: only -t ed25519")
+    if o.get("N", "") != "":
+        die("ssh-keygen stand-in: only an empty passphrase (-N '')")
+    path = o.get("f") or die("ssh-keygen stand-in: -f FILE is required")
+    if os.path.exists(path) or os.path.exists(path + ".pub"):
+        die("%s already exists" % path)
+    comment = o.get("C", "%s@%s" % (os.environ.get("USER", "user"), os.uname().nodename))
+    seed = os.urandom(32)
+    pub = ed_public(seed)
+    check = struct.unpack(">I", os.urandom(4))[0]
+    text = armour("OPENSSH PRIVATE KEY", private_bytes(seed, pub, comment, check))
+    with open(os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600), "w") as f:
+        f.write(text)
+    with open(os.open(path + ".pub", os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644), "w") as f:
+        f.write("%s %s %s\n" % (KT.decode(), base64.b64encode(pub_blob(pub)).decode(), comment))
+    if "q" not in o:
+        print("Generating public/private ed25519 key pair.")
+        print("Your identification has been saved in %s" % path)
+        print("Your public key has been saved in %s.pub" % path)
+        print("The key fingerprint is:")
+        print("%s %s" % (fingerprint(pub_blob(pub)), comment))
+
+
+def key_of_file(path):
+    """(blob, comment) of a public key file or a private key file."""
+    try:
+        with open(path) as f:
+            text = f.read()
+    except OSError as e:
+        die("%s: %s" % (path, e.strerror))
+    if "-----BEGIN OPENSSH PRIVATE KEY-----" in text:
+        _, pub, comment = read_private(path)
+        return pub_blob(pub), comment
+    try:
+        return read_public_line(text.strip().splitlines()[0])
+    except (ValueError, IndexError):
+        die("%s is not a key file." % path)
+
+
+# --- SSHSIG ----------------------------------------------------------------------------------------------------------
+
+def signed_data(ns, hashalg, msg):
+    h = hashlib.new(hashalg, msg).digest()
+    return b"SSHSIG" + s(ns.encode()) + s(b"") + s(hashalg.encode()) + s(h)
+
+
+def make_sig(seed, pub, ns, msg, hashalg="sha512"):
+    sig = ed_sign(seed, signed_data(ns, hashalg, msg))
+    blob = (b"SSHSIG" + struct.pack(">I", 1) + s(pub_blob(pub)) + s(ns.encode()) + s(b"") + s(hashalg.encode())
+            + s(s(KT) + s(sig)))
+    return armour("SSH SIGNATURE", blob)
+
+
+def parse_sig(path):
+    """(key blob, namespace, hashalg, raw signature)."""
+    try:
+        with open(path) as f:
+            b = unarmour("SSH SIGNATURE", f.read())
+        if b[:6] != b"SSHSIG":
+            raise ValueError("bad magic")
+        r = Reader(b[6:])
+        if r.u32() != 1:
+            raise ValueError("unsupported version")
+        blob, ns, _reserved, hashalg, sigw = r.str(), r.str(), r.str(), r.str(), r.str()
+        if not r.done():
+            raise ValueError("trailing bytes")
+        parse_pub_blob(blob)
+        sr = Reader(sigw)
+        if sr.str() != KT:
+            raise ValueError("not an ssh-ed25519 signature")
+        raw = sr.str()
+        if not sr.done():
+            raise ValueError("trailing bytes")
+        hashalg = hashalg.decode()
+        if hashalg not in ("sha256", "sha512"):
+            raise ValueError("unsupported hash")
+        return blob, ns.decode(), hashalg, raw
+    except OSError as e:
+        die("Couldn't read signature file %s: %s" % (path, e.strerror))
+    except (ValueError, UnicodeDecodeError) as e:
+        die("Couldn't parse signature: %s" % e)
+
+
+def check_sig(path, ns, msg):
+    blob, sns, hashalg, raw = parse_sig(path)
+    if ns is not None and sns != ns:
+        sys.stderr.write("Couldn't verify signature: namespace does not match\n")
+        return None
+    if not ed_verify(parse_pub_blob(blob), signed_data(sns, hashalg, msg), raw):
+        sys.stderr.write("Couldn't verify signature: incorrect signature\n")
+        return None
+    return blob
+
+
+# --- allowed_signers -------------------------------------------------------------------------------------------------
+
+def match_list(name, patterns):
+    """OpenSSH's match_pattern_list: 1 on a match, 0 none, -1 a negated match."""
+    got = 0
+    for p in patterns.split(","):
+        neg = p.startswith("!")
+        if neg:
+            p = p[1:]
+        if fnmatch.fnmatchcase(name, p):
+            if neg:
+                return -1
+            got = 1
+    return got
+
+
+def parse_time(v):
+    m = re.fullmatch(r"(\d{8})(\d{4}(\d{2})?)?(Z?)", v)
+    if not m:
+        raise ValueError("bad time " + v)
+    d = m.group(1) + (m.group(2) or "0000")
+    if not m.group(3):
+        d += "00"
+    t = time.strptime(d, "%Y%m%d%H%M%S")
+    return calendar.timegm(t) if m.group(4) else int(time.mktime(t))
+
+
+def parse_options(text):
+    """Options at the start of TEXT: (dict, rest). OpenSSH's quoting: "..." may hold commas and spaces."""
+    opts, i = {}, 0
+    while True:
+        m = re.match(r'([A-Za-z-]+)(="([^"]*)")?', text[i:])
+        if not m:
+            raise ValueError("bad options")
+        name = m.group(1).lower()
+        if name not in ("cert-authority", "namespaces", "valid-after", "valid-before"):
+            raise ValueError("unsupported option " + name)
+        opts[name] = m.group(3) if m.group(2) else True
+        i += m.end()
+        if i < len(text) and text[i] == ",":
+            i += 1
+            continue
+        return opts, text[i:].lstrip()
+
+
+def allowed_lines(path):
+    """Yield (principals, opts, key blob) for each usable line; skip comments and unparseable lines."""
+    try:
+        with open(path, "rb") as f:
+            data = f.read()
+    except OSError as e:
+        die("%s: %s" % (path, e.strerror))
+    for n, raw in enumerate(data.decode("utf-8", "replace").splitlines(), 1):
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        parts = line.split(None, 1)
+        if len(parts) < 2:
+            continue
+        principals, rest = parts
+        try:
+            if rest.startswith(KT.decode() + " ") or rest.startswith("ssh-") or rest.startswith("ecdsa-") or \
+                    rest.startswith("sk-"):
+                opts = {}
+            else:
+                opts, rest = parse_options(rest)
+            kf = rest.split(None, 2)
+            if len(kf) < 2:
+                raise ValueError("no key")
+            if kf[0] != KT.decode():
+                continue
+            blob = base64.b64decode(kf[1], validate=True)
+            parse_pub_blob(blob)
+            for k in ("valid-after", "valid-before"):
+                if k in opts:
+                    opts[k] = parse_time(opts[k])
+        except ValueError as e:
+            sys.stderr.write("%s:%d: %s\n" % (path, n, e))
+            continue
+        yield principals, opts, blob
+
+
+def line_ok(opts, ns, when):
+    if opts.get("cert-authority"):
+        return False
+    if ns is not None and "namespaces" in opts and match_list(ns, opts["namespaces"]) != 1:
+        return False
+    if "valid-after" in opts and when < opts["valid-after"]:
+        return False
+    if "valid-before" in opts and when > opts["valid-before"]:
+        return False
+    return True
+
+
+def revoked(path, blob):
+    """A revocation file as a list of public keys (KRLs are not supported: their magic refuses every key)."""
+    try:
+        with open(path, "rb") as f:
+            data = f.read()
+    except OSError as e:
+        die("%s: %s" % (path, e.strerror))
+    if data.startswith(b"SSHKRL"):
+        sys.stderr.write("ssh-keygen stand-in: %s is a KRL; the stand-in reads only key lists\n" % path)
+        return True
+    for line in data.decode("utf-8", "replace").splitlines():
+        f = line.split()
+        if len(f) >= 2 and f[0] == KT.decode():
+            try:
+                if base64.b64decode(f[1], validate=True) == blob:
+                    return True
+            except ValueError:
+                pass
+    return False
+
+
+# --- main ------------------------------------------------------------------------------------------------------------
+
+def parse_args(argv):
+    o, files, flags_with_arg = {}, [], set("tNCfnIsYOEr")
+    i = 0
+    while i < len(argv):
+        a = argv[i]
+        if a.startswith("-") and len(a) > 1:
+            j = 1
+            while j < len(a):
+                c = a[j]
+                if c in flags_with_arg:
+                    v = a[j + 1:] if j + 1 < len(a) else (argv[i + 1] if i + 1 < len(argv) else None)
+                    if v is None:
+                        die("ssh-keygen stand-in: -%s needs a value" % c)
+                    if j + 1 >= len(a):
+                        i += 1
+                    if c == "O":
+                        o.setdefault("O", []).append(v)
+                    else:
+                        o[c] = v
+                    break
+                if c in "lqyU":
+                    o[c] = True
+                    j += 1
+                    continue
+                die("ssh-keygen stand-in: unsupported option -%s" % c)
+        else:
+            files.append(a)
+        i += 1
+    return o, files
+
+
+def verify_time(o):
+    for v in o.get("O", []):
+        if v.startswith("verify-time="):
+            try:
+                return parse_time(v[len("verify-time="):])
+            except ValueError:
+                die("Invalid \"verify-time\" option")
+    return int(time.time())
+
+
+def main(argv):
+    o, files = parse_args(argv)
+    mode = o.get("Y")
+    if mode is None and "l" in o:
+        blob, comment = key_of_file(o.get("f") or die("ssh-keygen stand-in: -l needs -f FILE"))
+        print("256 %s %s (ED25519)" % (fingerprint(blob), comment or "no comment"))
+        return 0
+    if mode is None and "y" in o:
+        seed, pub, comment = read_private(o.get("f") or die("ssh-keygen stand-in: -y needs -f FILE"))
+        print("%s %s %s" % (KT.decode(), base64.b64encode(pub_blob(pub)).decode(), comment))
+        return 0
+    if mode is None:
+        keygen(o)
+        return 0
+    if mode == "sign":
+        if "U" in o:
+            die("ssh-keygen stand-in: no agent; sign with a private key file")
+        ns = o.get("n") or die("ssh-keygen stand-in: -Y sign needs -n NAMESPACE")
+        hashalg = "sha512"
+        for v in o.get("O", []):
+            if v.startswith("hashalg="):
+                hashalg = v[len("hashalg="):]
+        if hashalg not in ("sha256", "sha512"):
+            die("Invalid hash algorithm \"%s\"" % hashalg)
+        key = o.get("f") or die("ssh-keygen stand-in: -Y sign needs -f KEY")
+        with open(key) as f:
+            if "-----BEGIN OPENSSH PRIVATE KEY-----" not in f.read():
+                die("ssh-keygen stand-in: %s is not a private key file (no agent here)" % key)
+        seed, pub, _ = read_private(key)
+        if not files:
+            sys.stdout.write(make_sig(seed, pub, ns, sys.stdin.buffer.read(), hashalg))
+            return 0
+        for path in files:
+            with open(path, "rb") as f:
+                text = make_sig(seed, pub, ns, f.read(), hashalg)
+            with open(path + ".sig", "w") as f:
+                f.write(text)
+            sys.stderr.write("Signing file %s\nWrite signature to %s.sig\n" % (path, path))
+        return 0
+    when = verify_time(o)
+    if mode == "find-principals":
+        sig = o.get("s") or die("ssh-keygen stand-in: -Y find-principals needs -s SIG")
+        blob = parse_sig(sig)[0]
+        found = [p for p, opts, b in allowed_lines(o.get("f") or die("-f ALLOWED is required"))
+                 if b == blob and line_ok(opts, None, when)]
+        if not found:
+            die("No principal matched.")
+        print("\n".join(found))
+        return 0
+    if mode == "check-novalidate":
+        ns = o.get("n") or die("ssh-keygen stand-in: -Y check-novalidate needs -n NAMESPACE")
+        blob = check_sig(o.get("s") or die("-s SIG is required"), ns, sys.stdin.buffer.read())
+        if blob is None:
+            die("Could not verify signature.")
+        print('Good "%s" signature with ED25519 key %s' % (ns, fingerprint(blob)))
+        return 0
+    if mode == "verify":
+        ns = o.get("n") or die("ssh-keygen stand-in: -Y verify needs -n NAMESPACE")
+        principal = o.get("I") or die("ssh-keygen stand-in: -Y verify needs -I PRINCIPAL")
+        allowed = o.get("f") or die("ssh-keygen stand-in: -Y verify needs -f ALLOWED")
+        blob = check_sig(o.get("s") or die("-s SIG is required"), ns, sys.stdin.buffer.read())
+        if blob is not None and "r" in o and revoked(o["r"], blob):
+            sys.stderr.write("Signature key is revoked\n")
+            blob = None
+        ok = blob is not None and any(b == blob and match_list(principal, p) == 1 and line_ok(opts, ns, when)
+                                      for p, opts, b in allowed_lines(allowed))
+        if not ok:
+            if blob is not None:
+                sys.stderr.write("Signature for %s not allowed by %s\n" % (principal, allowed))
+            print("Could not verify signature.")
+            return 255
+        print('Good "%s" signature for %s with ED25519 key %s' % (ns, principal, fingerprint(blob)))
+        return 0
+    die("ssh-keygen stand-in: unsupported -Y %s" % mode)
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

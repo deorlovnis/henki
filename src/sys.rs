@@ -25,9 +25,9 @@ fn check(rc: libc::c_int) -> io::Result<()> {
     if rc < 0 { Err(io::Error::last_os_error()) } else { Ok(()) }
 }
 
-/// How many signals the signal thread has taken; bumped before each `Ev::Signal` is sent, so a wait outside
-/// `Session::wait` (a port binding's answer) ends at once and leaves the event queued for MAIN.
-static SEEN: AtomicU64 = AtomicU64::new(0);
+/// How many signals the signal thread (and `henki serve`'s `cancel`) has taken; bumped before each `Ev::Signal` is sent,
+/// so a wait outside `Session::wait` (a port binding's answer) ends at once and leaves the event queued for MAIN.
+pub static SEEN: AtomicU64 = AtomicU64::new(0);
 
 pub fn seen() -> u64 {
     SEEN.load(SeqCst)

@@ -9,6 +9,13 @@
 //! way: MODE `allow`, `ask`, `ask-always` (ask, offering always), `deny`, or `maybe` (a decision no contract has). Each
 //! `decide`'s params go as one line into `STATE/decide.log`, each `record`'s into `STATE/record.log`.
 //!
+//! `port_toy context MODE [FAULT...]` is a `context/1` binding. MODE `keep` answers keep; `last N` the history from its
+//! Nth-last user record on (the last N turns). Each fault mode breaks one of henki's rules: `unpaired` (the history
+//! without its first result), `huge` (a user record of `limit` bytes first), `wrong-last` (an assistant text record
+//! after the last), `invent-call` (a call no reply made, `{"id":"x"}`, with its result, first), `edit-result` (the first
+//! result's content changed); the two that need a result answer the history as it is when it has none. Each `fit`'s
+//! params go as one line into `STATE/fit.log` as the request comes, before any fault.
+//!
 //! Faults (each one is how a broken binding behaves; tests run them through a wrapper script, because henki starts a
 //! binding with no arguments):
 //!   --exit-at M     exits (status 3) when request M comes        --hang-at M     never answers M (M#K: the Kth M)
@@ -18,6 +25,7 @@
 //!   --no-durable    keeps appends in memory until bye            --bad-id        names sessions `../x`
 //!   --daemon MARK   leaves `sleep MARK` running                  --stderr-flood  writes 8 MiB to stderr first
 //!   --chatty        prints a banner before anything else        --name NAME     says NAME in hello
+//!   --fork          has cap `fork` (a copy of the parent's first lines)
 use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::fs::{self, File, OpenOptions};
@@ -33,8 +41,10 @@ struct Opts {
     no_read: bool,
     no_durable: bool,
     bad_id: bool,
+    fork: bool,
     name: Option<String>,
-    policy: Option<String>, // the MODE of a policy binding
+    policy: Option<String>,  // the MODE of a policy binding
+    context: Option<String>, // the MODE of a context binding (`last N` as `last:N`)
 }
 
 struct Held {
@@ -57,7 +67,8 @@ fn main() {
     match args.next().as_deref() {
         None | Some("history") => {}
         Some("policy") => o.policy = args.next(),
-        Some(_) => panic!("usage: port_toy [history [FAULT...] | policy MODE [FAULT...]]"),
+        Some("context") => o.context = args.next().map(|m| if m == "last" { format!("last:{}", args.next().unwrap()) } else { m }),
+        Some(_) => panic!("usage: port_toy [history [FAULT...] | policy MODE [FAULT...] | context MODE [FAULT...]]"),
     }
     while let Some(a) = args.next() {
         match a.as_str() {
@@ -67,6 +78,7 @@ fn main() {
             "--no-read" => o.no_read = true,
             "--no-durable" => o.no_durable = true,
             "--bad-id" => o.bad_id = true,
+            "--fork" => o.fork = true,
             "--name" => o.name = args.next(),
             "--daemon" => std::mem::forget(std::process::Command::new("sleep").arg(args.next().unwrap()).spawn().unwrap()), // left behind on purpose
             "--stderr-flood" => (0..128).for_each(|_| _ = std::io::stderr().write_all(&[b'e'; 64 << 10])),
@@ -81,6 +93,9 @@ fn main() {
         let (id, method) = (q["id"].clone(), q["method"].as_str().unwrap_or_default().to_string());
         std::thread::sleep(Duration::from_millis(t.o.slow));
         let k = *seen.entry(method.clone()).and_modify(|n| *n += 1).or_insert(1);
+        if method == "fit" && !t.state.as_os_str().is_empty() {
+            OpenOptions::new().create(true).append(true).open(t.state.join("fit.log")).unwrap().write_all(format!("{}\n", q["params"]).as_bytes()).unwrap();
+        }
         let fault = |f: &str| t.o.at.get(f).is_some_and(|m| *m == method || *m == format!("{method}#{k}"));
         if fault("--exit-at") {
             std::process::exit(3);
@@ -160,6 +175,41 @@ impl Toy {
         }
     }
 
+    /// A context binding's answer to `fit`: MODE's records, or keep.
+    fn context(&mut self, mode: &str, method: &str, p: &Value) -> Answer {
+        let mut recs = p["records"].as_array().cloned().unwrap_or_default();
+        let result = recs.iter().position(|r| r["t"] == "tool_result");
+        match method {
+            "hello" => {
+                self.state = PathBuf::from(p["state"].as_str().unwrap_or("."));
+                fs::create_dir_all(&self.state).map_err(|e| ("io", e.to_string()))?;
+                fs::write(self.state.join("pid"), std::process::id().to_string()).map_err(|e| ("io", e.to_string()))?;
+                Ok(json!({"caps": [], "impl": "0.1.0", "name": self.o.name.clone().unwrap_or("port_toy".into()), "protocol": 1, "version": 1}))
+            }
+            "fit" if mode == "keep" => Ok(json!({"keep": true})),
+            "fit" => {
+                match mode {
+                    "unpaired" => _ = result.map(|i| recs.remove(i)),
+                    "huge" => recs.insert(0, json!({"msg": {"content": "x".repeat(p["budget"]["limit"].as_u64().unwrap() as usize), "role": "user"}, "t": "user"})),
+                    "wrong-last" => recs.push(json!({"finish": "stop", "msg": {"content": "one more", "role": "assistant", "tool_calls": []}, "t": "assistant"})),
+                    "invent-call" => {
+                        let call = json!({"finish": "tool_calls", "msg": {"content": "", "role": "assistant", "tool_calls": [{"id": "x"}]}, "t": "assistant"});
+                        recs.splice(0..0, [call, json!({"content": "made up", "id": "x", "name": "shell", "t": "tool_result"})]);
+                    }
+                    "edit-result" => result.into_iter().for_each(|i| recs[i]["content"] = "not what it said".into()),
+                    m => {
+                        let n: usize = m.strip_prefix("last:").unwrap_or_else(|| panic!("unknown context mode {m}")).parse().unwrap();
+                        let users: Vec<usize> = recs.iter().enumerate().filter(|(_, r)| r["t"] == "user").map(|(i, _)| i).collect();
+                        recs.drain(..users[users.len().saturating_sub(n)]);
+                    }
+                }
+                Ok(json!({"records": recs}))
+            }
+            "bye" => Ok(Value::Null),
+            m => Err(("unsupported", format!("no method {m}"))),
+        }
+    }
+
     fn answer(&mut self, method: &str, p: &Value) -> Answer {
         if !p["versions"].as_array().is_none_or(|v| v.contains(&json!(1))) {
             return Err(("version", "port_toy speaks version 1 only".into()));
@@ -167,12 +217,16 @@ impl Toy {
         if let Some(mode) = self.o.policy.clone() {
             return self.policy(&mode, method, p);
         }
+        if let Some(mode) = self.o.context.clone() {
+            return self.context(&mode, method, p);
+        }
         match method {
             "hello" => {
                 self.state = PathBuf::from(p["state"].as_str().unwrap_or("."));
                 fs::create_dir_all(&self.state).map_err(|e| ("io", e.to_string()))?;
                 fs::write(self.state.join("pid"), std::process::id().to_string()).map_err(|e| ("io", e.to_string()))?;
-                Ok(json!({"caps": [], "impl": "0.1.0", "name": self.o.name.clone().unwrap_or("port_toy".into()), "protocol": 1, "version": 1}))
+                let caps: &[&str] = if self.o.fork { &["fork"] } else { &[] };
+                Ok(json!({"caps": caps, "impl": "0.1.0", "name": self.o.name.clone().unwrap_or("port_toy".into()), "protocol": 1, "version": 1}))
             }
             "create" => {
                 let id = match p["hint"].as_str() {
@@ -240,6 +294,21 @@ impl Toy {
                     let _ = fs::remove_file(self.path(&id, "scope"));
                 }
                 Ok(json!({"removed": self.held.as_ref().is_some_and(|h| h.gone)}))
+            }
+            "fork" if self.o.fork => {
+                let (id, n) = (p["session"].as_str().unwrap_or_default(), p["line"].as_u64().unwrap_or(0) as usize);
+                let text = Toy::valid(id).then(|| fs::read_to_string(self.path(id, "jsonl")).ok()).flatten().ok_or(("not_found", format!("no session {id}")))?;
+                let lines: Vec<&str> = text.lines().collect();
+                if !lines.get(n.wrapping_sub(1)).and_then(|l| serde_json::from_str::<Value>(l).ok()).is_some_and(|r| r["t"] == "user") {
+                    return Err(("invalid", format!("line {n} of {id} is not a user record")));
+                }
+                let made = self.answer("create", &json!({"hint": null, "scope": p["scope"]}))?;
+                let h = self.held.as_mut().unwrap();
+                h.file
+                    .write_all(lines[..n - 1].iter().map(|l| format!("{l}\n")).collect::<String>().as_bytes())
+                    .and_then(|()| h.file.sync_data())
+                    .map_err(|e| ("io", e.to_string()))?;
+                Ok(made)
             }
             "list" => {
                 Ok(json!({"sessions": self.list(p["scope"].as_str().unwrap_or_default()).into_iter().map(|(id, t)| json!({"session": id, "updated": t})).collect::<Vec<_>>()}))

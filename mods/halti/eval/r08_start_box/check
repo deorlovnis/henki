@@ -1,0 +1,9 @@
+#!/bin/sh
+# r08_start_box (running boxes)
+. "$EVAL_LIB/check"
+holds status/box/emanative.main running
+answer_has 'wire the henki halti extension'
+called '^(sh|run|open|box run) emanative([^[:alnum:]_]|$)'
+never '^(copy|set)([^[:alnum:]_]|$)'
+never '^with(--|[^[:alnum:]_].*--)[[:space:]]*(sh|bash|zsh|env|printenv|echo|cat|tee|python3?|node|perl)([^[:alnum:]_]|$)'
+verdict

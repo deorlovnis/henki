@@ -24,6 +24,7 @@ fn setup(m: &str, on: &[(&str, &str)]) -> (PathBuf, Ext) {
         cmds: Vec::new(),
         user: Vec::new(),
         on: on.iter().map(|o| o.0.to_string()).collect(),
+        ctx: Vec::new(),
         prompt: false,
         shadows: Vec::new(),
         paths: Vec::new(),

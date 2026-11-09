@@ -1,31 +1,26 @@
 #!/bin/sh
-# /sessions, and through links to this file /resume, /new and /reload (handoff/1). The sessions are henki's std
-# journals in this session's scope: the dir that holds $HENKI_STATE/sessions/*/$HENKI_SESSION.jsonl.
+# /sessions, and through links to this file /resume, /new, /reload and /fork (handoff/1). The sessions are this
+# folder's in the store henki keeps them in, std's or a bound history binding's: `henki mods history` reads either.
 LC_ALL=C
 export LC_ALL
 me=${0##*/}
 next() { printf '%s\n' "$1" >"$HENKI_NEXT"; }
+history() { "${HENKI_BIN:-henki}" mods history "$@"; }
+# The ids of `history list`'s lines (` N M ID DATE  FIRST`, M `*` for this session or blank), as `N ID`.
+ids() { awk '$1 ~ /^[0-9]+$/ { print $1, ($2 == "*" ? $3 : $2) }'; }
 case "$me" in
   new) next new && exit 0 ;;
   reload) next restart && exit 0 ;;
-esac
-dir=""
-for f in "$HENKI_STATE"/sessions/*/"$HENKI_SESSION".jsonl; do [ -f "$f" ] && dir=${f%/*}; done
-if [ -z "$dir" ]; then
-  echo "$me: history is bound to another store; use its commands" >&2
-  exit 1
-fi
-# The 20 newest, newest first; ids are [A-Za-z0-9._-], so ls's lines are names.
-newest() { (cd "$dir" && ls -t -- *.jsonl 2>/dev/null) | sed -n 's/\.jsonl$//p' | head -n 20; }
-case "$me" in
+  sessions) exec "${HENKI_BIN:-henki}" mods history list --scope "$PWD" ;;
   resume)
     want=${1:-}
+    list=$(history list --scope "$PWD" --all) || exit 1
     case "$want" in
-      '') id=$(newest | command grep -vxF -- "$HENKI_SESSION" | head -n 1) ;;
-      *[!0-9]*) id=$want ;;
-      *) id=$(newest | sed -n "${want}p") ;;
+      '') id=$(printf '%s\n' "$list" | ids | ME=${HENKI_SESSION:-} awk '$2 != ENVIRON["ME"] { print $2; exit }') ;;
+      *[!0-9]*) id=$(printf '%s\n' "$list" | ids | W=$want awk '$2 == ENVIRON["W"] { print $2; exit }') ;;
+      *) id=$(printf '%s\n' "$list" | ids | W=$want awk '$1 == ENVIRON["W"] { print $2; exit }') ;;
     esac
-    if [ -z "$id" ] || [ ! -f "$dir/$id.jsonl" ]; then
+    if [ -z "$id" ]; then
       echo "resume: no session ${want:-other than this one} in this folder; fix: /sessions lists them" >&2
       exit 1
     fi
@@ -33,19 +28,26 @@ case "$me" in
     exit 0
     ;;
 esac
-# The first message: the first user record's content (canonical JSON, escapes kept, so nothing reaches the terminal
-# raw), without the head henki puts before a session's first task, cut at its first line and at 60 characters.
-first() {
-  sed -n 's/^{"msg":{"content":"\(.*\)","role":"user"},"t":"user".*/\1/p' "$1" | head -n 1 |
-    sed 's/^cwd: [^\\]*\\nos: [^\\]*\\ndate: [^\\]*\\n\\n//; s/\\n.*//; s/\\"/"/g; s/\\\\/\\/g' | cut -c 1-60
-}
-n=0
-newest | while IFS= read -r id; do
-  n=$((n + 1))
-  f="$dir/$id.jsonl"
-  mark=" "
-  [ "$id" != "$HENKI_SESSION" ] || mark="*"
-  when=$(printf '%s\n' "$id" | sed -n 's/^\([0-9]\{4\}\)\([0-9]\{2\}\)\([0-9]\{2\}\)T\([0-9]\{2\}\)\([0-9]\{2\}\).*/\1-\2-\3 \4:\5/p')
-  size=$(wc -c <"$f" | tr -d ' ')
-  printf '%2d %s %-21s %-16s %9s B  %s\n' "$n" "$mark" "$id" "${when:--}" "$size" "$(first "$f")"
-done
+# /fork [N | ID@N]: a new session holding this session's (or ID's) records before line N, a user message, to which
+# the next message goes instead. Without N: the session's messages by line, then the question.
+arg=${1:-}
+id=${HENKI_SESSION:-}
+n=$arg
+case "$arg" in *@*) id=${arg%@*} n=${arg##*@} ;; esac
+shown=$(history show "$id") || exit 1
+if [ -z "$n" ]; then
+  printf '%s\n' "$shown"
+  printf 'fork at line? '
+  # No terminal to answer on (henki serve runs a command with stdin /dev/null): the line goes in the argument.
+  read -r n || { echo >&2 && echo "fork: no line given, and no terminal to ask on; fix: /fork N with N a line above" >&2 && exit 1; }
+fi
+case "$n" in '' | 0* | *[!0-9]*)
+  echo "fork: \"$n\" is not a line; fix: /fork N, N one of the lines /fork alone lists" >&2
+  exit 1
+  ;;
+esac
+if ! printf '%s\n' "$shown" | N=$n awk 'NR > 1 && $1 == ENVIRON["N"] { f = 1 } END { exit !f }'; then
+  echo "fork: line $n of session $id is not a message of yours; fix: /fork lists them" >&2
+  exit 1
+fi
+if [ -n "${HENKI_NEXT:-}" ]; then next "resume $id@$n"; else echo "henki --resume=$id@$n"; fi

@@ -178,17 +178,17 @@ fn handoff_trust_changes() {
     assert_eq!(d.out().matches("[y/N]").count(), 1, "{}", d.out());
 }
 
-/// HN6: ids a resume refuses (a path, a flag, a fork), and a verb henki does not know: a notice, nothing else.
+/// HN6: ids a resume refuses (a path, a flag, a fork point that is no number), and a verb henki does not know: a notice, nothing else.
 #[test]
 fn handoff_resume_refused() {
     let m = Mock::start(vec![say("still here")]);
     let r = Run::new(&m.url());
-    let cmds: Vec<(String, String)> = ["../x", "-x", "a@3", ""].iter().enumerate().map(|(i, id)| (format!("r{i}"), format!("echo 'resume {id}' >\"$HENKI_NEXT\""))).collect();
+    let cmds: Vec<(String, String)> = ["../x", "-x", "a@x", "a@", ""].iter().enumerate().map(|(i, id)| (format!("r{i}"), format!("echo 'resume {id}' >\"$HENKI_NEXT\""))).collect();
     let mut cmds: Vec<(&str, &str)> = cmds.iter().map(|(a, b)| (a.as_str(), b.as_str())).collect();
     cmds.push(("odd", "echo 'fork me' >\"$HENKI_NEXT\""));
     module(&r, "kit", &cmds);
     let p = start(&r, &[]);
-    for (i, id) in ["../x", "-x", "a@3", ""].iter().enumerate() {
+    for (i, id) in ["../x", "-x", "a@x", "a@", ""].iter().enumerate() {
         p.line(&format!("/r{i}"));
         p.expect(&format!("henki: /r{i}: cannot resume {id:?}\r\n"), W);
         p.prompt(W);
@@ -294,12 +294,14 @@ fn handoff_official_mods() {
         std::os::unix::fs::symlink(Path::new(env!("CARGO_MANIFEST_DIR")).join("mods").join(n), ext.join(n)).unwrap();
     }
     r.set("ext", &format!("[\"{}\"]", ext.display()));
+    // sessions reads them through `henki mods history`: the checkout's manager on PATH.
+    r.env("PATH", &format!("{}/manager:/usr/local/bin:/usr/bin:/bin", env!("CARGO_MANIFEST_DIR")));
     let mut p = Pty::spawn(&r, &[], 24, 80);
     p.expect("ext clip: clip-get, clip-put\r\next prompts: no tools\r\next sessions: no tools\r\n", W);
     p.prompt(W);
     p.line("/help");
     p.expect("this terminal; the model is told you ran it", W);
-    p.expect("\r\n/commit-msg  (prompts)\r\n/explain  (prompts)\r\n/fix-test  (prompts)\r\n/review  (prompts)\r\n/new  (sessions)\r\n", W);
+    p.expect("\r\n/commit-msg  (prompts)\r\n/explain  (prompts)\r\n/fix-test  (prompts)\r\n/review  (prompts)\r\n/fork  (sessions)\r\n/new  (sessions)\r\n", W);
     p.prompt(W);
     message(&p, "first task", "one");
     p.line("/new");
@@ -308,7 +310,7 @@ fn handoff_official_mods() {
     message(&p, "second task", "two");
     p.line("/sessions");
     p.expect(" 2   ", W);
-    p.expect("B  first task\r\n", W);
+    p.expect("  first task\r\n", W);
     p.prompt(W);
     // Two sessions started in one second sort by their random part: the first is the one holding the first task.
     let first = r.journals().into_iter().find(|j| fs::read_to_string(j).unwrap().contains("first task")).unwrap();
@@ -334,6 +336,42 @@ fn handoff_official_mods() {
     assert!(user[1].starts_with("Review the uncommitted changes") && user[1].ends_with("\n\nthe parser\n"), "{user:?}");
 }
 
+/// An Agent Skill the manager imported (`henki-mods add --skill`) is a template: `/NAME TEXT` shows the skill's
+/// instructions, TEXT after them, and sends them on a yes. It costs no prompt bytes, and its files stay data.
+#[test]
+fn handoff_skill_import() {
+    let m = Mock::start(vec![say("checked")]);
+    let r = Run::new(&m.url());
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let out = std::process::Command::new("bash")
+        .arg(root.join("manager/henki-mods"))
+        .args(["add", "--skill"])
+        .arg(root.join("manager/testdata/skills/plain-skill"))
+        .arg("--yes")
+        .env_clear()
+        .env("HOME", &r.home)
+        .env("PATH", "/usr/local/bin:/usr/bin:/bin")
+        .env("XDG_DATA_HOME", r.dir.join("xdg/data"))
+        .env("TMPDIR", &r.dir)
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let p = start(&r, &[]);
+    p.line("/plain-skill focus on 0.3");
+    p.expect("[from /plain-skill]\r\n(This skill's files are in ", W);
+    p.expect("/.henki/skill; read them when the text names them.)\r\n# Changelog check\r\n", W);
+    p.expect("3. Say which commits have no entry.\r\n\r\nfocus on 0.3\r\n", W);
+    p.expect("send? [Y/n] ", W);
+    p.line("y");
+    p.expect("checked", W);
+    p.prompt(W);
+    exit(&r, p);
+    let log = m.log();
+    let (system, user) = (log[0].system(), log[0].contents("user"));
+    assert!(!system.contains("plain-skill"), "{system}");
+    assert!(user[0].contains("\n\n(This skill's files are in ") && user[0].contains("2. Read `references/STYLE.md`") && user[0].ends_with("\n\nfocus on 0.3\n"), "{user:?}");
+}
+
 /// A `restart` after the history link changed (as `/mods swap history ...` does) starts a new session on the new
 /// binding: a resume there would be refused, since the session stays in the store it was kept in, which a note names.
 #[test]
@@ -347,18 +385,26 @@ fn handoff_restart_after_history_swap() {
     fs::write(&w, format!("#!/bin/sh\nexec {} history --name {}\n", toy.display(), r.marker)).unwrap();
     fs::set_permissions(&w, fs::Permissions::from_mode(0o700)).unwrap();
     let swap = format!("mkdir -p \"$HENKI_CONFIG/port\" && ln -s {} \"$HENKI_CONFIG/port/history\" && echo restart >\"$HENKI_NEXT\"", w.display());
-    module(&r, "kit", &[("swap", &swap)]);
+    module(&r, "kit", &[("swap", &swap), ("back", "rm \"$HENKI_CONFIG/port/history\" && echo restart >\"$HENKI_NEXT\"")]);
     let mut p = start(&r, &[]);
     message(&p, "first", "one");
     let first = r.journals()[0].file_stem().unwrap().to_string_lossy().into_owned();
     p.line("/swap");
     p.expect("henki: changed while /swap ran: ~/.config/henki/port/history\r\nrestart on these changes? [y/N] ", W);
     p.line("y");
-    p.expect(&format!("henki: session {first} stays in henki's own history; resume it with that bound (std: henki --port history=std --resume={first})\r\n"), W);
+    p.expect(&format!("henki: session {first} stays in henki's own history; henki --port history=std --resume={first} reaches it\r\n"), W);
     p.expect(&format!("henki: history: {} (port/1, {} 0.1.0)", w.display(), r.marker), W);
     p.prompt(W);
     p.renew(&r);
     message(&p, "second", "two");
+    // Back to std: the binding's session is reached by linking it again (a module's: henki mods swap history PKG).
+    let second = r.journals().into_iter().find(|j| j.starts_with(r.state().join("port/history"))).unwrap().file_stem().unwrap().to_string_lossy().into_owned();
+    p.line("/back");
+    p.expect("restart on these changes? [y/N] ", W);
+    p.line("y");
+    p.expect(&format!("henki: session {second} stays in history binding {0}; link {0} as port/history again, then henki --resume={second} reaches it\r\n", w.display()), W);
+    p.prompt(W);
+    p.renew(&r);
     exit(&r, p);
     // The first session stays in std; the second is the only one in the binding's store.
     let text: Vec<String> = r.journals().iter().map(|j| fs::read_to_string(j).unwrap()).collect();

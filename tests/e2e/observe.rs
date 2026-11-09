@@ -324,7 +324,7 @@ fn observe_checkpoints_under_a_git_hook() {
 }
 
 /// `src` copied to `dst` as it is: files with their modes, links as links.
-fn copy(src: &Path, dst: &Path) {
+pub fn copy(src: &Path, dst: &Path) {
     fs::create_dir_all(dst).unwrap();
     for e in fs::read_dir(src).unwrap().flatten() {
         let (from, to) = (e.path(), dst.join(e.file_name()));

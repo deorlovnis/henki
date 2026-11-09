@@ -2,7 +2,7 @@
 //! that henki kills by group and, on Linux, by sweeping every descendant. Also the user's own `!cmd`, on the terminal.
 use crate::{config::Env, sys, term, term::head_end, types::End, types::Ev, types::ToolOutput, types::lock};
 use std::sync::{Arc, Condvar, Mutex, OnceLock, PoisonError, mpsc, mpsc::Sender};
-use std::{collections::VecDeque, ffi::OsString, fs::File, os::unix::process::CommandExt, os::unix::process::ExitStatusExt, thread};
+use std::{collections::VecDeque, ffi::OsStr, ffi::OsString, fs::File, os::unix::process::CommandExt, os::unix::process::ExitStatusExt, thread};
 use std::{io, io::Read, io::Write, path::Path, path::PathBuf, process::Child, process::Command, process::Stdio, time::Duration, time::Instant};
 
 pub const GRACE: Duration = Duration::from_millis(300);
@@ -55,9 +55,11 @@ fn depth(env: &Env) -> String {
     env.get("HENKI_DEPTH").and_then(|v| v.to_str()?.parse::<u32>().ok()).map_or(1, |d| u64::from(d) + 1).to_string()
 }
 
-/// MAIN thread only. `bash --noprofile --norc -c CMD` in its own session, no tty, stdin /dev/null, one pipe for stdout
-/// and stderr. The group is in the ledger before this returns. A capture and a waiter thread send one `Ev::Tool { tag }`.
-pub fn spawn(bash: &Path, cmd: &str, cwd: &Path, env: &[(OsString, OsString)], cap: usize, spill: Spill, tag: u32, tx: &Sender<Ev>) -> io::Result<i32> {
+/// MAIN thread only. `argv` (a shell call: `BASH --noprofile --norc -c CMD`) in its own session, no tty, stdin /dev/null,
+/// one pipe for stdout and stderr. The group is in the ledger before this returns. A capture and a waiter thread send one
+/// `Ev::Tool { tag }`.
+pub fn spawn(argv: &[&OsStr], cwd: &Path, env: &[(OsString, OsString)], cap: usize, spill: Spill, tag: u32, tx: &Sender<Ev>) -> io::Result<i32> {
+    let [prog, args @ ..] = argv else { return Err(io::ErrorKind::InvalidInput.into()) };
     let t0 = Instant::now();
     let (r, w) = io::pipe()?;
     let shared = Arc::new((Mutex::new(Cap::new(cap, spill)), Condvar::new()));
@@ -66,8 +68,8 @@ pub fn spawn(bash: &Path, cmd: &str, cwd: &Path, env: &[(OsString, OsString)], c
     // close (the capture ends) and `give` drops (the waiter ends).
     thread::Builder::new().spawn(move || capture(r, &reader))?;
     thread::Builder::new().spawn(move || take.recv().map(|child| waiter(child, &shared, t0, tag, &tx)))?;
-    let mut c = Command::new(bash);
-    c.args(["--noprofile", "--norc", "-c", cmd]).current_dir(cwd).env_clear().envs(env.iter().map(|(k, v)| (k, v)));
+    let mut c = Command::new(prog);
+    c.args(args).current_dir(cwd).env_clear().envs(env.iter().map(|(k, v)| (k, v)));
     c.stdin(Stdio::null()).stdout(w.try_clone()?).stderr(w);
     sys::child_setup(&mut c, std::process::id());
     INHERITED.get_or_init(|| children(&sys::procs()));
@@ -83,8 +85,13 @@ pub fn spawn(bash: &Path, cmd: &str, cwd: &Path, env: &[(OsString, OsString)], c
 /// MAIN thread only. The user's own command, `prog ARGS` (`!cmd`: `bash --noprofile --norc -c CMD`; `/mods`: the
 /// manager), in henki's own process group on the terminal (stdin, stdout and stderr inherited), exactly `env`; not in the
 /// ledger, though a `!cmd &` job it leaves is counted and swept like a call's. A waiter thread reaps it and sends one
-/// `Ev::BangDone { tag, code }` (128 + N when signal N ended it). Returns the pid.
-pub fn bang(prog: &Path, args: &[OsString], cwd: &Path, env: &[(OsString, OsString)], tag: u32, tx: &Sender<Ev>) -> io::Result<i32> {
+/// `Ev::BangDone { tag, code }` (128 + N when signal N ended it). Returns the pid. `capture` (`henki serve`, which has no
+/// terminal): as a call is run instead (`spawn`), its output up to 1 MiB never spilled; the pid is its group's.
+pub fn bang(prog: &Path, args: &[OsString], cwd: &Path, env: &[(OsString, OsString)], tag: u32, tx: &Sender<Ev>, capture: bool) -> io::Result<i32> {
+    let argv: Vec<&OsStr> = [prog.as_os_str()].into_iter().chain(args.iter().map(OsString::as_os_str)).collect();
+    if capture {
+        return spawn(&argv, cwd, env, term::LINE_MAX, Spill { path: "/dev/null".into(), shown: String::new() }, tag, tx);
+    }
     let (tx, (give, take)) = (tx.clone(), mpsc::channel::<Child>());
     // The waiter starts before the fork, so nothing can fail once the command runs.
     thread::Builder::new().spawn(move || {

@@ -41,10 +41,10 @@ cd "$(dirname "$0")"
 # shellcheck disable=SC2046 # one variable name per word.
 unset $(git rev-parse --local-env-vars 2>/dev/null)
 
-max_lines=4358      # non-test lines in src/
+max_lines=4546      # non-test lines in src/
 max_file_lines=400  # per file; a module is one file
 max_crates=10       # packages in the normal dependency tree, henki included
-max_bytes=1065536   # release binary
+max_bytes=1131072   # release binary
 
 step() { printf '\n== %s\n' "$*"; }
 say() { echo "check.sh: $*" >&2; }
@@ -462,11 +462,13 @@ cargo clippy --locked --all-targets -- -D warnings
 step tests
 cargo test --locked
 
-# The module manager: its own suite (hermetic, with live prompt and eval checks against the henki the tests just
-# built), then the official modules: their own tests, and the layout henki loads; then the general eval suite's layout.
-step "mods (manager/tests.sh, manager/mods-tests.sh, mods/*/, eval/general/)"
+# The module manager: its own suites (hermetic, with live prompt and eval checks against the henki the tests just
+# built; dev-tests.sh holds the author's tools and the Agent Skills import), then the official modules: their own
+# tests, and the layout henki loads; then the general eval suite's layout.
+step "mods (manager/tests.sh, manager/dev-tests.sh, manager/mods-tests.sh, mods/*/, eval/general/)"
 MODS_TEST_HENKI="$target/debug/henki" manager/tests.sh
-manager/mods-tests.sh
+MODS_TEST_HENKI="$target/debug/henki" manager/dev-tests.sh
+MODS_TEST_HENKI="$target/debug/henki" manager/mods-tests.sh
 gate_mods mods
 manager/henki-mods eval --check eval/general
 

@@ -229,9 +229,9 @@ fn ext_ignored_entries() {
 fn ext_unknown_entry_fails() {
     let t = T::new();
     let d = t.ext("e/a", "# a");
-    for n in ["notes.txt", "lib", "tool", "gate", "tools.json", "transport", "ctx", "cmds", "binary", "evals", "events"] {
+    for n in ["notes.txt", "lib", "tool", "gate", "tools.json", "transport", "context", "ctxs", "cmds", "binary", "evals", "events"] {
         let p = if n.contains('.') { t.file(&format!("e/a/{n}"), "x") } else { t.dir(&format!("e/a/{n}")) };
-        let want = format!("ext {}: unknown entry {}; ext/2 modules hold doc.md, bin/, cmd/, on/, port/ and eval/; fix: move it out of the extension", d.display(), p.display());
+        let want = format!("ext {}: unknown entry {}; a module holds doc.md, bin/, cmd/, on/, port/, ctx/ and eval/; fix: move it out of the extension", d.display(), p.display());
         assert_eq!(err(&[t.p("e")]), want);
         let _ = fs::remove_file(&p).or_else(|_| fs::remove_dir(&p));
     }
@@ -483,6 +483,46 @@ fn ext_on_rules() {
     assert_eq!(ok(&[t.p("e")]).exts.iter().map(|x| x.on.len()).sum::<usize>(), 16);
     t.exe("e/b1/on/record");
     assert_eq!(err(&[t.p("e")]), format!("ext {}: more than 16 observers (on/ files) over all modules; fix: turn a module off", t.p("e/b5").display()));
+}
+
+/// ctx/: runnable entries are the context sources, sorted and stamped; a dot file that cannot run is watched; anything
+/// else is refused. A module of sources only is not in the prompt, and is held to ext/2's rules (its links stay in it).
+#[test]
+fn ext_ctx_rules() {
+    let t = T::new();
+    t.ext("e/a", "# a: project notes");
+    let (b, a, dot) = (t.exe("e/a/ctx/b"), t.exe("e/a/ctx/a.sh"), t.file("e/a/ctx/.DS_Store", "x"));
+    let f = ok(&[t.p("e")]);
+    assert_eq!((&f.exts[0].ctx, f.exts[0].prompt, f.exts[0].cmds.is_empty()), (&vec!["a.sh".to_string(), "b".into()], false, true));
+    assert_eq!(f.exts[0].paths[2..], [t.p("e/a/ctx"), dot, a, b.clone()]);
+    assert_eq!(prompt(&f.exts, &t.0), "", "a module of sources costs no doc line");
+    let plain = t.file("e/a/ctx/notes", "x");
+    let want = format!("ext {}: a command is a file you can run, named with A-Z, a-z, 0-9, ., _ and -; fix: rename it or chmod u+x it, or move it out of ctx/", plain.display());
+    assert_eq!(err(&[t.p("e")]), want);
+    fs::remove_file(&plain).unwrap();
+    // ext/2's link rule: a module with ctx/ is not an ext/1 one, whose links may leave it.
+    fs::remove_file(&b).unwrap();
+    symlink(t.exe("elsewhere/b"), &b).unwrap();
+    assert_eq!(err(&[t.p("e")]), format!("ext {}: a link that leaves the module; fix: copy the file in", b.display()));
+    fs::remove_file(&b).unwrap();
+    t.exe("e/a/bin/tool");
+    assert!(ok(&[t.p("e")]).exts[0].prompt, "with bin/ the model needs the doc");
+}
+
+/// A source runs unasked at every start, as an observer runs: ctx/, its files and the module dir are held to the
+/// owner and mode rule.
+#[test]
+fn ext_ctx_writable_by_others_refused() {
+    let t = T::new();
+    t.ext("e/a", "# a: project notes");
+    let s = t.exe("e/a/ctx/project");
+    for p in [t.p("e/a"), t.p("e/a/ctx"), s] {
+        let m = fs::metadata(&p).unwrap().mode() & 0o7777;
+        fs::set_permissions(&p, fs::Permissions::from_mode(m | 0o002)).unwrap();
+        assert_eq!(err(&[t.p("e")]), format!("ext {0} is group- or world-writable; fix: chmod go-w {0}", p.display()));
+        fs::set_permissions(&p, fs::Permissions::from_mode(m)).unwrap();
+    }
+    assert_eq!(ok(&[t.p("e")]).exts[0].ctx, ["project"]);
 }
 
 /// No on/ that another user can write, nor any directory from an observer's real file up to the module's: its files

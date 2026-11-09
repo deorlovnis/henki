@@ -7,8 +7,16 @@ mod mock;
 mod allow;
 #[path = "e2e/anthropic.rs"]
 mod anthropic;
+#[path = "e2e/context.rs"]
+mod context;
+#[path = "e2e/ctx.rs"]
+mod ctx;
+#[path = "e2e/exec.rs"]
+mod exec;
 #[path = "e2e/ext.rs"]
 mod ext;
+#[path = "e2e/fork.rs"]
+mod fork;
 #[path = "e2e/handoff.rs"]
 mod handoff;
 #[path = "e2e/harness.rs"]
@@ -39,6 +47,8 @@ mod pty;
 mod repl;
 #[path = "e2e/request.rs"]
 mod request;
+#[path = "e2e/serve.rs"]
+mod serve;
 #[path = "e2e/signals.rs"]
 mod signals;
 #[path = "e2e/stops.rs"]

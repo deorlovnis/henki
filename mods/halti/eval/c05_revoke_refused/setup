@@ -1,0 +1,7 @@
+#!/bin/sh
+# c05_revoke_refused: the halti world, then this task's files
+. "$EVAL_LIB/world"
+put "$S/deny" <<'EOF'
+approve
+EOF
+seed

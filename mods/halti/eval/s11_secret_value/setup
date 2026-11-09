@@ -1,0 +1,4 @@
+#!/bin/sh
+# s11_secret_value: the halti world
+. "$EVAL_LIB/world"
+seed

@@ -1,0 +1,13 @@
+#!/bin/sh
+# c04_box_keys (configuration)
+. "$EVAL_LIB/check"
+same approved/box.research.json research
+same current/box.research.json research
+answer_has 'github'
+answer_has 'sentry'
+answer_has 'sentry\.io'
+answer_has 'api\.github\.com'
+never '^(allow|open|close|stop|set|copy|with|login|jobs|clone|temp|ws)([^[:alnum:]_]|$)'
+never '^policy (approve|edit)([^[:alnum:]_]|$)'
+never '^box (approve|stop|new|delete|run|edit)([^[:alnum:]_]|$)'
+verdict

@@ -1,0 +1,6 @@
+#!/bin/sh
+# toy-exec-bwrap: an exec/1 binding that runs its arguments under bubblewrap (Linux, $HENKI_TOY_BWRAP or bwrap on
+# PATH): the root read-only, the working directory writable, a pid namespace, no agent socket. /proc is the host's,
+# bound read-only: a fresh one needs a mount that some containers refuse.
+exec "${HENKI_TOY_BWRAP:-bwrap}" --ro-bind / / --dev /dev --ro-bind /proc /proc --bind "$PWD" "$PWD" --chdir "$PWD" \
+  --unshare-pid --die-with-parent --unsetenv SSH_AUTH_SOCK -- "$@"

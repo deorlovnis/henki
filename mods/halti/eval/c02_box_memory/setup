@@ -1,0 +1,4 @@
+#!/bin/sh
+# c02_box_memory: the halti world
+. "$EVAL_LIB/world"
+seed

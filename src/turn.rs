@@ -1,5 +1,5 @@
 //! One session: the step loop of a turn, the only place the main thread waits, and the single way a turn and a session end.
-use crate::{anthropic, config::Config, ext, http, journal, journal::rec, observe, observe::Observers, port, port::Ports, supervise, sys, term, term::Out, term::Reader};
+use crate::{anthropic, config::Config, ext, http, journal, journal::rec, observe, observe::Observers, port, port::Ports, serve, supervise, sys, term, term::Out, term::Reader};
 use crate::{tools, tools::Killed, types::*};
 use call::Stuck;
 use serde_json::{Value, json};
@@ -74,6 +74,8 @@ struct Turn {
     open: Vec<(Call, bool)>,
     /// The running call's tag and id: MAIN waits on the tag, and FINISHING gives the call its output.
     live: Option<(u32, String)>,
+    /// From the turn's start to its `turn_end`: `henki serve`'s EOF is a hangup.
+    on: bool,
 }
 
 impl Session {
@@ -82,7 +84,7 @@ impl Session {
     /// the REPL (approvals are asked on the terminal), None in `run`.
     pub fn new(cfg: Config, ports: Ports, sid: String, hist: Vec<Value>, out: Out, ch: (Sender<Ev>, Receiver<Ev>), deadline: Option<Instant>, reader: Option<Reader>) -> Session {
         let env = supervise::child_env(&cfg.env, &cfg.pass_env, &ext::child_path(&cfg.exts, &cfg.user_path), &cfg.user_path, &sid);
-        let system = tools::system(cfg.agents.as_deref(), &ext::prompt(&cfg.exts, &cfg.home));
+        let system = tools::system(&cfg.tools, cfg.agents.as_deref(), &cfg.context, &ext::prompt(&cfg.exts, &cfg.home));
         // The Anthropic API can be silent for minutes while it buffers a large tool input.
         let lim = http::Limits { stall: if cfg.dialect == "anthropic" { anthropic::STALL } else { http::LIMITS.stall }, ..http::LIMITS };
         let (tools, next_h, spill_n) = (tools::schema(&cfg.tools), journal::next_h(&hist), journal::spill_n(&cfg.state, &sid, &hist));
@@ -179,6 +181,11 @@ impl Session {
         &self.out
     }
 
+    /// A line henki does not take now: a `reject` record on `henki serve`'s stdout (never journaled), else a note.
+    pub fn reject(&self, why: &str) {
+        if self.out.json() { self.out.record(&json!({"t": "reject", "why": why})) } else { self.out.note(why) }
+    }
+
     /// The run's `result` record: the last assistant text (or ""), this turn's successful replies, this process's usage.
     pub fn result(&self, o: &Outcome, duration_ms: u64) -> Value {
         rec::result(o, &self.t.text, self.usage_proc, Some(&self.sid), self.t.steps, duration_ms)
@@ -200,9 +207,14 @@ impl Session {
     /// Some((text, typed)): `typed` is false for a line that holds a paste or came with more input pending, which is
     /// never a command or an answer. None at EOF (Ctrl-D on an empty line, and every line after it) or without a reader.
     /// No deadline applies (the REPL has none). Err: a signal (also in `sig`) or a closed stdout. On every way out the
-    /// terminal has its modes back, and bracketed paste off is queued.
+    /// terminal has its modes back, and bracketed paste off is queued. `henki serve`: the frontend's next command line as
+    /// `serve::take` reads it, at the question about the first call that has no result, else idle; None at its EOF.
     pub fn line(&mut self, prompt: &str) -> Result<Option<(String, bool)>, Stop> {
         let Some(fd) = self.reader.as_ref().filter(|_| !self.eof).map(|r| r.1) else { return Ok(None) };
+        if self.out.json() {
+            let Some(Ev::Input { bytes: Some(b), .. }) = self.wait(serve::FRONT, None)? else { return Ok((self.eof = true, None).1) };
+            return Ok(Some(serve::take(self, &b, self.t.open.first().map(|o| o.0.id.as_str()))));
+        }
         self.sync()?;
         sys::raw(true).filter(|&n| n > 0).iter().for_each(|&n| self.out.note(&format!("dropped {} bytes typed before this prompt", term::num(n as u64))));
         self.out.control(term::PASTE_MODE[1]);
@@ -228,19 +240,25 @@ impl Session {
 
     /// `prog ARGS` on the terminal with exactly `env` (`!CMD`, `/mods`): its exit code, None when it did not start (a
     /// notice says why). INT and QUIT reach the command alone (it runs in henki's process group); TERM, HUP and a closed
-    /// stdout SIGKILL it and return Err.
+    /// stdout SIGKILL it and return Err. `henki serve` has no terminal: the command runs as a call does (supervise::bang),
+    /// a `cancel` is its Ctrl-C, and its output and exit code (null when a signal ended it) are the `command_output`
+    /// record, never journaled; it returns None.
     pub fn bang(&mut self, prog: &Path, args: &[OsString], env: &[(OsString, OsString)]) -> Result<Option<i32>, Stop> {
         // The line's end and bracketed paste off reach the terminal before the command writes to it.
         self.sync().or_else(|s| if matches!(s, Stop::Signal(libc::SIGINT | libc::SIGQUIT)) { Ok(()) } else { Err(s) })?;
-        let tag = self.next_tag();
-        let Ok(pid) = supervise::bang(prog, args, &self.cfg.cwd, env, tag, &self.tx).map_err(|e| self.out.note(&format!("cannot start {}: {e}", prog.display()))) else {
+        let (tag, json) = (self.next_tag(), self.out.json());
+        let Ok(pid) = supervise::bang(prog, args, &self.cfg.cwd, env, tag, &self.tx, json).map_err(|e| self.reject(&format!("cannot start {}: {e}", prog.display()))) else {
             return Ok(None);
         };
         let mut got = self.wait(tag, None);
         while let Err(Stop::Signal(libc::SIGINT | libc::SIGQUIT)) = got {
-            got = self.wait(tag, None); // the command got it too
+            json.then(|| sys::kill(-pid, libc::SIGINT)); // on a terminal the command got it too
+            got = self.wait(tag, None);
         }
         let done = got.inspect_err(|_| _ = sys::kill(pid, libc::SIGKILL))?;
+        if let Some(Ev::Tool { out, .. }) = &done {
+            self.out.record(&json!({"t": "command_output", "text": out.text, "exit": if let End::Exit(c) = out.end { Some(c) } else { None }}));
+        }
         Ok(done.and_then(|ev| if let Ev::BangDone { code, .. } = ev { Some(code) } else { None }))
     }
 
@@ -271,7 +289,7 @@ impl Session {
 
     /// Requests and calls until an outcome; `Err` is the only way out.
     fn step_loop(&mut self, task: Option<String>) -> Result<Infallible, Outcome> {
-        (self.t, self.sig) = (Turn::default(), None);
+        (self.t, self.sig) = (Turn { on: true, ..Turn::default() }, None);
         // Observers start with this process's first turn: a REPL session with no message has none.
         self.opened.take().map_or(Ok(()), |r| self.observe("session_start", &r))?;
         // The REPL's banner printed them already.
@@ -329,7 +347,7 @@ impl Session {
         let got = if o.stops() || self.t.live.is_some() { self.stop_all(int).0 } else { None };
         let r = self.settle(&o, got);
         // A second signal hurries this kill only; the next turn's cancel gets its grace again.
-        (self.finishing, self.hurry) = (false, false);
+        (self.finishing, self.hurry, self.t.on) = (false, false, false);
         r.err().filter(|_| !matches!(o, Outcome::Error { .. })).unwrap_or(o)
     }
 
@@ -368,7 +386,10 @@ impl Session {
             }
             // The session holds a sender, so the channel never disconnects.
             let ev = if let Some(e) = until.into_iter().chain(deadline).min() { self.rx.recv_timeout(e - now).ok() } else { self.rx.recv().ok() };
-            match ev {
+            // `henki serve`'s EOF comes after every line written before it: in a turn it is a hangup; outside one (a
+            // command) the session ends at the next line.
+            let hup = self.t.on && matches!(ev, Some(Ev::Input { tag: serve::FRONT, bytes: None }));
+            match if hup { Some(Ev::Signal(libc::SIGHUP)) } else { ev } {
                 Some(Ev::Signal(s)) => {
                     // While finishing, a Ctrl-C only hurries the kill: a TERM or HUP before it still ends the REPL.
                     let kept = self.sig.filter(|&p| self.finishing && matches!(p, libc::SIGTERM | libc::SIGHUP));
@@ -379,6 +400,7 @@ impl Session {
                 Some(Ev::Part { tag: t, part }) if t == tag => self.part(part),
                 Some(ev @ (Ev::Reply { tag: t, .. } | Ev::Tool { tag: t, .. } | Ev::Input { tag: t, .. } | Ev::BangDone { tag: t, .. })) if t == tag => return Ok(Some(ev)),
                 Some(ev @ Ev::Observed { tag: t }) if t == tag => return Ok(Some(ev)),
+                Some(Ev::Input { tag: serve::FRONT, bytes: None }) => self.eof = true,
                 _ => {} // stale: an ended attempt, a timer, an answered call, input nobody waits for
             }
         }

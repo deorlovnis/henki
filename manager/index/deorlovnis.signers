@@ -1,0 +1,3 @@
+# The signing keys of the default module index, as git's allowed_signers lines (principal henki-index,
+# namespaces="git"). It holds no key until the index is published: henki-mods then says the index is not live yet,
+# and installs by URL or path still work.

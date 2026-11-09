@@ -1,0 +1,8 @@
+#!/bin/sh
+# r07_box_command (running boxes)
+. "$EVAL_LIB/check"
+answer_has 'test_refund_rounding'
+called '^(sh|box run) crewpoint(/[^[:space:]]+)? .*run-tests'
+never '^(copy|set)([^[:alnum:]_]|$)'
+never '^with(--|[^[:alnum:]_].*--)[[:space:]]*(sh|bash|zsh|env|printenv|echo|cat|tee|python3?|node|perl)([^[:alnum:]_]|$)'
+verdict

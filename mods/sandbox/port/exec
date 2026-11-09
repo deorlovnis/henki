@@ -1,0 +1,199 @@
+#!/bin/sh
+# exec/1 binding: henki runs every shell call as `port/exec BASH --noprofile --norc -c COMMAND` in the session's
+# directory (the project). This program hides your home, henki's own dirs and the known control sockets (terminal
+# multiplexers, the X server, the session bus, docker), keeps writes inside the project and the temp dir, drops SSH_AUTH_SOCK,
+# then runs its arguments. It shares this machine's files, so it keeps argument 1 (the host bash). Backends, picked per
+# call: bwrap (Linux, if a trial run works), user namespaces through unshare (Linux), sandbox-exec (macOS).
+# Its own failures exit 126 with one line on stderr; otherwise it exits with the command's status.
+# HENKI_SANDBOX=bwrap|ns|seatbelt forces a backend (tests); unset or `auto` picks the first that works here.
+set -uf # -f: no globbing of paths
+die() { printf 'sandbox: %s\n' "$*" >&2; exit 126; }
+# Its own lookups (ls) use the system dirs only: a PATH dir inside the project (an activated .venv/bin, say) holds what
+# a sandboxed call wrote, which must never run here, on the host. The command gets the person's PATH back.
+userpath=${PATH-}
+PATH=/usr/bin:/bin:/usr/sbin:/sbin
+[ $# -gt 0 ] || die "nothing to run; fix: bind it with henki mods swap exec sandbox (henki passes the command)"
+# Its own files: from the real path of this program (CONFIG/port/exec may be a link to it).
+self=$0
+while [ -L "$self" ]; do
+  _l=$(ls -ld -- "$self") || break; _l=${_l#*" -> "}
+  case $_l in /*) self=$_l ;; *) self=${self%/*}/$_l ;; esac
+done
+case $self in */*) ;; *) self=./$self ;; esac
+mod=$(cd -P "${self%/*}/.." 2>/dev/null && pwd) && [ -f "$mod/.henki/module.toml" ] ||
+  die "cannot find its own files next to $0; fix: henki mods swap exec sandbox"
+
+# A tool from the system dirs first, then the person's PATH (never a module's bin/, which comes first on the tool PATH),
+# as its real path. Never one that lies in the project or the temp dir, through any link: a call can write there, and
+# the backend runs on the host (a planted bwrap would run the next call unsandboxed).
+tool() {
+  _ifs=$IFS; IFS=:
+  for _d in /usr/bin /bin /usr/sbin /sbin ${HENKI_USER_PATH:-}; do
+    IFS=$_ifs
+    case $_d in /*) _t=$_d/$1 _k=0 ;; *) continue ;; esac
+    while [ -L "$_t" ] && [ "$_k" -lt 40 ]; do
+      _l=$(ls -ld -- "$_t") || break; _l=${_l#*" -> "} _k=$((_k + 1))
+      case $_l in /*) _t=$_l ;; *) _t=${_t%/*}/$_l ;; esac
+    done
+    [ ! -L "$_t" ] && [ -f "$_t" ] && [ -x "$_t" ] && _r=$(real "${_t%/*}" && printf '%s\n' "$_r") || continue
+    case $_r/ in "$proj"/* | "$tmp"/*) continue ;; esac
+    printf '%s\n' "$_r/${_t##*/}"; return 0
+  done
+  IFS=$_ifs; return 1
+}
+# real DIR: the dir's path without links (no subshell: `cd -P` sets PWD; the caller returns to the project).
+real() { _r=; [ -d "$1" ] && cd -P -- "$1" 2>/dev/null && _r=$PWD; [ -n "$_r" ]; }
+
+case ${HOME:-} in /*) ;; *) die "HOME is not an absolute path; fix: set HOME to your home directory" ;; esac
+real . && proj=$_r || die "cannot read the working directory"
+real "$HOME" && home=$_r || die "HOME ($HOME) is not a directory; fix: set HOME to your home directory"
+real "${TMPDIR:-/tmp}" && tmp=$_r || die "the temp dir (${TMPDIR:-/tmp}) is not a directory; fix: set TMPDIR"
+cd "$proj" || die "cannot enter the project ($proj)"
+
+pick=${HENKI_SANDBOX:-auto}
+userns_ok() { # the kernel allows unprivileged user namespaces (a cheap check; ns-setup fails closed if mounts do not)
+  [ -r /proc/self/ns/user ] || return 1
+  _n=1; [ -r /proc/sys/user/max_user_namespaces ] && read -r _n </proc/sys/user/max_user_namespaces
+  [ "$_n" != 0 ] || return 1
+  _n=1; [ -r /proc/sys/kernel/unprivileged_userns_clone ] && read -r _n </proc/sys/kernel/unprivileged_userns_clone
+  [ "$_n" != 0 ]
+}
+if [ "$pick" = auto ]; then
+  bw= # a bwrap that cannot set up its namespaces here (a container's /proc, say) is passed over
+  if [ -x /usr/bin/sandbox-exec ]; then pick=seatbelt
+  elif bw=$(tool bwrap) && "$bw" --ro-bind / / --dev /dev --proc /proc --unshare-pid true </dev/null >/dev/null 2>&1; then pick=bwrap
+  elif tool unshare >/dev/null && userns_ok; then pick=ns
+  elif [ -n "$bw" ]; then
+    die "bwrap fails here (see: $bw --ro-bind / / --dev /dev --proc /proc --unshare-pid true) and user namespaces are off; fix: henki mods swap exec std"
+  else die "no bwrap, no user namespaces; fix: install bubblewrap, or henki mods swap exec std"
+  fi
+fi
+
+# The ops below lay an ancestor first, so a home inside the project or the temp dir stays hidden; the same dir as the
+# home, or the whole file system as the project, would leave nothing hidden or nothing read-only.
+case $home$proj$tmp in *'
+'*) die "a path holds a line break; fix: start henki in a dir whose path has none" ;; esac
+[ "$proj" != "$home" ] || die "the project is your home dir, so nothing would be hidden; fix: start henki in a project directory, or henki --port exec=std"
+[ "$proj" != / ] || die "the project is /, so nothing would be read-only; fix: start henki in a project directory, or henki --port exec=std"
+[ "$tmp" != "$home" ] || die "the temp dir is your home dir, so nothing would be hidden; fix: set TMPDIR to a dir outside your home"
+[ "$tmp" != / ] || die "the temp dir is /, so nothing would be read-only; fix: set TMPDIR to a dir of your own, or unset it"
+# Linux: /tmp and /var/tmp are private to the call (an empty tmpfs: the sockets other programs keep there, tmux's and
+# the X server's among them, are gone). A TMPDIR elsewhere is shared with the host, so it must be yours or a shared temp dir.
+tmp_private=0
+case $pick$tmp in bwrap/tmp | bwrap/var/tmp | ns/tmp | ns/var/tmp) tmp_private=1 ;; esac
+[ "$tmp_private" = 1 ] || [ -O "$tmp" ] || [ -k "$tmp" ] ||
+  die "the temp dir ($tmp) is neither yours nor a shared temp dir, so a system dir would be writable; fix: set TMPDIR to a dir you own, or unset it"
+
+# Hidden as well, wherever they are: henki's own dirs (config, state, data), the runtime dir (the session bus,
+# systemd, gpg and editor sockets), the terminal multiplexers' socket dirs and the person's ssh-agent socket. A hide is
+# an empty tmpfs over a dir; a mask is /dev/null over a file (a socket there then refuses every connection).
+hides=$home masks=
+nl='
+'
+add_hide() {
+  real "$1" || return 0
+  case $nl$hides$nl in *"$nl$_r$nl"*) return 0 ;; esac
+  [ "$_r" = / ] || hides=$hides$nl$_r
+}
+add_mask() { # a file (a socket): its dir's real path and its name
+  [ -e "$1" ] || [ -S "$1" ] || return 0
+  real "${1%/*}/" || return 0; _r=${_r%/}/${1##*/}
+  case $nl$masks$nl in *"$nl$_r$nl"*) ;; *) masks=$masks$nl$_r ;; esac
+}
+add_sock() { # PATH: the socket masked; its dir hidden too unless that is the project, the temp dir or /
+  add_mask "$1"; real "${1%/*}/" || return 0
+  [ "$_r" = "$proj" ] || [ "$_r" = "$tmp" ] || add_hide "$_r"
+}
+uid=
+[ -r /proc/self/status ] && while read -r _k _v _; do case $_k in Uid:) uid=$_v; break ;; esac; done </proc/self/status
+add_hide "$HOME/.config/henki"
+[ -n "${XDG_CONFIG_HOME:-}" ] && add_hide "$XDG_CONFIG_HOME/henki"
+add_hide "${XDG_STATE_HOME:-$HOME/.local/state}/henki"
+add_hide "${XDG_DATA_HOME:-$HOME/.local/share}/henki"
+[ -n "${XDG_RUNTIME_DIR:-}" ] && add_hide "$XDG_RUNTIME_DIR"
+if [ -n "$uid" ]; then
+  add_hide "/run/user/$uid"
+  [ -n "${TMUX_TMPDIR:-}" ] && add_hide "$TMUX_TMPDIR/tmux-$uid"
+fi
+add_hide /run/screen
+[ -n "${SCREENDIR:-}" ] && add_hide "$SCREENDIR"
+[ -n "${TMUX:-}" ] && add_sock "${TMUX%%,*}"
+[ -n "${SSH_AUTH_SOCK:-}" ] && add_sock "$SSH_AUTH_SOCK"
+for _f in /run/docker.sock /var/run/docker.sock /run/dbus/system_bus_socket /var/run/dbus/system_bus_socket; do
+  add_mask "$_f"
+done
+[ "$pick" = seatbelt ] || { add_hide /tmp; add_hide /var/tmp; }
+cd "$proj" || die "cannot enter the project ($proj)"
+# A bind laid on a hidden dir would show it again.
+_ifs=$IFS; IFS='
+'
+for _h in $hides; do
+  [ "$_h" != "$proj" ] || die "the project ($proj) is a dir the sandbox hides; fix: start henki in a project directory, or henki --port exec=std"
+  [ "$tmp_private" = 1 ] || [ "$_h" != "$tmp" ] || die "the temp dir ($tmp) is a dir the sandbox hides; fix: set TMPDIR to another dir, or unset it"
+done
+IFS=$_ifs
+
+# Linux: the layout as ops, an ancestor before what lies under it; at one depth, a hide before a bind of the same path
+# and a mask last. Each op is `hide:PATH` (an empty tmpfs), `bind:PATH` (PATH from the host, writable) or `mask:PATH`
+# (/dev/null over a file).
+ops() {
+  _all="$hides"; for _b in $tmp_bind "$proj"; do _all="$_all
+bind:$_b"; done
+  for _m in $masks; do _all="$_all
+mask:$_m"; done
+  _max=0; _list=
+  _ifs=$IFS; IFS='
+'
+  for _o in $_all; do
+    case $_o in bind:*) _p=${_o#bind:} _k=1 ;; mask:*) _p=${_o#mask:} _k=2 ;; *) _p=$_o _o=hide:$_o _k=0 ;; esac
+    _r=$_p _d=0; while [ -n "$_r" ]; do _r=${_r#/}; case $_r in */*) _r=${_r#*/} ;; *) _r= ;; esac; _d=$((_d + 1)); done
+    [ "$_d" -gt "$_max" ] && _max=$_d
+    _list="$_list
+$_d $_k $_o"
+  done
+  _d=0; while [ "$_d" -le "$_max" ]; do for _k in 0 1 2; do
+    for _l in $_list; do case $_l in "$_d $_k "*) printf '%s\n' "${_l#"$_d $_k "}" ;; esac; done
+  done; _d=$((_d + 1)); done
+  IFS=$_ifs
+}
+tmp_bind=$tmp; [ "$tmp_private" = 0 ] || tmp_bind=
+
+case $pick in
+bwrap)
+  bw=$(tool bwrap) || die "no bwrap on this machine; fix: install bubblewrap, or henki mods swap exec std"
+  _n=$# # the command's arguments go last, intact: append bwrap's, then move the command's behind them
+  set -- "$@" --ro-bind / / --dev /dev --proc /proc --unshare-pid --unshare-ipc --die-with-parent \
+    --unsetenv SSH_AUTH_SOCK --chdir "$proj"
+  _ifs=$IFS; IFS='
+'
+  for _o in $(ops); do
+    case $_o in
+    hide:*) set -- "$@" --tmpfs "${_o#hide:}" ;;
+    bind:*) set -- "$@" --bind "${_o#bind:}" "${_o#bind:}" ;;
+    mask:*) set -- "$@" --ro-bind-try /dev/null "${_o#mask:}" ;;
+    esac
+  done
+  IFS=$_ifs; set -- "$@" --
+  while [ "$_n" -gt 0 ]; do set -- "$@" "$1"; shift; _n=$((_n - 1)); done
+  PATH=$userpath; exec "$bw" "$@"
+  ;;
+ns)
+  us=$(tool unshare) || die "no unshare on this machine; fix: install util-linux or bubblewrap, or henki mods swap exec std"
+  userns_ok || die "this kernel does not allow user namespaces; fix: install bubblewrap, or henki mods swap exec std"
+  _ifs=$IFS; IFS='
+'
+  _o=$(ops); set -- "$us" "$proj" "$tmp" $_o -- "$@"
+  IFS=$_ifs
+  PATH=$userpath; exec "$us" --user --map-root-user --mount --pid --ipc --fork --kill-child -- /bin/sh "$mod/.henki/ns-setup" "$@"
+  ;;
+seatbelt)
+  [ -x /usr/bin/sandbox-exec ] || die "no sandbox-exec on this machine; fix: henki mods swap exec std"
+  real "${XDG_CONFIG_HOME:-$HOME/.config}" && cfg=$_r || cfg=$home/.config
+  real "${XDG_STATE_HOME:-$HOME/.local/state}" && state=$_r || state=$home/.local/state
+  real "${XDG_DATA_HOME:-$HOME/.local/share}" && data=$_r || data=$home/.local/share
+  cd "$proj" || die "cannot enter the project ($proj)"
+  PATH=$userpath; exec /usr/bin/env -u SSH_AUTH_SOCK /usr/bin/sandbox-exec -f "$mod/.henki/macos.sb" -D PROJECT="$proj" -D TMP="$tmp" \
+    -D HOME="$home" -D CONFIG="$cfg/henki" -D STATE="$state/henki" -D DATA="$data/henki" "$@"
+  ;;
+*) die "HENKI_SANDBOX=$pick names no backend; fix: unset it, or use bwrap, ns or seatbelt" ;;
+esac

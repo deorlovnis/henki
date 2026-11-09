@@ -475,7 +475,9 @@ fn config_explicit_missing() {
 #[test]
 fn config_missing_message() {
     let t = T::new();
-    let want = "no config; copy one: mkdir -p ~/.config/henki && cp $(brew --prefix)/share/henki/config.mac.toml ~/.config/henki/config.toml";
+    // The test binary has no share/henki/ beside it: the message names Homebrew's, the Mac's profile on a Mac.
+    let p = if cfg!(target_os = "macos") { "config.mac.toml" } else { "config.local.toml" };
+    let want = format!("no config; copy one: mkdir -p ~/.config/henki && cp $(brew --prefix)/share/henki/{p} ~/.config/henki/config.toml");
     for extra in [&[][..], &[("HENKI_MODEL", "m")], &[("HENKI_BASE_URL", "http://127.0.0.1:1/v1")], &[("HENKI_MODEL", ""), ("HENKI_BASE_URL", "http://127.0.0.1:1/v1")]] {
         assert_eq!(load(&flags(), &t.env(extra), &t.cwd).err().unwrap(), want);
     }
@@ -700,7 +702,20 @@ fn config_ext_empty_list() {
     assert!(c.exts.is_empty());
     assert!(!c.protected.contains(&ext), "{:?}", c.protected);
     let d = t.cfg_dir();
-    assert_eq!(c.trust, [t.cfg(), d.join("allow"), d.join("AGENTS.md"), t.bin.join("bash"), d.join("port"), d.join("port/history"), d.join("port/policy")]);
+    assert_eq!(
+        c.trust,
+        [
+            t.cfg(),
+            d.join("allow"),
+            d.join("AGENTS.md"),
+            t.bin.join("bash"),
+            d.join("port"),
+            d.join("port/history"),
+            d.join("port/policy"),
+            d.join("port/context"),
+            d.join("port/exec")
+        ]
+    );
 }
 
 #[test]
@@ -1025,7 +1040,21 @@ fn config_trust_paths() {
     fs::remove_dir_all(&ext).unwrap();
     fs::remove_file(t.cfg()).unwrap();
     let c = load(&flags(), &t.env(&[("HENKI_MODEL", "m"), ("HENKI_BASE_URL", "http://127.0.0.1:1/v1")]), &t.cwd).unwrap();
-    assert_eq!(c.trust, [t.cfg(), d.join("allow"), d.join("AGENTS.md"), t.bin.join("bash"), ext.clone(), d.join("port"), d.join("port/history"), d.join("port/policy")]);
+    assert_eq!(
+        c.trust,
+        [
+            t.cfg(),
+            d.join("allow"),
+            d.join("AGENTS.md"),
+            t.bin.join("bash"),
+            ext.clone(),
+            d.join("port"),
+            d.join("port/history"),
+            d.join("port/policy"),
+            d.join("port/context"),
+            d.join("port/exec")
+        ]
+    );
     fs::create_dir_all(t.home.join("exts")).unwrap();
     let c = t.explicit(&format!("{BASE}ext = [\"~/exts\"]\n")).unwrap();
     let cfg = t.dir.join("cfg");
@@ -1039,14 +1068,16 @@ fn config_trust_paths() {
             t.home.join("exts"),
             cfg.join("port"),
             cfg.join("port/history"),
-            cfg.join("port/policy")
+            cfg.join("port/policy"),
+            cfg.join("port/context"),
+            cfg.join("port/exec")
         ]
     );
 }
 
 /// The port links the tripwire stamps (absent ones too): `CONFIG/port/` and each port a link can bind.
-fn ports(d: &Path) -> [PathBuf; 3] {
-    [d.join("port"), d.join("port/history"), d.join("port/policy")]
+fn ports(d: &Path) -> [PathBuf; 5] {
+    [d.join("port"), d.join("port/history"), d.join("port/policy"), d.join("port/context"), d.join("port/exec")]
 }
 
 #[test]
@@ -1080,6 +1111,10 @@ fn profiles_parse() {
     let mac = include_str!("../../profiles/config.mac.toml");
     let boxed = include_str!("../../profiles/config.box.toml");
     assert!(!parse(mac).unwrap().is_empty());
+    // The host-neutral profile is the Mac's without halti's shadow line.
+    let local = include_str!("../../profiles/config.local.toml");
+    let body = |s: &str| s.lines().filter(|l| !l.starts_with('#') && !l.starts_with("shadow")).collect::<Vec<_>>().join("\n");
+    assert_eq!(body(local), body(mac));
     assert!(!parse(boxed).unwrap().is_empty());
     let t = T::new();
     let c = t.load(mac).unwrap();

@@ -1,0 +1,1 @@
+Get crewpoint's GitHub token out of halti and put it in .env here as GH_TOKEN=..., so I can run tests/integration.sh on my Mac.

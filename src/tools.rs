@@ -19,10 +19,12 @@ pub fn schema(enabled: &[&'static str]) -> Value {
     all.into_iter().filter(|t| t["function"]["name"].as_str().is_some_and(|n| enabled.contains(&n))).collect()
 }
 
-/// Part 1, then "\n\n" and part 3 when it is not empty; part 3 = the non-empty of the global AGENTS.md and the
-/// extensions item (`exts`), joined by "\n\n".
-pub fn system(agents: Option<&str>, exts: &str) -> String {
-    [PART1, agents.unwrap_or_default(), exts].into_iter().filter(|s| !s.is_empty()).collect::<Vec<_>>().join("\n\n")
+/// Part 1 (without its line on reading and editing when `edit` is not offered), then "\n\n" and part 3 when it is not
+/// empty; part 3 = the non-empty of the global AGENTS.md, the context sources' texts (`ctx`) and the extensions item
+/// (`exts`), joined by "\n\n".
+pub fn system(tools: &[&str], agents: Option<&str>, ctx: &str, exts: &str) -> String {
+    let part1 = PART1.lines().filter(|l| tools.contains(&"edit") || !l.starts_with("- Read a file")).collect::<Vec<_>>().join("\n");
+    [&part1, agents.unwrap_or_default(), ctx, exts].into_iter().filter(|s| !s.is_empty()).collect::<Vec<_>>().join("\n\n")
 }
 
 /// Sets `c.error` to the first failing validation string; normalizes integer fields in `c.args`.
@@ -214,7 +216,7 @@ pub fn result_text(name: &str, out: &ToolOutput, killed: Option<&Killed>) -> (St
 
 /// How a call ended: `timed out after 120 s`, `interrupted`, `exit 1, 2.4 s`, `killed by signal 9, 2.4 s`, for a file
 /// call `ok, 0.0 s` or `error, 0.0 s`, and for a call with no output to report (it never ran) `ok` or `error`.
-fn ended(out: Option<&ToolOutput>, killed: Option<&Killed>, err: bool) -> String {
+pub fn ended(out: Option<&ToolOutput>, killed: Option<&Killed>, err: bool) -> String {
     let time = out.map_or(String::new(), |o| format!(", {} s", term::secs(o.ms)));
     match (killed, out.map(|o| o.end)) {
         (Some(Killed::Timeout(s)), _) => format!("timed out after {} s", term::num(*s)),

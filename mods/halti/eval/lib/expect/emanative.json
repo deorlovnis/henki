@@ -1,0 +1,41 @@
+{
+ "about": "Own work: halti, henki, itse",
+ "browser": {
+  "downloads": false,
+  "keep_sessions": true
+ },
+ "cpus": 6,
+ "docker": true,
+ "image": "cred-agent-rust@sha256:f0c74fa9b8c7e3f94792a78c7291cd2bb41f89a620e949562c6600e7e7428969",
+ "keep": true,
+ "memory": "8G",
+ "model": "anthropic",
+ "mount": [],
+ "net": {
+  "allow": [
+   "https://api.github.com",
+   "https://codeload.github.com",
+   "https://crates.io",
+   "https://files.pythonhosted.org",
+   "https://github.com",
+   "https://index.crates.io",
+   "https://pypi.org",
+   "https://static.crates.io",
+   "https://static.rust-lang.org"
+  ],
+  "allow_writes": [
+   "https://api.github.com/repos/deorlovnis/"
+  ],
+  "writes": "ask"
+ },
+ "rosetta": false,
+ "run": [
+  "claude"
+ ],
+ "sites": [
+  "github"
+ ],
+ "standins": [
+  "GH_TOKEN"
+ ]
+}

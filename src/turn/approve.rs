@@ -9,14 +9,15 @@ impl Session {
     /// Shows `c`, asks until there is an answer, journals `ask` before and `approval` after; the verdict (`yes`, or
     /// `always` with the rule's number) to run the call, None for no.
     /// `always`: the policy can save a rule for it. INT and QUIT are a no; EOF, TERM, HUP and a closed stdout end the
-    /// turn; a tripwire found before the policy records a rule ends it `Error changed`.
+    /// turn; a tripwire found before the policy records a rule ends it `Error changed`. The `ask` record says when
+    /// `always` is offered, and the root its rule would be saved for; `henki serve`'s frontend confirms it itself.
     pub(super) fn ask(&mut self, c: &Call, t: Option<&Target>, always: bool) -> Result<Option<(&'static str, Option<usize>)>, Outcome> {
-        self.record(rec::ask(c, t.map(|t| t.shown.as_str())))?;
         let (shell, cmd) = (c.name == "shell", c.args["command"].as_str().unwrap_or_default());
         // A rule saves an exact command; none while a process started earlier still runs, since it may be what the
         // command talks to.
         let bg = supervise::reap();
         let offer = always && shell && bg == 0;
+        self.record(rec::ask(c, t.map(|t| t.shown.as_str()), self.cfg.root.to_str().filter(|_| offer)))?;
         let ((rows, cols), lines) = (sys::winsize(0).unwrap_or((24, 80)), tools::display(c, t));
         self.out.control(term::RESET);
         lines.iter().for_each(|l| self.out.line(l));
@@ -27,11 +28,11 @@ impl Session {
         loop {
             match self.typed(if offer { "run? [y/N/always] " } else { "run? [y/N] " })?.as_str() {
                 "y" | "yes" => return self.verdict(c, "yes", None),
-                "always" if !offer => self.out.note("always is not offered for this call; answer y or n"),
+                "always" if !offer => self.reject("always is not offered for this call; answer y or n"),
                 "always" => {
                     self.out.control(term::RESET);
                     self.out.line(&format!("a rule allows whatever this command does in {root}, including the files and config it reads"));
-                    if !matches!(self.typed(&format!("save rule for {root}: {cmd} ? [y/N] "))?.as_str(), "y" | "yes") {
+                    if !self.out.json() && !matches!(self.typed(&format!("save rule for {root}: {cmd} ? [y/N] "))?.as_str(), "y" | "yes") {
                         continue;
                     }
                     self.tripwire()?;
@@ -74,9 +75,10 @@ impl Session {
         }
     }
 
-    /// `reply` is y or yes.
+    /// `reply` is y or yes. Always yes in `henki serve`: what the question would start is a `next` record, with the
+    /// trust files the command changed, which the frontend asks the person about.
     pub fn yes(&mut self, prompt: &str) -> Result<bool, Stop> {
-        Ok(matches!(self.reply(prompt)?.as_deref(), Some("y" | "yes")))
+        Ok(self.out.json() || matches!(self.reply(prompt)?.as_deref(), Some("y" | "yes")))
     }
 
     /// Journals the verdict; it and the rule unless it is `no`.

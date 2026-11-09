@@ -4,7 +4,8 @@
 # `hello` (the instance's first line) or {"method": M, "params": P}. `@NAME@` is a saved value, `@SCOPE@` and
 # `@SCOPE2@` two empty dirs, `@BIG@` 1 MiB of text. EXPECT: the canonical answer line, where `*` is any text and
 # `@(A|B)` is A or B; every other character stands for itself. SAVE: NAME=KEY keeps the first string value of "KEY".
-# A step whose name ends in a letter prepares the next check; the checks are the names without one.
+# A step whose name ends in a letter prepares the next check; the checks are the names without one. `#cap NAME`: the
+# steps after it run only for a binding whose hello lists cap NAME (else they are skipped, with a line saying so).
 H01	a	hello	{"result":{"caps":[*],"name":"* *"}}
 H02	+99	hello	{"error":{"code":"version",*
 H03	a	{"method":"x-none","params":{}}	{"error":{"code":"unsupported",*
@@ -35,3 +36,9 @@ H24b	b	{"method":"append","params":{"record":{"msg":{"content":"@BIG@","role":"u
 H24	b	{"method":"read","params":{"from":5,"session":"@s@"}}	{"result":{*"records":[{"msg":{"content":"@BIG@","role":"user"},"t":"user"}]}}
 H25a	b	{"method":"append","params":{"record":{"t":"x-later","x":[1,{"y":null}]},"session":"@s@"}}	{"result":null}
 H25	b	{"method":"read","params":{"from":6,"session":"@s@"}}	{"result":{*"records":[{"t":"x-later","x":[1,{"y":null}]}]}}
+#cap fork
+H26a	b	{"method":"fork","params":{"line":2,"scope":"@SCOPE2@","session":"@s@"}}	{"result":{"session":"*"}}	f=session
+H26	b	{"method":"read","params":{"from":0,"session":"@f@"}}	{"result":{*"records":[{"id":"@s@","t":"session","v":1}]}}
+H27	b	{"method":"fork","params":{"line":3,"scope":"@SCOPE@","session":"@s@"}}	{"error":{"code":"invalid",*
+H28	b	{"method":"fork","params":{"line":2,"scope":"@SCOPE@","session":"conform-none"}}	{"error":{"code":"not_found",*
+H29	b	{"method":"read","params":{"from":0,"session":"@s@"}}	{"result":{*"records":[{"id":"@s@","t":"session","v":1},{"msg":{"content":"é \"x\"\n\u202e","role":"user"},"t":"user"},{"msg":{"content":"","role":"assistant","tool_calls":[{"args":{"command":"true"},"id":"h1","name":"shell"}]},"t":"assistant"},{"content":"ok","id":"h1","is_error":false,"name":"shell","t":"tool_result"},{"t":"notice","text":"n"},{"msg":{"content":"@BIG@","role":"user"},"t":"user"},{"t":"x-later","x":[1,{"y":null}]}]}}

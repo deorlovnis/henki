@@ -3,7 +3,10 @@
 # henki asks before a call, through osascript (macOS) or notify-send (Linux) when there is one. No terminal bell: an
 # observer has no terminal.
 LC_ALL=C
-export LC_ALL
+# The notifier comes from the system dirs, never the tool PATH: a PATH dir inside the project (an activated .venv/bin)
+# holds what the model wrote there, and this runs on the host after each turn. HENKI_NOTIFY_PATH replaces them (tests).
+PATH=${HENKI_NOTIFY_PATH:-/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin}
+export LC_ALL PATH
 ev=$(cat)
 case "${HENKI_EVENT:-}" in
   question) what="asks before a $(printf '%s\n' "$ev" | sed -n 's/.*"name":"\([^"]*\)","t":"ask".*/\1/p') call" ;;
@@ -17,4 +20,4 @@ fi
 if command -v notify-send >/dev/null 2>&1; then
   exec notify-send -- "$title" "$what"
 fi
-echo "notify: no osascript or notify-send on PATH" >&2
+echo "notify: no osascript or notify-send in $PATH" >&2

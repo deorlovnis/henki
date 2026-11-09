@@ -85,18 +85,37 @@ fn schema_filtered_order() {
 
 #[test]
 fn system_joins_part3() {
-    assert_eq!(system(None, ""), PART1);
-    assert_eq!(system(Some(""), ""), PART1);
-    assert_eq!(system(Some("Prefer small commits.\n\nKeep answers short."), ""), format!("{PART1}\n\nPrefer small commits.\n\nKeep answers short."));
+    assert_eq!(system(&TOOLS, None, "", ""), PART1);
+    assert_eq!(system(&TOOLS, Some(""), "", ""), PART1);
+    assert_eq!(system(&TOOLS, Some("Prefer small commits.\n\nKeep answers short."), "", ""), format!("{PART1}\n\nPrefer small commits.\n\nKeep answers short."));
+}
+
+/// Without `edit` (an exec binding offers `shell` only) part 1 drops its line on reading before editing, and nothing else.
+#[test]
+fn system_without_edit() {
+    let want: String = PART1.lines().filter(|l| !l.contains("edit")).map(|l| format!("{l}\n")).collect();
+    for tools in [&["shell"][..], &["shell", "read", "write"]] {
+        assert_eq!(system(tools, None, "", ""), want.trim_end());
+        assert_eq!(system(tools, Some("x"), "", ""), format!("{}\n\nx", want.trim_end()));
+    }
+    assert_eq!(PART1.len() - system(&["shell"], None, "", "").len(), "- Read a file before you edit it. edit replaces one exact span that occurs once.\n".len());
 }
 
 #[test]
 fn system_with_exts() {
     let exts = "Extensions are commands on PATH; read the doc in brackets before first use.\n- notes: keep notes per project [~/.config/henki/ext/notes/doc.md]";
-    assert_eq!(system(Some("Prefer small commits."), exts), format!("{PART1}\n\nPrefer small commits.\n\n{exts}"));
-    assert_eq!(system(None, exts), format!("{PART1}\n\n{exts}"));
-    assert_eq!(system(Some(""), exts), format!("{PART1}\n\n{exts}"));
-    assert_eq!(system(None, ""), PART1);
+    assert_eq!(system(&TOOLS, Some("Prefer small commits."), "", exts), format!("{PART1}\n\nPrefer small commits.\n\n{exts}"));
+    assert_eq!(system(&TOOLS, None, "", exts), format!("{PART1}\n\n{exts}"));
+    assert_eq!(system(&TOOLS, Some(""), "", exts), format!("{PART1}\n\n{exts}"));
+    assert_eq!(system(&TOOLS, None, "", ""), PART1);
+}
+
+/// The context sources' texts go after the global AGENTS.md and before the extensions item, with nothing added.
+#[test]
+fn system_with_sources() {
+    let (ctx, exts) = ("# project instructions\n\nrun make test\n\ngit: /w on main", "Extensions are commands on PATH; read the doc in brackets before first use.");
+    assert_eq!(system(&TOOLS, Some("global"), ctx, exts), format!("{PART1}\n\nglobal\n\n{ctx}\n\n{exts}"));
+    assert_eq!(system(&TOOLS, None, ctx, ""), format!("{PART1}\n\n{ctx}"));
 }
 
 #[test]
@@ -439,7 +458,7 @@ fn ext(dir: &Path, name: &str) -> Ext {
     fs::create_dir_all(dir.join(name).join("bin")).unwrap();
     fs::write(&doc, format!("# {name}: a tool\n")).unwrap();
     let (line, bin, cmds, shadows, paths, targets) = (format!("{name}: a tool"), Some(dir.join(name).join("bin")), Vec::new(), Vec::new(), Vec::new(), Vec::new());
-    Ext { name: name.into(), line, dir: dir.join(name), doc, bin, cmds, user: Vec::new(), on: Vec::new(), prompt: true, shadows, paths, targets }
+    Ext { name: name.into(), line, dir: dir.join(name), doc, bin, cmds, user: Vec::new(), on: Vec::new(), ctx: Vec::new(), prompt: true, shadows, paths, targets }
 }
 
 #[test]

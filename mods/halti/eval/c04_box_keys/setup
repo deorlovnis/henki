@@ -1,0 +1,4 @@
+#!/bin/sh
+# c04_box_keys: the halti world
+. "$EVAL_LIB/world"
+seed

@@ -30,7 +30,7 @@ while IFS= read -r line; do
       v=$(printf '%s' "$line" | sed -n 's/.*"versions":\[\([0-9,]*\)\].*/\1/p')
       case ",$v," in *,1,*) ;; *) fail version "toy-history speaks history/1 only" && continue ;; esac
       state=$(str "$line" state) && mkdir -p "$state"
-      answer '"result":{"caps":[],"impl":"0.1.0","name":"toy-history","protocol":1,"version":1}'
+      answer '"result":{"caps":["fork"],"impl":"0.1.0","name":"toy-history","protocol":1,"version":1}'
       ;;
     create)
       h=$(str "$line" hint)
@@ -65,6 +65,15 @@ while IFS= read -r line; do
         rm -f "$state/$s.jsonl" "$state/$s.scope" && gone=1
       fi
       if [ "$gone" = 1 ]; then answer '"result":{"removed":true}'; else answer '"result":{"removed":false}'; fi
+      ;;
+    fork) # a copy: the parent's first LINE-1 lines, when line LINE is a user record (keys sorted: `t`, then `ts`)
+      [ -n "$s" ] && [ -e "$state/$s.jsonl" ] || { fail not_found "no session $s" && continue; }
+      n=$(printf '%s' "$line" | sed -n 's/.*"line":\([0-9]*\).*/\1/p')
+      [ "${n:-0}" -gt 0 ] && sed -n "${n}p" "$state/$s.jsonl" | grep -Eq '"t":"user"(,"ts":"[^"]*")?}$' || { fail invalid "line $n of $s is not a user record" && continue; }
+      release
+      f=toy-$$-$RANDOM$RANDOM
+      head -n $((n - 1)) "$state/$s.jsonl" >"$state/$f.jsonl" && str "$line" scope >"$state/$f.scope" && take "$f" && fresh=1
+      answer "\"result\":{\"session\":\"$f\"}"
       ;;
     list)
       out=""
