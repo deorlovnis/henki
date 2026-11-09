@@ -1806,6 +1806,14 @@ t_history_live() {
   rc_is 0
   out_has "imported 101 sessions (101 records)"
   check "henki port started again after 100 sessions" [ "$(wc -l <"$W/starts" | tr -d ' ')" = 2 ]
+  # A scope dir ls cannot list (as when its names would pass ARG_MAX): its sessions fail, not 0 imported and 0 failed.
+  mkdir -p "$W/nols"
+  printf '#!/bin/sh\necho "ls: Argument list too long" >&2\nexit 126\n' >"$W/nols/ls"
+  chmod 755 "$W/nols/ls"
+  PATH="$W/nols:$PATH" run history import --yes --scope "$W/many"
+  rc_is 1
+  out_has "import: cannot list the sessions in $st/$sc; none of them imported"
+  out_has "skipped 0 (already there); 101 failed"
   kill "$STUB_PID" 2>/dev/null
 }
 is_id_like() { case "$1" in 2026*Z-*) return 0 ;; esac; return 1; }

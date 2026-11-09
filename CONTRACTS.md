@@ -820,11 +820,12 @@ the fix `henki --port history=std for this session, or henki mods swap history s
 a session. `list` is for tools (henki-mods, an import); henki itself does not call it.
 
 `henki-mods history list` and `history show` read a binding through `henki port`'s `list` and `read`.
-`henki-mods history import` copies std's sessions into a binding: for each journal, oldest written first, `create`
-with its id as the `hint` (`exists`: the binding has it, skipped) in the scope of the working directory the journal
-belongs to, then each complete line through `append`, as it is in the file. So an imported `close` keeps its `bytes`
-and a resumed `session` its `from_bytes`; henki reads neither in a binding's session. std's files are only read. A
-binding whose `open(scope, null)` takes the session it wrote last (as std and tree do) then picks the one std would.
+`henki-mods history import` copies std's sessions into a binding: for each journal, oldest written first in its scope
+dir, `create` with its id as the `hint` (`exists`: the binding has it, skipped) in the scope of the working directory
+the journal belongs to, then each complete line through `append`, as it is in the file. A scope dir it cannot list
+fails all its sessions. So an imported `close` keeps its `bytes` and a resumed `session` its `from_bytes`; henki
+reads neither in a binding's session. std's files are only read. A binding whose `open(scope, null)` takes the
+session it wrote last (as std and tree do) then picks the one std would.
 
 `henki --resume=ID@N` forks (journal/1): henki reads session ID, checks its records 1 to N-1 (the dialect, tampering,
 the pairing) and only then calls `fork`; it then appends `close` and the new segment's `session` record with

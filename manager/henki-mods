@@ -4282,7 +4282,7 @@ hist_list() {
   if [ -z "$H_EXE" ]; then
     # ids are file stems in the scope's dir, newest first; ls's lines are names (ids hold no newline).
     sdir="$ST/sessions/$(fnv "$SCOPE")"
-    ids=$( (cd "$sdir" 2>/dev/null && ls -t -- *.jsonl 2>/dev/null) | sed -n 's/\.jsonl$//p')
+    ids=$( (cd "$sdir" 2>/dev/null && ls -t 2>/dev/null) | sed -n 's/\.jsonl$//p')
   else
     hp_open
     hp_call "{\"method\":\"list\",\"params\":{\"scope\":$SCOPE_J}}"
@@ -4400,35 +4400,44 @@ import_std() { # [SCOPEDIR]
   local f id k cwd rec n ok=0 old=0 bad=0 recs=0 held=0 done
   hp_open
   # Oldest written first: a binding that orders a scope's sessions by when it last wrote them (as std does) then has
-  # the same newest session as std, so a plain --resume continues the same one after the swap.
-  # shellcheck disable=SC2012 # the names are session ids in hex scope dirs: no newline in them
-  ls -dtr -- "$ST"/sessions/${1:-*}/*.jsonl >"$HP/order" 2>/dev/null || :
-  while IFS= read -r f; do
-    [ -s "$f" ] || continue
-    id=${f##*/} id=${id%.jsonl} k=${f%/*}
-    is_id "$id" || { bad=$((bad + 1)) && say "import: $(shown "$f") is not named by a session id; skipped" && continue; }
-    cat "$f" >"$HP/s" || { bad=$((bad + 1)) && say "import $id: cannot read $(shown "$f")" && continue; }
-    [ -z "$(tail -c 1 "$HP/s")" ] || { sed '$d' "$HP/s" >"$HP/t" && mv -f "$HP/t" "$HP/s"; } # a torn last line
-    [ -s "$HP/s" ] || continue
-    n=$(not_objects "$HP/s")
-    [ -z "$n" ] || { bad=$((bad + 1)) && say "import $id: line $n is not one JSON object; not imported" && continue; }
-    cwd=$(std_scope "$HP/s" "${k##*/}")
-    [ "$held" -lt 100 ] || { hp_close && hp_open && held=0; }
-    hp_call "{\"method\":\"create\",\"params\":{\"hint\":\"$id\",\"scope\":$cwd}}"
-    case "$HP_A" in
-      "{\"result\":{\"session\":\"$id\"}}") held=$((held + 1)) ;;
-      *'"code":"exists"'*) old=$((old + 1)) && continue ;;
-      *) bad=$((bad + 1)) && say "import $id: $HP_A" && continue ;;
-    esac
-    n=0 done=1
-    while IFS= read -r rec; do
-      hp_call "{\"method\":\"append\",\"params\":{\"record\":$rec,\"session\":\"$id\"}}"
-      [ "$HP_A" = '{"result":null}' ] || { done=0 && say "import $id: record $((n + 1)): $HP_A (the binding keeps the $n before it)" && break; }
-      n=$((n + 1))
-    done <"$HP/s"
-    recs=$((recs + n))
-    if [ "$done" = 1 ]; then ok=$((ok + 1)); else bad=$((bad + 1)); fi
-  done <"$HP/order"
+  # the same newest session as std, so a plain --resume continues the same one after the swap. Only the order within a
+  # scope counts (open(scope, null) picks in one), so each scope dir's names come from ls in it, not as arguments: no
+  # ARG_MAX however many sessions it holds. A scope dir that cannot be listed fails its sessions.
+  for k in "$ST"/sessions/${1:-*}; do
+    [ -d "$k" ] || continue
+    # shellcheck disable=SC2012 # the names are session ids: no newline in them
+    (cd "$k" && ls -tr) >"$HP/order" || {
+      n=$(std_count "${k##*/}") && [ "$n" != 0 ] || n=1
+      bad=$((bad + n)) && say "import: cannot list the sessions in $(shown "$k"); none of them imported" && continue
+    }
+    while IFS= read -r f; do
+      case "$f" in *.jsonl) f=$k/$f ;; *) continue ;; esac
+      [ -s "$f" ] || continue
+      id=${f##*/} id=${id%.jsonl}
+      is_id "$id" || { bad=$((bad + 1)) && say "import: $(shown "$f") is not named by a session id; skipped" && continue; }
+      cat "$f" >"$HP/s" || { bad=$((bad + 1)) && say "import $id: cannot read $(shown "$f")" && continue; }
+      [ -z "$(tail -c 1 "$HP/s")" ] || { sed '$d' "$HP/s" >"$HP/t" && mv -f "$HP/t" "$HP/s"; } # a torn last line
+      [ -s "$HP/s" ] || continue
+      n=$(not_objects "$HP/s")
+      [ -z "$n" ] || { bad=$((bad + 1)) && say "import $id: line $n is not one JSON object; not imported" && continue; }
+      cwd=$(std_scope "$HP/s" "${k##*/}")
+      [ "$held" -lt 100 ] || { hp_close && hp_open && held=0; }
+      hp_call "{\"method\":\"create\",\"params\":{\"hint\":\"$id\",\"scope\":$cwd}}"
+      case "$HP_A" in
+        "{\"result\":{\"session\":\"$id\"}}") held=$((held + 1)) ;;
+        *'"code":"exists"'*) old=$((old + 1)) && continue ;;
+        *) bad=$((bad + 1)) && say "import $id: $HP_A" && continue ;;
+      esac
+      n=0 done=1
+      while IFS= read -r rec; do
+        hp_call "{\"method\":\"append\",\"params\":{\"record\":$rec,\"session\":\"$id\"}}"
+        [ "$HP_A" = '{"result":null}' ] || { done=0 && say "import $id: record $((n + 1)): $HP_A (the binding keeps the $n before it)" && break; }
+        n=$((n + 1))
+      done <"$HP/s"
+      recs=$((recs + n))
+      if [ "$done" = 1 ]; then ok=$((ok + 1)); else bad=$((bad + 1)); fi
+    done <"$HP/order"
+  done
   hp_close
   say "imported $ok sessions ($(num "$recs") records) into $H_NAME; skipped $old (already there); $bad failed"
   [ "$bad" = 0 ] || { say "a failed session stays in the binding as far as it got (history/1 has no delete)" && return 1; }
