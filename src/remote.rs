@@ -3,7 +3,7 @@
 //! environment without the extensions, stderr to the kernel log), greeted with `hello`, ended with `bye` and then the
 //! kill of its group. MAIN waits for an answer on this binding's own channel, never longer than the method's contract
 //! timeout; for the methods that change nothing a signal or the session deadline cuts the wait short (`interrupted`,
-//! `budget`).
+//! `budget`), and the binding, which still runs that request, gets its time on top of the next one's.
 //! A timeout, an exit or a broken line kills the binding for the rest of the session: every later call fails at once
 //! with that error, and the kernel's floor takes over (history: the turn ends `error journal`; policy: every call is
 //! asked). Paths go as UTF-8 strings only: JSON cannot hold others, so such a scope refuses the start.
@@ -45,6 +45,9 @@ pub struct Remote {
     rx: Receiver<Line>,
     /// The id of the request whose answer the reader passes on, once (u64::MAX: none); every other line it drops.
     want: Arc<AtomicU64>,
+    /// Until when the binding may still be at its last request: an interrupted one runs on to its end (port/1 serves
+    /// requests one at a time), so the next request's clock starts there (bye's does not: the kill follows it).
+    busy: Option<Instant>,
     next: u64,
     got: usize,
     dead: Option<PortError>,
@@ -58,9 +61,9 @@ impl Remote {
     pub fn start(port: &'static str, exe: &Path, (name, fix): (String, String), cwd: &Path, env: &[(OsString, OsString)], stderr: Stdio) -> Result<Remote, PortError> {
         let ((tx, wrx), (rtx, rx), want) = (mpsc::channel::<String>(), mpsc::channel(), Arc::new(AtomicU64::new(u64::MAX)));
         let mut r =
-            Remote { port, name, said: String::new(), caps: Vec::new(), deadline: None, fix, child: None, tx, rx, want: want.clone(), next: 0, got: 0, dead: None, noted: false };
+            Remote { port, name, said: String::new(), caps: Vec::new(), deadline: None, fix, child: None, tx, rx, want, busy: None, next: 0, got: 0, dead: None, noted: false };
         let mut c = supervise::kernel_child(exe, cwd, env, [Stdio::piped(), Stdio::piped(), stderr]).map_err(|e| r.named("crashed", &format!("not started: {e}")))?;
-        let (stdin, stdout) = (c.stdin.take(), c.stdout.take());
+        let (stdin, stdout, want) = (c.stdin.take(), c.stdout.take(), r.want.clone());
         r.child = Some(c);
         let (Some(mut w), Some(out)) = (stdin, stdout) else { return Err(r.fail(err("crashed", "no pipes"))) };
         // The writer is a thread: a binding that stops reading fills its pipe, and MAIN must never block in write(2).
@@ -90,18 +93,16 @@ impl Remote {
 
     /// One request and its answer within the method's timeout: the result, or the binding's error (the binding lives
     /// on), or the kernel's (`timeout`, `crashed`, `protocol`: the binding is dead; `interrupted`: it is not, and a late
-    /// answer is dropped as stale).
+    /// answer is dropped as stale). After an interrupted request the timeout counts from the end of that one's.
     pub fn call(&mut self, method: &str, params: Value) -> Result<Value, PortError> {
-        if let Some(e) = &self.dead {
-            return Err(e.clone());
-        }
+        self.dead.clone().map_or(Ok(()), Err)?;
         let &(_, ms, cut) = METHODS.iter().find(|m| m.0 == method).unwrap_or(&("", 5_000, false));
         let line = term::json_line(&json!({"id": self.next, "method": method, "params": params})) + "\n";
         if line.len() > LINE_MAX {
             return Err(err("invalid", format!("{} binding {}: {method}: a line over {} bytes", self.port, self.name, term::num(LINE_MAX as u64))));
         }
-        let (id, end, seen) = (self.next, Instant::now() + Duration::from_millis(ms), sys::seen());
-        self.next += 1;
+        let (id, end, seen) = (self.next, self.busy.filter(|b| method != "bye" && *b > Instant::now()).unwrap_or_else(Instant::now) + Duration::from_millis(ms), sys::seen());
+        (self.next, self.busy) = (id + 1, Some(end));
         self.want.store(id, SeqCst);
         let _ = self.tx.send(line);
         loop {
@@ -111,7 +112,7 @@ impl Remote {
             }
             match self.rx.recv_timeout(left.min(Duration::from_millis(50))) {
                 Ok(Ok((v, n))) if v["id"] == id => {
-                    self.got += n;
+                    (self.got, self.busy) = (self.got + n, None);
                     return match (v.get("result"), v.get("error").map(|e| e["code"].as_str())) {
                         (Some(r), None) => Ok(r.clone()),
                         (None, Some(Some(c))) => {
@@ -212,10 +213,7 @@ impl History for Remote {
 
     fn open(&mut self, scope: &Path, session: Option<&str>) -> Result<String, PortError> {
         let got = id(&self.call("open", json!({"scope": utf8(scope)?, "session": session}))?).map_err(|e| self.fail(e))?;
-        if session.is_some_and(|s| s != got) {
-            return Err(self.fail(err("protocol", format!("open {session:?} answered {got}"))));
-        }
-        Ok(got)
+        if session.is_some_and(|s| s != got) { Err(self.fail(err("protocol", format!("open {session:?} answered {got}")))) } else { Ok(got) }
     }
 
     /// Page by page: `next`, the index of the next record, as long as it grows; at most READ_MAX bytes in all.

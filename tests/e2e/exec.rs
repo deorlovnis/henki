@@ -269,3 +269,27 @@ fn e2e_exec_official_sandbox() {
     assert!(!seen.contains("secret-key") && seen.contains("No such file") && seen.contains("[unset] 0\n"), "{seen}");
     assert!(wrote.starts_with("started\n") && r.cwd.join("made-here").is_file() && !r.home.join("out").exists(), "{wrote}");
 }
+
+/// Linux: a PATH dir inside the project (an activated `.venv/bin`, say) never lends the sandbox its backend. Call 1
+/// plants `.venv/bin/bwrap` (the project is writable inside); call 2 still runs sandboxed, and the planted program
+/// never runs on the host.
+#[test]
+#[cfg(target_os = "linux")]
+fn e2e_exec_sandbox_planted_backend() {
+    let prog = concat!(env!("CARGO_MANIFEST_DIR"), "/mods/sandbox/port/exec");
+    let (mut r, _m) = scripted(|r| {
+        let plant = format!("printf '#!/bin/sh\\necho ran >%s/escaped\\nexit 0\\n' {} >.venv/bin/bwrap", r.dir.display());
+        vec![shell(&format!("mkdir -p .venv/bin && {plant} && chmod +x .venv/bin/bwrap && echo planted")), shell("echo second; find ~ -mindepth 1 ! -type d | wc -l"), say("done")]
+    });
+    r.env("PATH", &format!("{}/.venv/bin:/usr/local/bin:/usr/bin:/bin", r.cwd.display()));
+    let port = r.config_dir().join("port");
+    fs::create_dir_all(&port).unwrap();
+    fs::set_permissions(r.config_dir(), fs::Permissions::from_mode(0o700)).unwrap();
+    symlink(prog, port.join("exec")).unwrap();
+    let d = r.json("plant");
+    d.finish();
+    assert_eq!(d.code, Some(0), "{}", d.diag());
+    assert!(content(&d, 0).starts_with("planted\n") && r.cwd.join(".venv/bin/bwrap").is_file(), "{}", content(&d, 0));
+    assert!(!r.dir.join("escaped").exists(), "the planted bwrap ran on the host");
+    assert!(content(&d, 1).starts_with("second\n0\n"), "call 2 did not run sandboxed: {}", content(&d, 1));
+}

@@ -129,7 +129,11 @@ fn remote_timeout_and_deadline() {
     assert_eq!(r.read("s").err().unwrap().code, "budget");
     assert!(t0.elapsed() < Duration::from_millis(250), "{:?}", t0.elapsed());
     assert!(r.dead.is_none());
+    // The binding still works on that read (one request at a time): the next request's clock starts at its end.
+    let busy = r.busy.unwrap().saturating_duration_since(t0);
+    assert!(busy >= Duration::from_secs(10) && busy < Duration::from_millis(10_300), "{busy:?}");
     // `append` changes state: it waits its whole timeout, then the binding is dead.
+    let (_t, mut r) = binding("sleep 30");
     let t0 = Instant::now();
     let e = r.append("s", json!({"t": "user"})).unwrap_err();
     assert_eq!(e.message, "history binding t 1: timeout: no answer to append in 2.0 s; fix: X");

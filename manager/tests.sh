@@ -103,7 +103,7 @@ commit() {
 }
 
 num() { printf '%s\n' "$1" | awk '{ s = $0; o = ""; while (length(s) > 3) { o = "," substr(s, length(s) - 2) o; s = substr(s, 1, length(s) - 3) } print s o }'; }
-lockline() { awk -F '\t' -v n="$1" '$2 == n' "$CONF/mods.lock" 2>/dev/null; }
+lockline() { awk -F '\t' -v n="$1" '$1 == "lock/1" && $2 == n' "$CONF/mods.lock" 2>/dev/null; }
 field() { lockline "$1" | cut -f "$2"; }
 
 # --- the static check ---------------------------------------------------------------------------------------------------
@@ -137,6 +137,15 @@ static_bash32() {
     for f in "$MODS" "$HERE/henki-mods-dev" "$HERE/tests.sh" "$HERE/mods-tests.sh" "$HERE/dev-tests.sh"; do
       "$HENKI_TEST_BASH32" -n "$f" || fail "bash 3.2 cannot parse $f"
     done
+    # Every sh program of the official modules and the general eval suite too: /bin/sh is bash 3.2 on a Mac. A file
+    # whose second line hands it to python ("exec" "python3" ...) is python past that line.
+    while IFS= read -r f; do
+      [ -f "$HERE/../$f" ] && [ ! -L "$HERE/../$f" ] && [ "$(head -n 1 "$HERE/../$f")" = '#!/bin/sh' ] || continue
+      case $(sed -n 2p "$HERE/../$f") in '"exec" '* | '"export" '* | "''''exec "*) continue ;; esac
+      "$HENKI_TEST_BASH32" -n "$HERE/../$f" || fail "bash 3.2 (a Mac's /bin/sh) cannot parse $f"
+    done <<EOF
+$(cd "$HERE/.." && git ls-files mods eval)
+EOF
   fi
 }
 
@@ -1525,9 +1534,14 @@ t_ports() {
   run swap history std
   rc_is 0
   out_has "history: std"
+  out_has "the sessions made while tree was bound stay in its store; henki mods swap history tree reaches them again"
   check "std: no link, no bind/1 line" [ ! -L "$CONF/port/history" ] && [ -z "$(command grep '^bind/1' "$CONF/mods.lock")" ]
+  run swap history std
+  out_lacks "were bound"
+  out_lacks "was bound"
   run rm tree
   rc_is 0
+  out_has "if tree kept sessions as your history binding, they stay in its dir under"
   # A binding that fails the suite is not swapped to; one that has no port/history neither.
   mkport bad
   printf '#!/bin/sh\nexit 0\n' >"$W/bad/port/history"
@@ -1669,6 +1683,11 @@ t_history() {
   chmod 755 "$W/notes/ctx/notes"
   run add "$W/notes" --yes
   rc_is 0
+  # Added after the newest session's last start (10:00 UTC): its bytes come with the next start, not "none counted".
+  run_in "$w" list
+  rc_is 0
+  out_has "context sources: their bytes are shown at the next start (a module with ctx/ was added, turned on or changed after the last start of 20261108T090000Z-bbbb)"
+  TZ=UTC0 touch -h -t 202611080900 "$CONF/ext/notes"
   run_in "$w" list
   rc_is 0
   out_has "context sources in $w, at the last start of 20261108T090000Z-bbbb: project/project 1,234 B, x/y 5 B"
@@ -1938,6 +1957,35 @@ t_exec() {
   run swap exec std
   rc_is 0
   check "std: no link" [ ! -L "$CONF/port/exec" ]
+  # update and rollback of the module that holds the exec binding run exec/1's checks (never a missing suite's eof
+  # check alone): a copy that fails them is refused and the binding stays on the copy that passed.
+  mkexec flip "[ ! -e '$W/flip-off' ] || exit 0${nl}exec \"\$@\""
+  run add "$W/flip" --yes
+  rc_is 0
+  run swap exec flip --yes
+  rc_is 0
+  printf '#!/bin/sh\n# 2\nexec "$@"\n' >"$W/flip/port/exec"
+  run update flip --yes
+  rc_is 0
+  out_has "exec: bound to flip; the new copy runs the exec/1 checks before the switch"
+  out_has "exec: flip 0.1.0 passes the exec/1 checks (7 checks)"
+  printf '#!/bin/sh\necho "not your command"\nexit 0\n' >"$W/flip/port/exec"
+  run update flip --yes
+  refused "flip 0.1.0 does not pass the exec/1 checks (above); nothing changed"
+  out_has "FAIL R01"
+  err_lacks "exec.tsv"
+  check "update: still bound to the copy that passed" [ "$(readlink "$CONF/port/exec")" = "$(readlink "$CONF/ext/flip")/port/exec" ]
+  printf '%s\n' "$(readlink "$CONF/port/exec")" >"$W/flip-bound"
+  touch "$W/flip-off" # the first copy fails its checks now
+  run rollback flip --yes
+  refused "flip 0.1.0 does not pass the exec/1 checks (above); nothing changed"
+  check "rollback: still bound to the copy that passed" [ "$(readlink "$CONF/port/exec")" = "$(cat "$W/flip-bound")" ]
+  rm "$W/flip-off"
+  run rollback flip --yes
+  rc_is 0
+  out_has "exec: flip 0.1.0 passes the exec/1 checks (7 checks)"
+  run swap exec std
+  rc_is 0
 }
 
 # context/1's suite (shapes only; henki checks the records in a session): port_toy's context modes pass, its faults
@@ -2881,7 +2929,7 @@ t_index_yank() {
   ln -s "$(readlink "$CONF/ext/lean")/bin/lean" "$CONF/port/policy"
   printf 'bind/1\thistory\thello\t%s\t2026-11-08T10:00Z\tyes\nbind/1\tpolicy\tlean\t%s\t2026-11-08T10:00Z\tyes\n' "${hstore##*/}" "$(readlink "$CONF/ext/lean" | sed 's|.*/||')" >>"$CONF/mods.lock"
   # A pin does not keep a malicious module on.
-  awk -F '\t' 'BEGIN { OFS = "\t" } $2 == "hello" { $11 = "pin" } { print }' "$CONF/mods.lock" >"$W/l" && cp "$W/l" "$CONF/mods.lock"
+  awk -F '\t' 'BEGIN { OFS = "\t" } $1 == "lock/1" && $2 == "hello" { $11 = "pin" } { print }' "$CONF/mods.lock" >"$W/l" && cp "$W/l" "$CONF/mods.lock"
   setkey "$IX/mods/hello/0.2.0.toml" yanked '"malicious: steals keys (2026-11-08)"'
   setkey "$IX/mods/lean/0.1.0.toml" yanked '"malicious: phones home (2026-11-08)"'
   printf 'byurl = "buggy: a test (2026-11-08)"\n' >>"$IX/removed.toml"
@@ -2892,6 +2940,10 @@ t_index_yank() {
   out_has "history: henki will not start until you choose: henki-mods swap history std (or another package) for good, or henki --port history=std for one session"
   out_has "policy: std again (it was lean's)"
   check "hello off, flagged, pinned" [ "$(field hello 3):$(field hello 11)" = "off:pin,yanked=malicious" ]
+  # A yank/1 line per malicious yank, last: the henki-mods of henki 0.2 refuses the whole lock for it, so it cannot
+  # turn hello back on (it ignores FLAGS).
+  check "yank/1 lines for the malicious yanks, last" [ "$(awk -F '\t' '$1 == "yank/1" { print $2 " " $3 }' "$CONF/mods.lock")" = "$(awk -F '\t' '$1 == "lock/1" && $11 ~ /yanked=malicious/ { print $2 " " $8 }' "$CONF/mods.lock")" ] &&
+    [ "$(tail -n 1 "$CONF/mods.lock" | cut -f 1,2)" = "$(printf 'yank/1\thello')" ]
   check "no ext link" [ ! -L "$CONF/ext/hello" ]
   check "the history marker" [ "$(readlink "$CONF/port/history")" = yanked ]
   check "bind/1 history yanked" [ "$(awk -F '\t' '$1 == "bind/1" && $2 == "history" { print $6 }' "$CONF/mods.lock")" = yanked ]
@@ -3006,7 +3058,7 @@ t_index_yank() {
   rc_is 0
   run swap history tree --yes
   refused "tree 0.1.0 was yanked as malicious; it stays off; fix: henki-mods swap history std, or to another package"
-  awk -F '\t' 'BEGIN { OFS = "\t" } $2 == "tree" { $11 = "" } { print }' "$CONF/mods.lock" >"$W/l" && cp "$W/l" "$CONF/mods.lock"
+  awk -F '\t' 'BEGIN { OFS = "\t" } $1 == "lock/1" && $2 == "tree" { $11 = "" } { print }' "$CONF/mods.lock" >"$W/l" && cp "$W/l" "$CONF/mods.lock"
   run swap history tree --yes
   refused "tree 0.1.0 was yanked as malicious (forges sessions (2026-11-08)) by index deorlovnis"
   check "history stays std" [ ! -L "$CONF/port/history" ] && [ -z "$(awk -F '\t' '$1 == "bind/1"' "$CONF/mods.lock")" ]
@@ -3845,6 +3897,13 @@ t_index_verbs() {
   run index add extra "file://$W/extra" --signers "$W/k2.signers" --yes
   refused "(index extra was not added)"
   check "not added" [ ! -f "$CONF/mods.index" ] && [ ! -f "$CONF/index/extra.signers" ]
+  # A signers file whose keys henki refuses (refused.keys): named on the screen, and refused before the trust question.
+  blob k1 >"$W/share/index/refused.keys"
+  run index add extra "file://$W/extra" --signers "$W/extra.signers" --yes
+  refused "every key in $W/extra.signers is a refused key (a development or rotated-out key henki never trusts), so no commit of index extra could verify; fix: ask the index owner for its real signing key"
+  out_has "REFUSED: a development or rotated-out key henki never trusts"
+  check "not added: refused key" [ ! -f "$CONF/mods.index" ] && [ ! -f "$CONF/index/extra.signers" ]
+  printf '# none\n' >"$W/share/index/refused.keys"
   printf 'n\n' >"$W/answer"
   HENKI_MODS_TTY="$W/answer" run index add extra "file://$W/extra" --signers "$W/extra.signers"
   refused "not added (the answer was no)"

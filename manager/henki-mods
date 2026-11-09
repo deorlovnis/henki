@@ -1103,6 +1103,8 @@ lock_check() {
       p = $2; gsub(/[^a-z0-9_-]/, "?", p)
       printf "henki-mods: %s:%d: this lock is newer than this henki-mods (it binds %s); fix: upgrade henki\n", f, NR, p; exit 1 }
     $1 == "bind/1" { next }
+    # One per module yanked as malicious (lock_write makes them from FLAGS): what stops an older henki-mods.
+    $1 == "yank/1" && NF == 3 && $2 ~ /^[a-z0-9][a-z0-9_-]*$/ && $3 ~ /^hd1:[0-9a-f]+$/ { next }
     $1 != "lock/1" { printf "henki-mods: %s:%d: this lock is newer than this henki-mods; fix: upgrade henki\n", f, NR; exit 1 }
     NF != 11 || $2 !~ /^[a-z0-9][a-z0-9_-]*$/ || ($3 != "on" && $3 != "off") || $5 !~ /^(official|path|url|skill|index:[a-z0-9][a-z0-9_-]*)$/ {
       printf "henki-mods: %s:%d: not a lock/1 line; fix: henki-mods rm the module named on it, or remove the line\n", f, NR; exit 1 }
@@ -1139,13 +1141,17 @@ store_of() {
 lock_put() { lock_write lock/1 "$1" "$2"; }
 
 # Replaces the KIND line of KEY (a lock/1 NAME, a bind/1 PORT) by LINE, or drops it; the lock/1 lines first, then the
-# bind/1 lines, each sorted by their second field.
+# bind/1 lines, each sorted by their second field, then a yank/1 line (NAME, HD1) for each lock/1 line whose FLAGS hold
+# yanked=malicious: the henki-mods of henki 0.2 ignores FLAGS but refuses the whole lock for a line kind it does not
+# know, so it can never turn such a module back on.
 lock_write() {
   local tmp="$LOCK.tmp.$$"
   {
-    [ ! -f "$LOCK" ] || HM_K="$1" HM_N="$2" awk -F '\t' '$1 != ENVIRON["HM_K"] || $2 != ENVIRON["HM_N"]' "$LOCK"
+    [ ! -f "$LOCK" ] || HM_K="$1" HM_N="$2" awk -F '\t' '$1 != "yank/1" && ($1 != ENVIRON["HM_K"] || $2 != ENVIRON["HM_N"])' "$LOCK"
     [ -z "$3" ] || printf '%s\n' "$3"
-  } | sort -t "$tab" -k1,1r -k2,2 >"$tmp" && mv -f "$tmp" "$LOCK" || {
+  } | sort -t "$tab" -k1,1r -k2,2 |
+    awk -F '\t' '{ print } $1 == "lock/1" && ("," $11 ",") ~ /,yanked=malicious,/ { y = y "yank/1\t" $2 "\t" $8 "\n" } END { printf "%s", y }' >"$tmp" &&
+    mv -f "$tmp" "$LOCK" || {
     rm -f "$tmp"
     die "cannot write $LOCK; fix: make $CONF writable"
   }
@@ -1193,15 +1199,17 @@ prompt_bytes() { # NAME DIR
 }
 
 # The cards block for the modules on, plus EXTRA (NAME DIR) when given, into FILE (empty when there are no cards).
-cards_block() {
-  local out="$1" extra="${2:-}" extra_dir="${3:-}" n d any=0
+cards_block() { # OUT [NAME DIR | PAIRS]: PAIRS, lines NAME=DIR, are copies not on yet (init's)
+  local out="$1" extra="${2:-}" n d any=0
+  [ -z "${3:-}" ] || extra="$extra=$3"
   : >"$out.cards"
   for n in $( (
     lock_names_on
-    [ -z "$extra" ] || echo "$extra"
+    printf '%s\n' "$extra" | sed -n 's/=.*//p'
   ) | sort -u); do
     # A subshell, so the caller's L_* stay as they are.
-    if [ "$n" = "$extra" ]; then d=$extra_dir; else d=$(lock_get "$n" && store_of); fi
+    d=$(printf '%s\n' "$extra" | HM_N="$n" awk 'index($0, ENVIRON["HM_N"] "=") == 1 { print substr($0, length(ENVIRON["HM_N"]) + 2); exit }')
+    [ -n "$d" ] || d=$(lock_get "$n" && store_of)
     [ -f "$d/.henki/card.md" ] || continue
     [ "$any" = 0 ] || echo >>"$out.cards"
     cat "$d/.henki/card.md" >>"$out.cards"
@@ -1278,6 +1286,20 @@ agents_bytes() {
   }
   t=$(cat "$1")
   if [ -n "$t" ]; then echo $((${#t} + 2)); else echo 0; fi
+}
+
+# The bytes the cards put into every request, as list counts them (AGENTS.md against AGENTS.md without the block): the
+# modules on now, or (PAIRS, NAME=DIR lines) with those copies on too.
+cards_bytes() { # [PAIRS]
+  local now="$AGENTS"
+  : >"$STAGE/cb.empty"
+  splice "$STAGE/cb.empty" "$STAGE/cb.plain" 2>/dev/null || cp "$AGENTS" "$STAGE/cb.plain" 2>/dev/null || : >"$STAGE/cb.plain"
+  if [ $# -gt 0 ]; then
+    cards_block "$STAGE/cb.block" "$1"
+    splice "$STAGE/cb.block" "$STAGE/cb.now" 2>/dev/null || cp "$STAGE/cb.block" "$STAGE/cb.now"
+    now="$STAGE/cb.now"
+  fi
+  echo $(($(agents_bytes "$now") - $(agents_bytes "$STAGE/cb.plain")))
 }
 
 # Writes AGENTS.md for the modules on (plus EXTRA NAME DIR); DRY 1: only check the size. Exit 1 with ERR.
@@ -2460,6 +2482,9 @@ cmd_rm() {
   lock_put "$n" ""
   cards_write 0 || die "$ERR"
   say "removed $n; its store copy stays in $(shown "$store") for a rollback"
+  if (manifest "$store" 0 && printf '%s\n' "$M_ports") 2>/dev/null | command grep -qx history; then
+    say "  if $n kept sessions as your history binding, they stay in its dir under $(shown "$(state_dir)/port/history"); add $n and henki mods swap history $n to reach them"
+  fi
   allow_offer "$(bin_names "$store")"
   restart
 }
@@ -2811,13 +2836,14 @@ pin_switch() { # WHY OLD_LINE
   store=$(store_of)
   for p in $(bound_to "$L_name"); do
     [ -f "$store/port/$p" ] && [ -x "$store/port/$p" ] || die "$L_name $L_version has no port/$p, and $L_name holds henki's $p binding; fix: henki-mods swap $p std first"
-    C_suite="$(conform_dir)/$p.tsv" || die "no conformance suites found; fix: reinstall henki"
-    h=$(henki_bin) || exit 1
-    conform_run "$p" "$store/port/$p" "$h" >"$STAGE/conform" || {
+    # As swap checks a binding: the manifest still declares the port, and the port's own checks pass.
+    (manifest "$store" 0 && printf '%s\n' "$M_ports") | command grep -qx "$p" ||
+      die "$L_name $L_version's manifest does not list $p in ports, and $L_name holds henki's $p binding; nothing changed; fix: henki-mods swap $p std first"
+    port_check "$p" "$store/port/$p" >"$STAGE/conform" || {
       cat "$STAGE/conform"
-      die "$L_name $L_version does not pass the $p/1 suite (above); nothing changed; fix: ask its author, or keep this version"
+      die "$L_name $L_version does not pass the $p/1 $C_what (above); nothing changed; fix: ask its author, or keep this version"
     }
-    say "  $p: $L_name $L_version passes the $p/1 suite ($C_checks checks)"
+    say "  $p: $L_name $L_version passes the $p/1 $C_what ($C_checks checks)"
   done
   link=$(mask_make) || exit 1
   if [ "$L_state" = on ]; then
@@ -2925,7 +2951,7 @@ cmd_update() {
   screen_review
   say "  pin      ${L_commit} $L_hd1 -> $new_commit $new_hd1"
   change_screen "$STAGE/old.facts" "$STAGE/new.facts" "$old" "$STAGE/m"
-  for x in $(bound_to "$n"); do say "  $x: bound to $n; the new copy runs the $x/1 suite before the switch"; done
+  for x in $(bound_to "$n"); do say "  $x: bound to $n; the new copy runs the $x/1 $(port_what "$x") before the switch"; done
   x=$(allow_hits "$new_cmds")
   [ -z "$x" ] || say "  allow rules that run its programs without asking: $(printf '%s\n' "$x" | tr '\n' ' ')(asked after the update)"
   if [ "$yes" != 1 ] && [ -s "$STAGE/diff" ] && tty_ask "show the whole diff? [y/N]"; then
@@ -3393,6 +3419,7 @@ EOF
     # Whatever index a line names, the default index's yank of the same files applies too.
     case "$L_kind" in "index:$INDEX_DEFAULT") ;; index:*) yank_guard "$n" "$L_version" path - "$L_hd1" ;; esac
     say "  $n $L_version ($L_kind $L_source)$([ -z "$old" ] || printf ', replaces the one here'): $L_state, +$(num "$(prompt_bytes "$n" "$u/store/$n/$(basename "$(store_of)")")") B of prompt"
+    [ "$I_card" = 0 ] || [ "$L_state" != on ] || say "    card     +$(num "$I_card") B into $(shown "$AGENTS")"
     x=$(hd1_hits "$L_hd1" | head -n 1)
     if [ -n "$x" ]; then
       tier_of "${x%%"$tab"*}" "$STAGE/ix/${x%%"$tab"*}/r/$(printf '%s' "$x" | cut -f 2)@${x##*"$tab"}"
@@ -3467,21 +3494,26 @@ profile_get() { # P
 
 # The prompt bytes of profile file F's official modules on, the header included (index lines: their entries' bytes
 # when loaded).
-profile_bytes() { # F
-  local n d t=0 b
+profile_bytes() { # F: its official modules' prompt bytes and cards in a home with nothing else on, as list then shows
+  local n d t=0 b pairs=""
   for n in $(awk -F '\t' '$3 == "on" && $5 == "official" { print $2 }' "$1"); do
     d=$(official_dir "$n") || continue
     b=$(prompt_bytes "$n" "$d") && t=$((t + b))
+    pairs="$pairs$n=$d$nl"
   done
   [ "$t" = 0 ] || t=$((t + ${#HEADER} + 2))
-  printf '%s\n' "$t"
+  b=$(
+    LOCK=/dev/null AGENTS="$STAGE/pb.none" # a subshell: they stay as they are outside
+    cards_bytes "$pairs"
+  ) || b=0
+  printf '%s\n' $((t + b))
 }
 
 # init [PROFILE] [--yes]: without PROFILE, the profiles henki ships, each with its modules and prompt bytes; with one,
 # its modules staged and checked as add does (a module in the lock already is left as it is: an off line is never turned
 # on), one screen, one question, then each installed.
 cmd_init() {
-  local p="" yes=0 d f line n s x want kind source fallback dir ref sub url pkg cmds="" bytes=0 b k=0
+  local p="" yes=0 d f line n s x want kind source fallback dir ref sub url pkg cmds="" bytes=0 b k=0 pairs=""
   while [ $# -gt 0 ]; do
     case "$1" in
       --yes | -y) yes=1 ;;
@@ -3539,6 +3571,11 @@ EOF
     x=$(prompt_bytes "$n" "$STAGE/m")
     bytes=$((bytes + x))
     say "  $n ${M_version:--} ($kind): +$(num "$x") B of prompt"
+    # Its card goes into AGENTS.md, so into every request, once it is on.
+    [ "$I_card" = 0 ] || [ "$(printf '%s' "$line" | cut -f 3)" != on ] || {
+      say "    card     +$(num "$I_card") B into $(shown "$AGENTS")"
+      pairs="$pairs$n=$STAGE/init/$n$nl"
+    }
     case "$kind" in index:*) tier_of "$F_index" "$E_rec" && say "    review   $(tier_paint)" ;; esac
     # pick_version passes over yanked versions; a removal of the package refuses here, as it does at add.
     [ -z "$pkg" ] || yank_guard "$n" "$E_ver" "$kind" "$pkg" "$I_hd1"
@@ -3555,7 +3592,9 @@ EOF
     return 0
   }
   [ "$bytes" = 0 ] || [ "$(total_on)" != 0 ] || bytes=$((bytes + ${#HEADER} + 2))
-  say "  prompt   +$(num "$bytes") B on every request (total on after: $(num $(($(total_on) + bytes))) B)"
+  # The cards as list will count them: the block with these cards against the block now.
+  b=$(cards_bytes) && x=$(cards_bytes "$pairs") || die "$ERR"
+  say "  prompt   +$(num $((bytes + x - b))) B on every request (extensions +$(num "$bytes") B, cards +$(num $((x - b))) B into $(shown "$AGENTS"); total on after: $(num $(($(total_on) + bytes + x))) B)"
   confirm "$yes" "add these $k modules? [y/N]" "nothing added (the answer was no); fix: run init again and answer y"
   cards_ok
   while IFS= read -r line; do
@@ -3658,7 +3697,7 @@ index_list() {
 # index add NAME URL --signers FILE [--checkpoint COMMIT] [--yes]: an index of your own choosing: its allowed_signers
 # FILE becomes the pinned anchor CONFIG/index/NAME.signers (shown by key fingerprint first), then the first sync.
 index_add() {
-  local n="" u="" f="" c="" yes=0 k d o shared=""
+  local n="" u="" f="" c="" yes=0 k d o x shared=""
   while [ $# -gt 0 ]; do
     case "$1" in
       --yes | -y) yes=1 ;;
@@ -3695,8 +3734,18 @@ index_add() {
   done <<EOF
 $(users)
 EOF
+  # A key in refused.keys never verifies a commit (index_chain drops it): say so here, before anything is trusted.
   say "index $n: $u"
-  printf '%s\n' "$k" | while IFS="$tab" read -r f u c; do say "  signer   $f $u $(key_fp "$c")"; done
+  printf '%s\n' "$k" | while IFS="$tab" read -r d x c; do
+    if key_refused "$c"; then
+      say "  signer   $d $x $(key_fp "$c") $(red "REFUSED: a development or rotated-out key henki never trusts")"
+    else
+      say "  signer   $d $x $(key_fp "$c")"
+    fi
+  done
+  d=0
+  for x in $(printf '%s\n' "$k" | cut -f 3); do key_refused "$x" || d=1; done
+  [ "$d" = 1 ] || die "every key in $f is a refused key (a development or rotated-out key henki never trusts), so no commit of index $n could verify; fix: ask the index owner for its real signing key"
   [ -n "$c" ] || say "  $(yellow "no checkpoint: a key this index rotated out could still graft a branch on the first sync (--checkpoint COMMIT, from its owner, closes that)")"
   confirm "$yes" "trust these keys for index $n? [y/N]" "not added (the answer was no); fix: run index add again and answer y"
   [ -n "$shared" ] || [ ! -d "$IDXD/$n.git" ] || { chmod -R u+w "$IDXD/$n.git" && rm -rf "$IDXD/$n.git" "$IDXD/$n.synced"; } ||
@@ -3708,6 +3757,13 @@ EOF
     die "$ERR (index $n was not added)"
   fi
   say "added index $n: henki-mods search lists what it holds"
+}
+
+# Whether key BLOB (base64) is in the refused.keys henki ships: one that never verifies a commit in any index.
+key_refused() { # BLOB
+  local s
+  s=$(index_share 2>/dev/null) && [ -f "$s/refused.keys" ] || return 1
+  HM_K="$1" awk '$1 == ENVIRON["HM_K"] { f = 1 } END { exit !f }' "$s/refused.keys"
 }
 
 # Index NAME out of CONFIG/mods.index, with its pinned anchor and checkpoint.
@@ -3809,6 +3865,8 @@ inst_end() { # X [kill]
 conform_run() { # PORT PROGRAM HENKI
   local name inst req want save got n=0 ok=0 v w r pid big i x skip=""
   C_port=$1 C_exe=$2 C_henki=$3 C_fail="" U_a=0 U_b=0 U_v=0
+  # No suite, no pass: a port without one (exec has fixed checks: port_check) must never pass on the EOF check alone.
+  [ -f "${C_suite:-}" ] && [ -r "$C_suite" ] && [ "${C_suite##*/}" = "$1.tsv" ] || die "no conformance suite for $1/1 (${C_suite:-none named}); fix: reinstall henki"
   CT=$(mktemp -d "${TMPDIR:-/tmp}/henki-conform.XXXXXX") || die "cannot make a scratch dir; fix: check TMPDIR"
   mkdir -p "$CT/scope" "$CT/scope2" "$CT/home"
   SAVED="SCOPE=$(cd -P "$CT/scope" && pwd)$nl""SCOPE2=$(cd -P "$CT/scope2" && pwd)"
@@ -3981,6 +4039,23 @@ exec_run() { # PROGRAM
   )
 }
 
+# PORT's checks against PROGRAM, as swap, update, rollback and the author's tools run them: exec/1's fixed checks
+# (exec_run), any other port's conform/1 suite (conform_run). Sets C_checks, C_passed and C_what ("checks" or
+# "suite"); fails when one fails.
+port_check() { # PORT PROGRAM
+  local rc=0 h
+  C_what=$(port_what "$1")
+  if [ "$1" = exec ]; then
+    exec_run "$2" || rc=$?
+    C_checks=7 C_passed=$((rc > 7 ? 0 : 7 - rc))
+    return $((rc > 0))
+  fi
+  C_suite="$(conform_dir)/$1.tsv" || die "no conformance suites found; fix: reinstall henki"
+  h=$(henki_bin) || exit 1
+  conform_run "$1" "$2" "$h"
+}
+port_what() { if [ "$1" = exec ]; then echo checks; else echo suite; fi; }
+
 # test --port PORT NAME|std|DIR|PROGRAM: the suite of PORT against module NAME's port/PORT (its store copy), a module
 # directory's port/PORT (one not added yet: an author's, or a pull request's to the index), a program by path (while
 # writing one), or std. DIR and PROGRAM start with /, ./ or ../. exec has fixed checks, not a suite.
@@ -4024,9 +4099,13 @@ cmd_swap() {
   busy
   lock_check
   if [ "$n" = std ]; then
+    was=
+    [ "$port" != history ] || ! bind_get history || was=$B_name
     rm -f "$CONF/port/$port" || die "cannot remove $(shown "$CONF/port/$port"); fix: make it writable"
     lock_write bind/1 "$port" ""
     say "$port: std"
+    # The binding keeps its sessions: list and --resume see std's from now on.
+    [ -z "$was" ] || say "  the sessions made while $was was bound stay in its store; henki mods swap history $was reaches them again"
     restart
     return 0
   fi
@@ -4044,15 +4123,13 @@ cmd_swap() {
   [ "$I_hd1" = "$L_hd1" ] || die "the store copy $store does not match the lock (it changed); fix: henki-mods rm $n and add it again"
   printf '%s\n' "$M_ports" | command grep -qx "$port" || die "$n's manifest does not list $port in ports; fix: swap to a module that declares it"
   if [ "$port" = exec ]; then
-    exec_run "$exe" >"$STAGE/conform" || {
+    port_check exec "$exe" >"$STAGE/conform" || {
       cat "$STAGE/conform"
       die "$n does not pass the exec/1 checks (above); fix: ask its author, or keep std"
     }
-    C_checks=7 what=checks
+    what=checks
   else
-    C_suite="$(conform_dir)/$port.tsv" || die "no conformance suites found; fix: reinstall henki"
-    h=$(henki_bin) || exit 1
-    conform_run "$port" "$exe" "$h" >"$STAGE/conform" || {
+    port_check "$port" "$exe" >"$STAGE/conform" || {
       cat "$STAGE/conform"
       die "$n does not pass the $port/1 suite (above); fix: ask its author, or keep std"
     }
@@ -4325,6 +4402,8 @@ hist_show() {
   command grep '^{"agents_hash":' "$HP/recs" | tail -n 1 | sed -n 's/.*,"sources":\[\([^]]*\)\].*/\1/p' |
     awk '{ n = split($0, s, "},{"); for (i = 1; i <= n; i++) { b = s[i]; sub(/.*"bytes":/, "", b); sub(/[,}].*/, "", b); m = s[i]; sub(/.*"name":"/, "", m); sub(/".*/, "", m); print m, b } }' >"$HP/src"
   while read -r m b; do src="${src:+$src, }$m $(num "$b") B"; done <"$HP/src"
+  m=$(command grep '^{"agents_hash":' "$HP/recs" | tail -n 1 | sed -n 's/.*,"ts":"\([^"]*\)".*/\1/p')
+  [ -z "$m" ] || say "last start: $m"
   [ -z "$src" ] || say "context at its last start: $src"
 }
 
@@ -4332,12 +4411,17 @@ hist_show() {
 # then history show, from the bound history or std's). Their bytes depend on the dir, so with no session here, or a
 # history that does not answer, the line says where they are shown instead. N: the modules on with ctx/.
 list_sources() {
-  local id x why="no session of $(shown "$PWD") to read them from"
+  local id x ts why="no session of $(shown "$PWD") to read them from"
   if x=$( (hist_list) 2>/dev/null); then
     id=$(printf '%s\n' "$x" | awk 'NR == 1 && $1 == 1 { print ($2 == "*" ? $3 : $2) }')
     if [ -n "$id" ] && x=$( (hist_show "$id") 2>/dev/null); then
+      ts=$(printf '%s\n' "$x" | sed -n 's/^last start: //p')
       x=$(printf '%s\n' "$x" | sed -n 's/^context at its last start: //p')
-      say "context sources in $(shown "$PWD"), at the last start of $id: ${x:-none counted}"
+      if [ -n "$ts" ] && ctx_since "$ts"; then
+        say "context sources: their bytes are shown at the next start (a module with ctx/ was added, turned on or changed after the last start of $id)"
+      else
+        say "context sources in $(shown "$PWD"), at the last start of $id: ${x:-none counted}"
+      fi
       return 0
     fi
     [ -z "$id" ] || why="session $id could not be read"
@@ -4345,6 +4429,20 @@ list_sources() {
     why="the history did not answer"
   fi
   say "context sources: their bytes are shown at session start ($why)"
+}
+
+# Whether a module on with ctx/ got its ext link (add, on, update, rollback) after TS, a session record's UTC ts, which
+# has whole seconds: a link from the second the session started in, or the next, does not count (touch takes :60).
+ctx_since() { # TS
+  local t n s
+  t=$(printf '%s\n' "$1" | sed -n 's/^\([0-9]\{4\}\)-\([0-9][0-9]\)-\([0-9][0-9]\)T\([0-9][0-9]\):\([0-9][0-9]\):\([0-9][0-9]\)Z$/\1\2\3\4\5 \6/p')
+  [ -n "$t" ] || return 1
+  s=${t#* } && s=${s#0}
+  TZ=UTC0 touch -t "$(printf '%s.%02d' "${t% *}" $((s + 1)))" "$STAGE/ctx.start" 2>/dev/null || return 1
+  for n in $(ext_names); do
+    [ -d "$EXT/$n/ctx" ] && [ -n "$(find "$EXT/$n" -prune -newer "$STAGE/ctx.start" 2>/dev/null)" ] && return 0
+  done
+  return 1
 }
 
 # The scope (a JSON string, as written) of a std journal in FILE, kept in the scope dir SCOPEDIR: the cwd of its first

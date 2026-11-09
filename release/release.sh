@@ -12,7 +12,7 @@
 #   share/henki/index/           the default module index's anchor from manager/index/: its URL, signers, checkpoint
 #                                and the refused keys (henki-mods search, info, add NAME, sync)
 #   share/henki/mod-profiles/    the module profiles of manager/mod-profiles/ (henki-mods init)
-#   share/henki/config.*.toml    the config profiles in profiles/ (henki's no-config message names config.mac.toml)
+#   share/henki/config.*.toml    the config profiles in profiles/ (henki's no-config message names the one beside it)
 #   LICENSE README.md CONTRACTS.md SECURITY.md EXTENDING.md
 #
 # Usage:
@@ -196,7 +196,8 @@ stage() {
   cp manager/henki-mods "$dir/bin/henki-mods" && chmod 755 "$dir/bin/henki-mods"
   cp manager/henki-mods-dev "$dir/bin/henki-mods-dev" && chmod 755 "$dir/bin/henki-mods-dev"
   for n in LICENSE README.md CONTRACTS.md SECURITY.md EXTENDING.md; do cp "$n" "$dir/$n" && chmod 644 "$dir/$n"; done
-  # The profiles, where henki's no-config message sends a Homebrew user: $(brew --prefix)/share/henki/.
+  # The profiles: henki's no-config message names config.local.toml (config.mac.toml on a Mac) in the share/henki/
+  # beside its bin/.
   for n in $(git ls-files 'profiles/config.*.toml'); do cp "$n" "$dir/share/henki/${n#profiles/}" && chmod 644 "$dir/share/henki/${n#profiles/}"; done
   for n in $(git ls-files 'manager/conform/*.tsv' 'manager/conform/fixtures/*.json'); do
     cp "$n" "$dir/share/henki/${n#manager/}" && chmod 644 "$dir/share/henki/${n#manager/}"
@@ -449,10 +450,11 @@ selftest() {
   got=$(env -i HOME="$t/home" PATH=/usr/bin:/bin "$x/bin/henki" --version) || got="(exit $?)"
   want="henki $version ($commit, $(host_arch)-$(host_os))"
   [ "$got" = "$want" ] || { say "selftest: bin/henki --version said \"$got\", not \"$want\""; bad=1; }
-  # Without a config henki names a profile under $(brew --prefix)/share/henki/: the tarball's share/henki/ has it.
+  # Without a config henki names the profile in the share/henki/ beside its bin/: here the tarball's own file.
   got=$(env -i HOME="$t/home" PATH=/usr/bin:/bin "$x/bin/henki" run hi 2>&1) && got="(exit 0) $got" || true
-  want=$(printf '%s\n' "$got" | sed -n 's,.*\$(brew --prefix)/\(share/henki/[^ ]*\).*,\1,p')
-  [ -n "$want" ] && [ -f "$x/$want" ] || { say "selftest: henki without a config said \"$got\", and the tarball has no ${want:-file it names}"; bad=1; }
+  want=$(printf '%s\n' "$got" | sed -n 's,.* cp \([^ ]*\) ~/\.config/henki/config\.toml$,\1,p')
+  case "$want" in "$(cd "$x" && pwd -P)/share/henki/config."*.toml) ;; *) want= ;; esac
+  [ -n "$want" ] && [ -f "$want" ] || { say "selftest: henki without a config said \"$got\", not a profile in the tarball's share/henki/"; bad=1; }
   got=$(env -i HOME="$t/home" PATH=/usr/bin:/bin "$x/bin/henki-mods" --version 2>&1) || got="(exit $?)"
   [ "$got" = "henki-mods $version" ] || { say "selftest: bin/henki-mods --version said \"$got\""; bad=1; }
   # The official modules are found in the tarball's share/ (no HENKI_SHARE, no repo checkout next to it).

@@ -9,7 +9,10 @@
 # is the target of a write or edit in a git work tree that the commit cannot hold: outside the work tree, in a repo
 # nested in it, or ignored there.
 LC_ALL=C
-export LC_ALL
+# Its programs (git and the rest) come from the system dirs, never the tool PATH: a PATH dir inside the project (an
+# activated .venv/bin) holds what the model wrote there, and this runs on the host before each call.
+PATH=/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin
+export LC_ALL PATH
 me=${0##*/}
 S=${HENKI_SESSION:-}
 case "$S" in '' | *[!A-Za-z0-9._-]* | [.-]*) echo "$me: no session (HENKI_SESSION); run it from henki" >&2 && exit 1 ;; esac
@@ -84,7 +87,8 @@ snapshot() {
     die "$*"
   }
   n=$(($(numbers | tail -n 1) + 1))
-  plain=$(case "$path" in '' | *\\*) ;; *) echo y ;; esac)
+  plain=y
+  case "$path" in '' | *\\*) plain= ;; esac
   if [ -n "$top" ]; then
     [ -z "$eq" ] || no "$eq"
     t=$(tree) || no "cannot read the work tree"
@@ -151,10 +155,12 @@ put_back() {
   done
 }
 
-# y or yes on stdin (the terminal henki runs a command on).
+# y or yes on stdin (the terminal henki runs a command on), or `yes` after the command (`/undo yes`, `/rewind N yes`):
+# with no terminal (henki serve runs a command with stdin /dev/null) there is no one to ask, so nothing is put back.
 yes_() {
   printf '%s [y/N] ' "$1"
-  read -r a || return 1
+  [ "$confirm" != yes ] || { echo yes && return 0; }
+  read -r a || { echo && die "no answer, and no terminal to ask on; nothing put back; fix: /$me ${n_arg:+$n_arg }yes puts them back without the question"; }
   case "$a" in y | Y | yes) return 0 ;; esac
   return 1
 }
@@ -208,6 +214,13 @@ restore() {
   echo "back at checkpoint $n; the model was not told, so say so in your next message"
 }
 
+# The arguments, as one (the REPL's /NAME REST) or as words: N for /rewind, then `yes` to confirm without the question.
+set -f
+# shellcheck disable=SC2086,SC2048 # split on purpose: `/rewind 3 yes` is one argument
+set -- $*
+confirm= n_arg=
+[ "$me" != rewind ] || { n_arg=${1:-} && shift $(($# > 0)); }
+case "$*" in '') ;; yes) confirm=yes ;; *) [ "$me" = call_start.wait ] || die "usage: /undo [yes], /rewind N [yes]; fix: /checkpoints lists them" ;; esac
 case "$me" in
   call_start.wait) snapshot ;;
   undo)
@@ -217,9 +230,9 @@ case "$me" in
     restore "$n"
     ;;
   rewind)
-    case "${1:-}" in '' | *[!0-9]*) die "usage: /rewind N; fix: /checkpoints lists them" ;; esac
+    case "$n_arg" in '' | *[!0-9]*) die "usage: /rewind N [yes]; fix: /checkpoints lists them" ;; esac
     missed
-    restore "$1"
+    restore "$n_arg"
     ;;
   *)
     missed

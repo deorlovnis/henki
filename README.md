@@ -9,7 +9,7 @@ v=0.3.0 t=aarch64-apple-darwin          # or x86_64-apple-darwin, aarch64-unknow
 curl -fLO https://github.com/deorlovnis/henki/releases/download/v$v/henki-$v-$t.tar.gz && tar -xzf henki-$v-$t.tar.gz
 export PATH="$PWD/henki-$v-$t/bin:$PATH" # henki, henki-mods and henki-mods-dev
 llama-server -m Qwen3.5-2B-Q8_0.gguf -c 32768 --port 8080 &   # a local model server (Ollama: base_url :11434/v1)
-mkdir -p ~/.config/henki && cp henki-$v-$t/share/henki/config.mac.toml ~/.config/henki/config.toml   # then set model
+mkdir -p ~/.config/henki && cp henki-$v-$t/share/henki/config.local.toml ~/.config/henki/config.toml   # then set model (on a Mac: config.mac.toml)
 henki                                   # the REPL; /exit quits
 henki mods                              # the modules: none is on yet
 henki mods init starter                 # sessions, prompts and project, after a screen and one question
@@ -38,8 +38,9 @@ What works today (each row names a test that shows it):
 ## Usage
 
 ```sh
-mkdir -p ~/.config/henki && cp $(brew --prefix)/share/henki/config.mac.toml ~/.config/henki/config.toml   # then set model and base_url
-                                        # (from a tarball: share/henki/config.mac.toml; from a checkout: profiles/)
+mkdir -p ~/.config/henki && cp PREFIX/share/henki/config.local.toml ~/.config/henki/config.toml   # then set model and base_url
+                                        # PREFIX: the unpacked tarball, or $(brew --prefix); from a checkout: profiles/;
+                                        # on a Mac config.mac.toml (halti's line); henki with no config names the file
 henki-mods add halti                    # if you use halti: its doc, wrappers and card (1.1 KB into every request)
 henki                                   # the REPL
 henki run "why does the build fail?"    # one task, headless
@@ -141,7 +142,7 @@ A module is an extension with an optional manifest, `.henki/module.toml`, that `
 
 - `henki mods test [DIR]` checks a module as an install would (layout, every text, links, the manifest, `eval/`), plus the names henki keeps, commands an official module has too, each `port/PORT`'s conformance suite and `shellcheck` when you have it; on a directory of modules it checks each, then runs `DIR/test.sh` there with HOME and the XDG dirs in a scratch dir. It runs your module's code. `henki-mods verify --dir DIR` is the install's check alone, `henki-mods test --port PORT ./DIR` one binding's suite.
 - `henki mods try [DIR]` starts henki with only that module on, in a scratch home (HOME and the XDG dirs in a temp dir, holding a copy of your `config.toml` without its `ext` key, and the shadow line the module needs); nothing of it reaches your config, store or sessions, and the temp dir goes at the end (`--keep` keeps it). Arguments after `--` go to henki.
-- `henki-mods eval ./DIR` measures it against the module off, `henki-mods add ./DIR` installs it from a directory, and `henki-mods add URL[@REF]#DIR` from a git repository, which is how you share one: henki-mods pins the commit and runs nothing from the repository, and its install screen marks such a module unreviewed. `henki mods share NAME` prints one line that installs exactly these files elsewhere (`add URL@COMMIT#DIR --expect hd1:HASH`, which refuses any other files), or `add NAME` for an official or index module.
+- `henki-mods eval ./DIR` measures it against the module off, `henki-mods add ./DIR` installs it from a directory, and `henki-mods add URL[@REF]#DIR` from a git repository, which is how you share one: henki-mods pins the commit and runs nothing from the repository, and its install screen marks such a module unreviewed. `henki mods share NAME` prints one line that installs exactly these files elsewhere (`add URL@COMMIT#DIR --expect hd1:HASH`, which refuses any other files; `add NAME --version V --expect hd1:HASH` for an index module), or `add NAME` for an official one.
 - `henki mods publish [DIR]`, for a module committed and pushed, prints the index's two entry files (`mods/NAME.toml`, `mods/NAME/VERSION.toml`), derived from the commit and checked by the index's own rules, and the steps of the pull request; it sends nothing. With `--eval RUN` it adds the badge of an eval run that earns one, and the run's rows (`evals/NAME/VERSION.tsv`), which the index recomputes the badge from. `henki mods entry derive REPO PATH COMMIT` prints the keys of an index entry that the module itself decides, and `henki mods entry lint FILE` checks an entry file. These author's verbs are `henki-mods-dev`'s, shipped beside henki-mods.
 
 ### henki serve

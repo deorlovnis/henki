@@ -88,7 +88,15 @@ const KEYS: &str = "model, base_url, dialect, api_key, approve, tools, ext, shad
 const INTS: [(&str, u64, u64); 6] = [("max_steps", 1, 10_000), ("max_seconds", 0, 604_800), ("tool_timeout_s", 1, 600), ("output_cap", 1_024, 262_144),
     ("context_window", 1_024, 2_147_483_647), ("max_tokens", 1, 1_000_000)];
 const WS: [char; 2] = [' ', '\t'];
-const NO_CONFIG: &str = "no config; copy one: mkdir -p ~/.config/henki && cp $(brew --prefix)/share/henki/config.mac.toml ~/.config/henki/config.toml";
+/// The profile the no-config message names: the Mac's (halti's shadows), else the one for any local model server.
+const PROFILE: &str = if cfg!(target_os = "macos") { "share/henki/config.mac.toml" } else { "share/henki/config.local.toml" };
+
+/// The no-config message, naming the profile beside this henki (`PREFIX/bin/henki`: a tarball, Homebrew), else Homebrew's.
+fn no_config() -> String {
+    let p = std::env::current_exe().ok().and_then(|e| Some(e.parent()?.parent()?.join(PROFILE))).filter(|p| p.is_file());
+    let p = p.map_or_else(|| format!("$(brew --prefix)/{PROFILE}"), |p| p.display().to_string());
+    format!("no config; copy one: mkdir -p ~/.config/henki && cp {p} ~/.config/henki/config.toml")
+}
 
 /// Defaults, then one file, then HENKI_MODEL and HENKI_BASE_URL, then the flags. Err: "FILE:LINE: PROBLEM; fix: ..."
 /// (or "PROBLEM; fix: ..." when no file is involved); `main` turns it into exit 2 `config`.
@@ -131,7 +139,7 @@ pub fn load(f: &Flags, env: &Env, cwd: &Path) -> Result<Config, String> {
         layers.extend(lines.into_iter().map(|(n, k, v)| (format!("{}:{n}", file.display()), k, v)));
         (c.hash, c.file) = (Some(sys::fnv(text.as_bytes())), Some(file.clone()));
     } else if env_model.is_none() || env_url.is_none() {
-        return Err(NO_CONFIG.into());
+        return Err(no_config());
     }
     fs::metadata(&c.dir).map_or(Ok(()), |m| owner_mode(&c.dir, m.mode(), m.uid(), sys::euid(), true))?;
     // The dir's AGENTS.md, extensions and allow file steer henki as the file does, so the rule holds without a file too.

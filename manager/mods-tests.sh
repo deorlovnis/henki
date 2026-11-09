@@ -117,6 +117,14 @@ t_sessions() {
   err_has 'fork: "02" is not a line'
   run "$s/fork" 20261108T080000Z-aaaa@3
   err_has "fork: line 3 of session 20261108T080000Z-aaaa is not a message of yours; fix: /fork lists them"
+  # No line and no terminal to ask on (henki serve): the list, then a refusal whose fix is /fork N.
+  RC=0
+  OUT=$(HENKI_SESSION=20261108T080000Z-aaaa PATH=/usr/bin:/bin "$s/fork" </dev/null 2>"$SCRATCH/err") || RC=$?
+  ERR=$(cat "$SCRATCH/err")
+  rc_is 1
+  out_has "     4  second"
+  err_has "fork: no line given, and no terminal to ask on; fix: /fork N with N a line above"
+  next_is ""
   run "$s/fork" nope@2
   rc_is 1
   err_has "no session nope in std's store"
@@ -245,7 +253,17 @@ t_checkpoints() {
   err_has "usage: /rewind N"
   run "$m/cmd/rewind" 9
   err_has "no checkpoint 9"
-  run "$m/cmd/rewind" 1 <<<y
+  # No terminal to answer on (henki serve runs a command with stdin /dev/null): nothing is put back, exit 1, and the
+  # fix names the argument that confirms without the question; `/rewind 1 yes` (one argument, as henki passes it) does.
+  run "$m/cmd/rewind" 1 </dev/null
+  rc_is 1
+  err_has "no terminal to ask on; nothing put back; fix: /rewind 1 yes puts them back"
+  [ "$(cat a.txt)" = three ] || fail "/rewind with no answer changed a.txt"
+  run "$m/cmd/rewind" "1 nope" </dev/null
+  err_has "usage: /undo [yes], /rewind N [yes]"
+  run "$m/cmd/rewind" "1 yes" </dev/null
+  rc_is 0
+  out_has "? [y/N] yes${nl}back at checkpoint 1"
   [ "$(cat a.txt)" = one ] || fail "/rewind 1 did not put a.txt back"
   run "$m/cmd/checkpoints"
   out_has "no checkpoints in this session"
@@ -291,8 +309,12 @@ t_checkpoints() {
   printf 'new\n' >x.txt && printf 'made\n' >y.txt
   run "$m/cmd/checkpoints"
   out_has "2  before write or edit $D/plain/y.txt (absent)"
-  run "$m/cmd/undo" <<<y
-  [ ! -e y.txt ] || fail "/undo did not remove the file made after the snapshot"
+  run "$m/cmd/undo" </dev/null
+  rc_is 1
+  err_has "fix: /undo yes puts them back"
+  [ -e y.txt ] || fail "/undo with no answer removed y.txt"
+  run "$m/cmd/undo" yes </dev/null
+  [ ! -e y.txt ] || fail "/undo yes did not remove the file made after the snapshot"
   run "$m/cmd/undo" <<<y
   [ "$(cat x.txt)" = old ] || fail "/undo did not put x.txt back"
   event write 'a\\nb' >"$D/ev"
@@ -474,6 +496,13 @@ t_project() {
   run "$src" </dev/null
   out_has "git: $repo on $(git -C "$repo" rev-parse --short HEAD)"
   [ ! -e "$D/fsmonitor-ran" ] || fail "the repository's core.fsmonitor ran"
+  # A git, tr or awk on PATH inside the project (a .venv/bin the model wrote) never runs: the system's do.
+  mkdir -p "$repo/.venv/bin"
+  for t in git tr awk; do printf '#!/bin/sh\ntouch %s/planted-ran\n' "$D" >"$repo/.venv/bin/$t" && chmod 755 "$repo/.venv/bin/$t"; done
+  P="$repo/.venv/bin:/usr/bin:/bin" run "$src" </dev/null
+  out_has "git: $repo on $(git -C "$repo" rev-parse --short HEAD)"
+  [ ! -e "$D/planted-ran" ] || fail "a git, tr or awk from the project's PATH dir ran"
+  rm -rf "$repo/.venv"
   # Nothing outside git, nor in a repository at or above HOME (a dotfiles repo).
   cd "$D/plain" || return
   run "$src" </dev/null
@@ -513,17 +542,21 @@ t_notify() {
   [ "$(readlink "$MODS_DIR/notify/on/question")" = turn_end ] || fail "on/question is not the link"
   printf '#!/bin/sh\nprintf "%%s|" "$@"\n' >"$b/notify-send" && chmod 755 "$b/notify-send"
   printf '{"data":{"status":"ok","steps":2,"t":"turn_end","ts":"x","usage":{}},"event":"turn_end","seq":9,"session":"s","v":1}\n' >"$D/ev"
-  HENKI_EVENT=turn_end P="$b:/usr/bin:/bin" run "$MODS_DIR/notify/on/turn_end" <"$D/ev"
+  HENKI_EVENT=turn_end HENKI_NOTIFY_PATH="$b:/usr/bin:/bin" run "$MODS_DIR/notify/on/turn_end" <"$D/ev"
   [ "$OUT" = "--|henki: ${PWD##*/}|turn ended: ok|" ] || fail "turn_end: $OUT"
   printf '{"data":{"args":{"command":"ls"},"id":"h1","name":"shell","t":"ask","ts":"x"},"event":"question","seq":9,"session":"s","v":1}\n' >"$D/ev"
-  HENKI_EVENT=question P="$b:/usr/bin:/bin" run "$MODS_DIR/notify/on/question" <"$D/ev"
+  HENKI_EVENT=question HENKI_NOTIFY_PATH="$b:/usr/bin:/bin" run "$MODS_DIR/notify/on/question" <"$D/ev"
   [ "$OUT" = "--|henki: ${PWD##*/}|asks before a shell call|" ] || fail "question: $OUT"
   printf '#!/bin/sh\nprintf "%%s|" "$@"\n' >"$b/osascript" && chmod 755 "$b/osascript"
-  HENKI_EVENT=turn_end P="$b:/usr/bin:/bin" run "$MODS_DIR/notify/on/turn_end" <<<'{}'
+  HENKI_EVENT=turn_end HENKI_NOTIFY_PATH="$b:/usr/bin:/bin" run "$MODS_DIR/notify/on/turn_end" <<<'{}'
   out_has "display notification (item 2 of argv) with title (item 1 of argv)|-e|end run|henki: "
   rm "$b/osascript" "$b/notify-send"
+  HENKI_EVENT=turn_end HENKI_NOTIFY_PATH="$b:/usr/bin:/bin" run "$MODS_DIR/notify/on/turn_end" <<<'{}'
+  err_has "notify: no osascript or notify-send in $b:/usr/bin:/bin"
+  # A notifier on the tool PATH (a project's .venv/bin the model wrote) is never run: only the system dirs are searched.
+  printf '#!/bin/sh\ntouch %s/planted-ran\n' "$D" >"$b/notify-send" && chmod 755 "$b/notify-send"
   HENKI_EVENT=turn_end P="$b:/usr/bin:/bin" run "$MODS_DIR/notify/on/turn_end" <<<'{}'
-  err_has "notify: no osascript or notify-send on PATH"
+  [ ! -e "$D/planted-ran" ] || fail "a notify-send on PATH ran"
 }
 
 # compact, the context binding, with a stub model server on loopback (python3; compact needs it too): keep below its
@@ -889,6 +922,24 @@ if [ "$(uname -s)" = Linux ]; then
   case $a in *" --tmpfs /tmp "*"--tmpfs $root/home "*"--bind $root/tmp $root/tmp "*"--bind $root/proj $root/proj "*"--ro-bind-try /dev/null $root/tmp/agent.sock "*) ok "a private /tmp, then the home hidden, the temp dir and project bound, the agent socket masked" ;;
     *) bad "unexpected layout: $a" ;; esac
   case $a in *" -- $bash_abs --noprofile --norc -c echo \"a b\" x y z ") ok "the command's arguments come last" ;; *) bad "the command is not last: $a" ;; esac
+  # A backend a call could have written is never run: one in the project or the temp dir, or a link from a PATH dir
+  # outside to one there, is passed over (an activated .venv/bin on PATH); and port/exec's own lookups (ls) skip PATH.
+  be=planted
+  mkdir -p "$root/proj/.venv/bin" "$root/tmp/bin" "$root/links"
+  for d in "$root/proj/.venv/bin" "$root/tmp/bin"; do
+    for t in bwrap unshare ls; do printf '#!/bin/sh\necho ran >>%s/escaped\n' "$root" >"$d/$t"; chmod +x "$d/$t"; done
+  done
+  ln -s "$root/proj/.venv/bin/bwrap" "$root/links/bwrap"; ln -s ../proj/.venv/bin/unshare "$root/links/unshare"
+  ln -s "$exe" "$root/links/exec" # run through a link, so port/exec looks itself up with ls
+  ran=0
+  for up in "$root/proj/.venv/bin" "$root/tmp/bin" "$root/links" "$root/links/../proj/.venv/bin"; do
+    for p in bwrap ns auto; do
+      r=$(cd "$root/proj" && HOME=$root/home TMPDIR=$root/tmp HENKI_SANDBOX=$p HENKI_USER_PATH=$up:/usr/bin:/bin \
+        PATH=$up:/usr/bin:/bin "$root/links/exec" "$bash_abs" --noprofile --norc -c 'echo inside' 2>&1 </dev/null)
+      [ ! -e "$root/escaped" ] || { bad "$p with $up on PATH ran a planted program on the host: $r"; rm -f "$root/escaped"; ran=1; }
+    done
+  done
+  [ "$ran" = 1 ] || ok "a backend or tool in the project or the temp dir is never run"
   rm -rf "$root"
 fi
 

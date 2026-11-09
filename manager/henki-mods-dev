@@ -600,6 +600,15 @@ test_module() { # DIR
   done
   [ ! -d "$d/eval" ] || t_ok "$n" "eval/: $(printf '%s' "$E_tasks" | awk 'NF' | wc -l | tr -d ' ') tasks (eval/1)"
   for p in $(printf '%s' "$I_ports"); do
+    if [ "$p" = exec ]; then # fixed checks, no suite and no henki
+      if port_check exec "$d/port/exec" >"$STAGE/conform"; then
+        t_ok "$n" "port/exec passes the exec/1 checks ($C_checks checks)"
+      else
+        sed 's/^/     | /' "$STAGE/conform"
+        t_fail "$n" "port/exec fails the exec/1 checks (above); fix: as each FAIL line says"
+      fi
+      continue
+    fi
     C_suite="$(conform_dir)/$p.tsv" || die "no conformance suites found; fix: reinstall henki"
     if ! h=$(henki_bin 2>/dev/null); then
       t_fail "$n" "port/$p: no henki to run the $p/1 suite with; fix: put henki on PATH"
@@ -772,11 +781,9 @@ dev_publish() {
     printf 'index = 1\n'
     cat "$STAGE/ver.body"
     for p in $(printf '%s' "$I_ports"); do
-      C_suite="$(conform_dir)/$p.tsv" || die "no conformance suites found; fix: reinstall henki"
-      h=$(henki_bin) || exit 1
-      conform_run "$p" "$STAGE/m/port/$p" "$h" >"$STAGE/conform" || {
+      port_check "$p" "$STAGE/m/port/$p" >"$STAGE/conform" || {
         cat "$STAGE/conform"
-        die "port/$p fails the $p/1 suite (above); an index lists only bindings that pass; fix: henki mods test $d"
+        die "port/$p fails the $p/1 $C_what (above); an index lists only bindings that pass; fix: henki mods test $d"
       }
       printf 'conform = "%s/1 %s/%s"\n' "$p" "$C_passed" "$C_checks"
       break
@@ -952,8 +959,9 @@ dev_share() { # NAME
   case "$L_source" in *'#'*) x="$x#${L_source#*#}" ;; esac
   case "$L_kind:$L_source" in
     official:*) say "henki mods add $L_name" ;;
-    index:"$INDEX_DEFAULT":*) say "henki mods add $L_source" ;;
-    index:*) say "henki mods add $L_source@${L_kind#index:}   (once: henki mods index add ${L_kind#index:} URL --signers FILE)" ;;
+    # The version installed here and its files, not the index's newest.
+    index:"$INDEX_DEFAULT":*) say "henki mods add $L_source --version $L_version --expect $L_hd1" ;;
+    index:*) say "henki mods add $L_source@${L_kind#index:} --version $L_version --expect $L_hd1   (once: henki mods index add ${L_kind#index:} URL --signers FILE)" ;;
     url:*) say "henki mods add $x --expect $L_hd1" ;;
     skill:[!/]*) say "henki mods add --skill $x --as $L_name --expect $L_hd1" ;;
     *) die "$1 comes from a directory on this machine ($L_source), which no one else can add; fix: push it to a git repository and share that (henki mods add URL#DIR)" ;;

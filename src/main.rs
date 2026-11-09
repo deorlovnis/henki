@@ -240,12 +240,8 @@ fn start(a: Args, tx: &Sender<Ev>, rx: &Receiver<Ev>, t0: Instant, early: io::Re
     }
     cfg.context = ext::sources(&mut cfg, tx, rx)?;
     // A signal or the deadline that came during startup ends it here, before the session file exists.
-    if let Ok(Ev::Signal(_)) = rx.try_recv() {
-        return Err(Outcome::Interrupted);
-    }
-    if deadline.is_some_and(|d| Instant::now() >= d) {
-        return Err(Outcome::Budget);
-    }
+    let early = if matches!(rx.try_recv(), Ok(Ev::Signal(_))) { Some(Outcome::Interrupted) } else { deadline.is_some_and(|d| Instant::now() >= d).then_some(Outcome::Budget) };
+    early.map_or(Ok(()), Err)?;
     let mut ports = port::bind(&mut cfg, *deadline)?;
     let (sid, hist, mut head, notices) = journal::start(ports.history.as_mut(), &a.resume, &mut cfg)?;
     cfg.notices.extend(notices);

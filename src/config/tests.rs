@@ -475,7 +475,9 @@ fn config_explicit_missing() {
 #[test]
 fn config_missing_message() {
     let t = T::new();
-    let want = "no config; copy one: mkdir -p ~/.config/henki && cp $(brew --prefix)/share/henki/config.mac.toml ~/.config/henki/config.toml";
+    // The test binary has no share/henki/ beside it: the message names Homebrew's, the Mac's profile on a Mac.
+    let p = if cfg!(target_os = "macos") { "config.mac.toml" } else { "config.local.toml" };
+    let want = format!("no config; copy one: mkdir -p ~/.config/henki && cp $(brew --prefix)/share/henki/{p} ~/.config/henki/config.toml");
     for extra in [&[][..], &[("HENKI_MODEL", "m")], &[("HENKI_BASE_URL", "http://127.0.0.1:1/v1")], &[("HENKI_MODEL", ""), ("HENKI_BASE_URL", "http://127.0.0.1:1/v1")]] {
         assert_eq!(load(&flags(), &t.env(extra), &t.cwd).err().unwrap(), want);
     }
@@ -1109,6 +1111,10 @@ fn profiles_parse() {
     let mac = include_str!("../../profiles/config.mac.toml");
     let boxed = include_str!("../../profiles/config.box.toml");
     assert!(!parse(mac).unwrap().is_empty());
+    // The host-neutral profile is the Mac's without halti's shadow line.
+    let local = include_str!("../../profiles/config.local.toml");
+    let body = |s: &str| s.lines().filter(|l| !l.starts_with('#') && !l.starts_with("shadow")).collect::<Vec<_>>().join("\n");
+    assert_eq!(body(local), body(mac));
     assert!(!parse(boxed).unwrap().is_empty());
     let t = T::new();
     let c = t.load(mac).unwrap();

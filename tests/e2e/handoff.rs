@@ -385,18 +385,26 @@ fn handoff_restart_after_history_swap() {
     fs::write(&w, format!("#!/bin/sh\nexec {} history --name {}\n", toy.display(), r.marker)).unwrap();
     fs::set_permissions(&w, fs::Permissions::from_mode(0o700)).unwrap();
     let swap = format!("mkdir -p \"$HENKI_CONFIG/port\" && ln -s {} \"$HENKI_CONFIG/port/history\" && echo restart >\"$HENKI_NEXT\"", w.display());
-    module(&r, "kit", &[("swap", &swap)]);
+    module(&r, "kit", &[("swap", &swap), ("back", "rm \"$HENKI_CONFIG/port/history\" && echo restart >\"$HENKI_NEXT\"")]);
     let mut p = start(&r, &[]);
     message(&p, "first", "one");
     let first = r.journals()[0].file_stem().unwrap().to_string_lossy().into_owned();
     p.line("/swap");
     p.expect("henki: changed while /swap ran: ~/.config/henki/port/history\r\nrestart on these changes? [y/N] ", W);
     p.line("y");
-    p.expect(&format!("henki: session {first} stays in henki's own history; resume it with that bound (std: henki --port history=std --resume={first})\r\n"), W);
+    p.expect(&format!("henki: session {first} stays in henki's own history; henki --port history=std --resume={first} reaches it\r\n"), W);
     p.expect(&format!("henki: history: {} (port/1, {} 0.1.0)", w.display(), r.marker), W);
     p.prompt(W);
     p.renew(&r);
     message(&p, "second", "two");
+    // Back to std: the binding's session is reached by linking it again (a module's: henki mods swap history PKG).
+    let second = r.journals().into_iter().find(|j| j.starts_with(r.state().join("port/history"))).unwrap().file_stem().unwrap().to_string_lossy().into_owned();
+    p.line("/back");
+    p.expect("restart on these changes? [y/N] ", W);
+    p.line("y");
+    p.expect(&format!("henki: session {second} stays in history binding {0}; link {0} as port/history again, then henki --resume={second} reaches it\r\n", w.display()), W);
+    p.prompt(W);
+    p.renew(&r);
     exit(&r, p);
     // The first session stays in std; the second is the only one in the binding's store.
     let text: Vec<String> = r.journals().iter().map(|j| fs::read_to_string(j).unwrap()).collect();

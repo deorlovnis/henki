@@ -20,10 +20,15 @@ An observer and commands for you, not for the model (they cost no prompt bytes):
   `.gitignore` uncovered), and no snapshot holds it.
 - `/rewind N`: the same for snapshot N, with the targets every later snapshot kept by path; it drops N and every later
   one.
+- `/undo yes` and `/rewind N yes` put the files back without the question. A frontend on `henki serve` runs a command
+  with no terminal: there `/undo` and `/rewind N` alone show what they would do and refuse (exit 1), so send `yes`
+  once the person agreed.
 
 Ignored files (`.gitignore`, under the rules as they are when the snapshot is made) are not in a snapshot. So once an
 edit drops a rule, the files it hid are in the snapshots after it, kept by refs: a `git push --mirror` would publish
-them. The mod's git calls run no program your git config names (no `core.fsmonitor`, hook, pager or filter driver such
+them. The mod takes git and the tools it uses from `/opt/homebrew/bin`, `/usr/local/bin`, `/usr/bin` and `/bin`, never
+from your PATH, where a dir inside the project (an activated `.venv/bin`) can hold what the model wrote: the snapshot
+runs on the host before each call. The mod's git calls run no program your git config names (no `core.fsmonitor`, hook, pager or filter driver such
 as Git LFS): a snapshot holds the files' bytes as they are, and `/undo` puts those bytes back. A filter driver whose
 name holds `=` cannot be turned off so: in such a repo no snapshot is made and `/undo` refuses. A file or directory
 git cannot read (mode 000, a nested repo with no commit) is left out of the snapshot, marked `(partial)`. henki shows

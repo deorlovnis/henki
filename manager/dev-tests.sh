@@ -80,7 +80,7 @@ mkrepo() {
 commit() {
   git -C "$1" add -A 2>/dev/null && git -C "$1" -c commit.gpgsign=false -c core.hooksPath=/dev/null commit -q --no-verify -m "$2" 2>/dev/null
 }
-lockline() { HM_N="$1" awk -F '\t' '$2 == ENVIRON["HM_N"]' "$CONF/mods.lock" 2>/dev/null; }
+lockline() { HM_N="$1" awk -F '\t' '$1 == "lock/1" && $2 == ENVIRON["HM_N"]' "$CONF/mods.lock" 2>/dev/null; }
 field() { lockline "$1" | cut -f "$2"; }
 # Every file and link under DIR as PATH<TAB>KIND (644, 755 or link), sorted.
 modlist() {
@@ -593,7 +593,7 @@ t_share() {
   # An index line (written as an index install writes it).
   printf 'lock/1\tixm\ton\t0.2.0\tindex:deorlovnis\tixm\t%s\t%s\t2026-11-08T10:00Z\tyes\t\n' "$c" "$hd" >>"$CONF/mods.lock"
   OUT=$($RUN "$MODS" share ixm 2>"$SCRATCH/err")
-  eq 'index' "$OUT" "henki mods add ixm"
+  eq 'index' "$OUT" "henki mods add ixm --version 0.2.0 --expect $hd"
   run share nope
   refused "nope is not added"
   # The line on another home: these files, or a refusal.
@@ -742,6 +742,17 @@ t_test() {
   mkdir -p "$W/empty"
   dev_run "$W/empty" test
   refused_out "holds no module"
+  # An exec binding: exec/1's fixed checks (no henki needed), never the eof check of a suite that does not exist.
+  mkmod "$W/x/ge" 'ports = ["exec"]\ncontracts = ["exec/1"]\n'
+  mkdir -p "$W/x/ge/port" && printf '#!/bin/sh\nexec "$@"\n' >"$W/x/ge/port/exec" && chmod 755 "$W/x/ge/port/exec"
+  dev_run "$W/x" test ./ge
+  rc_is 0
+  has 'exec checks' "$OUT" "ok   ge: port/exec passes the exec/1 checks (7 checks)"
+  printf '#!/bin/sh\necho "not your command"\nexit 0\n' >"$W/x/ge/port/exec"
+  dev_run "$W/x" test ./ge
+  rc_is 1
+  has 'exec fails' "$OUT" "FAIL ge: port/exec fails the exec/1 checks (above)"
+  case "$OUT" in *exec.tsv* | *"suite (1 checks)"*) fail "dev test ran a suite for exec: $OUT" ;; esac
   if [ -n "$REAL_HENKI" ]; then
     # A binding that fails its suite.
     mkdir -p "$W/p/bp/port" && printf '# a broken binding\n' >"$W/p/bp/doc.md"
@@ -862,6 +873,22 @@ t_publish() {
   has 'owner' "$OUT" 'maintainer = "someone"'
   dev_run "$W" publish ./src
   refused_out "is not a module"
+  # An exec binding's entry carries exec/1's checks; one that fails them is never written.
+  mkmod "$W/src/pe" 'ports = ["exec"]\ncontracts = ["exec/1"]\nmaintainer = "fixture-dev"\n'
+  mkdir -p "$W/src/pe/port" && printf '#!/bin/sh\nexec "$@"\n' >"$W/src/pe/port/exec" && chmod 755 "$W/src/pe/port/exec"
+  commit "$W/src" "an exec binding"
+  git -C "$W/src" remote set-url origin "file://$W/remote.git"
+  git -C "$W/src" push -q origin HEAD:main 2>/dev/null
+  git -C "$W/src" fetch -q origin 2>/dev/null
+  HENKI_INDEX_ALLOW_FILE=1 dev_run "$W/src" publish ./pe
+  rc_is 0
+  has 'exec conform' "$OUT" 'conform = "exec/1 7/7"'
+  printf '#!/bin/sh\nexit 0\n' >"$W/src/pe/port/exec"
+  commit "$W/src" "a broken exec binding"
+  git -C "$W/src" push -q origin HEAD:main 2>/dev/null
+  git -C "$W/src" fetch -q origin 2>/dev/null
+  HENKI_INDEX_ALLOW_FILE=1 dev_run "$W/src" publish ./pe
+  refused_out "port/exec fails the exec/1 checks (above); an index lists only bindings that pass"
 }
 
 # --- eval: the statistics, report, badge and publish --eval -------------------------------------------------------------

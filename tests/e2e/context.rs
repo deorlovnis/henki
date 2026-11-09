@@ -268,3 +268,45 @@ fn e2e_context_signal_during_fit() {
     assert!(d.exited - t < Duration::from_millis(1000), "exit {:?} after the signal", d.exited - t);
     assert!(m.log().is_empty());
 }
+
+/// A cancel during a slow `fit` (6 s, inside its 10 s) in `henki serve`: the binding still works on it, so the next
+/// turn's `fit` gets its 10 s on top of that one's, and the binding lives on (no "rest of the session" notice).
+#[test]
+fn e2e_context_cancel_slow_fit() {
+    let m = Mock::start(vec![say("two"), say("three")]);
+    let r = Run::new(&m.url());
+    let log = r.dir.join("fit.log");
+    bind(
+        &r,
+        &format!(
+            r#"while IFS= read -r line; do
+  id=$(printf '%s' "$line" | sed -n 's/^{{"id":\([0-9]*\),.*/\1/p')
+  case $line in
+    *'"method":"hello"'*) printf '{{"id":%s,"result":{{"protocol":1,"name":"slow","impl":"0.1","version":1}}}}\n' "$id" ;;
+    *'"method":"fit"'*) echo "start $id" >>{log}; sleep 6; printf '{{"id":%s,"result":{{"keep":true}}}}\n' "$id" ;;
+    *'"method":"bye"'*) printf '{{"id":%s,"result":null}}\n' "$id"; exit 0 ;;
+  esac
+done"#,
+            log = log.display()
+        ),
+    );
+    let mut l = r.cmd(&[] as &[&str]).serve().stdin(In::Open).spawn();
+    let put = |l: &mut Live, v: Value| l.write_stdin(format!("{v}\n").as_bytes());
+    let ends = |l: &Live| l.stdout_records().into_iter().filter(|x| x["t"] == "turn_end").collect::<Vec<_>>();
+    put(&mut l, json!({"c": "send", "text": "one"}));
+    l.until("fit 1", 15 * SEC, |_| fs::read_to_string(&log).unwrap_or_default().contains("start"));
+    std::thread::sleep(Duration::from_millis(500));
+    put(&mut l, json!({"c": "cancel"}));
+    l.until("turn 1's end", 15 * SEC, |l| ends(l).len() == 1);
+    put(&mut l, json!({"c": "send", "text": "two"}));
+    l.until("turn 2's end", 30 * SEC, |l| ends(l).len() == 2);
+    put(&mut l, json!({"c": "send", "text": "three"}));
+    l.until("turn 3's end", 30 * SEC, |l| ends(l).len() == 3);
+    l.close_stdin();
+    let d = l.wait();
+    d.finish();
+    let e: Vec<String> = d.of("turn_end").iter().map(|x| x["status"].as_str().unwrap().to_string()).collect();
+    assert_eq!(e, ["interrupted", "ok", "ok"], "{}", d.diag());
+    assert!(!d.notices().iter().any(|n| n.contains("rest of the session")), "the binding died after a cancel: {:?}", d.notices());
+    assert_eq!(fs::read_to_string(&log).unwrap().lines().count(), 3, "every turn went through the binding");
+}

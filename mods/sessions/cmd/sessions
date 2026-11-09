@@ -38,10 +38,11 @@ shown=$(history show "$id") || exit 1
 if [ -z "$n" ]; then
   printf '%s\n' "$shown"
   printf 'fork at line? '
-  read -r n || n=""
+  # No terminal to answer on (henki serve runs a command with stdin /dev/null): the line goes in the argument.
+  read -r n || { echo >&2 && echo "fork: no line given, and no terminal to ask on; fix: /fork N with N a line above" >&2 && exit 1; }
 fi
 case "$n" in '' | 0* | *[!0-9]*)
-  echo "fork: \"$n\" is not a line; fix: /fork lists the lines of this session's messages" >&2
+  echo "fork: \"$n\" is not a line; fix: /fork N, N one of the lines /fork alone lists" >&2
   exit 1
   ;;
 esac

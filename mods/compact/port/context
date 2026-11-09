@@ -1,8 +1,11 @@
 #!/bin/sh
+"export" "PATH=/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin"
 "exec" "python3" "-I" "$0" "$@"
-# compact's context/1 binding: henki runs this file (the realpath of CONFIG/port/context) with no arguments. The line
-# above is sh and python both: sh runs it as python3 in isolated mode (no user site, no PYTHON* variables, and this
-# file's directory is not on the module path); for python it is a string, which does nothing.
+# compact's context/1 binding: henki runs this file (the realpath of CONFIG/port/context) with no arguments. The lines
+# above are sh and python both: sh runs it as python3 in isolated mode (no user site, no PYTHON* variables, and this
+# file's directory is not on the module path); for python they are strings, which do nothing. python3 comes from the
+# system dirs, never the tool PATH: a PATH dir inside the project (an activated .venv/bin) holds what the model wrote
+# there, and this runs on the host for the whole session.
 """compact: henki's official `context` binding (context/1 over port/1).
 
 When a session grows past `start` x the byte limit, the turns before the last `keep_turns` user records are replaced

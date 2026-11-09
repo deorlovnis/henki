@@ -238,9 +238,11 @@ fn serve_tripwire() {
     put(&mut l, json!({"c": "send", "text": "change it"}));
     assert_eq!(nth(&mut l, "turn_end", 1)["status"], "error");
     assert!(of(&l, "notice").iter().any(|n| n["text"].as_str().unwrap().starts_with("trust file changed: ")), "{}", l.diag());
-    nth(&mut l, "reject", 1);
+    // No reject comes unasked after the turn_end: the frontend pairs each with the line it sent.
+    std::thread::sleep(Duration::from_millis(300));
+    assert!(of(&l, "reject").is_empty(), "{}", l.diag());
     put(&mut l, json!({"c": "send", "text": "again"}));
-    assert!(nth(&mut l, "reject", 2)["why"].as_str().unwrap().contains("restart henki"));
+    assert!(nth(&mut l, "reject", 1)["why"].as_str().unwrap().contains("restart henki"));
     let _ = end(l, 0);
     assert_eq!(m.log().len(), 1);
 }
@@ -373,4 +375,57 @@ fn serve_command_changed_trust() {
     let d = l.wait();
     d.finish();
     assert_eq!(d.code, Some(0), "{}", d.diag());
+}
+
+/// EOF at a question is a hangup, as in the REPL: no `approval` (the person said nothing), the call is not run, the turn
+/// is interrupted, exit 130.
+#[test]
+fn serve_eof_at_question() {
+    let m = Mock::start(vec![shell("echo one"), say("never")]);
+    let mut r = Run::new(&m.url());
+    r.set("approve", "\"ask\"");
+    let mut l = serve(&r, &[]);
+    nth(&mut l, "session", 1);
+    put(&mut l, json!({"c": "send", "text": "go"}));
+    nth(&mut l, "ask", 1);
+    let d = end(l, 130);
+    assert!(d.of("approval").is_empty(), "{}", d.diag());
+    let t = &d.of("tool_result")[0];
+    assert_eq!((t["content"].as_str(), &d.of("turn_end")[0]["status"]), (Some("not run: interrupted"), &json!("interrupted")), "{}", d.diag());
+    assert_eq!(m.log().len(), 1);
+}
+
+/// EOF comes after the lines written before it: a `command` written just before EOF runs to its end (its output and a
+/// file it writes after a while), then the session closes, exit 0.
+#[test]
+fn serve_command_then_eof() {
+    let m = Mock::start(vec![]);
+    let r = Run::new(&m.url());
+    let mark = r.dir.join("mark");
+    module(&r, "kit", &[("mark", &format!("sleep 0.5; echo done > {}; echo marked", mark.display()))]);
+    let mut l = serve(&r, &[]);
+    put(&mut l, json!({"c": "command", "name": "mark", "args": ""}));
+    l.close_stdin();
+    let d = l.wait();
+    d.finish();
+    assert_eq!(d.code, Some(0), "{}", d.diag());
+    let o: Vec<Value> = d.records().into_iter().filter(|x| x["t"] == "command_output").collect();
+    assert_eq!(o, [json!({"t": "command_output", "text": "marked\n", "exit": 0})], "{}", d.diag());
+    assert_eq!(fs::read_to_string(&mark).unwrap(), "done\n");
+}
+
+/// A turn that ends `error` says why in its `turn_end` (kind and message, as `run --json`'s result), so a frontend can
+/// tell the person; the journal holds the same.
+#[test]
+fn serve_turn_end_error() {
+    let m = Mock::start(vec![error(401, r#"{"error":{"message":"bad key"}}"#, 1), say("ok")]);
+    let r = Run::new(&m.url());
+    let mut l = serve(&r, &[]);
+    put(&mut l, json!({"c": "send", "text": "a"}));
+    let t = nth(&mut l, "turn_end", 1);
+    assert_eq!((&t["status"], t["error"]["kind"].as_str(), t["error"]["message"].as_str().is_some_and(|m| m.contains("bad key"))), (&json!("error"), Some("auth"), true), "{t}");
+    put(&mut l, json!({"c": "send", "text": "b"}));
+    assert!(nth(&mut l, "turn_end", 2).get("error").is_none());
+    let d = end(l, 0);
+    assert_eq!(d.of("turn_end")[0]["error"], t["error"]);
 }

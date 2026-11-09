@@ -39,6 +39,11 @@ Backends, picked per call:
 - None of these: every call exits 126 with "sandbox: no bwrap, no user namespaces; fix: install bubblewrap, or henki
   mods swap exec std".
 
+`bwrap` and `unshare` come from `/usr/bin`, `/bin`, `/usr/sbin` and `/sbin`, then the dirs of the PATH henki started
+with, but never one whose real path (through any link) lies in the project or the temp dir: a call can write there,
+and the backend runs on the host, so a planted `bwrap` in an activated `.venv/bin` would run the next call unsandboxed.
+The program's own lookups use the system dirs only, and the command gets your PATH back.
+
 On Linux a call is the whole life of its processes and of its `/tmp`: a `sleep 1000 &` or a server started in the
 background ends with the call that started it, and files in `/tmp` are gone after it. Start it and use it in one
 call; keep files that later calls need in the project.

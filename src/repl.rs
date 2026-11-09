@@ -110,7 +110,8 @@ fn lines(s: &mut Session) -> (u8, Option<handoff::Again>) {
             _ if s.out().closed() => return (141, None),
             Outcome::Error { kind: "journal" | "tampered", .. } => return (2, None),
             Outcome::Error { kind: "changed", .. } => {
-                s.reject(TRIPPED);
+                // `henki serve` writes no reject unasked: the notice and turn_end said it, and every later send gets one.
+                (!s.out().json()).then(|| s.reject(TRIPPED));
                 tripped = true;
             }
             _ => {}

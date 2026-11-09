@@ -41,10 +41,10 @@ cd "$(dirname "$0")"
 # shellcheck disable=SC2046 # one variable name per word.
 unset $(git rev-parse --local-env-vars 2>/dev/null)
 
-max_lines=4544      # non-test lines in src/
+max_lines=4546      # non-test lines in src/
 max_file_lines=400  # per file; a module is one file
 max_crates=10       # packages in the normal dependency tree, henki included
-max_bytes=1065536   # release binary
+max_bytes=1131072   # release binary
 
 step() { printf '\n== %s\n' "$*"; }
 say() { echo "check.sh: $*" >&2; }

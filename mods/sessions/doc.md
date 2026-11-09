@@ -8,7 +8,8 @@ Commands for you, not for the model (they cost no prompt bytes):
 - `/fork N`: a new session that holds this one up to its message at line N, without that message: what you send next
   goes there instead, and this session stays as it is. `/fork` alone lists this session's messages by line and asks
   for one; `/fork ID@N` forks another session. henki asks first (`fork session ID at line N?`). A history binding
-  that cannot fork is refused by henki, which names the fix.
+  that cannot fork is refused by henki, which names the fix. With no terminal to ask on (a frontend on `henki serve`),
+  `/fork` alone lists the lines and refuses (exit 1): send `/fork N`.
 - `/new`: close this session and start a new one.
 - `/reload`: restart henki on this session (a henki you upgraded, say). It cannot load a config, AGENTS.md or module
   that changed before it ran: henki refuses a one-key restart then, and you restart henki yourself

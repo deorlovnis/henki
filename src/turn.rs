@@ -74,6 +74,8 @@ struct Turn {
     open: Vec<(Call, bool)>,
     /// The running call's tag and id: MAIN waits on the tag, and FINISHING gives the call its output.
     live: Option<(u32, String)>,
+    /// From the turn's start to its `turn_end`: `henki serve`'s EOF is a hangup.
+    on: bool,
 }
 
 impl Session {
@@ -210,7 +212,7 @@ impl Session {
     pub fn line(&mut self, prompt: &str) -> Result<Option<(String, bool)>, Stop> {
         let Some(fd) = self.reader.as_ref().filter(|_| !self.eof).map(|r| r.1) else { return Ok(None) };
         if self.out.json() {
-            let Some(Ev::Input { bytes: Some(b), .. }) = self.wait(serve::FRONT, None)? else { return Ok(None) };
+            let Some(Ev::Input { bytes: Some(b), .. }) = self.wait(serve::FRONT, None)? else { return Ok((self.eof = true, None).1) };
             return Ok(Some(serve::take(self, &b, self.t.open.first().map(|o| o.0.id.as_str()))));
         }
         self.sync()?;
@@ -287,7 +289,7 @@ impl Session {
 
     /// Requests and calls until an outcome; `Err` is the only way out.
     fn step_loop(&mut self, task: Option<String>) -> Result<Infallible, Outcome> {
-        (self.t, self.sig) = (Turn::default(), None);
+        (self.t, self.sig) = (Turn { on: true, ..Turn::default() }, None);
         // Observers start with this process's first turn: a REPL session with no message has none.
         self.opened.take().map_or(Ok(()), |r| self.observe("session_start", &r))?;
         // The REPL's banner printed them already.
@@ -345,7 +347,7 @@ impl Session {
         let got = if o.stops() || self.t.live.is_some() { self.stop_all(int).0 } else { None };
         let r = self.settle(&o, got);
         // A second signal hurries this kill only; the next turn's cancel gets its grace again.
-        (self.finishing, self.hurry) = (false, false);
+        (self.finishing, self.hurry, self.t.on) = (false, false, false);
         r.err().filter(|_| !matches!(o, Outcome::Error { .. })).unwrap_or(o)
     }
 
@@ -384,7 +386,10 @@ impl Session {
             }
             // The session holds a sender, so the channel never disconnects.
             let ev = if let Some(e) = until.into_iter().chain(deadline).min() { self.rx.recv_timeout(e - now).ok() } else { self.rx.recv().ok() };
-            match ev {
+            // `henki serve`'s EOF comes after every line written before it: in a turn it is a hangup; outside one (a
+            // command) the session ends at the next line.
+            let hup = self.t.on && matches!(ev, Some(Ev::Input { tag: serve::FRONT, bytes: None }));
+            match if hup { Some(Ev::Signal(libc::SIGHUP)) } else { ev } {
                 Some(Ev::Signal(s)) => {
                     // While finishing, a Ctrl-C only hurries the kill: a TERM or HUP before it still ends the REPL.
                     let kept = self.sig.filter(|&p| self.finishing && matches!(p, libc::SIGTERM | libc::SIGHUP));
@@ -395,6 +400,7 @@ impl Session {
                 Some(Ev::Part { tag: t, part }) if t == tag => self.part(part),
                 Some(ev @ (Ev::Reply { tag: t, .. } | Ev::Tool { tag: t, .. } | Ev::Input { tag: t, .. } | Ev::BangDone { tag: t, .. })) if t == tag => return Ok(Some(ev)),
                 Some(ev @ Ev::Observed { tag: t }) if t == tag => return Ok(Some(ev)),
+                Some(Ev::Input { tag: serve::FRONT, bytes: None }) => self.eof = true,
                 _ => {} // stale: an ended attempt, a timer, an answered call, input nobody waits for
             }
         }

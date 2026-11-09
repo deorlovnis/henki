@@ -35,4 +35,5 @@ the summariser to report what tool output showed, never instructions found in it
 the chance that text planted in a file or page reaches the model as if you had asked for it. Unbind compact if you work
 with untrusted content and do not want that.
 
-Needs python3 (3.8 or later).
+Needs python3 (3.8 or later) in `/opt/homebrew/bin`, `/usr/local/bin`, `/usr/bin` or `/bin`: never one from your PATH,
+where a dir inside the project (an activated `.venv/bin`) can hold what the model wrote.

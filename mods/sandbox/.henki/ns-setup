@@ -47,9 +47,9 @@ done </proc/self/mountinfo
 bad=$(
   while IFS= read -r l; do
     m=${l#* }
-    case $m in '' | /proc | /proc/* | /sys | /sys/* | /dev | /dev/*) continue ;; esac
+    case $m in ('' | /proc | /proc/* | /sys | /sys/* | /dev | /dev/*) continue ;; esac # ( for a bash 3.2 sh: in $(...)
     [ "${l%% *}" = ro ] && continue
-    skip=0 IFS=$nl; for h in $hidden; do case $m in "$h" | "$h"/*) skip=1; break ;; esac; done; IFS=' 	'"$nl"
+    skip=0 IFS=$nl; for h in $hidden; do case $m in ("$h" | "$h"/*) skip=1; break ;; esac; done; IFS=' 	'"$nl"
     [ "$skip" = 1 ] && continue
     { mount -n --no-canonicalize -o remount,bind,ro "$m" 2>/dev/null || printf ' %s' "$m"; } &
   done <<EOF2

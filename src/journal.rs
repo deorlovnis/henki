@@ -424,17 +424,19 @@ pub mod rec {
     pub fn elide(ids: &[String]) -> Value {
         json!({"t": "elide", "ids": ids})
     }
+    /// An error's kind and message, in `turn_end` and `result`: what a frontend or a reader shows.
+    fn error(o: &Outcome) -> Option<Value> {
+        if let Outcome::Error { kind, message } = o { Some(json!({"kind": kind, "message": message})) } else { None }
+    }
     pub fn turn_end(o: &Outcome, steps: u32, u: Usage) -> Value {
-        with(json!({"t": "turn_end", "status": o.status(), "steps": steps, "usage": usage(u)}), "reason", o.reason())
+        with(with(json!({"t": "turn_end", "status": o.status(), "steps": steps, "usage": usage(u)}), "reason", o.reason()), "error", error(o))
     }
     pub fn result(o: &Outcome, text: &str, u: Usage, session: Option<&str>, steps: u32, duration_ms: u64) -> Value {
         let v = json!({"t": "result", "status": o.status(), "exit": o.exit(), "text": text, "usage": usage(u), "session": session, "steps": steps,
             "duration_s": (duration_ms.saturating_add(50) / 100) as f64 / 10.0});
-        let mut v = with(v, "reason", o.reason());
-        match o {
-            Outcome::Error { kind, message } => v["error"] = json!({"kind": kind, "message": message}),
-            Outcome::NeedsApproval(c) => v["call"] = json!({"args": c.args, "id": c.id, "name": c.name}),
-            _ => {}
+        let mut v = with(with(v, "reason", o.reason()), "error", error(o));
+        if let Outcome::NeedsApproval(c) = o {
+            v["call"] = json!({"args": c.args, "id": c.id, "name": c.name});
         }
         v
     }

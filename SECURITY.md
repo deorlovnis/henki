@@ -74,6 +74,13 @@ no tool of the model runs on the host outside it. What it does not cover:
   `doc.md` lists what it hides; the list is not a proof.
 - Files the model writes inside the project (`AGENTS.md`, git hooks, scripts) are read or run later by code on the
   host with your rights: a context source, git, you.
+- A PATH dir inside the project (an activated `.venv/bin`, direnv's `PATH_add bin`, a `node_modules/.bin`) lets the
+  model put a program of its own in front of the tools that code on the host runs by name. The sandbox takes its
+  backend (`bwrap`, `unshare`) from the system dirs or your PATH but never one whose real path is in the project or
+  the temp dir, and runs its own lookups on the system dirs; the official `project`, `checkpoints`, `notify` and `compact`,
+  which run unasked, take their programs from the system dirs only. The commands you type (`henki mods`, `/sessions`,
+  the `prompts` templates, your own modules), your shell and the programs you run from the project still find them
+  first: keep such a dir off the PATH you start henki with.
 - An exec program that hands the command to a daemon (a container runtime, ssh) moves it out of henki's kill and
   sweep; such a binding must say so in its doc.
 
@@ -83,7 +90,8 @@ no tool of the model runs on the host outside it. What it does not cover:
   no checkout, no hooks, no build. Its screen lists every program the module brings and when each runs, and asks.
 - A module's code runs with your rights once it is on. `caps_net` says where its programs connect; it is declared,
   not enforced.
-- A module from a URL or a path is marked UNREVIEWED in red and gets one question. A module from the signed index
+- A module from a URL is marked UNREVIEWED in red and gets one question; one from a directory on this machine is
+  shown by its path (the screen says it is a directory here) and gets the same question. A module from the signed index
   shows who reviewed which version. The index's `main` is a chain of SSH signatures checked from the key henki ships:
   a key changes only through a commit signed by a current key, the verified commit must stay on the first-parent line
   of every later head (no rollback, no branch grafted by a key since rotated out), a first sync must find the
@@ -136,6 +144,7 @@ no tool of the model runs on the host outside it. What it does not cover:
 | a bound exec runs every shell call and leaves only `shell`; a dangling one stops the start | `e2e_exec_runs_every_call`, `e2e_exec_shell_only`, `e2e_exec_needs_shell`, `e2e_exec_dangling_refused` |
 | an exec program is killed and swept as the call; a module's `bash` never runs the call | `e2e_exec_timeout_kills_program`, `e2e_exec_background_swept`, `e2e_exec_module_bash_not_used` |
 | `sandbox` hides the home (Linux) or a list of secret paths (macOS) and the agent socket, and keeps writes to the project and the temp dirs | `e2e_exec_official_sandbox`, `t_sandbox` |
+| `sandbox` never runs a backend or tool from the project or the temp dir; `project` and `notify` never run one from the tool PATH | `e2e_exec_sandbox_planted_backend`, `t_sandbox`, `t_project`, `t_notify` |
 | context sources do not run through exec, are skipped not cut, killed when slow, swept, trusted | `ctx_not_through_exec`, `ctx_skip_never_cut`, `ctx_slow_source_killed`, `ctx_leftover_swept`, `ctx_entry_is_trusted` |
 | `project` never follows a link | `t_project` |
 | a context binding's answer is checked; a failing one leaves henki's elision | `e2e_context_refused_answers`, `e2e_context_dead_or_failing`, `e2e_context_start_failure` |

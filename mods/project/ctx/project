@@ -2,6 +2,10 @@
 # The project's instructions for henki: AGENTS.md, else CLAUDE.md, at the git root of the working directory, cut to fit
 # a context source's 16 KiB, then the git line. Prints nothing outside a git work tree, or in one at or above HOME.
 # Reads only regular files, never a link: a link could name a secret outside the project.
+# Its programs (git, tr, awk) come from the system dirs, never the tool PATH: a PATH dir inside a project (an activated
+# .venv/bin) holds what the model wrote there, and this runs on the host at every start, before any question.
+PATH=/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin
+export PATH
 g() { git -c core.fsmonitor=false "$@" 2>/dev/null; } # rev-parse and symbolic-ref only: nothing reads the index
 root=$(g rev-parse --show-toplevel) || exit 0
 case $root in "" | /) exit 0 ;; esac

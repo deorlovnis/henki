@@ -57,8 +57,13 @@ pub fn run(s: &mut Session, name: &str, prog: &Path, module: Option<&Path>, args
     // resume there is refused) and says where this one stays.
     let moved = verb == "restart" && changed.contains(&s.cfg.dir.join("port").join("history"));
     let id = if verb == "resume" { Some(arg.to_string()) } else { s.resumable().filter(|_| verb == "restart" && !moved) };
-    let old = s.cfg.links.iter().find(|l| l.0 == "history").map_or_else(|| "henki's own history".into(), |l| format!("history binding {}", l.2));
-    let kept = |i: &String| format!("session {i} stays in {old}; resume it with that bound (std: henki --port history=std --resume={i})");
+    // Where the session stays, and how to reach it again: std's from any binding; a binding's once it is bound again, by
+    // the manager for a module (`PKG ID`), else by its link.
+    let old = s.cfg.links.iter().find(|l| l.0 == "history");
+    let pkg = old.and_then(|l| l.2.split_once(' ').filter(|_| l.2 != allow::shown(&l.1, &s.cfg.home))).map(|p| format!("henki mods swap history {}", p.0));
+    let how = old.map_or("henki --port history=std".into(), |l| format!("{}, then henki", pkg.unwrap_or_else(|| format!("link {} as port/history again", l.2))));
+    let old = old.map_or("henki's own history".into(), |l| format!("history binding {}", l.2));
+    let kept = |i: &String| format!("session {i} stays in {old}; {how} --resume={i} reaches it");
     Ok(match verb {
         "" => stay,
         "send" if stale => (s.reject(&format!("/{name}: a trust file changed; nothing is sent")), Next::Tripped).1,

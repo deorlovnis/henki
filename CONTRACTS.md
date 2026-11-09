@@ -95,7 +95,7 @@ values of `args` and `blocks` are opaque JSON.
 | `tool_result` | `t` `ts` `id` `name` `content` `is_error` `ms` `bytes` |
 | `notice` | `t` `ts` `text` |
 | `elide` | `t` `ts` `ids` |
-| `turn_end` | `t` `ts` `status` `steps` `usage` `usage.cached` `usage.in` `usage.out` `reason?` |
+| `turn_end` | `t` `ts` `status` `steps` `usage` `usage.cached` `usage.in` `usage.out` `reason?` `error?` `error.kind?` `error.message?` |
 | `result` | `t` `ts?` `status` `exit` `text` `usage` `usage.cached` `usage.in` `usage.out` `session` `steps` `duration_s` `reason?` `error?` `error.kind?` `error.message?` `call?` `call.args?` `call.id?` `call.name?` |
 | `close` | `t` `ts` `bytes?` |
 
@@ -138,7 +138,7 @@ values of `args` and `blocks` are opaque JSON.
 - `elide`: from here on, the `tool_result`s with these `ids` are replaced by `[output elided: N bytes]` (N their
   content's length, with `,` thousands separators) in every request.
 - `turn_end`: the end of one turn: `status` (see json/1), `steps` (model replies in the turn), `usage` (the turn's),
-  `reason` when the status is `gave_up`.
+  `reason` when the status is `gave_up`, `error` (`kind` and `message`, as in json/1's `result`) when it is `error`.
 - `result`: the end of a `henki run` (a REPL session has none): see json/1. In the journal it always has `ts`.
 - `close`: the session ended cleanly; `bytes` is the file's length before this line (absent in a session a history
   binding keeps: history/1).
@@ -595,11 +595,15 @@ lock/1 NAME STATE VERSION SOURCE_KIND SOURCE COMMIT HD1 ADDED HOW FLAGS
   `mask=cmd/NAME`, one per masked command (`henki-mods off NAME/CMD`: the link names a copy of the store copy without
   `cmd/CMD` and `cmd/CMD.md`, beside it as `ID.mHASH`, where HASH is 8 hex digits of the SHA-256 of the masked names,
   sorted, one per line; HD1 stays the module's own).
-- A line whose first field is not `lock/1` (or `bind/1`, after them), or that holds a kind or flag henki-mods does not
-  know, is refused: `this lock is newer than this henki-mods; upgrade henki`. So no rewrite of the lock drops what a
-  later henki-mods wrote. The henki-mods of henki 0.2, which had no FLAGS, refuses the kinds `skill` and `index:INDEX`
-  and a `bind/1` line of a port it does not bind, but ignores field 11 on a line of kind `official`, `path` or `url`:
-  a pin, a mask or a yank there has no effect on it.
+- Last, one line `yank/1 NAME HD1` per lock/1 line whose FLAGS hold `yanked=malicious`. henki-mods makes them from
+  FLAGS at every write of the lock and reads nothing else from them: they are there for an older henki-mods.
+- A line whose first field is not `lock/1` (or `bind/1` or `yank/1`, after them), or that holds a kind or flag
+  henki-mods does not know, is refused: `this lock is newer than this henki-mods; upgrade henki`. So no rewrite by
+  this henki-mods drops what a later one wrote. The henki-mods of henki 0.2 does not hold to that: it had no FLAGS
+  (field 11 was MASK there, always empty), refuses the kinds `skill` and `index:INDEX`, a `bind/1` line of a port it
+  does not bind or with HOW `yanked`, and any `yank/1` line, but takes a line of kind `official`, `path` or `url` with
+  field 11 set and writes field 11 back empty when it rewrites the lock: a pin or a mask is lost then. A module yanked
+  as malicious has its `yank/1` line, so henki-mods 0.2 refuses that lock and never turns the module back on.
 - On means the link `CONFIG_DIR/ext/NAME` points at the module's store copy (or its masked copy); off means no link.
 - A profile is a file of lock/1 lines that `henki-mods init PROFILE` adds: lines of kind `official` (VERSION, COMMIT,
   HD1, ADDED and HOW `-`: the copy this henki ships) and of kind `index:INDEX` (a package pinned by VERSION and HD1).
@@ -780,7 +784,9 @@ links say. `exec` speaks no protocol (exec/1): of this section only the link rul
 - **Timeouts.** `hello` 5 s, `create` 2 s, `open` 5 s, `read` 10 s per page, `list` 5 s, `append` 2 s, `discard` 2 s,
   `fork` 10 s, `decide` 5 s, `record` 2 s, `fit` 10 s, `bye` 300 ms. A signal or the session deadline ends a wait for
   `hello`, `create`, `open`, `read`, `list`, `fork`, `decide` or `fit` within 50 ms, never one for a method that changes
-  state.
+  state. Requests are served one at a time, so a request whose wait was cut short still runs in the binding to its
+  end: the next request's timeout counts from when that one's would have ended (`bye`'s does not), and its late answer
+  is dropped.
 - **The dead rule.** A timeout, a closed stdout, a line over the cap or cut at EOF, a non-object line, or an answer
   with both or neither of `result` and `error`, or 256 MiB of lines no request asked for, kills the binding for the
   rest of the session: every later call fails at once. An error answer is one failed call; the binding lives on.
@@ -976,7 +982,9 @@ never in the journal, with no `ts`:
 
 - `reject`: a line henki did not take now, why a command did nothing (an unknown command, a trust file changed), or a
   line about its hand-off that the REPL notes (handoff/1: `changed while /NAME ran: PATH`, one per file); `why` may
-  change.
+  change. henki writes one only while it reads a line or runs a command, never after a `turn_end`.
+- `turn_end` with status `error` holds the error's `kind` and `message` (journal/1), as `run --json`'s `result` does:
+  what the frontend tells the person (a bad API key, a context exceeded, a server down).
 - `command_output`: what a `command` printed, stdout and stderr as one stream (over 1 MiB: its first and last 512 KiB
   around a cut marker), and its exit code, `null` when a signal ended it.
 - `next`: what a command handed back (handoff/1). `send`: the text, shown to the person; the frontend sends it as a
@@ -995,7 +1003,7 @@ dropped, and answered with one `reject` (asking, it is also a no).
 |---|---|---|
 | `{"c":"send","text":TEXT}` | idle | TEXT is the next message. It is never a command: `/exit` or `!ls` is text for the model |
 | `{"c":"answer","id":ID,"verdict":V}` | at the question about call ID | V is `yes`, `no` or `always`. `always` only when the `ask` record has `always: true`: it saves the call's command as an allow rule for the project root `ask.root`, used by every later session there, the REPL's included. henki asks no second question, so the frontend must show the person what the REPL shows ("a rule allows whatever this command does in ROOT, including the files and config it reads") and get a separate confirmation before it sends `always`. `always` where it is not offered is a `reject`, and the question stays open |
-| `{"c":"command","name":NAME,"args":ARGS}` | idle | as the line `/NAME ARGS` typed at the REPL's prompt (handoff/1): the module command `cmd/NAME` with ARGS (trimmed) as one argument, or `mods` and `allow` with ARGS split at spaces (`exit` and `help` are a `reject`: EOF ends the session). It runs with no terminal (a session of its own, stdin `/dev/null`), so it cannot ask the person anything; its output is the `command_output` record, and what it hands back is a `next` record. `cancel` sends it SIGINT |
+| `{"c":"command","name":NAME,"args":ARGS}` | idle | as the line `/NAME ARGS` typed at the REPL's prompt (handoff/1): the module command `cmd/NAME` with ARGS (trimmed) as one argument, or `mods` and `allow` with ARGS split at spaces (`exit` and `help` are a `reject`: EOF ends the session). It runs with no terminal (a session of its own, stdin `/dev/null`), so it cannot ask the person anything (a question it asks reads EOF: the official `/undo` and `/rewind N` then refuse, and take `yes` after them to confirm; `/fork` takes its line); its output is the `command_output` record, and what it hands back is a `next` record. `cancel` sends it SIGINT |
 | `{"c":"cancel"}` | any time | as Ctrl-C in the REPL: during a turn it ends the turn `interrupted` (the tools get SIGINT, then the kill); at a question it is a no; idle, nothing |
 
 henki is *idle* after the `session` record, after each `turn_end`, and after a command's `command_output` (or its
@@ -1011,7 +1019,10 @@ After a trust file changed (a `turn_end` with status `error` after the notice `t
 ### End
 
 EOF on stdin while idle closes the session: exit 0; like a hangup, it kills background processes at once, without the
-grace `/exit` gives. EOF during a turn is a hangup: the turn is interrupted, the session closes, exit 130. SIGTERM and
+grace `/exit` gives. EOF comes after every line written before it, and henki takes those lines first: a command that
+runs at EOF (one written just before it, say) runs to its end, then the session closes, exit 0. EOF during a turn, a
+question included, is a hangup: the turn is interrupted (no `approval` for an open question), the session closes, exit
+130; so a frontend keeps stdin open until the `turn_end` it waits for. SIGTERM and
 SIGHUP: 130. stdout closed: 141. A journal failure: 2. `henki serve --resume` continues the session. `!cmd` is not in
 this version.
 
